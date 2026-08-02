@@ -5173,6 +5173,15 @@ USQUEDOWNEOF
 }
 
 # systemd-юнит. Type=simple: usque держит туннель в foreground.
+#
+# --no-tunnel-ipv6 обязателен, и сразу по двум причинам:
+#  1) IPv6 в туннель мы принципиально не пускаем — у бэкенда wg ровно так же
+#     («только IPv4, избегаем утечек»), и таблица 200 содержит только
+#     IPv4-маршрут, так что IPv6 внутри туннеля не даёт ничего;
+#  2) на хостах с отключённым IPv6 (типовая настройка VPS) ядро отвечает
+#     "permission denied" на попытку назначить IPv6-адрес, и usque не может
+#     создать TUN вообще. В логе это выглядит как "Are you root?", хотя сервис
+#     и так работает от root — сообщение сбивает с толку.
 _usque_write_unit() {
   # quic-go упирается в размеры буферов UDP — без этого скорость режется.
   cat > "$USQUE_SYSCTL" << 'EOF'
@@ -5196,6 +5205,7 @@ ExecStartPre=-/sbin/sysctl -q -w net.core.rmem_max=7500000 -w net.core.wmem_max=
 ExecStart=${USQUE_BIN} nativetun \
   --config ${USQUE_CONF} \
   --interface-name ${WARP_IFACE_NAME} \
+  --no-tunnel-ipv6 \
   --always-reconnect \
   --on-connect ${USQUE_UP_HOOK} \
   --on-disconnect ${USQUE_DOWN_HOOK}
