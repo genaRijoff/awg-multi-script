@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.1"
+VERSION="v0.7.2"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -4731,6 +4731,777 @@ do_reset_server() {
 # Поддерживает бесплатный Warp и Warp+ с лицензионным ключом.
 # Полезно когда IP сервера в блок-листах РКН — выходной IP меняется на Cloudflare.
 
+# ═══════════════════════════════════════════════════════════════
+#  Слой абстракции бэкендов WARP
+# ═══════════════════════════════════════════════════════════════
+# У WARP два способа реализации, и меню, per-client тумблер, бот и бэкап
+# обязаны работать только через этот контракт, не зная, какой из них активен:
+#
+#   wg    — kernel WireGuard. Профиль генерируется wgcf, интерфейс поднимается
+#           вручную через ip link + wg setconf. Быстрый (в ядре), но требует
+#           модуль wireguard и пакет wireguard-tools.
+#   usque — MASQUE поверх QUIC, статический Go-бинарь в userspace. Не нужен
+#           ни kernel-модуль, ни apt-репозиторий. Медленнее и ест CPU.
+#
+# Контракт (реализация = функция warp_<backend>_<метод>):
+#   probe     можно ли поставить на этой ОС/ядре  → 0 да, 1 нет
+#   install   установка                           → 0 успех
+#   uninstall полное снятие                       → 0 успех
+#   up/down   поднять/опустить туннель            → 0 успех
+#   iface     имя интерфейса для policy routing   → stdout
+#   health    жив ли туннель                      → 0 жив, stdout = внешний IP
+#   status    строки для меню и бота              → stdout
+#
+# ВАЖНО: оба бэкенда используют ОДНО имя интерфейса — warp0. Благодаря этому
+# peers.list, все "ip rule ... lookup 200", MASQUERADE -o warp0, FORWARD,
+# health-check и статус в боте одинаковы для обоих, а смена бэкенда не требует
+# пересоздавать клиентов и трогать их правила.
+WARP_IFACE_NAME="warp0"
+WARP_BACKEND_FILE="/etc/awg-warp-backend"
+WARP_BACKENDS=(wg usque)
+
+# Какой бэкенд активен. Существующие установки файла не имеют — для них wg,
+# то есть обратная совместимость сохраняется без миграции.
+# Известен ли такой бэкенд. Единственное место со списком — WARP_BACKENDS.
+warp_backend_known() {
+  local b="$1" known
+  for known in "${WARP_BACKENDS[@]}"; do
+    [[ "$b" == "$known" ]] && return 0
+  done
+  return 1
+}
+
+warp_backend_current() {
+  local b=""
+  [[ -f "$WARP_BACKEND_FILE" ]] && b=$(tr -d '[:space:]' < "$WARP_BACKEND_FILE" 2>/dev/null || true)
+  if warp_backend_known "$b"; then echo "$b"; else echo "${WARP_BACKENDS[0]}"; fi
+}
+
+warp_backend_set() {
+  local b="$1"
+  warp_backend_known "$b" || { err "Неизвестный бэкенд WARP: $b"; return 1; }
+  if ! printf '%s\n' "$b" > "$WARP_BACKEND_FILE" 2>/dev/null; then
+    err "Не удалось записать $WARP_BACKEND_FILE"
+    return 1
+  fi
+  chmod 644 "$WARP_BACKEND_FILE" 2>/dev/null || true
+  log_info "WARP backend = $b"
+  return 0
+}
+
+# Диспетчер контракта. Держим его единственной точкой вызова, чтобы добавление
+# третьего бэкенда не требовало правок в меню и боте.
+_warp_dispatch() {
+  local method="$1"; shift
+  local backend fn
+  backend=$(warp_backend_current)
+  fn="warp_${backend}_${method}"
+  if ! declare -F "$fn" >/dev/null; then
+    err "Бэкенд '$backend' не реализует метод '$method'"
+    log_err "warp dispatch: нет функции $fn"
+    return 1
+  fi
+  "$fn" "$@"
+}
+
+# Автовыбор бэкенда. Порядок в WARP_BACKENDS не случаен: wg первым, потому что
+# kernel-WireGuard быстрее и заметно дешевле по CPU, чем userspace-QUIC. usque
+# берётся там, где wg не может — нет модуля ядра, Secure Boot режет неподписанный
+# DKMS, контейнер без wireguard. Пишет выбранный бэкенд в stdout, диагностику —
+# в stderr, чтобы вызывающий мог показать её пользователю.
+warp_backend_autoselect() {
+  local b reason
+  for b in "${WARP_BACKENDS[@]}"; do
+    if declare -F "warp_${b}_probe" >/dev/null; then
+      if reason=$("warp_${b}_probe" 2>/dev/null); then
+        echo "$b"
+        return 0
+      fi
+      echo "  $b: ${reason:-недоступен}" >&2
+    fi
+  done
+  return 1
+}
+
+# Методы контракта аргументов не принимают — состояние берётся из конфигов и
+# из активного бэкенда. Понадобятся аргументы — добавим тогда, а не заранее.
+warp_probe()     { _warp_dispatch probe;     }
+warp_install()   { _warp_dispatch install;   }
+warp_uninstall() { _warp_dispatch uninstall; }
+warp_up()        { _warp_dispatch up;        }
+warp_down()      { _warp_dispatch down;      }
+warp_iface()     { _warp_dispatch iface;     }
+warp_health()    { _warp_dispatch health;    }
+warp_status()    { _warp_dispatch status;    }
+
+# ── Реализация бэкенда wg (существующая, поведение не меняется) ──
+# Это тонкие адаптеры над уже работающими _warp_* функциями. Никакой логики
+# здесь нет намеренно: задача этапа — вынести под контракт, ничего не сломав.
+
+warp_wg_iface() { echo "$WARP_IFACE_NAME"; }
+
+# Ставится везде, где есть kernel-модуль wireguard и wireguard-tools.
+# _warp_ensure_deps сама доставит пакет; проверяем то, что доставить нельзя.
+warp_wg_probe() {
+  if ! modprobe wireguard 2>/dev/null && [[ ! -d /sys/module/wireguard ]]; then
+    echo "нет модуля ядра wireguard"
+    return 1
+  fi
+  return 0
+}
+
+warp_wg_install()   { _warp_install_wgcf && _warp_register && _warp_generate_profile; }
+warp_wg_uninstall() { _warp_remove; }
+warp_wg_up()        { _warp_up; }
+warp_wg_down()      { _warp_down; }
+warp_wg_status()    { _warp_status; }
+
+# Жив ли туннель. stdout — внешний IP, по которому видно, что выход через
+# Cloudflare. Возврат 1 = туннеля нет или он не отвечает.
+warp_wg_health() {
+    local ip
+    ip link show "$WARP_IFACE_NAME" &>/dev/null || return 1
+    ip=$(timeout 5 curl -s --interface "$WARP_IFACE_NAME" -4 https://api.ipify.org 2>/dev/null || true)
+    [[ -n "$ip" ]] || return 1
+    echo "$ip"
+    return 0
+}
+
+# ── Реализация бэкенда usque (MASQUE поверх QUIC, userspace) ──
+# https://github.com/Diniboy1123/usque — статический Go-бинарь, без apt и без
+# kernel-модулей. Нужен только /dev/net/tun. Медленнее kernel-WireGuard и
+# заметно дороже по CPU (весь QUIC в userspace), поэтому это резервный путь.
+USQUE_DIR="/etc/usque"
+USQUE_CONF="$USQUE_DIR/config.json"
+USQUE_BIN="/usr/local/bin/usque"
+USQUE_UP_HOOK="$USQUE_DIR/on-connect.sh"
+USQUE_DOWN_HOOK="$USQUE_DIR/on-disconnect.sh"
+USQUE_SERVICE="/etc/systemd/system/awg-usque.service"
+USQUE_SYSCTL="/etc/sysctl.d/99-awg-usque.conf"
+USQUE_LOG="/var/log/awg-usque.log"
+USQUE_FALLBACK_VER="4.2.1"   # если GitHub API недоступен
+
+warp_usque_iface() { echo "$WARP_IFACE_NAME"; }
+
+# uname -m → суффикс релиза usque. Пустой вывод = архитектура не поддержана.
+_usque_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   echo "linux_amd64"   ;;
+    aarch64|arm64)  echo "linux_arm64"   ;;
+    armv7l|armv7)   echo "linux_armv7"   ;;
+    armv6l|armv6)   echo "linux_armv6"   ;;
+    armv5*)         echo "linux_armv5"   ;;
+    mips64el|mips64le) echo "linux_mips64le" ;;
+    mips64)         echo "linux_mips64"  ;;
+    mipsel|mipsle)  echo "linux_mipsle"  ;;
+    mips)           echo "linux_mips"    ;;
+    *) echo "" ;;
+  esac
+}
+
+# Можно ли поставить usque на этой машине. В отличие от wg, kernel-модуль
+# wireguard не нужен — достаточно tun.
+warp_usque_probe() {
+  if [[ -z "$(_usque_arch)" ]]; then
+    echo "архитектура $(uname -m) не поддерживается usque"
+    return 1
+  fi
+  if [[ ! -c /dev/net/tun ]]; then
+    modprobe tun 2>/dev/null || true
+    if [[ ! -c /dev/net/tun ]]; then
+      echo "нет /dev/net/tun (в контейнере он может быть недоступен)"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+# Сверяет sha256 файла со строкой из checksums.txt.
+# $1 = файл, $2 = checksums.txt, $3 = имя ассета в списке.
+# Возврат: 0 совпало, 1 не совпало, 2 записи для ассета нет.
+#
+# Сравниваем хеши напрямую, а не через "sha256sum -c": тот ищет файл по имени
+# из checksums.txt, а скачиваем мы во временный u.zip — из-за этого проверка
+# падала с «не совпала», хотя сумма была верной.
+_usque_verify_sha256() {
+  local file="$1" sums="$2" asset="$3" expected actual
+  [[ -f "$file" && -f "$sums" ]] || return 2
+  expected=$(awk -v f="$asset" '$2 == f { print $1; exit }' "$sums" 2>/dev/null || true)
+  [[ -n "$expected" ]] || return 2
+  actual=$(sha256sum "$file" | cut -d' ' -f1)
+  [[ "$expected" == "$actual" ]] && return 0
+  echo "ожидалось: $expected" >&2
+  echo "получено:  $actual"  >&2
+  return 1
+}
+
+# Скачивание бинаря с проверкой sha256 из checksums.txt релиза.
+# Без проверки суммы не ставим: это исполняемый файл, работающий от root.
+_usque_install_bin() {
+  local arch tag ver url tmpd
+  arch=$(_usque_arch)
+  [[ -n "$arch" ]] || { err "Архитектура $(uname -m) не поддерживается"; return 1; }
+
+  if command -v "$USQUE_BIN" &>/dev/null && "$USQUE_BIN" version &>/dev/null; then
+    info "usque уже установлен: $("$USQUE_BIN" version 2>/dev/null | tail -1)"
+    return 0
+  fi
+
+  command -v unzip &>/dev/null || {
+    info "Ставлю unzip (релизы usque — zip-архивы)"
+    apt-get install -y -q unzip >/dev/null 2>&1 || { err "unzip не установился"; return 1; }
+  }
+
+  info "Узнаём последнюю версию usque..."
+  tag=$(curl -4 -fsSL --connect-timeout 8 --max-time 15 \
+    "https://api.github.com/repos/Diniboy1123/usque/releases/latest" 2>/dev/null \
+    | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -1 || true)
+  ver="${tag#v}"
+  [[ -n "$ver" ]] || { ver="$USQUE_FALLBACK_VER"; warn "GitHub API недоступен, беру версию $ver"; }
+
+  tmpd=$(mktemp -d) || return 1
+  url="https://github.com/Diniboy1123/usque/releases/download/v${ver}/usque_${ver}_${arch}.zip"
+  info "Скачиваю usque v${ver} (${arch})..."
+  if ! curl -4 -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$tmpd/u.zip"; then
+    err "Не удалось скачать usque"
+    info "Проверь вручную: $url"
+    rm -rf "$tmpd"; return 1
+  fi
+
+  # Проверка контрольной суммы
+  local asset="usque_${ver}_${arch}.zip" vrc
+  if curl -4 -fsSL --max-time 30 \
+       "https://github.com/Diniboy1123/usque/releases/download/v${ver}/checksums.txt" \
+       -o "$tmpd/checksums.txt" 2>/dev/null; then
+    _usque_verify_sha256 "$tmpd/u.zip" "$tmpd/checksums.txt" "$asset"; vrc=$?
+    case $vrc in
+      0) ok "Контрольная сумма совпала" ;;
+      2) warn "В checksums.txt нет строки для $asset — ставим без проверки" ;;
+      *) err "Контрольная сумма НЕ совпала — файл повреждён или подменён"
+         rm -rf "$tmpd"; return 1 ;;
+    esac
+  else
+    warn "checksums.txt не скачался — ставим без проверки суммы"
+  fi
+
+  if ! unzip -oq "$tmpd/u.zip" usque -d "$tmpd"; then
+    err "Не удалось распаковать архив"; rm -rf "$tmpd"; return 1
+  fi
+  install -m 0755 "$tmpd/usque" "$USQUE_BIN" || { err "Не удалось установить $USQUE_BIN"; rm -rf "$tmpd"; return 1; }
+  rm -rf "$tmpd"
+
+  if ! "$USQUE_BIN" version &>/dev/null; then
+    err "Бинарь usque не запускается"; rm -f "$USQUE_BIN"; return 1
+  fi
+  ok "usque установлен: $("$USQUE_BIN" version 2>/dev/null | tail -1)"
+  return 0
+}
+
+# Регистрация устройства в Cloudflare. Ключевая ловушка: rate-limit — это НЕ
+# ошибка установки, а «приходи позже». Отличаем её от настоящего отказа и
+# повторяем с экспоненциальным бэкоффом.
+_usque_register() {
+  mkdir -p "$USQUE_DIR" && chmod 700 "$USQUE_DIR"
+
+  if [[ -s "$USQUE_CONF" ]]; then
+    info "Конфиг usque уже есть — регистрацию пропускаем"
+    chmod 600 "$USQUE_CONF" 2>/dev/null || true
+    return 0
+  fi
+
+  local attempt=0 max=4 delay=5 out rc
+  while (( attempt < max )); do
+    attempt=$((attempt+1))
+    info "Регистрация в Cloudflare, попытка ${attempt}/${max}..."
+    out=$("$USQUE_BIN" register --accept-tos --config "$USQUE_CONF" 2>&1); rc=$?
+
+    if [[ $rc -eq 0 && -s "$USQUE_CONF" ]]; then
+      chmod 600 "$USQUE_CONF"
+      ok "Устройство зарегистрировано, конфиг: $USQUE_CONF"
+      return 0
+    fi
+
+    if echo "$out" | grep -qiE '429|rate.?limit|too many requests'; then
+      warn "Cloudflare ограничил частоту регистраций — это не ошибка установки"
+      if (( attempt < max )); then
+        info "Жду ${delay}с и пробую снова..."
+        sleep "$delay"; delay=$((delay*3))
+        continue
+      fi
+      err "Лимит не снялся за ${max} попыток"
+      info "Подожди 10-15 минут и повтори установку — конфиг сохранится"
+      return 1
+    fi
+
+    warn "Регистрация не удалась: $(echo "$out" | tail -2 | tr '\n' ' ')"
+    if (( attempt < max )); then sleep "$delay"; delay=$((delay*3)); fi
+  done
+
+  err "Регистрация usque не удалась"
+  info "Диагностика: $USQUE_BIN register --accept-tos --config $USQUE_CONF"
+  return 1
+}
+
+# Хуки on-connect / on-disconnect. usque вызывает их БЕЗ аргументов, контекст
+# приходит через окружение: USQUE_EVENT, USQUE_IFACE, USQUE_IPV4, USQUE_IPV6,
+# USQUE_ENDPOINT (проверено по usque --help и README v4.2.1).
+#
+# ГЛАВНОЕ ПРАВИЛО: работаем ТОЛЬКО в таблице 200. Пример из документации самого
+# usque делает "ip route del default" и заворачивает default в туннель в main —
+# для сервера это означает мгновенную потерю SSH и обрыв AWG. Мы так не делаем.
+_usque_write_hooks() {
+  mkdir -p "$USQUE_DIR" && chmod 700 "$USQUE_DIR"
+
+  cat > "$USQUE_UP_HOOK" << 'USQUEUPEOF'
+#!/bin/bash
+# AWG Toolza — usque on-connect. Generated, do not edit manually.
+# Идемпотентен: вызывается при каждом реконнекте, поэтому только route replace
+# и проверка перед добавлением правил iptables.
+set -u
+
+IFACE="${USQUE_IFACE:-warp0}"
+SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
+PEERS="/etc/wgcf/peers.list"
+TABLE=200
+LOG="/var/log/awg-usque.log"
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG" 2>/dev/null || true; }
+
+log "on-connect: iface=$IFACE ipv4=${USQUE_IPV4:-?} endpoint=${USQUE_ENDPOINT:-?}"
+
+# Без AWG-сервера split-tunnel бессмысленен
+[[ -f "$SERVER_CONF" ]] || { log "нет $SERVER_CONF — выходим"; exit 0; }
+
+addr=$(awk '/^Address/{print $3; exit}' "$SERVER_CONF")
+if [[ "$addr" =~ ^([0-9]+\.[0-9]+\.[0-9]+)\.[0-9]+/([0-9]+)$ ]]; then
+  client_net="${BASH_REMATCH[1]}.0/${BASH_REMATCH[2]}"
+else
+  log "не разобрал Address из $SERVER_CONF — выходим"; exit 0
+fi
+
+ext_if=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+gw=$(ip -4 route show default 2>/dev/null | awk '{print $3; exit}')
+
+# 1) Маршрут до endpoint Cloudflare — принудительно через ОСНОВНОЙ шлюз.
+# В нашей схеме петли и так нет (в main мы не лезем, трафик самого usque идёт
+# штатным маршрутом), но это дешёвая страховка на случай более широких правил.
+ep="${USQUE_ENDPOINT:-}"
+ep="${ep%\]*}"; ep="${ep#[}"        # срезаем скобки IPv6-формы
+ep_ip="${ep%%:*}"                    # host из host:port
+if [[ "$ep_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ && -n "$gw" && -n "$ext_if" ]]; then
+  ip route replace "${ep_ip}/32" via "$gw" dev "$ext_if" 2>/dev/null &&     log "endpoint $ep_ip закреплён через $gw dev $ext_if"
+fi
+
+# 2) MTU снимаем с живого интерфейса, а не угадываем
+mtu=$(cat "/sys/class/net/${IFACE}/mtu" 2>/dev/null || echo "")
+log "MTU интерфейса $IFACE = ${mtu:-неизвестен}"
+
+# 2a) Ограничение MSS. Без него мелкие пакеты (DNS, ping) ходят, а TLS-хендшейк
+# виснет: клиент шлёт пакеты под СВОЙ MTU, они не влезают в туннель, а PMTU
+# discovery через userspace-QUIC часто не работает — ICMP "Fragmentation Needed"
+# до клиента не доходит, и получается чёрная дыра. Снаружи выглядит как
+# «интернет есть, а сайты не открываются».
+# У kernel-WireGuard этой беды нет, поэтому в бэкенде wg клампа и не было.
+if [[ "$mtu" =~ ^[0-9]+$ ]] && (( mtu > 100 )); then
+  mss=$((mtu - 40))   # IPv4 (20) + TCP (20)
+  iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+    -j TCPMSS --set-mss "$mss" 2>/dev/null || \
+  iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+    -j TCPMSS --set-mss "$mss" 2>/dev/null && log "MSS ограничен до $mss"
+  # Обратное направление: ответы из туннеля клиенту
+  iptables -t mangle -C FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+    -j TCPMSS --set-mss "$mss" 2>/dev/null || \
+  iptables -t mangle -A FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
+    -j TCPMSS --set-mss "$mss" 2>/dev/null || true
+fi
+
+# 3) Только своя таблица. main НЕ трогаем — иначе теряется доступ к VPS.
+src4="${USQUE_IPV4:-}"; src4="${src4%%/*}"
+if [[ -n "$src4" ]]; then
+  ip route replace default dev "$IFACE" src "$src4" table "$TABLE" 2>/dev/null ||     ip route replace default dev "$IFACE" table "$TABLE"
+else
+  ip route replace default dev "$IFACE" table "$TABLE"
+fi
+
+# 4) NAT: клиенты сидят в приватной подсети, у туннеля внутренний CGNAT-адрес,
+# без MASQUERADE их пакеты уйдут наружу с приватным src и будут отброшены.
+iptables -t nat -C POSTROUTING -s "$client_net" -o "$IFACE" -j MASQUERADE 2>/dev/null ||   iptables -t nat -A POSTROUTING -s "$client_net" -o "$IFACE" -j MASQUERADE
+# Fallback наружу для клиентов ВНЕ WARP — они идут по main через ext_if
+if [[ -n "$ext_if" ]]; then
+  iptables -t nat -C POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE 2>/dev/null ||     iptables -t nat -A POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE
+fi
+iptables -C FORWARD -i awg0 -o "$IFACE" -j ACCEPT 2>/dev/null ||   iptables -A FORWARD -i awg0 -o "$IFACE" -j ACCEPT
+iptables -C FORWARD -i "$IFACE" -o awg0 -j ACCEPT 2>/dev/null ||   iptables -A FORWARD -i "$IFACE" -o awg0 -j ACCEPT
+
+# rp_filter loose только на VPN-интерфейсах; all.rp_filter не трогаем, иначе
+# ослабнет защита от спуфинга на внешнем интерфейсе.
+sysctl -w "net.ipv4.conf.${IFACE}.rp_filter=2" >/dev/null 2>&1 || true
+sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
+
+# 5) Правила клиентов. Список общий с бэкендом wg — при смене бэкенда
+# per-client тумблер не требует пересоздания клиентов.
+if [[ -s "$PEERS" ]]; then
+  n=0
+  while IFS= read -r peer_ip; do
+    [[ -z "$peer_ip" ]] && continue
+    ip rule del from "$peer_ip" lookup "$TABLE" 2>/dev/null || true
+    ip rule add from "$peer_ip" lookup "$TABLE" 2>/dev/null && n=$((n+1))
+  done < "$PEERS"
+  log "правил для клиентов применено: $n"
+fi
+
+log "on-connect: готово"
+exit 0
+USQUEUPEOF
+  chmod 700 "$USQUE_UP_HOOK"
+
+  cat > "$USQUE_DOWN_HOOK" << 'USQUEDOWNEOF'
+#!/bin/bash
+# AWG Toolza — usque on-disconnect. Generated, do not edit manually.
+# ВАЖНО: при обрыве НЕ снимаем правила клиентов. usque запущен с
+# --always-reconnect, разрыв H3_NO_ERROR при простое — штатное поведение, и
+# снос правил на каждом таком разрыве только устроил бы мигание маршрутов.
+# Реальная уборка делается при остановке сервиса (warp_usque_down).
+set -u
+LOG="/var/log/awg-usque.log"
+echo "$(date '+%F %T') on-disconnect: event=${USQUE_EVENT:-?} iface=${USQUE_IFACE:-?}" >> "$LOG" 2>/dev/null || true
+exit 0
+USQUEDOWNEOF
+  chmod 700 "$USQUE_DOWN_HOOK"
+  ok "Хуки on-connect / on-disconnect записаны"
+  return 0
+}
+
+# systemd-юнит. Type=simple: usque держит туннель в foreground.
+_usque_write_unit() {
+  # quic-go упирается в размеры буферов UDP — без этого скорость режется.
+  cat > "$USQUE_SYSCTL" << 'EOF'
+# AWG Toolza — буферы UDP для quic-go (usque). Без этого скорость режется.
+net.core.rmem_max = 7500000
+net.core.wmem_max = 7500000
+EOF
+  sysctl -p "$USQUE_SYSCTL" >/dev/null 2>&1 || true
+
+  cat > "$USQUE_SERVICE" << EOF
+[Unit]
+Description=AWG Toolza — WARP через usque (MASQUE)
+Documentation=https://github.com/Diniboy1123/usque
+After=network-online.target awg-quick@awg0.service
+Wants=network-online.target
+ConditionPathExists=${USQUE_CONF}
+
+[Service]
+Type=simple
+ExecStartPre=-/sbin/sysctl -q -w net.core.rmem_max=7500000 -w net.core.wmem_max=7500000
+ExecStart=${USQUE_BIN} nativetun \
+  --config ${USQUE_CONF} \
+  --interface-name ${WARP_IFACE_NAME} \
+  --always-reconnect \
+  --on-connect ${USQUE_UP_HOOK} \
+  --on-disconnect ${USQUE_DOWN_HOOK}
+Restart=always
+RestartSec=5
+StandardOutput=append:${USQUE_LOG}
+StandardError=append:${USQUE_LOG}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ok "systemd-юнит записан: awg-usque.service"
+  return 0
+}
+
+warp_usque_install() {
+  hdr "☁  Установка WARP через usque"
+  _usque_install_bin || return 1
+  _usque_register    || return 1
+  _usque_write_hooks || return 1
+  _usque_write_unit  || return 1
+  systemctl enable awg-usque.service >/dev/null 2>&1 || \
+    warn "Автозапуск awg-usque не включился"
+  ok "Бэкенд usque готов. Включить туннель — пункт 3"
+  return 0
+}
+
+warp_usque_up() {
+  [[ -s "$USQUE_CONF" ]] || { err "Нет $USQUE_CONF — сначала установка (пункт 1)"; return 1; }
+  [[ -x "$USQUE_BIN"  ]] || { err "Нет $USQUE_BIN — сначала установка (пункт 1)"; return 1; }
+
+  # Хуки и юнит перезаписываем на каждом подъёме. Они сгенерированы из этого
+  # скрипта, и без перезаписи обновление awg2 не доезжало бы до уже записанных
+  # файлов: пользователь ставит новую версию, а на диске остаётся хук от
+  # старой. Именно так после обновления терялось ограничение MSS.
+  _usque_write_hooks >/dev/null || return 1
+  _usque_write_unit  >/dev/null || return 1
+
+  # Первый запуск (файла ещё нет) — включаем всех клиентов по умолчанию.
+  # Проверяем именно ОТСУТСТВИЕ файла, а не пустоту: пустой список означает
+  # обратное — пользователь сознательно выключил WARP последнему клиенту, и
+  # подъём туннеля не должен возвращать всех назад.
+  if [[ ! -f "$WARP_PEERS" ]]; then
+    info "Список клиентов в Warp не создан — добавляем всех по умолчанию"
+    mkdir -p "$WARP_DIR"
+    : > "$WARP_PEERS"
+    while IFS='|' read -r _name ip; do
+      [[ -z "$ip" ]] && continue
+      echo "$ip" >> "$WARP_PEERS"
+    done < <(_warp_list_awg_clients)
+  fi
+
+  info "Запускаю awg-usque.service..."
+  systemctl restart awg-usque.service || { err "Сервис не стартовал"; info "Логи: journalctl -u awg-usque -n 40"; return 1; }
+
+  # Ждём появления интерфейса — хук on-connect отработает уже после подключения
+  local i
+  for i in $(seq 1 20); do
+    ip link show "$WARP_IFACE_NAME" &>/dev/null && break
+    sleep 1
+  done
+  if ! ip link show "$WARP_IFACE_NAME" &>/dev/null; then
+    err "Интерфейс $WARP_IFACE_NAME не появился за 20 с"
+    info "Логи: journalctl -u awg-usque -n 40  и  $USQUE_LOG"
+    return 1
+  fi
+
+  echo "active" > "$WARP_STATE"
+  echo "backend=usque" >> "$WARP_STATE"
+  ok "Туннель usque поднят на $WARP_IFACE_NAME"
+  info "SSH и серверный трафик идут напрямую"
+  return 0
+}
+
+warp_usque_down() {
+  info "Останавливаю awg-usque.service..."
+  systemctl stop awg-usque.service 2>/dev/null || true
+
+  # Уборка ровно того, что ставил хук. main не трогаем — там ничего нашего нет.
+  local client_net ext_if
+  client_net=$(_warp_get_client_net 2>/dev/null || echo "")
+  ext_if=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+
+  if [[ -s "$WARP_PEERS" ]]; then
+    while IFS= read -r peer_ip; do
+      [[ -z "$peer_ip" ]] && continue
+      ip rule del from "$peer_ip" lookup 200 2>/dev/null || true
+    done < "$WARP_PEERS"
+  fi
+  ip route flush table 200 2>/dev/null || true
+
+  # Правила ограничения MSS — снимаем все, сколько бы их ни накопилось
+  while iptables -t mangle -D FORWARD -o "$WARP_IFACE_NAME" -p tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$(cat "/sys/class/net/${WARP_IFACE_NAME}/mtu" 2>/dev/null || echo 1240)" 2>/dev/null; do :; done
+  iptables -t mangle -S FORWARD 2>/dev/null | grep -oP '(?<=^-A FORWARD ).*TCPMSS.*' | while read -r rule; do
+    [[ "$rule" == *"$WARP_IFACE_NAME"* ]] || continue
+    # shellcheck disable=SC2086
+    iptables -t mangle -D FORWARD $rule 2>/dev/null || true
+  done
+
+  if [[ -n "$client_net" ]]; then
+    iptables -t nat -D POSTROUTING -s "$client_net" -o "$WARP_IFACE_NAME" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i awg0 -o "$WARP_IFACE_NAME" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$WARP_IFACE_NAME" -o awg0 -j ACCEPT 2>/dev/null || true
+    # Прямой выход клиентам оставляем — иначе они потеряют интернет совсем
+    if [[ -n "$ext_if" ]]; then
+      iptables -t nat -C POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -A POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE
+    fi
+  fi
+
+  rm -f "$WARP_STATE" 2>/dev/null || true
+  ok "Туннель usque опущен, клиенты идут напрямую"
+  return 0
+}
+
+# Жив ли туннель. Отдельно от wg: разрыв H3_NO_ERROR при простое — штатное
+# поведение MASQUE, реконнект идёт по исходящему трафику. Поэтому пока сервис
+# активен, кратковременное отсутствие ответа падением НЕ считаем.
+warp_usque_health() {
+  systemctl is-active --quiet awg-usque.service 2>/dev/null || return 1
+  ip link show "$WARP_IFACE_NAME" &>/dev/null || return 1
+  local ip
+  ip=$(timeout 8 curl -s --interface "$WARP_IFACE_NAME" -4 https://api.ipify.org 2>/dev/null || true)
+  [[ -n "$ip" ]] || return 1
+  echo "$ip"
+  return 0
+}
+
+warp_usque_status() {
+  _warp_sync_peers 2>/dev/null || true
+
+  if [[ -x "$USQUE_BIN" ]]; then
+    echo -e "  usque      : ${G}$("$USQUE_BIN" version 2>/dev/null | tail -1)${N}"
+  else
+    echo -e "  usque      : ${D}не установлен${N}"
+    return 0
+  fi
+
+  if [[ -s "$USQUE_CONF" ]]; then
+    echo -e "  Аккаунт    : ${G}$USQUE_CONF${N}"
+  else
+    echo -e "  Аккаунт    : ${D}не зарегистрирован${N}"
+  fi
+
+  local svc
+  svc=$(systemctl is-active awg-usque.service 2>/dev/null || echo "inactive")
+  if [[ "$svc" == "active" ]]; then
+    echo -e "  Сервис     : ${G}● активен${N}"
+  else
+    echo -e "  Сервис     : ${D}○ $svc${N}"
+  fi
+
+  if ip link show "$WARP_IFACE_NAME" &>/dev/null; then
+    local mtu ext
+    mtu=$(cat "/sys/class/net/${WARP_IFACE_NAME}/mtu" 2>/dev/null || echo "?")
+    echo -e "  Интерфейс  : ${G}● $WARP_IFACE_NAME активен${N} ${D}(MTU $mtu)${N}"
+    ext=$(timeout 5 curl -s --interface "$WARP_IFACE_NAME" -4 https://api.ipify.org 2>/dev/null || true)
+    [[ -n "$ext" ]] && echo -e "  Внешний IP : ${G}$ext${N}" || \
+                       echo -e "  Внешний IP : ${Y}нет ответа${N} ${D}(идёт реконнект?)${N}"
+  else
+    echo -e "  Интерфейс  : ${D}○ $WARP_IFACE_NAME выключен${N}"
+  fi
+
+  local cnt=0
+  [[ -f "$WARP_PEERS" ]] && cnt=$(grep -c . "$WARP_PEERS" 2>/dev/null || echo 0)
+  echo -e "  Клиентов   : ${W}${cnt}${N} ${D}через Warp${N}"
+  return 0
+}
+
+# Переключение бэкенда. Клиенты, peers.list и правила не трогаем: имя
+# интерфейса общее, поэтому per-client тумблер переживает смену без изменений.
+_warp_switch_backend() {
+  local target="$1" current was_up=0
+  current=$(warp_backend_current)
+
+  if [[ "$target" == "$current" ]]; then
+    info "Бэкенд уже $target"
+    return 0
+  fi
+
+  if ! declare -F "warp_${target}_probe" >/dev/null; then
+    err "Бэкенд $target не реализован"; return 1
+  fi
+  local reason
+  if ! reason=$("warp_${target}_probe" 2>/dev/null); then
+    err "Бэкенд $target недоступен на этой машине: ${reason:-причина неизвестна}"
+    return 1
+  fi
+
+  echo ""
+  warn "Переключение $current → $target"
+  echo -e "  ${D}Клиенты и их настройки WARP сохранятся: список общий,${N}"
+  echo -e "  ${D}имя интерфейса тоже. Туннель прервётся на несколько секунд.${N}"
+  echo ""
+  read_confirm "$(echo -e "${R}  Переключить бэкенд? (введи yes): ${N}")" || \
+    { info "Отменено"; return 0; }
+
+  ip link show "$WARP_IFACE_NAME" &>/dev/null && was_up=1
+
+  if [[ $was_up -eq 1 ]]; then
+    info "Опускаю туннель на бэкенде $current..."
+    warp_down || warn "Не удалось чисто опустить $current — продолжаем"
+  fi
+
+  warp_backend_set "$target" || return 1
+  ok "Активный бэкенд: $target"
+
+  # Ставим целевой бэкенд, если он ещё не установлен
+  if ! warp_install; then
+    err "Установка бэкенда $target не удалась"
+    warn "Возвращаю активным $current"
+    warp_backend_set "$current"
+    # Туннель мы опустили выше — обязаны поднять обратно, иначе пользователь
+    # остаётся без WARP из-за неудачной попытки переключения.
+    if [[ $was_up -eq 1 ]]; then
+      info "Поднимаю туннель обратно на бэкенде $current..."
+      if warp_up; then
+        ok "Туннель восстановлен на бэкенде $current"
+      else
+        err "Не удалось вернуть туннель — подними вручную: меню Warp → п.3"
+      fi
+    fi
+    return 1
+  fi
+
+  if [[ $was_up -eq 1 ]]; then
+    info "Поднимаю туннель на бэкенде $target..."
+    warp_up || { err "Туннель не поднялся"; return 1; }
+  else
+    info "Туннель был выключен — включи его пунктом 3"
+  fi
+  return 0
+}
+
+# Меню выбора бэкенда
+do_warp_backend_menu() {
+  set +e
+  while true; do
+    clear
+    echo ""
+    hdr "⚙  Бэкенд WARP"
+    echo ""
+    local cur; cur=$(warp_backend_current)
+    echo -e "  Активный: ${G}${cur}${N}"
+    echo ""
+    echo -e "  ${W}wg${N}    — kernel WireGuard через wgcf"
+    echo -e "         ${D}быстрый, в ядре; нужен модуль wireguard${N}"
+    if reason=$(warp_wg_probe 2>/dev/null); then
+      echo -e "         ${G}доступен${N}"
+    else
+      echo -e "         ${R}недоступен:${N} ${D}${reason:-?}${N}"
+    fi
+    echo ""
+    echo -e "  ${W}usque${N} — MASQUE поверх QUIC, userspace"
+    echo -e "         ${D}без модулей ядра и DKMS, проходит там где режут WG;${N}"
+    echo -e "         ${D}дороже по CPU — на 1 vCPU упрётся в процессор${N}"
+    if reason=$(warp_usque_probe 2>/dev/null); then
+      echo -e "         ${G}доступен${N}"
+    else
+      echo -e "         ${R}недоступен:${N} ${D}${reason:-?}${N}"
+    fi
+    echo ""
+    echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  1) Переключить на wg"
+    echo -e "  2) Переключить на usque"
+    echo -e "  3) Выбрать автоматически"
+    echo -e "  0) Назад"
+    echo ""
+    read_choice BE_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")" 0 3 "0"
+    case "${BE_CHOICE:-}" in
+      1) _warp_switch_backend wg;    read -rp "Enter..." ;;
+      2) _warp_switch_backend usque; read -rp "Enter..." ;;
+      3)
+        local auto
+        if auto=$(warp_backend_autoselect 2>/dev/null); then
+          info "Автовыбор: $auto"
+          _warp_switch_backend "$auto"
+        else
+          err "Ни один бэкенд не доступен на этой машине"
+        fi
+        read -rp "Enter..." ;;
+      0|"") set -e; return 0 ;;
+    esac
+  done
+  set -e
+}
+
+warp_usque_uninstall() {
+  warp_usque_down 2>/dev/null || true
+  systemctl disable --now awg-usque.service >/dev/null 2>&1 || true
+  rm -f "$USQUE_SERVICE" "$USQUE_SYSCTL" 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -f "$USQUE_UP_HOOK" "$USQUE_DOWN_HOOK" 2>/dev/null || true
+  rm -f "$USQUE_BIN" 2>/dev/null || true
+  # config.json НЕ удаляем молча: повторная регистрация тратит лимит Cloudflare
+  if [[ -s "$USQUE_CONF" ]]; then
+    warn "Аккаунт $USQUE_CONF оставлен"
+    info "Повторная регистрация упирается в лимит Cloudflare — если он точно"
+    info "не нужен, удали вручную: rm -rf $USQUE_DIR"
+  fi
+  ok "Бэкенд usque снят"
+  return 0
+}
+
 # Гарантирует, что есть всё, на чём держится WARP: бинарь wg, ping и каталог
 # /etc/wireguard. Раньше wireguard-tools ставились только внутри
 # _warp_install_wgcf (пункт 1 меню), а документированный для РФ-хостинга путь
@@ -5608,10 +6379,13 @@ EOF
   # Сначала синхронизируем — убираем мёртвые IP (удалённых клиентов)
   _warp_sync_peers 2>/dev/null || true
 
-  # Если peers list пуст или не существует — заполняем всеми клиентами по умолчанию
-  if [[ ! -s "$WARP_PEERS" ]]; then
-    info "Список клиентов в Warp пуст — добавляем всех по умолчанию"
+  # Первый запуск (файла ещё нет) — заполняем всеми клиентами по умолчанию.
+  # Именно отсутствие файла, а не пустота: пустой список значит, что WARP
+  # сознательно выключен всем, и подъём не должен это отменять.
+  if [[ ! -f "$WARP_PEERS" ]]; then
+    info "Список клиентов в Warp не создан — добавляем всех по умолчанию"
     mkdir -p "$WARP_DIR"
+    : > "$WARP_PEERS"
     while IFS='|' read -r name ip; do
       [[ -z "$ip" ]] && continue
       echo "$ip" >> "$WARP_PEERS"
@@ -6192,27 +6966,52 @@ do_warp_menu() {
   while true; do
     clear
     echo ""
-    hdr "☁  Warp туннель (Cloudflare)"
+    local _be; _be=$(warp_backend_current)
+    hdr "☁  Warp туннель (Cloudflare) — бэкенд: ${_be}"
     echo ""
-    _warp_status || true
+    warp_status || true
     echo ""
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-    echo -e "  1) Установить wgcf и зарегистрировать Warp (бесплатный)"
-    echo -e "  2) Активировать Warp+ (ввести лицензионный ключ)"
+    if [[ "$_be" == "wg" ]]; then
+      echo -e "  1) Установить wgcf и зарегистрировать Warp (бесплатный)"
+    else
+      echo -e "  1) Установить usque и зарегистрировать Warp"
+    fi
+    # Пункты 2, 5, 8, 9 специфичны для wgcf и на usque неприменимы
+    if [[ "$_be" == "wg" ]]; then
+      echo -e "  2) Активировать Warp+ (ввести лицензионный ключ)"
+    else
+      echo -e "  ${D}2) Активировать Warp+ (только для бэкенда wg)${N}"
+    fi
     echo -e "  3) Включить туннель"
     echo -e "  4) Выключить туннель"
-    echo -e "  5) Перегенерировать профиль (после смены лицензии)"
+    if [[ "$_be" == "wg" ]]; then
+      echo -e "  5) Перегенерировать профиль (после смены лицензии)"
+    else
+      echo -e "  ${D}5) Перегенерировать профиль (только для бэкенда wg)${N}"
+    fi
     echo -e "  ${C}6) Управление клиентами в Warp${N}"
     echo -e "  ${C}7) Health-check (вкл/выкл авто-failover)${N}"
-    echo -e "  ${C}8) Импорт wgcf-profile.conf (если регистрация не работает)${N}"
-    echo -e "  ${C}9) Поиск рабочего endpoint (если 2408 заблокирован DPI)${N}"
+    if [[ "$_be" == "wg" ]]; then
+      echo -e "  ${C}8) Импорт wgcf-profile.conf (если регистрация не работает)${N}"
+      echo -e "  ${C}9) Поиск рабочего endpoint (если 2408 заблокирован DPI)${N}"
+    else
+      echo -e "  ${D}8) Импорт wgcf-profile.conf (только для бэкенда wg)${N}"
+      echo -e "  ${D}9) Поиск рабочего endpoint (только для бэкенда wg)${N}"
+    fi
+    echo -e "  ${W}b) Сменить бэкенд WARP${N} ${D}(сейчас ${_be})${N}"
     echo -e "  ${R}d) Удалить Warp полностью${N}"
     echo -e "  0) Назад в главное меню"
     echo ""
-    read_choice WARP_CHOICE "$(echo -e "${C}  Выбор [0-9, d]: ${N}")" 0 9 "0" "d"
+    read_choice WARP_CHOICE "$(echo -e "${C}  Выбор [0-9, b, d]: ${N}")" 0 9 "0" "b|d"
 
     case "${WARP_CHOICE:-}" in
       1)
+        if [[ "$_be" != "wg" ]]; then
+          warp_install || warn "Установка бэкенда $_be не удалась"
+          read -rp "Enter..."
+          continue
+        fi
         _warp_install_wgcf || { read -rp "Enter..."; continue; }
         if ! _warp_register; then
           echo ""
@@ -6235,18 +7034,32 @@ do_warp_menu() {
         ok "Готово! Теперь пункт 3 — включить туннель"
         read -rp "Enter..."
         ;;
-      2) _warp_apply_license; read -rp "Enter..." ;;
-      3) _warp_up; read -rp "Enter..." ;;
-      4) _warp_down; read -rp "Enter..." ;;
+      2)
+        if [[ "$_be" == "wg" ]]; then _warp_apply_license
+        else warn "Warp+ лицензия применима только к бэкенду wg"; fi
+        read -rp "Enter..." ;;
+      3) warp_up;   read -rp "Enter..." ;;
+      4) warp_down; read -rp "Enter..." ;;
       5)
-        _warp_generate_profile && info "Профиль обновлён. Если warp0 активен — выключи и включи (4 → 3)"
+        if [[ "$_be" == "wg" ]]; then
+          _warp_generate_profile && info "Профиль обновлён. Если warp0 активен — выключи и включи (4 → 3)"
+        else
+          warn "Перегенерация профиля применима только к бэкенду wg"
+        fi
         read -rp "Enter..."
         ;;
       6) do_warp_peers_menu || true ;;
       7) _warp_health_toggle; read -rp "Enter..." ;;
-      8) _warp_import_account; read -rp "Enter..." ;;
-      9) _warp_endpoint_finder; read -rp "Enter..." ;;
-      d|D) _warp_remove; read -rp "Enter..." ;;
+      8)
+        if [[ "$_be" == "wg" ]]; then _warp_import_account
+        else warn "Импорт wgcf-profile.conf применим только к бэкенду wg"; fi
+        read -rp "Enter..." ;;
+      9)
+        if [[ "$_be" == "wg" ]]; then _warp_endpoint_finder
+        else warn "Поиск endpoint применим только к бэкенду wg"; fi
+        read -rp "Enter..." ;;
+      b|B) do_warp_backend_menu || true ;;
+      d|D) warp_uninstall; read -rp "Enter..." ;;
       0|"")
         set -e
         return 0
@@ -7347,6 +8160,24 @@ do_backup() {
     ok "Live dump awg show awg0"
   fi
 
+  # ── Состояние WARP ──
+  # Раньше в бэкап не попадало вовсе: при потере сервера аккаунт Cloudflare
+  # приходилось регистрировать заново, а он упирается в лимиты.
+  local warp_backend
+  warp_backend=$(warp_backend_current)
+  mkdir -p "$backup_path/warp"
+  # Бэкенд wg: аккаунт и профиль wgcf
+  if [[ -d "$WARP_DIR" ]]; then
+    cp -a "$WARP_DIR" "$backup_path/warp/wgcf" 2>/dev/null &&       { ok "WARP (wg): аккаунт и список клиентов"; backed_up=$((backed_up + 1)); }
+  fi
+  [[ -f "$WARP_CONF" ]] && cp "$WARP_CONF" "$backup_path/warp/warp0.conf" 2>/dev/null || true
+  # Бэкенд usque: config.json — это и есть зарегистрированное устройство
+  if [[ -f "$USQUE_CONF" ]]; then
+    mkdir -p "$backup_path/warp/usque"
+    cp "$USQUE_CONF" "$backup_path/warp/usque/config.json" 2>/dev/null &&       { ok "WARP (usque): регистрация устройства"; backed_up=$((backed_up + 1)); }
+  fi
+  rmdir "$backup_path/warp" 2>/dev/null || true
+
   # Лог
   [[ -f "$LOG_FILE" ]] && cp "$LOG_FILE" "$backup_path/awg-manager.log" || true
 
@@ -7356,6 +8187,7 @@ do_backup() {
     echo "server_conf=$SERVER_CONF"
     echo "backed_files=$backed_up"
     echo "awg_version=2.0"
+    echo "warp_backend=$warp_backend"
     echo "hostname=$(hostname)"
   } > "$backup_path/backup_meta.txt"
 
@@ -7447,6 +8279,32 @@ do_restore() {
     ok "Клиент восстановлен: $(basename "$cfile")"
     restored=$((restored + 1))
   done < <(find "$chosen_backup" -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
+
+  # ── Состояние WARP ──
+  # Восстанавливаем аккаунты обоих бэкендов: перерегистрация упирается в лимиты
+  # Cloudflare, а список клиентов в WARP иначе пришлось бы собирать заново.
+  if [[ -d "$chosen_backup/warp" ]]; then
+    if [[ -d "$chosen_backup/warp/wgcf" ]]; then
+      mkdir -p "$(dirname "$WARP_DIR")"
+      cp -a "$chosen_backup/warp/wgcf/." "$WARP_DIR/" 2>/dev/null &&         { ok "WARP (wg): аккаунт и список клиентов"; restored=$((restored + 1)); }
+      chmod 700 "$WARP_DIR" 2>/dev/null || true
+    fi
+    if [[ -f "$chosen_backup/warp/warp0.conf" ]]; then
+      mkdir -p /etc/wireguard && chmod 700 /etc/wireguard
+      cp "$chosen_backup/warp/warp0.conf" "$WARP_CONF" 2>/dev/null &&         chmod 600 "$WARP_CONF" 2>/dev/null || true
+    fi
+    if [[ -f "$chosen_backup/warp/usque/config.json" ]]; then
+      mkdir -p "$USQUE_DIR" && chmod 700 "$USQUE_DIR"
+      cp "$chosen_backup/warp/usque/config.json" "$USQUE_CONF" 2>/dev/null &&         { chmod 600 "$USQUE_CONF"; ok "WARP (usque): регистрация устройства"; restored=$((restored + 1)); }
+    fi
+    # Возвращаем тот бэкенд, который был активен на момент бэкапа
+    local saved_be
+    saved_be=$(grep -oP '^warp_backend=\K\S+' "$chosen_backup/backup_meta.txt" 2>/dev/null || true)
+    if [[ -n "$saved_be" ]] && warp_backend_known "$saved_be"; then
+      warp_backend_set "$saved_be" && info "Активный бэкенд WARP: $saved_be"
+    fi
+    info "Туннель WARP не поднимается автоматически — включи его в меню Туннели"
+  fi
 
   # Поднимаем интерфейс
   info "Запускаем awg0..."
