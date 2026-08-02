@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v6.9.4"
+VERSION="v0.7.1"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -26,7 +26,6 @@ EXPIRE_CHECK_BIN="/usr/local/bin/awg2-expire-check"
 EXPIRE_SERVICE="/etc/systemd/system/awg2-expire.service"
 EXPIRE_TIMER="/etc/systemd/system/awg2-expire.timer"
 EXPIRE_SUSPEND_IP="127.0.0.2/32"        # AllowedIPs у заблокированных
-EXPIRE_BOT_CONF="/etc/awg-bot.conf"     # для опциональных Telegram-уведомлений
 EXPIRE_STATE_DIR="/var/lib/awg2-expire" # флаги "уже уведомили" по pubkey
 EXPIRE_LOG="/var/log/awg2-expire.log"
 
@@ -43,50 +42,94 @@ hdr()  {
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
 }
 
-# safe_read — сбрасывает буфер stdin перед read, чтобы случайные клавиши/повторы
-# не попадали в prompt. Особенно критично для подтверждений (yes/no для удаления).
+# ── Единые правила ввода ───────────────────────────────────
+# Во всём скрипте ввод читается только через хелперы ниже. Общий контракт:
+#   • Ctrl+D (EOF) = «отмена/назад». Никогда не роняет скрипт и не зацикливает
+#     переспрос — раньше read_choice/read_yesno на EOF крутили бесконечный цикл,
+#     а safe_read под set -e убивал весь скрипт.
+#   • Мусорный ввод переспрашивается, а не проваливается дальше.
+#   • В меню принимаются только цифры (плюс явно объявленные буквенные пункты),
+#     0 = назад или выход.
+#   • Опасные действия подтверждаются через read_confirm — полным словом.
+
+# _flush_stdin — сбрасывает буфер stdin, чтобы случайные клавиши/повторы
+# не попадали в следующий prompt. Только в интерактивном режиме (TTY):
+# в неинтерактивном (heredoc/пайп) -t 0.05 съел бы реальный ввод.
+_flush_stdin() {
+  if [[ -t 0 ]]; then
+    while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+  fi
+}
+
+# safe_read — свободный ввод (имена, IP, комментарии). Валидацию делает вызывающий.
+# EOF → пустое значение и rc=0: вызывающие трактуют пустую строку как отмену,
+# а ненулевой код возврата под set -e снёс бы весь скрипт.
 # Использование: safe_read VARNAME "Промпт: "
 safe_read() {
   local _var_name="$1"
   local _prompt="${2:-}"
-  # Сбрасываем буфер stdin только в интерактивном режиме (TTY).
-  # В неинтерактивном (heredoc/пайп) -t 0.05 съедает реальный ввод.
-  if [[ -t 0 ]]; then
-    while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+  _flush_stdin
+  # shellcheck disable=SC2229  # читаем в переменную по имени — это намеренно
+  if ! read -rp "$_prompt" "$_var_name"; then
+    printf -v "$_var_name" '%s' ""
+    echo "" >&2
   fi
-  # Теперь читаем реальный ответ пользователя
-  read -rp "$_prompt" "$_var_name"
+  return 0
 }
 
-# read_choice — читает выбор из числового диапазона с переспросом.
-# Принимает пустой ввод (применит дефолт). Невалидный ввод → переспрос.
-# Использование: read_choice VARNAME "Промпт: " MIN MAX [DEFAULT]
-#   DEFAULT необязателен; если задан — пустой ввод заменяется на него.
-#   Если DEFAULT не задан — пустой ввод тоже считается невалидным.
+# read_choice — единая функция чтения выбора: числовой диапазон с переспросом.
+# Использование: read_choice VARNAME "Промпт: " MIN MAX [DEFAULT] [EXTRA]
+#   DEFAULT — что подставить на пустой Enter. Без него пустой ввод невалиден.
+#   EXTRA   — дополнительные буквенные пункты через '|' (например "d" или "d|r").
+#             Регистр не важен, результат отдаётся в нижнем регистре.
+# MIN должен быть значением «назад/отмена» (в меню это 0): именно его получает
+# вызывающий на Ctrl+D, если не задан DEFAULT.
 read_choice() {
   local _var_name="$1"
   local _prompt="$2"
   local _min="$3"
   local _max="$4"
   local _default="${5:-}"
-  local _value
+  local _extra="${6:-}"
+  local _value _lc _k _matched
+  local _keys=()
+  [[ -n "$_extra" ]] && IFS='|' read -ra _keys <<< "$_extra"
+
   while true; do
-    # Сбрасываем буфер stdin только в интерактивном режиме (TTY).
-    # В неинтерактивном (тесты/heredoc) -t 0.05 съедает реальный ввод.
-    if [[ -t 0 ]]; then
-      while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+    _flush_stdin
+    if ! read -rp "$_prompt" _value; then
+      # Ctrl+D / закрытый stdin: читать больше нечего. Раньше здесь крутился
+      # бесконечный цикл переспроса. Отдаём безопасный вариант.
+      echo "" >&2
+      _value="${_default:-$_min}"
+      break
     fi
-    read -rp "$_prompt" _value
     # Пустой ввод + есть дефолт → применяем дефолт
     if [[ -z "$_value" && -n "$_default" ]]; then
       _value="$_default"
       break
     fi
-    # Проверка: число в диапазоне
-    if [[ "$_value" =~ ^[0-9]+$ ]] && (( _value >= _min && _value <= _max )); then
+    # Число в диапазоне. 10# обязателен: без него ввод "08" ломает арифметику
+    # bash (трактуется как восьмеричное) и вываливает сырую ошибку в терминал.
+    if [[ "$_value" =~ ^[0-9]+$ ]] && (( 10#$_value >= _min && 10#$_value <= _max )); then
+      _value="$((10#$_value))"
       break
     fi
-    echo -e "${R}  Введи число от ${_min} до ${_max}${N}" >&2
+    # Буквенные пункты меню
+    _matched=0
+    _lc="${_value,,}"
+    for _k in ${_keys[@]+"${_keys[@]}"}; do
+      if [[ "$_lc" == "${_k,,}" ]]; then
+        _value="${_k,,}"; _matched=1; break
+      fi
+    done
+    [[ $_matched -eq 1 ]] && break
+
+    if [[ -n "$_extra" ]]; then
+      echo -e "${R}  Введи число от ${_min} до ${_max} или: ${_extra//|/, }${N}" >&2
+    else
+      echo -e "${R}  Введи число от ${_min} до ${_max}${N}" >&2
+    fi
   done
   # Присваиваем результат вызывающей переменной
   printf -v "$_var_name" '%s' "$_value"
@@ -104,10 +147,14 @@ read_yesno() {
   local _default="${3:-}"
   local _value _lc
   while true; do
-    if [[ -t 0 ]]; then
-      while read -t 0.05 -n 100 -r _discard 2>/dev/null; do :; done
+    _flush_stdin
+    if ! read -rp "$_prompt" _value; then
+      # Ctrl+D: раньше здесь был бесконечный цикл переспроса.
+      # Отдаём дефолт, а без него — отказ.
+      echo "" >&2
+      _value="${_default:-n}"
+      break
     fi
-    read -rp "$_prompt" _value
     # Пустой ввод + есть дефолт
     if [[ -z "$_value" && -n "$_default" ]]; then
       _value="$_default"
@@ -122,6 +169,27 @@ read_yesno() {
     esac
   done
   printf -v "$_var_name" '%s' "$_value"
+}
+
+# read_confirm — подтверждение НЕОБРАТИМОГО действия (удаление клиента, снос
+# интерфейса, переустановка, восстановление из бекапа).
+# Требует полное слово: yes или да. Одной буквы 'y' СОЗНАТЕЛЬНО недостаточно —
+# чтобы случайное нажатие не снесло рабочую конфигурацию.
+# Переспроса нет: на опасном действии неверный ответ должен отменять операцию,
+# а не удерживать пользователя в цикле. Пустой ввод и Ctrl+D = отказ.
+# Использование: read_confirm "Промпт" || { warn "Отменено"; return 0; }
+read_confirm() {
+  local _prompt="$1"
+  local _value
+  _flush_stdin
+  if ! read -rp "$_prompt" _value; then
+    echo "" >&2
+    return 1
+  fi
+  case "${_value,,}" in
+    yes|да) return 0 ;;
+    *)      return 1 ;;
+  esac
 }
 
 # Тематические хелперы
@@ -186,6 +254,10 @@ CASCADE_APPLY_SCRIPT="/usr/local/bin/awg-cascade-apply.sh"
 CASCADE_TAG="awg-cascade"
 CASCADE_LOG="/var/log/awg-cascade.log"
 CASCADE_LOG_MAX=1048576  # 1 MB — после превышения ротация
+
+# NAT-персистентность (do_install) — fallback для образов без ifupdown
+NAT_PERSIST_SERVICE="/etc/systemd/system/awg-nat.service"
+NAT_PERSIST_SCRIPT="/usr/local/bin/awg-nat-apply.sh"
 
 # ── Логирование ────────────────────────────────────────────
 _log() {
@@ -1264,20 +1336,16 @@ do_sniff_test() {
 
 check_deps() {
   HAS_AWG=false
-  HAS_QRENCODE=false
   HAS_SERVER_CONF=false
-  HAS_CLIENT_CONFS=false
   HAS_BACKUPS=false
 
   # Кэш проверки бинарей (они не появляются/исчезают в течение сессии).
   # _DEPS_CACHED — пустая до первой проверки, потом "1".
   if [[ -z "${_DEPS_CACHED:-}" ]]; then
     command -v awg &>/dev/null && _CACHED_HAS_AWG=true || _CACHED_HAS_AWG=false
-    command -v qrencode &>/dev/null && _CACHED_HAS_QRENCODE=true || _CACHED_HAS_QRENCODE=false
     _DEPS_CACHED=1
   fi
   HAS_AWG="$_CACHED_HAS_AWG"
-  HAS_QRENCODE="$_CACHED_HAS_QRENCODE"
 
   [[ -f "$SERVER_CONF" ]] && HAS_SERVER_CONF=true
 
@@ -1302,11 +1370,6 @@ check_deps() {
     fi
   fi
 
-  # Проверка конфигов клиентов
-  local f
-  for f in /root/*_awg2.conf; do
-    if [[ -f "$f" ]]; then HAS_CLIENT_CONFS=true; break; fi
-  done
   # Проверка бекапов
   if [[ -d "$BACKUP_DIR" ]]; then
     local d
@@ -1463,12 +1526,43 @@ do_repair() {
         warn "modprobe вернул успех, но модуль не виден — попробуй reboot"
       fi
     else
-      err "modprobe amneziawg провалился"
-      info "Проверь вручную:"
-      info "  ls /sys/module/amneziawg     (проверка загрузки)"
-      info "  dkms status amneziawg        (статус сборки)"
-      info "  dmesg | tail -20             (ошибки ядра)"
-      info "Возможно нужен reboot или переустановка модуля"
+      # Типовая причина: apt подтянул новое ядро, машину перезагрузили, а
+      # модуль собран под прежнее. Пробуем пересобрать, а не советовать.
+      warn "modprobe не сработал — пробую пересобрать модуль под $(uname -r)"
+
+      # Secure Boot: пересборка не поможет, неподписанный модуль всё равно
+      # не загрузится. Говорим об этом сразу, а не после долгой сборки.
+      local _sb=""
+      if command -v mokutil &>/dev/null; then
+        _sb=$(mokutil --sb-state 2>/dev/null | grep -io 'enabled' || true)
+      fi
+      if [[ -n "$_sb" ]]; then
+        err "Включён Secure Boot — ядро отвергает неподписанные DKMS-модули"
+        info "Варианты: подписать модуль своим MOK-ключом либо выключить"
+        info "Secure Boot в настройках сервера/BIOS"
+      elif ! command -v dkms &>/dev/null; then
+        err "dkms не установлен — пересобрать нечем"
+        info "Переустанови: Сервер (1) → п.1"
+      else
+        if [[ ! -d "/lib/modules/$(uname -r)/build" ]]; then
+          info "Ставлю заголовки: linux-headers-$(uname -r)"
+          apt-get install -y -q "linux-headers-$(uname -r)" >/dev/null 2>&1 || \
+            warn "Заголовки под $(uname -r) не установились"
+        fi
+        info "Запускаю: dkms autoinstall (это займёт минуту)"
+        if dkms autoinstall >/dev/null 2>&1 && modprobe amneziawg 2>/dev/null && \
+           [[ -d /sys/module/amneziawg ]]; then
+          ok "Модуль пересобран под $(uname -r) и загружен"
+          fixed=$((fixed+1))
+        else
+          err "Пересборка не помогла"
+          info "Проверь вручную:"
+          info "  dkms status                  (под какие ядра собран модуль)"
+          info "  uname -r                     (какое ядро загружено)"
+          info "  dmesg | tail -20             (ошибки ядра)"
+          info "Если dkms status пуст — переустанови: Сервер (1) → п.1"
+        fi
+      fi
     fi
   fi
 
@@ -1715,9 +1809,15 @@ do_self_update() {
   fi
 
   # ───── 5. Сравнение версий ─────
+  # Версия → число вида МАЖОР|МИНОР(3)|ПАТЧ(3). У схемы 0.x мажор нулевой, поэтому
+  # строка получается с ведущим нулём ("0007001") — сравнивать её обычной
+  # арифметикой нельзя: bash считает такое восьмеричным и на 0.7.9 / 0.8.x
+  # падает с "value too great for base", проваливаясь не в ту ветку.
+  # Отсюда 10# во всех сравнениях ниже.
   local cur_num new_num
   cur_num=$(echo "$VERSION" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
   new_num=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
+  cur_num=${cur_num:-0}; new_num=${new_num:-0}
 
   if [[ "$new_ver" == "?" ]]; then
     warn "Не удалось определить версию"
@@ -1727,19 +1827,18 @@ do_self_update() {
       rm -f "$tmp_file"
       return 0
     fi
-  elif [[ "$new_num" -lt "$cur_num" ]]; then
+  elif (( 10#$new_num < 10#$cur_num )); then
     warn "На GitHub версия СТАРШЕ текущей — это даунгрейд!"
     echo -e "${Y}  Текущая ($VERSION) > GitHub ($new_ver)${N}"
-    echo -e "${Y}  Возможно ты обновлял скрипт вручную, а в репо ещё старая версия.${N}"
+    echo -e "${Y}  Возможно ты обновлял скрипт вручную, а в репо ещё старая версия,${N}"
+    echo -e "${Y}  либо в проекте сменилась схема нумерации.${N}"
     echo ""
-    local CONFIRM_DOWNGRADE
-    read_yesno CONFIRM_DOWNGRADE "$(echo -e "${R}  Откатить до $new_ver? [y/N]: ${N}")" "n"
-    if [[ ! "$CONFIRM_DOWNGRADE" =~ ^[Yy]$ ]]; then
+    if ! read_confirm "$(echo -e "${R}  Откатить до $new_ver? (введи yes): ${N}")"; then
       info "Отменено — текущая версия сохранена"
       rm -f "$tmp_file"
       return 0
     fi
-  elif [[ "$new_num" -eq "$cur_num" ]]; then
+  elif (( 10#$new_num == 10#$cur_num )); then
     # Версии равны. Если содержимое тоже идентично — обновление не нужно.
     if cmp -s "$target" "$tmp_file"; then
       ok "У тебя уже последняя версия ($VERSION) — обновление не требуется"
@@ -1781,25 +1880,11 @@ do_self_update() {
   if mv "$tmp_file" "$target"; then
     ok "Скрипт обновлён до $new_ver"
 
-    # Авто-очистка PPA остатков при апгрейде с версий до v6.7 (когда был PPA)
-    local new_major_minor
-    new_major_minor=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d\n", $1, $2 }')
-    if [[ "${new_major_minor:-0}" -ge "6007" ]]; then
-      local cleaned=0
-      for f in /etc/apt/sources.list.d/amnezia*.list \
-               /etc/apt/sources.list.d/amnezia*.sources \
-               /etc/apt/sources.list.d/canonical-kernel-team*.list \
-               /etc/apt/sources.list.d/canonical-kernel-team*.sources; do
-        if [[ -f "$f" ]]; then
-          rm -f "$f"
-          cleaned=1
-        fi
-      done
-      rm -f /etc/apt/trusted.gpg.d/amnezia*.gpg 2>/dev/null
-      rm -f /etc/apt/keyrings/amnezia*.gpg 2>/dev/null
-      if [[ $cleaned -eq 1 ]]; then
-        info "Удалены остатки PPA от прошлых версий (теперь установка через git)"
-      fi
+    # Раньше здесь стоял гейт "новая версия >= 6.7". После смены схемы нумерации
+    # на 0.x он стал бы навсегда ложным — и чистка отключилась бы ровно у тех,
+    # кто приезжает со старых 6.x и кому она нужна. Гейт убран.
+    if _purge_legacy_ppa; then
+      info "Удалены остатки PPA от прошлых версий (теперь установка через git)"
     fi
 
     # ───── 8. Сброс bash hash cache ─────
@@ -1875,7 +1960,9 @@ show_menu() {
   echo ""
   echo -e "  ${W}0)${N}  Выход"
   echo ""
-  safe_read CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")"
+  # Без DEFAULT: пустой Enter переспрашивает, а не выходит из скрипта.
+  # Ctrl+D отдаёт 0 → штатный выход.
+  read_choice CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")" 0 8
 }
 
 # ── Подменю 1: Сервер ──────────────────────────────────
@@ -1910,7 +1997,7 @@ show_submenu_1() {
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")" 0 5 "0"
     case "${SUB_CHOICE:-}" in
       1) do_install || true ;;
       2) do_gen || true ;;
@@ -1946,7 +2033,7 @@ show_submenu_2() {
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
     case "${SUB_CHOICE:-}" in
       1) do_manage_clients || true ;;
       2) do_list_clients || true ;;
@@ -1975,7 +2062,7 @@ show_submenu_3() {
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
     case "${SUB_CHOICE:-}" in
       1) do_check_domains || true ;;
       2) do_sniff_test || true ;;
@@ -2004,7 +2091,7 @@ show_submenu_4() {
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
     case "${SUB_CHOICE:-}" in
       1) do_backup || true ;;
       2) do_restore || true ;;
@@ -2058,7 +2145,7 @@ show_submenu_5() {
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")" 0 3 "0"
     case "${SUB_CHOICE:-}" in
       1) do_warp_menu || true ;;
       2) do_dns_menu || true ;;
@@ -2109,8 +2196,10 @@ show_submenu_6() {
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
 
-    local _bc
-    safe_read _bc "$(echo -e "${C}  Выбор: ${N}")"
+    # Набор пунктов зависит от того, установлен ли бот
+    local _bc _bc_max=1
+    $installed && _bc_max=5
+    read_choice _bc "$(echo -e "${C}  Выбор [0-${_bc_max}]: ${N}")" 0 "$_bc_max" "0"
 
     case "${_bc:-}" in
       1)
@@ -2184,7 +2273,7 @@ show_submenu_7() {
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    safe_read SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
     case "${SUB_CHOICE:-}" in
       1) do_clean_clients || true ;;
       2) do_uninstall || true ;;
@@ -2401,6 +2490,96 @@ _share_config() {
   fi
 }
 
+# Удаляет остатки APT-репозиториев от версий, когда установка шла через PPA.
+# Идемпотентна: путей, которых нет, rm -f не замечает.
+# Возвращает 0, если что-то удалила, 1 — если чистить было нечего.
+_purge_legacy_ppa() {
+  local f cleaned=1
+  for f in /etc/apt/sources.list.d/amnezia*.list \
+           /etc/apt/sources.list.d/amnezia*.sources \
+           /etc/apt/sources.list.d/canonical-kernel-team*.list \
+           /etc/apt/sources.list.d/canonical-kernel-team*.sources; do
+    if [[ -f "$f" ]]; then
+      rm -f "$f"
+      cleaned=0
+    fi
+  done
+  rm -f /etc/apt/trusted.gpg.d/amnezia*.gpg 2>/dev/null || true
+  rm -f /etc/apt/keyrings/amnezia*.gpg 2>/dev/null || true
+  return $cleaned
+}
+
+# Делает правила NAT/FORWARD переживающими ребут.
+# Классический путь — hook ifupdown (/etc/network/if-pre-up.d). На минимальных
+# образах Ubuntu 26.04 / Debian 13 ifupdown не ставится и каталога нет — раньше
+# запись туда молча падала, и после перезагрузки клиенты теряли интернет.
+# Если каталога нет — поднимаем собственный systemd-юнит.
+# $1 = внешний интерфейс (на момент установки)
+_nat_install_persist() {
+  local ext_if="$1"
+  local hook="/etc/network/if-pre-up.d/iptables-nat"
+
+  if [[ -d /etc/network/if-pre-up.d ]]; then
+    cat > "$hook" <<EOF
+#!/bin/sh
+iptables -t nat -C POSTROUTING -o ${ext_if} -j MASQUERADE 2>/dev/null || \
+iptables -t nat -A POSTROUTING -o ${ext_if} -j MASQUERADE
+iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -j ACCEPT
+iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o awg0 -j ACCEPT
+EOF
+    if [[ -s "$hook" ]]; then
+      chmod +x "$hook"
+      ok "NAT hook сохранён в $hook"
+      return 0
+    fi
+    warn "Не удалось записать $hook — ставим systemd-юнит"
+  else
+    info "ifupdown не используется — NAT через systemd-юнит"
+  fi
+
+  # ── Fallback: systemd-юнит ──
+  cat > "$NAT_PERSIST_SCRIPT" <<EOF
+#!/bin/sh
+set -u
+# AWG Toolza — восстановление NAT/FORWARD при загрузке.
+# Generated by _nat_install_persist, do not edit manually.
+# Интерфейс определяем на лету: в облаке имя может смениться после ребута.
+IFACE=\$(ip -4 route show default 2>/dev/null | awk '/default/ {print \$5; exit}')
+[ -z "\$IFACE" ] && IFACE="${ext_if}"
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE 2>/dev/null || \\
+  iptables -t nat -A POSTROUTING -o "\$IFACE" -j MASQUERADE
+iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -j ACCEPT
+iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o awg0 -j ACCEPT
+exit 0
+EOF
+  chmod +x "$NAT_PERSIST_SCRIPT"
+
+  cat > "$NAT_PERSIST_SERVICE" <<EOF
+[Unit]
+Description=AWG Toolza — NAT/FORWARD rules for awg0
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$NAT_PERSIST_SCRIPT
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if systemctl enable awg-nat.service >/dev/null 2>&1; then
+    ok "NAT-правила переживут ребут (systemd: awg-nat.service)"
+  else
+    warn "systemctl enable awg-nat.service не сработал"
+    warn "После перезагрузки NAT придётся вернуть вручную: sudo awg2 → Сервер (1) → п.1"
+  fi
+  return 0
+}
+
 do_install() {
   while true; do
   # Detect OS
@@ -2426,7 +2605,7 @@ do_install() {
   case "$OS_ID" in
     ubuntu)
       case "$OS_VER" in
-        24.04|24.10|25.04|25.10)
+        24.04|24.10|25.04|25.10|26.04)
           ok "Ubuntu $OS_VER — будем собирать amneziawg через git+DKMS"
           ;;
         *)
@@ -2455,21 +2634,7 @@ do_install() {
   # Чтобы apt-get update не плевался ошибками типа "Temporary failure resolving"
   # при наличии висящих PPA от прошлой версии скрипта
   hdr "✂  Очистка старых PPA"
-  local cleaned=0
-  for f in /etc/apt/sources.list.d/amnezia*.list \
-           /etc/apt/sources.list.d/amnezia*.sources \
-           /etc/apt/sources.list.d/canonical-kernel-team*.list \
-           /etc/apt/sources.list.d/canonical-kernel-team*.sources; do
-    if [[ -f "$f" ]]; then
-      info "Удаляю $f"
-      rm -f "$f"
-      cleaned=1
-    fi
-  done
-  # GPG ключи от старых PPA
-  rm -f /etc/apt/trusted.gpg.d/amnezia*.gpg 2>/dev/null
-  rm -f /etc/apt/keyrings/amnezia*.gpg 2>/dev/null
-  if [[ $cleaned -eq 1 ]]; then
+  if _purge_legacy_ppa; then
     ok "Старые PPA удалены"
   else
     ok "Чисто — PPA остатков нет"
@@ -2519,10 +2684,20 @@ EOF
     -o Dpkg::Options::="--force-confold"
 
   hdr "+  Установка зависимостей"
-  local base_deps=(python3 net-tools curl ufw iptables qrencode bc ca-certificates gnupg)
+  # iputils-ping — ping не входит в минимальные облачные образы Ubuntu 26.04 /
+  # Debian 13, а на нём держатся scan_pool, _probe_host и WARP health-check.
+  local base_deps=(python3 net-tools curl ufw iptables qrencode bc ca-certificates gnupg iputils-ping)
   # Всегда добавляем deps для git+DKMS сборки
   base_deps+=(build-essential git libmnl-dev pkg-config dkms)
-  apt-get install -y -q "${base_deps[@]}"
+  # do_install вызывается как «do_install || true», то есть errexit внутри не
+  # работает. Без явной проверки провал apt проходил молча, а ломалось потом —
+  # на сборке DKMS или на отсутствии git, и уже без внятной причины.
+  if ! apt-get install -y -q "${base_deps[@]}"; then
+    err "Не удалось установить зависимости"
+    info "Проверь вывод выше — обычно это битое зеркало или нет места на диске"
+    info "Повтори вручную: apt-get update && apt-get install -y ${base_deps[*]}"
+    prompt_retry || return 1; continue
+  fi
 
   hdr "+  Kernel headers"
   local running_kernel
@@ -2574,7 +2749,7 @@ EOF
     installed_headers="${installed_headers%$'\n'}"
     if [[ -n "$installed_headers" ]]; then
       warn "Обнаружены headers под другие ядра:"
-      echo "$installed_headers" | while read k; do echo "    /lib/modules/$k"; done
+      echo "$installed_headers" | while read -r k; do echo "    /lib/modules/$k"; done
       echo ""
       warn "Скорее всего ядро было обновлено через apt upgrade"
       warn "Нужен REBOOT чтобы загрузилось новое ядро с headers"
@@ -2625,6 +2800,41 @@ EOF
   }
   rm -rf "$tmp_mod"
 
+  # ── Сборка под ВСЕ установленные ядра, не только под работающее ──
+  # apt-get upgrade выше мог принести новое ядро. DKMS собирает модуль под
+  # текущее (uname -r), а хук автопересборки для нового ядра не отработал —
+  # модуль регистрируется в DKMS уже ПОСЛЕ его установки. Без этого шага
+  # всё живо до первой перезагрузки, а после неё грузится новое ядро,
+  # modprobe amneziawg падает и awg0 не поднимается.
+  local running_k newest_k k
+  running_k="$(uname -r)"
+  newest_k=""
+  for k in /lib/modules/*/; do
+    k=${k%/}; k=${k##*/}
+    [[ -e "/boot/vmlinuz-$k" ]] || continue
+    # заголовки нужны, иначе DKMS не соберёт
+    [[ -d "/lib/modules/$k/build" ]] || apt-get install -y -q "linux-headers-$k" >/dev/null 2>&1 || true
+    newest_k="$k"
+  done
+  if dkms autoinstall >/dev/null 2>&1; then
+    ok "Модуль собран под все установленные ядра"
+  else
+    warn "dkms autoinstall отработал с ошибкой — проверь: dkms status"
+  fi
+
+  # Если загружено не самое новое ядро — предупреждаем прямо, а не постфактум
+  if [[ -n "$newest_k" && "$newest_k" != "$running_k" ]]; then
+    echo ""
+    warn "Установлено более новое ядро: $newest_k (сейчас работает $running_k)"
+    if dkms status 2>/dev/null | grep -q "$newest_k"; then
+      info "Модуль под него собран — после reboot awg0 поднимется сам"
+    else
+      err "Модуль под $newest_k НЕ собран — после reboot awg0 не поднимется"
+      info "Собери вручную: dkms autoinstall -k $newest_k"
+    fi
+    echo ""
+  fi
+
   hdr "+  amneziawg-tools (git + make)"
   local tmp_tools=/tmp/amneziawg-tools
   rm -rf "$tmp_tools"
@@ -2671,16 +2881,7 @@ EOF
     iptables -A FORWARD -o awg0 -j ACCEPT
   ok "NAT и FORWARD правила добавлены"
 
-  local hook="/etc/network/if-pre-up.d/iptables-nat"
-  cat > "$hook" <<EOF
-#!/bin/sh
-iptables -t nat -C POSTROUTING -o ${ext_if} -j MASQUERADE 2>/dev/null || \
-iptables -t nat -A POSTROUTING -o ${ext_if} -j MASQUERADE
-iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -j ACCEPT
-iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o awg0 -j ACCEPT
-EOF
-  chmod +x "$hook"
-  ok "NAT hook сохранён в $hook"
+  _nat_install_persist "$ext_if"
 
   hdr "›  Папка конфигов"
   mkdir -p /etc/amnezia/amneziawg
@@ -2972,8 +3173,8 @@ do_gen() {
     echo "Endpoint = $srv_ip:$PORT"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = 25"
-  } > /root/${FIRST_CLIENT_NAME}_awg2.conf
-  chmod 600 /root/${FIRST_CLIENT_NAME}_awg2.conf
+  } > "/root/${FIRST_CLIENT_NAME}_awg2.conf"
+  chmod 600 "/root/${FIRST_CLIENT_NAME}_awg2.conf"
 
   if awg-quick up "$SERVER_CONF"; then
     log_info "do_gen: awg-quick up успешно"
@@ -3115,7 +3316,7 @@ do_manage_clients() {
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    safe_read MGMT_CHOICE "$(echo -e "${C}  Выбор [0-9]: ${N}")"
+    read_choice MGMT_CHOICE "$(echo -e "${C}  Выбор [0-9]: ${N}")" 0 9 "0"
     case "${MGMT_CHOICE:-}" in
       1) do_add_client || true ;;
       2) do_rename_client || true ;;
@@ -3136,15 +3337,17 @@ do_manage_clients() {
 
 # ── Показать конфиг клиента (текст) ──
 do_show_config() {
-  local found=()
+  # found_files, а не found: в других функциях found — скалярный счётчик,
+  # и от одноимённого массива shellcheck путает области видимости.
+  local found_files=()
   while IFS= read -r -d '' f; do
-    found+=("$f")
+    found_files+=("$f")
   done < <(find /root -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
 
-  [[ ${#found[@]} -eq 0 ]] && { err "Конфиги не найдены в /root/"; return 1; }
+  [[ ${#found_files[@]} -eq 0 ]] && { err "Конфиги не найдены в /root/"; return 1; }
 
   local unique
-  mapfile -t unique < <(printf "%s\n" "${found[@]}" | sort -u)
+  mapfile -t unique < <(printf "%s\n" "${found_files[@]}" | sort -u)
 
   hdr "≡  Выбери конфиг"
   local i=0
@@ -3154,11 +3357,10 @@ do_show_config() {
   done
 
   local SEL
-  local prompt="  Выбор [1-$i] (Enter = 1): "
-  [[ $i -eq 1 ]] && prompt="  Выбор [1] (Enter = 1): "
-  safe_read SEL "$(echo -e "${C}${prompt}${N}")"
-  SEL=${SEL:-1}
-  [[ "$SEL" =~ ^[0-9]+$ ]] && (( SEL >= 1 && SEL <= i )) || { warn "Неверный выбор"; return 0; }
+  local prompt="  Выбор [1-$i] (Enter = 1, 0 = отмена): "
+  [[ $i -eq 1 ]] && prompt="  Выбор [1] (Enter = 1, 0 = отмена): "
+  read_choice SEL "$(echo -e "${C}${prompt}${N}")" 0 "$i" "1"
+  [[ "$SEL" == "0" ]] && { info "Отменено"; return 0; }
 
   local chosen="${unique[$((SEL - 1))]}"
   [[ -f "$chosen" ]] || { warn "Файл не найден"; return 0; }
@@ -3181,11 +3383,8 @@ do_rename_client() {
   _mgmt_print_list
 
   local SEL
-  safe_read SEL "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")"
-  [[ "$SEL" == "0" || -z "$SEL" ]] && { info "Отменено"; return 0; }
-  if ! [[ "$SEL" =~ ^[0-9]+$ ]] || (( SEL < 1 || SEL > ${#MGMT_PUBKEYS[@]} )); then
-    warn "Неверный номер"; return 0
-  fi
+  read_choice SEL "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")" 0 "${#MGMT_PUBKEYS[@]}" "0"
+  [[ "$SEL" == "0" ]] && { info "Отменено"; return 0; }
 
   local idx=$((SEL - 1))
   local old_name="${MGMT_NAMES[$idx]}"
@@ -3435,11 +3634,8 @@ do_delete_client() {
   else
     # ── Один по номеру ──
     local SEL
-    safe_read SEL "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")"
-    [[ "$SEL" == "0" || -z "$SEL" ]] && { info "Отменено"; return 0; }
-    if ! [[ "$SEL" =~ ^[0-9]+$ ]] || (( SEL < 1 || SEL > ${#MGMT_PUBKEYS[@]} )); then
-      warn "Неверный номер"; return 0
-    fi
+    read_choice SEL "$(echo -e "${C}  Номер клиента [1-${#MGMT_PUBKEYS[@]}] (0 = отмена): ${N}")" 0 "${#MGMT_PUBKEYS[@]}" "0"
+    [[ "$SEL" == "0" ]] && { info "Отменено"; return 0; }
     local idx=$((SEL - 1))
     _del_idx=("$idx")
 
@@ -3451,9 +3647,8 @@ do_delete_client() {
   fi
 
   echo ""
-  local CONFIRM
-  safe_read CONFIRM "$(echo -e "${R}  Подтвердить удаление? [y/N]: ${N}")"
-  [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && { info "Отменено"; return 0; }
+  read_confirm "$(echo -e "${R}  Подтвердить удаление? (введи yes): ${N}")" || \
+    { info "Отменено"; return 0; }
 
   # Один общий бекап перед серией удалений
   local bak
@@ -3651,7 +3846,7 @@ do_add_client() {
       ;;
   esac
 
-  local srv_pub srv_ip port mtu
+  local srv_pub srv_ip port
   srv_pub=$(awg show awg0 public-key 2>/dev/null) \
     || { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
   srv_ip=$(get_public_ip)
@@ -4368,15 +4563,17 @@ _print_client_info() {
 }
 
 do_show_qr() {
-  local found=()
+  # found_files, а не found: в других функциях found — скалярный счётчик,
+  # и от одноимённого массива shellcheck путает области видимости.
+  local found_files=()
   while IFS= read -r -d '' f; do
-    found+=("$f")
+    found_files+=("$f")
   done < <(find /root -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
 
-  [[ ${#found[@]} -eq 0 ]] && { err "Конфиги клиентов не найдены в /root/"; return 1; }
+  [[ ${#found_files[@]} -eq 0 ]] && { err "Конфиги клиентов не найдены в /root/"; return 1; }
 
   local unique
-  mapfile -t unique < <(printf "%s\n" "${found[@]}" | sort -u)
+  mapfile -t unique < <(printf "%s\n" "${found_files[@]}" | sort -u)
 
   hdr "≡  Выбери конфиг"
   local i=0
@@ -4387,15 +4584,12 @@ do_show_qr() {
 
   local QR_CHOICE prompt_txt
   if [[ $i -eq 1 ]]; then
-    prompt_txt="  Выбор [1] (Enter = 1): "
+    prompt_txt="  Выбор [1] (Enter = 1, 0 = отмена): "
   else
-    prompt_txt="  Выбор [1-$i] (Enter = 1): "
+    prompt_txt="  Выбор [1-$i] (Enter = 1, 0 = отмена): "
   fi
-  safe_read QR_CHOICE "$(echo -e "${C}${prompt_txt}${N}")"
-  QR_CHOICE=${QR_CHOICE:-1}
-  if ! [[ "$QR_CHOICE" =~ ^[0-9]+$ ]] || (( QR_CHOICE < 1 || QR_CHOICE > i )); then
-    warn "Неверный выбор"; return 0
-  fi
+  read_choice QR_CHOICE "$(echo -e "${C}${prompt_txt}${N}")" 0 "$i" "1"
+  [[ "$QR_CHOICE" == "0" ]] && { info "Отменено"; return 0; }
 
   local chosen="${unique[$((QR_CHOICE - 1))]}"
   [[ -f "$chosen" ]] || { warn "Файл не найден"; return 0; }
@@ -4465,12 +4659,8 @@ do_reset_server() {
   echo -e "${C}  После сброса: Сервер (1) → п.2 — создать новый сервер.${N}"
   echo ""
 
-  local CONFIRM_RST
-  safe_read CONFIRM_RST "$(echo -e "${R}  Подтверди сброс [yes/N]: ${N}")"
-  if [[ "$CONFIRM_RST" != "yes" ]]; then
-    warn "Отменено."
-    return 0
-  fi
+  read_confirm "$(echo -e "${R}  Подтверди сброс (введи yes): ${N}")" || \
+    { warn "Отменено."; return 0; }
 
   # Авто-бэкап (всегда создаём перед сбросом)
   if [[ -f "$SERVER_CONF" ]]; then
@@ -4541,7 +4731,58 @@ do_reset_server() {
 # Поддерживает бесплатный Warp и Warp+ с лицензионным ключом.
 # Полезно когда IP сервера в блок-листах РКН — выходной IP меняется на Cloudflare.
 
+# Гарантирует, что есть всё, на чём держится WARP: бинарь wg, ping и каталог
+# /etc/wireguard. Раньше wireguard-tools ставились только внутри
+# _warp_install_wgcf (пункт 1 меню), а документированный для РФ-хостинга путь
+# «импорт профиля (8) → включить туннель (3)» проходил мимо. На минимальных
+# образах Ubuntu 26.04 / Debian 13 wireguard-tools не предустановлены — не было
+# ни /etc/wireguard (cp профиля падал молча), ни самого wg.
+# Идемпотентна: на уже настроенной машине не делает ничего.
+_warp_ensure_deps() {
+  local missing=()
+  command -v wg   &>/dev/null || missing+=("wireguard-tools")
+  # ping нужен health-check'у; без него он копит фейлы и сносит рабочий туннель
+  command -v ping &>/dev/null || missing+=("iputils-ping")
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    info "Ставим зависимости WARP: ${missing[*]}"
+    apt-get update -y >/dev/null 2>&1 || \
+      warn "apt-get update завершился с ошибкой — пробуем ставить как есть"
+    if ! apt-get install -y -q "${missing[@]}" >/dev/null 2>&1; then
+      err "Не удалось установить: ${missing[*]}"
+      info "Поставь вручную и повтори:"
+      info "  apt-get update && apt-get install -y ${missing[*]}"
+      return 1
+    fi
+  fi
+
+  # Проверяем результат, а не код возврата apt — пакет мог «успешно»
+  # приехать из битого зеркала.
+  if ! command -v wg &>/dev/null; then
+    err "Бинарь wg недоступен даже после установки wireguard-tools"
+    info "WARP поднимает интерфейс через 'wg setconf' — без него никак"
+    return 1
+  fi
+
+  # /etc/wireguard приходит из пакета wireguard-tools, но создаём и сами —
+  # сюда кладётся warp0.conf.
+  if [[ ! -d /etc/wireguard ]]; then
+    mkdir -p /etc/wireguard || { err "Не удалось создать /etc/wireguard"; return 1; }
+    chmod 700 /etc/wireguard
+  fi
+
+  # Модуль ядра: warp0 создаётся как 'ip link ... type wireguard'.
+  # Обычно автозагружается, но на кастомных ядрах лучше попросить явно.
+  modprobe wireguard 2>/dev/null || true
+
+  return 0
+}
+
 _warp_install_wgcf() {
+  # Зависимости нужны независимо от того, стоит уже wgcf или нет — иначе
+  # ранний return ниже увёл бы нас мимо установки wireguard-tools.
+  _warp_ensure_deps || return 1
+
   if command -v wgcf &>/dev/null && wgcf --help &>/dev/null; then
     info "wgcf уже установлен"
     return 0
@@ -4652,13 +4893,6 @@ _warp_install_wgcf() {
     info "    https://github.com/ViRb3/wgcf/releases/download/v2.2.30/wgcf_2.2.30_linux_${arch}"
     info "  chmod +x /usr/local/bin/wgcf"
     return 1
-  fi
-
-  # ───── WireGuard tools ─────
-  if ! command -v wg-quick &>/dev/null; then
-    info "Устанавливаем wireguard-tools..."
-    apt-get update -y >/dev/null 2>&1
-    apt-get install -y -q wireguard-tools >/dev/null 2>&1 || warn "wireguard-tools не установился"
   fi
 
   return 0
@@ -4998,6 +5232,7 @@ _warp_health_install() {
 #!/bin/bash
 # AWG Toolza Warp health-check
 # Проверяет что warp0 жив, при 3 фейлах подряд — опускает Warp
+set -u
 
 LOG="/var/log/awg-warp-health.log"
 STATE="/etc/wgcf/state"
@@ -5009,6 +5244,13 @@ log() { echo "$(date +'%F %T') $*" >> "$LOG"; }
 # Если warp0 не существует — health-check бессмысленен
 if ! ip link show warp0 &>/dev/null; then
   log "warp0 не существует - skip"
+  exit 0
+fi
+
+# Без ping проверять нечем. Раньше это молча копило фейлы и через 3 цикла
+# сносило РАБОЧИЙ туннель. Отсутствие утилиты — не отказ Warp: выходим.
+if ! command -v ping >/dev/null 2>&1; then
+  log "ping недоступен (нет iputils-ping) - skip, failover НЕ выполняется"
   exit 0
 fi
 
@@ -5092,7 +5334,11 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now awg-warp-healthcheck.timer 2>/dev/null
+  if ! systemctl enable --now awg-warp-healthcheck.timer >/dev/null 2>&1; then
+    err "Не удалось включить awg-warp-healthcheck.timer"
+    info "Проверь: systemctl status awg-warp-healthcheck.timer"
+    return 1
+  fi
   ok "Health-check установлен (проверка каждые 60 сек)"
   return 0
 }
@@ -5159,7 +5405,9 @@ do_warp_peers_menu() {
     echo -e "  a — все через Warp, n — все напрямую"
     echo -e "  0 — назад"
     echo ""
-    read -rp "$(echo -e "${C}  Выбор: ${N}")" PEER_CHOICE
+    local _peer_max=${#clients[@]}
+    read_choice PEER_CHOICE "$(echo -e "${C}  Выбор [0-${_peer_max}, a, n]: ${N}")" \
+      0 "$_peer_max" "0" "a|n"
 
     case "${PEER_CHOICE:-}" in
       0|"") set -e; return 0 ;;
@@ -5218,8 +5466,13 @@ do_warp_peers_menu() {
 }
 
 _warp_up() {
+  # warp0 поднимается через 'wg setconf' — без wireguard-tools дальше нет смысла.
+  # Проверяем здесь, а не полагаемся на то, что пользователь прошёл пункт 1.
+  _warp_ensure_deps || return 1
+
   if [[ ! -f "$WARP_CONF" ]]; then
-    err "Конфиг Warp не найден. Сначала выполни пункт 1"
+    err "Конфиг Warp не найден ($WARP_CONF)"
+    info "Зарегистрируй аккаунт (пункт 1) либо импортируй готовый профиль (пункт 8)"
     return 1
   fi
 
@@ -5282,8 +5535,14 @@ _warp_up() {
   # Конфигурируем приватный ключ + peer
   # ВАЖНО: AllowedIPs = 0.0.0.0/0 нужен только на стороне peer config wireguard
   # это значит "куда МЫ шлём трафик через peer", НЕ маршрутизация ОС
-  local tmp_wg_conf
-  tmp_wg_conf=$(mktemp)
+  # Временный конфиг кладём в /etc/wireguard, а НЕ в /tmp. На Ubuntu 26.04
+  # пакетный wg не смог прочитать файл из /tmp — "fopen: Permission denied",
+  # при том что собранный из исходников awg тот же /tmp читает спокойно
+  # (похоже на AppArmor-профиль пакета wireguard-tools). Каталог /etc/wireguard
+  # создаётся с правами 700 и принадлежит root — не менее строго, чем /tmp,
+  # и это канонический путь, откуда wg читает конфиги.
+  local tmp_wg_conf="/etc/wireguard/.warp0.setconf.$$"
+  rm -f "$tmp_wg_conf"
   cat > "$tmp_wg_conf" << EOF
 [Interface]
 PrivateKey = $warp_priv
@@ -5293,8 +5552,11 @@ PublicKey = $warp_pub
 AllowedIPs = 0.0.0.0/0
 Endpoint = $warp_endpoint
 EOF
+  chmod 600 "$tmp_wg_conf" 2>/dev/null || true
   if ! wg setconf warp0 "$tmp_wg_conf"; then
-    err "wg setconf warp0 failed"
+    err "wg setconf warp0 failed (конфиг: $tmp_wg_conf)"
+    info "Проверь: wg setconf warp0 $tmp_wg_conf"
+    info "Если тут 'fopen: Permission denied' — смотри dmesg | grep -i apparmor"
     rm -f "$tmp_wg_conf"
     ip link delete warp0 2>/dev/null
     return 1
@@ -5453,7 +5715,10 @@ ip link show warp0 &>/dev/null && exit 0
 # Поднимаем warp0
 ip link add dev warp0 type wireguard || exit 1
 
-tmp_conf=$(mktemp)
+# Не /tmp: пакетный wg на Ubuntu 26.04 не читает оттуда конфиг
+# ("fopen: Permission denied"). /etc/wireguard — каталог root:700.
+tmp_conf="/etc/wireguard/.warp0.setconf.boot.$$"
+rm -f "$tmp_conf"
 cat > "$tmp_conf" << EOC
 [Interface]
 PrivateKey = $warp_priv
@@ -5463,6 +5728,7 @@ PublicKey = $warp_pub
 AllowedIPs = 0.0.0.0/0
 Endpoint = $warp_endpoint
 EOC
+chmod 600 "$tmp_conf" 2>/dev/null || true
 wg setconf warp0 "$tmp_conf" || { rm -f "$tmp_conf"; ip link delete warp0; exit 1; }
 rm -f "$tmp_conf"
 
@@ -5686,8 +5952,8 @@ _warp_remove() {
   warn "  • /usr/local/bin/wgcf"
   warn "  • Health-check service/timer"
   echo ""
-  safe_read CONFIRM "$(echo -e "${R}  Подтверди [yes/N]: ${N}")"
-  [[ "$CONFIRM" != "yes" ]] && { warn "Отменено"; return 0; }
+  read_confirm "$(echo -e "${R}  Подтверди (введи yes): ${N}")" || \
+    { warn "Отменено"; return 0; }
 
   _warp_down
   _warp_health_remove 2>/dev/null || true
@@ -5796,6 +6062,11 @@ _warp_status() {
 # ── Импорт готового wgcf-account.toml с другого VPS ─────────────
 
 _warp_import_account() {
+  # Импорт — документированный путь для РФ-хостинга (README: 8 → 3), и он идёт
+  # мимо пункта 1. Зависимости доставляем здесь, до того как пользователь
+  # вставит длинный конфиг — чтобы не потерять его на ошибке apt.
+  _warp_ensure_deps || return 1
+
   echo ""
   hdr "★  Импорт готового профиля Warp"
   echo ""
@@ -5885,8 +6156,15 @@ _warp_import_account() {
   echo "$content" > "$WARP_PROFILE"
   chmod 600 "$WARP_PROFILE"
 
-  # Также копируем в /etc/wireguard/warp0.conf для использования скриптом
-  cp "$WARP_PROFILE" "$WARP_CONF"
+  # Также копируем в /etc/wireguard/warp0.conf — отсюда его читает _warp_up.
+  # Код возврата проверяем: раньше cp падал молча (нет /etc/wireguard), а ниже
+  # всё равно печаталось «импортирован» — ложный успех, из-за которого пункт 3
+  # потом жаловался на отсутствующий конфиг.
+  if ! cp "$WARP_PROFILE" "$WARP_CONF"; then
+    err "Не удалось скопировать профиль в $WARP_CONF"
+    info "Профиль сохранён в $WARP_PROFILE — импорт можно повторить"
+    return 1
+  fi
   chmod 600 "$WARP_CONF"
 
   ok "wgcf-profile.conf импортирован"
@@ -5931,7 +6209,7 @@ do_warp_menu() {
     echo -e "  ${R}d) Удалить Warp полностью${N}"
     echo -e "  0) Назад в главное меню"
     echo ""
-    safe_read WARP_CHOICE "$(echo -e "${C}  Выбор [0-9, d]: ${N}")"
+    read_choice WARP_CHOICE "$(echo -e "${C}  Выбор [0-9, d]: ${N}")" 0 9 "0" "d"
 
     case "${WARP_CHOICE:-}" in
       1)
@@ -6016,8 +6294,6 @@ _dns_proxy_status() {
     fi
     # Healthcheck
     if systemctl is-active --quiet awg-dns-healthcheck.timer 2>/dev/null; then
-      local last_check
-      last_check=$(systemctl status awg-dns-healthcheck.timer 2>/dev/null | grep "Trigger:" | head -1 | sed 's/.*Trigger: //' || echo "?")
       echo -e "  Healthcheck: ${G}● включён${N} ${D}(каждые 2 мин)${N}"
     else
       echo -e "  Healthcheck: ${D}○ выключен${N}"
@@ -6360,6 +6636,7 @@ EOF
 #!/usr/bin/env bash
 # AWG Toolza — healthcheck для dnscrypt-proxy
 # Проверяет что сервис активен и резолвит. Если упал — пишет в лог.
+set -u
 
 LOG="$DNS_HEALTH_LOG"
 TIMESTAMP=\$(date '+%Y-%m-%d %H:%M:%S')
@@ -6578,7 +6855,7 @@ _dns_proxy_change_upstream() {
   echo -e "  ${C}6) Ввести вручную${N} ${D}(произвольный список из public-resolvers.md)${N}"
   echo -e "  ${G}0)${N} Отмена"
   echo ""
-  read -rp "  Выбор: " UPSTREAM_CHOICE
+  read_choice UPSTREAM_CHOICE "$(echo -e "${C}  Выбор [0-6]: ${N}")" 0 6 "0"
 
   local servers=""
   # Флаг: нужно ли резолверам быть без фильтрации.
@@ -6707,7 +6984,7 @@ do_dns_menu() {
     echo -e "  ${R}5) Выключить и удалить${N}"
     echo -e "  0) Назад в главное меню"
     echo ""
-    safe_read DNS_CHOICE "  Выбор [0-5]: "
+    read_choice DNS_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")" 0 5 "0"
 
     case "${DNS_CHOICE:-}" in
       1)
@@ -6744,10 +7021,10 @@ do_uninstall() {
   echo -e "  ${R}—${N} /etc/amnezia/amneziawg/"
   echo -e "  ${R}—${N} /root/*_awg2.conf"
   echo -e "  ${R}—${N} Автозапуск awg-quick@awg0"
+  echo -e "  ${R}—${N} NAT-персистентность (hook / awg-nat.service)"
   echo ""
-  local CONFIRM_DEL
-  safe_read CONFIRM_DEL "$(echo -e "${R}  Подтверди удаление [yes/N]: ${N}")"
-  [[ "$CONFIRM_DEL" != "yes" ]] && { warn "Отменено."; return 0; }
+  read_confirm "$(echo -e "${R}  Подтверди удаление (введи yes): ${N}")" || \
+    { warn "Отменено."; return 0; }
 
   # v6.4: авто-бэкап перед удалением (последний шанс восстановиться)
   if [[ -f "$SERVER_CONF" ]]; then
@@ -6764,6 +7041,11 @@ do_uninstall() {
   trash "Отключаем автозапуск..."
   systemctl disable awg-quick@awg0 2>/dev/null || true
   rm -rf /etc/systemd/system/awg-quick@awg0.service.d 2>/dev/null || true
+
+  trash "Удаляем NAT-персистентность..."
+  systemctl disable --now awg-nat.service >/dev/null 2>&1 || true
+  rm -f "$NAT_PERSIST_SERVICE" "$NAT_PERSIST_SCRIPT" 2>/dev/null || true
+  rm -f /etc/network/if-pre-up.d/iptables-nat 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
 
   trash "Удаляем пакеты..."
@@ -6977,8 +7259,8 @@ do_clean_clients() {
   echo -e "${Y}  ! Будет удалено ${client_count} клиентов${N}"
   echo -e "${Y}    Все конфиги клиентов из /root также будут удалены${N}"
   echo ""
-  safe_read CONFIRM "$(echo -e "${R}  Подтвердить удаление клиентов? [yes/N]: ${N}")"
-  [[ "$CONFIRM" != "yes" ]] && { warn "Отменено."; return 0; }
+  read_confirm "$(echo -e "${R}  Подтвердить удаление клиентов? (введи yes): ${N}")" || \
+    { warn "Отменено."; return 0; }
 
   # v6.4: авто-бэкап перед опасной операцией
   auto_backup "clean" || warn "Авто-бэкап не удался"
@@ -7031,7 +7313,7 @@ do_clean_clients() {
 }
 
 do_backup() {
-  local username timestamp backup_path
+  local timestamp backup_path
 
   timestamp=$(date '+%Y%m%d_%H%M%S')
   backup_path="${BACKUP_DIR}/awg2_backup_${timestamp}"
@@ -7121,21 +7403,18 @@ do_restore() {
   echo ""
 
   local RESTORE_CHOICE
-  safe_read RESTORE_CHOICE "$(echo -e "${C}  Выбери номер бекапа (Enter = 1): ${N}")"
-  RESTORE_CHOICE=${RESTORE_CHOICE:-1}
+  read_choice RESTORE_CHOICE "$(echo -e "${C}  Выбери номер бекапа (Enter = 1, 0 = отмена): ${N}")" 0 "${#backups[@]}" "1"
 
-  if ! [[ "$RESTORE_CHOICE" =~ ^[0-9]+$ ]] || \
-     [[ "$RESTORE_CHOICE" -lt 1 ]] || \
-     [[ "$RESTORE_CHOICE" -gt ${#backups[@]} ]]; then
-    err "Неверный выбор"
-    return 1
+  if [[ "$RESTORE_CHOICE" == "0" ]]; then
+    info "Отменено"
+    return 0
   fi
 
   local chosen_backup="${backups[$((RESTORE_CHOICE - 1))]}"
   echo -e "${C}  → Восстановление из: ${W}$(basename "$chosen_backup")${N}"
 
-  safe_read CONFIRM_RESTORE "$(echo -e "${R}  Текущий серверный конфиг будет заменён. Продолжить? [yes/N]: ${N}")"
-  [[ "$CONFIRM_RESTORE" != "yes" ]] && { warn "Отменено."; return 0; }
+  read_confirm "$(echo -e "${R}  Текущий серверный конфиг будет заменён. Продолжить? (введи yes): ${N}")" || \
+    { warn "Отменено."; return 0; }
 
   # Останавливаем интерфейс
   info "Останавливаем awg0..."
@@ -7196,7 +7475,6 @@ I5=""
 MIMICRY_PROFILE=""
 MTU=""
 AWG_PARAMS_LINES=""
-ERROR_COUNT=0
 
 touch "$LOG_FILE" 2>/dev/null && chmod 600 "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/awg-manager.log"
 
@@ -7228,7 +7506,9 @@ log_info "=== AWG Toolza ${VERSION} запущен ==="
 _cascade_valid_ip() {
   local ip="$1"
   [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
-  local IFS='.'; local -a o=($ip)
+  local IFS='.'
+  # shellcheck disable=SC2206  # сплит по точкам; регулярка выше уже гарантирует цифры
+  local -a o=($ip)
   local i
   for i in 0 1 2 3; do
     [[ "${o[$i]}" =~ ^[0-9]+$ ]] || return 1
@@ -7397,7 +7677,7 @@ _cascade_ufw_full_revoke() {
   # Снести все port allow с нашим comment
   local rule_num
   while true; do
-    rule_num=$(ufw status numbered 2>/dev/null | grep -F "${CASCADE_TAG}:" | head -1 | grep -oE '^\[\s*[0-9]+\s*\]' | tr -d '[ ]')
+    rule_num=$(ufw status numbered 2>/dev/null | grep -F "${CASCADE_TAG}:" | head -1 | grep -oE '^\[\s*[0-9]+\s*\]' | tr -d '[] ')
     [[ -z "$rule_num" ]] && break
     echo "y" | ufw --force delete "$rule_num" >/dev/null 2>&1 || break
   done
@@ -7515,6 +7795,7 @@ _cascade_remove_one() {
   local target_ip="" out_port=""
   if [[ -f "$CASCADE_RULES" ]]; then
     local fp fin ftgt fout frest
+    # shellcheck disable=SC2034  # frest — приёмник остатка строки, нужен для корректного сплита
     while IFS='|' read -r fp fin ftgt fout frest; do
       if [[ "$fp" == "$proto" && "$fin" == "$in_port" ]]; then
         target_ip="$ftgt"
@@ -7579,6 +7860,7 @@ _cascade_flush_iptables() {
   # (точные команды с теми же аргументами что использовали при добавлении)
   if [[ -f "$CASCADE_RULES" ]]; then
     local fp fin ftgt fout frest tag
+    # shellcheck disable=SC2034  # frest — приёмник остатка строки, нужен для корректного сплита
     while IFS='|' read -r fp fin ftgt fout frest; do
       [[ -z "${fp:-}" || "${fp:0:1}" == "#" ]] && continue
       [[ "$fp" != "tcp" && "$fp" != "udp" ]] && continue
@@ -7602,7 +7884,7 @@ _cascade_flush_iptables() {
 
   # ШАГ 2: fallback — убираем всё что осталось с нашим тегом, парся iptables-save
   # (iptables-save выводит правила однострочно, в отличие от iptables -S который в nftables-бэкенде ломает строки)
-  local line tag_only
+  local line
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
     [[ "$line" != *"${CASCADE_TAG}:"* ]] && continue
@@ -7950,22 +8232,20 @@ _cascade_delete_one() {
 
   echo ""
   local num
-  safe_read num "$(echo -e "${C}  Номер для удаления (Enter — отмена): ${N}")"
-  [[ -z "${num// /}" ]] && return 0
-  [[ "$num" =~ ^[0-9]+$ ]] || { err "Нужно число"; return 1; }
-  (( num >= 1 && num <= count )) || { err "Номер вне диапазона"; return 1; }
+  read_choice num "$(echo -e "${C}  Номер для удаления (0 = отмена): ${N}")" 0 "$count" "0"
+  [[ "$num" == "0" ]] && { info "Отменено"; return 0; }
 
-  local n=0 proto in_port target_ip out_port comment found=""
+  local n=0 proto in_port target_ip out_port comment found_rule=""
   while IFS='|' read -r proto in_port target_ip out_port comment; do
     [[ -z "${proto:-}" || "${proto:0:1}" == "#" ]] && continue
     n=$((n + 1))
     if (( n == num )); then
-      found="yes"
+      found_rule="yes"
       break
     fi
   done < "$CASCADE_RULES"
 
-  [[ -n "$found" ]] || { err "Не нашёл #$num"; return 1; }
+  [[ -n "$found_rule" ]] || { err "Не нашёл #$num"; return 1; }
 
   echo ""
   local confirm
@@ -8249,7 +8529,7 @@ do_cascade_menu() {
     echo -e "  0) Назад в главное меню"
     echo ""
     local CASCADE_CHOICE
-    safe_read CASCADE_CHOICE "$(echo -e "${C}  Выбор: ${N}")"
+    read_choice CASCADE_CHOICE "$(echo -e "${C}  Выбор [0-7, d]: ${N}")" 0 7 "0" "d"
 
     case "${CASCADE_CHOICE:-}" in
       1) _cascade_add_standard; read -rp "Enter..." ;;
@@ -8693,7 +8973,7 @@ do_expire_menu() {
     echo -e "  ${W}0)${N} Назад"
     echo ""
     local EXP_CHOICE
-    safe_read EXP_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")"
+    read_choice EXP_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")" 0 5 "0"
     case "${EXP_CHOICE:-}" in
       1) _expire_action_set || true ;;
       2) _expire_action_clear || true ;;
@@ -8745,10 +9025,8 @@ _expire_pick_client() {
   done
   echo "" >&2
   local SEL
-  safe_read SEL "$(echo -e "${C}  Номер клиента [1-$i] (Enter — отмена): ${N}")" >&2
-  [[ -z "$SEL" ]] && return 1
-  [[ ! "$SEL" =~ ^[0-9]+$ ]] && { warn "Неверный номер" >&2; return 1; }
-  (( SEL < 1 || SEL > i )) && { warn "Номер вне диапазона" >&2; return 1; }
+  read_choice SEL "$(echo -e "${C}  Номер клиента [1-$i] (0 = отмена): ${N}")" 0 "$i" "0" >&2
+  [[ "$SEL" == "0" ]] && return 1
   echo "${names[$((SEL-1))]}"
   return 0
 }
@@ -8768,10 +9046,11 @@ _expire_action_set() {
   echo -e "  ${C}7)${N} Своя дата (YYYY-MM-DD HH:MM)"
   echo ""
   local PRESET
-  safe_read PRESET "$(echo -e "${C}  Выбор [1-7]: ${N}")"
+  read_choice PRESET "$(echo -e "${C}  Выбор [1-7] (0 = отмена): ${N}")" 0 7 "0"
 
   local ts=""
   case "${PRESET:-}" in
+    0) info "Отменено"; return 0 ;;
     1) ts=$(_expire_parse_duration "1h") ;;
     2) ts=$(_expire_parse_duration "6h") ;;
     3) ts=$(_expire_parse_duration "1d") ;;
@@ -8963,8 +9242,7 @@ _expire_ask_at_creation() {
   echo -e "  ${C}6)${N} Своя дата (YYYY-MM-DD HH:MM)" >&2
   echo "" >&2
   local CH
-  safe_read CH "$(echo -e "${C}  Выбор [1-6] (Enter = 1): ${N}")" >&2
-  CH="${CH:-1}"
+  read_choice CH "$(echo -e "${C}  Выбор [1-6] (Enter = 1): ${N}")" 1 6 "1" >&2
   local ts=""
   case "$CH" in
     1) echo ""; return 0 ;;
@@ -9000,7 +9278,7 @@ while true; do
   check_deps
   show_header
   show_menu
-  # show_menu уже читает CHOICE через safe_read
+  # show_menu читает CHOICE через read_choice — валидация внутри
 
   case "${CHOICE:-}" in
     1) show_submenu_1 ;;
@@ -9017,24 +9295,11 @@ while true; do
       echo -e "<< Подпишись на ТГ :) >>"
       echo -e "<< https://t.me/awgToolza >>\n"
       exit 0 ;;
-    "")
-      # Пустой Enter — перерисовать меню, не выходить
-      ;;
-    *)
-      warn "Неверный выбор"
-      ERROR_COUNT=$((ERROR_COUNT + 1))
-      if [[ $ERROR_COUNT -ge 5 ]]; then
-        warn "Слишком много неверных нажатий подряд (${ERROR_COUNT}). Будь внимательнее — проверь раскладку и Caps Lock."
-        log_err "Слишком много неверных выборов подряд (${ERROR_COUNT}) — продолжаем"
-        ERROR_COUNT=0
-        sleep 1
-      fi
-      ;;
+    # read_choice наружу ничего кроме 0-8 не выпускает: пустой Enter и мусор
+    # переспрашиваются внутри него, Ctrl+D отдаёт 0. Ветка оставлена как
+    # страховка на случай правок валидатора.
+    *) warn "Неверный выбор" ;;
   esac
-
-  if [[ "${CHOICE:-}" =~ ^[1-8]$ ]]; then
-    ERROR_COUNT=0
-  fi
 
   # Сбрасываем CHOICE — защита от повторного срабатывания
   CHOICE=""
