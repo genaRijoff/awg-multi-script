@@ -960,12 +960,33 @@ def set_dns_upstream(key: str) -> tuple[bool, str]:
 # `ip rule from <ip> lookup 200`. Меняем только правило конкретного клиента.
 WARP_DIR = "/etc/wgcf"
 WARP_PEERS = os.path.join(WARP_DIR, "peers.list")
+# Имя интерфейса общее для обоих бэкендов awg2 (wg и usque) — именно поэтому
+# per-client тумблер и policy routing одинаковы и не зависят от бэкенда.
 WARP_IFACE = "warp0"
 WARP_TABLE = "200"
 
+# Какой бэкенд WARP активен в awg2. Файла может не быть — у установок до
+# появления второго бэкенда его нет, и там всегда wg.
+WARP_BACKEND_FILE = "/etc/awg-warp-backend"
+WARP_WG_CONF = "/etc/wireguard/warp0.conf"
+USQUE_CONF = "/etc/usque/config.json"
+USQUE_SERVICE = "awg-usque.service"
+
+
+def warp_backend() -> str:
+    """Активный бэкенд WARP: 'wg' или 'usque'."""
+    try:
+        v = Path(WARP_BACKEND_FILE).read_text().strip()
+    except OSError:
+        return "wg"
+    return v if v in ("wg", "usque") else "wg"
+
 
 def warp_installed() -> bool:
-    return os.path.isfile("/etc/wireguard/warp0.conf")
+    """Установлен ли WARP — проверка зависит от активного бэкенда."""
+    if warp_backend() == "usque":
+        return os.path.isfile(USQUE_CONF)
+    return os.path.isfile(WARP_WG_CONF)
 
 
 def warp_iface_up() -> bool:
@@ -1035,22 +1056,32 @@ def warp_client_state(name: str) -> bool | None:
 
 # ───────────────────────── статусы WARP / DNS (прямое чтение) ─────────────────────────
 def warp_status() -> str:
-    """Читаем состояние WARP напрямую, без захода в меню awg2."""
-    lines = []
-    conf = "/etc/wireguard/warp0.conf"
-    if not os.path.isfile(conf):
-        return "WARP не установлен (нет warp0.conf)."
+    """Состояние WARP напрямую, без захода в меню awg2.
+
+    Формат вывода одинаков для обоих бэкендов — карточка в боте не должна
+    знать, чем именно поднят туннель.
+    """
+    backend = warp_backend()
+    lines = [f"Бэкенд: {backend}"]
+
+    if not warp_installed():
+        missing = USQUE_CONF if backend == "usque" else WARP_WG_CONF
+        return f"WARP не установлен (нет {missing})."
     lines.append("WARP установлен.")
-    rc, out, _ = run(["wg", "show", "warp0"]) if have("wg") else (1, "", "")
-    if rc == 0 and out.strip():
-        lines.append("Интерфейс warp0: 🟢 поднят")
-        m = re.search(r"latest handshake:\s*(.+)", out)
-        if m:
-            lines.append(f"Последний handshake: {m.group(1).strip()}")
+
+    if backend == "usque":
+        rc, out, _ = run(["systemctl", "is-active", USQUE_SERVICE])
+        state = (out or "").strip() or "unknown"
+        lines.append(f"Сервис usque: {'🟢 активен' if state == 'active' else f'🔴 {state}'}")
     else:
-        # пробуем через awg/ip
-        rc2, out2, _ = run(["ip", "link", "show", "warp0"])
-        lines.append("Интерфейс warp0: " + ("🟢 есть" if rc2 == 0 else "🔴 не поднят"))
+        rc, out, _ = run(["wg", "show", WARP_IFACE]) if have("wg") else (1, "", "")
+        if rc == 0 and out.strip():
+            m = re.search(r"latest handshake:\s*(.+)", out)
+            if m:
+                lines.append(f"Последний handshake: {m.group(1).strip()}")
+
+    rc2, _, _ = run(["ip", "link", "show", WARP_IFACE])
+    lines.append(f"Интерфейс {WARP_IFACE}: " + ("🟢 поднят" if rc2 == 0 else "🔴 не поднят"))
     return "\n".join(lines)
 
 
@@ -1059,6 +1090,15 @@ def warp_hard_restart() -> tuple[bool, str]:
     WARP_CONF  = "/etc/wireguard/warp0.conf"
     WARP_STATE = "/etc/wgcf/state"
     WARP_TABLE = "200"
+
+    # Жёсткий перезапуск реализован только для бэкенда wg: у usque туннель
+    # держит systemd-сервис, и перезапускать его надо через systemctl, а не
+    # пересборкой интерфейса руками.
+    if warp_backend() == "usque":
+        rc, _, err_out = run(["systemctl", "restart", USQUE_SERVICE])
+        if rc == 0:
+            return True, "Сервис usque перезапущен"
+        return False, f"Не удалось перезапустить {USQUE_SERVICE}: {err_out.strip()[:200]}"
 
     if not os.path.isfile(WARP_CONF):
         return False, "WARP не установлен (нет warp0.conf)"
