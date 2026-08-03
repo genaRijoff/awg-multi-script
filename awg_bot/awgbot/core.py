@@ -16,6 +16,7 @@ core.py — низкоуровневая работа с AmneziaWG.
 from __future__ import annotations
 
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -34,6 +35,20 @@ SUSPEND_IP = "127.0.0.2/32"  # AllowedIPs у заблокированных по
 
 
 # ───────────────────────── exec helpers ─────────────────────────
+def _keepalive_value(server_conf_text: str) -> str:
+    """PersistentKeepalive для клиента.
+
+    На AWG 3.0 — диапазон: ядро выбирает значение заново на каждой отправке,
+    а фиксированные 25 дают пакет ровно раз в 25 секунд, то есть стабильную
+    временную сигнатуру — ровно то, что 3.0 призван скрывать. Держим диапазон
+    вокруг привычных 25 с, иначе рвётся проход через домашние NAT.
+    На 2.0 — как было, 25.
+    """
+    if not re.search(r"^#\s*AWG_PROTO=3\.0\s*$", server_conf_text, re.M):
+        return "25"
+    return f"{random.randint(18, 24)}-{random.randint(26, 34)}"
+
+
 def run(cmd: list[str], timeout: int = 60) -> tuple[int, str, str]:
     """Запуск команды. Возвращает (rc, stdout, stderr)."""
     try:
@@ -93,6 +108,7 @@ class ServerInfo:
     public_ip: str = ""
     iface_up: bool = False
     profile: str = ""
+    proto: str = ""            # версия протокола AmneziaWG: "2.0" или "3.0"
     region: str = ""
     peers_count: int = 0
     extra: dict = field(default_factory=dict)
@@ -136,6 +152,10 @@ def get_server_info() -> ServerInfo:
         info.mtu = m.group(1).strip()
     if m := re.search(r"^#\s*AWG_PROFILE=(.+)$", text, re.M):
         info.profile = m.group(1).strip()
+    # Версия протокола. У серверов, созданных до её появления, маркера нет —
+    # такие читаем как 2.0.
+    m = re.search(r"^#\s*AWG_PROTO=(\S+)", text, re.M)
+    info.proto = m.group(1).strip() if m else "2.0"
     if m := re.search(r"^#\s*Region:\s*(.+)$", text, re.M):
         info.region = m.group(1).strip()
 
@@ -398,12 +418,17 @@ def add_client(name: str, expires: int | None = None,
     mtu_m = re.search(r"^MTU\s*=\s*(\S+)", text, re.M)
     mtu = mtu_m.group(1) if mtu_m else "1320"
 
-    # AWG-параметры (Jc, Jmin, ... S1, H1) копируем из [Interface] сервера
+    # AWG-параметры копируем из [Interface] сервера. Список включает и 3.0
+    # (HeaderProtectionKey, паддинг, таймеры): без них клиент, выданный ботом
+    # для сервера 3.0, молча получил бы конфиг 2.0 и не подключился.
     iface_block = _split_blocks(text)[0]
     awg_params = []
     for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
                 "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5",
-                "Itime", "T1", "T2", "T3", "T4", "T5"):
+                "Itime", "T1", "T2", "T3", "T4", "T5",
+                "HeaderProtectionKey", "ContentPaddingAddition",
+                "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime",
+                "KeepaliveTimeout", "MaxHandshakeAttempts"):
         km = re.search(rf"^{key}\s*=\s*(.+)$", iface_block, re.M)
         if km:
             awg_params.append(f"{key} = {km.group(1).strip()}")
@@ -478,7 +503,7 @@ def add_client(name: str, expires: int | None = None,
         f"PresharedKey = {psk}",
         f"Endpoint = {public_ip}:{listen_port}",
         "AllowedIPs = 0.0.0.0/0, ::/0",
-        "PersistentKeepalive = 25",
+        f"PersistentKeepalive = {_keepalive_value(text)}",
     ]
     conf_path = os.path.join(CLIENT_DIR, f"{name}_awg2.conf")
     Path(conf_path).write_text("\n".join(cli_lines) + "\n")

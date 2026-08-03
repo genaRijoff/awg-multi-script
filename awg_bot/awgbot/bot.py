@@ -150,7 +150,8 @@ def menu_text() -> str:
     return (
         "🛡 <b>awgToolza Bot</b>\n\n"
         "<b>СЕРВЕР</b>\n"
-        f"{state} · профиль <code>{esc(info.profile or '—')}</code>\n"
+        f"{state} · профиль <code>{esc(info.profile or '—')}</code>"
+        f" · AWG <code>{esc(info.proto or '2.0')}</code>\n"
         f"🌍 <code>{esc(info.public_ip or '—')}:{esc(info.listen_port or '—')}</code>\n"
         f"⏱ аптайм: {uptime}\n\n"
         "<b>ЗАЩИТА</b>\n"
