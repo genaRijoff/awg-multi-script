@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.2"
+VERSION="v0.7.4"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -970,11 +970,11 @@ choose_obf_level() {
   OBF_LEVEL=""
   echo ""
   hdr "⛊  Уровень обфускации"
-  echo -e "  ${G}1${N}  Базовый AWG 2.0 — H ranges + S1-S4 + Jc junk"
+  echo -e "  ${G}1${N}  Базовый — H ranges + S1-S4 + Jc junk"
   echo -e "     ${D}Без I1-I5. Максимальная совместимость. Рекомендуется.${N}"
-  echo -e "  ${G}2${N}  AWG 2.0 + I1 — добавляет 1 сигнатурный пакет"
+  echo -e "  ${G}2${N}  + I1 — добавляет 1 сигнатурный пакет"
   echo -e "     ${D}I1 = снимок реального TLS/QUIC/DTLS протокола${N}"
-  echo -e "  ${Y}3${N}  AWG 2.0 + I1-I5 полный CPS chain"
+  echo -e "  ${Y}3${N}  + I1-I5 полный CPS chain"
   echo -e "     ${D}Максимум DPI bypass. Некоторые клиенты могут глючить.${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" 1 3 1
@@ -1925,6 +1925,10 @@ show_header() {
       "")       profile_label="—" ;;
       *)        profile_label="$profile_raw" ;;
     esac
+    # Версия протокола: маркера нет у серверов, созданных до 0.7.3 — там 2.0
+    local proto_raw
+    proto_raw=$(grep -m1 '^# AWG_PROTO=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+    profile_label="${profile_label} ${D}/ AWG ${proto_raw:-2.0}${N}"
   fi
 
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
@@ -1990,20 +1994,23 @@ show_submenu_1() {
       echo -e "  ${D}4) Авторемонт (нужен пункт 2)${N}"
     fi
     if $HAS_SERVER_CONF; then
-      echo -e "  ${Y}5)${N} Сбросить настройки сервера (чистая переустановка)"
+      echo -e "  ${C}5)${N} Перегенерировать параметры обфускации"
+      echo -e "  ${Y}6)${N} Сбросить настройки сервера (чистая переустановка)"
     else
-      echo -e "  ${D}5) Сбросить сервер (нет сервера)${N}"
+      echo -e "  ${D}5) Перегенерировать параметры (нужен пункт 2)${N}"
+      echo -e "  ${D}6) Сбросить сервер (нет сервера)${N}"
     fi
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-5]: ${N}")" 0 5 "0"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-6]: ${N}")" 0 6 "0"
     case "${SUB_CHOICE:-}" in
       1) do_install || true ;;
       2) do_gen || true ;;
       3) do_restart || true ;;
       4) do_repair || true ;;
-      5) do_reset_server || true ;;
+      5) do_rotate_awg_params || true ;;
+      6) do_reset_server || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2319,6 +2326,114 @@ choose_dns() {
 #   Ограничение 2^31-1 для совместимости с Windows клиентом.
 # Jc/Jmax: снижены для мобильных сетей (Yota/Tele2/МТС).
 # Результат: глобальная AWG_PARAMS_LINES
+# Выбор версии протокола AmneziaWG при создании сервера.
+#
+# Параметры 3.0 — уровня УСТРОЙСТВА (в модуле это WGDEVICE_A_*), то есть
+# действуют на весь интерфейс сразу. Отдельному клиенту свою версию выдать
+# нельзя: включив 3.0, сервер перестаёт принимать клиентов на 2.0. Поэтому
+# спрашиваем один раз при создании и пишем маркер в awg0.conf.
+# Результат: глобальная AWG_PROTO = "2.0" | "3.0"
+choose_awg_proto() {
+  AWG_PROTO="2.0"
+  echo ""
+  hdr "▤  Версия протокола AmneziaWG"
+  echo ""
+  echo -e "  ${G}1)${N} ${W}AWG 2.0${N} ${D}(по умолчанию, максимальная совместимость)${N}"
+  echo -e "     ${D}Обфускация Jc/Jmin/Jmax, S1-S4, H1-H4 плюс мимикрия I1-I5.${N}"
+  echo -e "     ${D}Работает со всеми клиентами AmneziaWG.${N}"
+  echo ""
+  echo -e "  ${G}2)${N} ${W}AWG 3.0${N} ${C}(сильнее против анализа трафика)${N}"
+  echo -e "     ${D}Дополнительно: защита заголовков ключом, случайный паддинг${N}"
+  echo -e "     ${D}содержимого и рандомизация таймингов рукопожатий —${N}"
+  echo -e "     ${D}то есть скрывает не только размеры, но и временные паттерны.${N}"
+  echo ""
+  echo -e "  ${Y}  Требует клиента с поддержкой 3.0. Версия задаётся на ВЕСЬ${N}"
+  echo -e "  ${Y}  сервер: клиенты на 2.0 подключиться к нему не смогут.${N}"
+  echo ""
+  local _proto_choice
+  read_choice _proto_choice "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 "1"
+  case "$_proto_choice" in
+    2) AWG_PROTO="3.0"; ok "Выбран AmneziaWG 3.0" ;;
+    *) AWG_PROTO="2.0"; ok "Выбран AmneziaWG 2.0" ;;
+  esac
+  log_info "AWG_PROTO=$AWG_PROTO"
+}
+
+# Заменяет блок параметров AmneziaWG в секции [Interface] файла.
+# Работает и для серверного конфига, и для клиентских: строки I1-I5, ключи,
+# адреса, DNS, MTU и секция [Peer] не трогаются — меняются только параметры
+# обфускации, а они у сервера и всех клиентов обязаны совпадать.
+# $1 = файл, $2 = новые строки параметров (с реальными переводами строк)
+_replace_awg_params() {
+  local file="$1" params="$2" tmp rc
+  [[ -f "$file" ]] || return 1
+  tmp=$(mktemp) || return 1
+
+  awk -v params="$params" -v re="^${AWG_PARAM_KEYS_RE} = " '
+    BEGIN { in_iface = 0; inserted = 0 }
+    /^\[Interface\]/ { in_iface = 1; print; next }
+    /^\[/ {
+      # начало любой другой секции — параметры вставляем до неё
+      if (in_iface && !inserted) { print params; inserted = 1 }
+      in_iface = 0; print; next
+    }
+    {
+      if (in_iface && $0 ~ re) {
+        # старый параметр: первый заменяем блоком, остальные выбрасываем
+        if (!inserted) { print params; inserted = 1 }
+        next
+      }
+      print
+    }
+    END { if (in_iface && !inserted) print params }
+  ' "$file" > "$tmp"
+  rc=$?
+
+  if [[ $rc -ne 0 || ! -s "$tmp" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+  # Проверяем, что параметры действительно на месте — иначе не подменяем файл
+  if ! grep -qE "^${AWG_PARAM_KEYS_RE} = " "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+
+  cat "$tmp" > "$file" && rm -f "$tmp" || { rm -f "$tmp"; return 1; }
+  return 0
+}
+
+# Значение PersistentKeepalive для клиентского конфига.
+#
+# На 2.0 — фиксированные 25 секунд, как было: старые клиенты диапазон могут не
+# понять, а выигрыша там всё равно нет.
+#
+# На 3.0 — диапазон. Это не косметика: ядро выбирает значение заново на каждой
+# отправке (u16_range_pick_one в timers.c), а фиксированные 25 дают пакет ровно
+# раз в 25 секунд — идеально стабильную временную сигнатуру. Рандомизировать
+# рекеи и оставить keepalive константой значит наполовину обесценить 3.0.
+# Диапазон держим вокруг привычных 25 с, чтобы не ломать проход через NAT:
+# слишком редкий keepalive рвёт сессию у домашних роутеров.
+awg_keepalive_value() {
+  local proto="${AWG_PROTO:-}"
+  # Клиента могли добавлять уже после создания сервера — тогда AWG_PROTO в
+  # этой сессии не задана, и версию надо взять из конфига сервера. Без этого
+  # такой клиент получил бы фиксированные 25 на сервере 3.0.
+  if [[ -z "$proto" && -f "$SERVER_CONF" ]]; then
+    proto=$(grep -m1 '^# AWG_PROTO=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+  fi
+  if [[ "${proto:-2.0}" == "3.0" ]]; then
+    echo "$(rand_range 18 24)-$(rand_range 26 34)"
+  else
+    echo "25"
+  fi
+}
+
+# Все ключи параметров AmneziaWG, которые клиент обязан получить от сервера.
+# Единый источник: любой новый параметр добавляется здесь, а не в трёх местах.
+# 2.0 — Jc/Jmin/Jmax, S1-S4, H1-H4. 3.0 — защита заголовков, паддинг, таймеры.
+AWG_PARAM_KEYS_RE="(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts)"
+
 gen_awg_params() {
   AWG_PARAMS_LINES=""
 
@@ -2436,6 +2551,70 @@ gen_awg_params() {
   H4=$(_gen_quadrant_pair "$SQ4_MIN" "$SQ4_MAX")
 
   AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nS3 = $S3\nS4 = $S4\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
+
+  # ── AWG 3.0: защита заголовков и рандомизация таймингов ──
+  # Включается только если AWG_PROTO=3.0. Параметры уровня УСТРОЙСТВА, то есть
+  # действуют на весь интерфейс сразу — клиент на 2.0 к такому серверу уже не
+  # подключится. Отсюда выбор версии при создании сервера, а не на клиента.
+  if [[ "${AWG_PROTO:-2.0}" == "3.0" ]]; then
+    local _p3
+    _p3=$(gen_awg3_params) || { err "Не удалось сгенерировать параметры AWG 3.0"; return 1; }
+    [[ -n "$_p3" ]] || { err "Параметры AWG 3.0 пусты"; return 1; }
+    AWG_PARAMS_LINES+="\n${_p3}"
+  fi
+}
+
+# Параметры AmneziaWG 3.0.
+#
+# Форматы сняты с исходников amneziawg-tools и ядерного модуля, а не по памяти:
+#  • HeaderProtectionKey — ChaCha-ключ 32 байта (HEADER_PROTECTION_KEY_SIZE =
+#    CHACHA_KEY_SIZE), то есть обычный awg genkey;
+#  • остальные — u16_range_from_string: либо "N", либо "LO-HI" при HI >= LO,
+#    оба конца uint16.
+#
+# ВАЖНО: модуль эти значения НЕ валидирует — принимает любой u32 и молча
+# применяет. Осмысленность целиком на нас, поэтому диапазоны строятся вокруг
+# протокольных дефолтов WireGuard (они же в messages.h модуля):
+#   REKEY_AFTER_TIME 120, REJECT_AFTER_TIME 180, KEEPALIVE_TIMEOUT 10,
+#   REKEY_TIMEOUT 5, MAX_TIMER_HANDSHAKES 18.
+# Инвариант, который нельзя нарушать: RejectAfterTime > RekeyAfterTime, иначе
+# сессия будет отвергнута раньше, чем сторона успеет её переустановить.
+gen_awg3_params() {
+  local hp_key cpa rat_lo rat_hi rjt_lo rjt_hi ka_lo ka_hi rkt mha
+
+  # Ключ защиты заголовков — обязан совпадать на обоих концах
+  hp_key=$(awg genkey 2>/dev/null || true)
+  if [[ -z "$hp_key" ]]; then
+    log_err "gen_awg3_params: awg genkey не сработал"
+    echo ""
+    return 1
+  fi
+
+  # Добавка к паддингу содержимого: 0 = выключено, поэтому берём от 8
+  cpa="$(rand_range 8 24)-$(rand_range 48 96)"
+
+  # Рекей: вокруг 120 с. Верх держим ниже нижней границы RejectAfterTime.
+  rat_lo=$(rand_range 110 125)
+  rat_hi=$(rand_range 140 160)
+
+  # Отклонение сессии: строго выше рекея, вокруг 180 с
+  rjt_lo=$(rand_range 175 190)
+  rjt_hi=$(rand_range 200 215)
+  # Страховка инварианта на случай неудачного розыгрыша
+  (( rjt_lo <= rat_hi )) && rjt_lo=$((rat_hi + 15))
+  (( rjt_hi <= rjt_lo )) && rjt_hi=$((rjt_lo + 20))
+
+  # Keepalive: вокруг 10 с
+  ka_lo=$(rand_range 9 14)
+  ka_hi=$(rand_range 20 30)
+
+  # Таймаут повтора рукопожатия оставляем фиксированным: разброс тут даёт
+  # мало маскировки, зато заметно влияет на скорость восстановления связи.
+  rkt=5
+  mha=$(rand_range 16 20)
+
+  printf 'HeaderProtectionKey = %s\nContentPaddingAddition = %s\nRekeyAfterTime = %s-%s\nRekeyTimeout = %s\nRejectAfterTime = %s-%s\nKeepaliveTimeout = %s-%s\nMaxHandshakeAttempts = %s' \
+    "$hp_key" "$cpa" "$rat_lo" "$rat_hi" "$rkt" "$rjt_lo" "$rjt_hi" "$ka_lo" "$ka_hi" "$mha"
 }
 
 _apply_config() {
@@ -2962,7 +3141,7 @@ do_gen() {
   echo "  2) 1380 — баланс"
   echo "  3) 1360 — провайдеры с PPPoE overhead"
   echo "  4) 1340 — мобильный 4G/LTE"
-  echo "  5) 1320 — безопасно для AWG 2.0 + CPS, рекомендуется"
+  echo "  5) 1320 — безопасно для AWG + CPS, рекомендуется"
   echo "  6) 1280 — максимальная совместимость"
   echo "  7) 1500 — Ethernet без tunnel overhead"
   echo "  8) Вручную"
@@ -2989,6 +3168,7 @@ do_gen() {
   esac
 
   choose_awg_profile || return 1
+  choose_awg_proto   || return 1
 
   hdr "»  IP подсеть сервера"
   echo "  1) Случайная подсеть из пула 10.[10-55].[1-254].0/24 (рекомендуется)"
@@ -3057,7 +3237,7 @@ do_gen() {
   esac
 
   hdr "≡  Параметры настройки"
-  echo -e "  ${W}Версия     : ${N}$AWG_VERSION"
+  echo -e "  ${W}Версия     : ${N}AWG ${AWG_PROTO:-2.0}"
   echo -e "  ${W}Обфускация : ${N}$obf_label"
   echo -e "  ${W}DNS        : ${N}$CLIENT_DNS"
   echo -e "  ${W}Мимикрия   : ${N}${MIMICRY_PROFILE:-none}"
@@ -3132,6 +3312,7 @@ do_gen() {
     echo "# AWG_PROFILE=${AWG_PROFILE:-pro}"
     echo "# AmneziaWG Toolza — AWG 2.0 server config"
     echo "# Region: ${SERVER_REGION:-world}"
+    echo "# AWG_PROTO=${AWG_PROTO:-2.0}"
     echo "[Interface]"
     echo "PrivateKey = $srv_priv"
     echo "Address = $SERVER_ADDR"
@@ -3172,7 +3353,7 @@ do_gen() {
     echo "PresharedKey = $psk"
     echo "Endpoint = $srv_ip:$PORT"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
-    echo "PersistentKeepalive = 25"
+    echo "PersistentKeepalive = $(awg_keepalive_value)"
   } > "/root/${FIRST_CLIENT_NAME}_awg2.conf"
   chmod 600 "/root/${FIRST_CLIENT_NAME}_awg2.conf"
 
@@ -3211,7 +3392,7 @@ do_gen() {
 
   echo ""
   success_box "■  Сервер создан успешно"
-  echo -e "${W}  Версия : ${N}$AWG_VERSION"
+  echo -e "${W}  Версия : ${N}AWG ${AWG_PROTO:-2.0}"
   echo -e "${W}  Профиль: ${N}${MIMICRY_PROFILE:-none}"
   echo -e "${W}  Сервер : ${N}$SERVER_CONF"
   echo -e "${W}  Клиент : ${N}/root/${FIRST_CLIENT_NAME}_awg2.conf"
@@ -3754,7 +3935,11 @@ do_add_client() {
 
   choose_dns
 
-  info "Версия сервера: AWG 2.0"
+  # Версию берём из маркера в конфиге сервера, а не печатаем константу:
+  # раньше здесь всегда было «AWG 2.0», независимо от того, на чём сервер.
+  local _srv_proto
+  _srv_proto=$(grep -m1 '^# AWG_PROTO=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+  info "Версия сервера: AWG ${_srv_proto:-2.0}"
 
   # MTU: по умолчанию из конфига сервера, но даём возможность override
   local srv_mtu
@@ -3884,7 +4069,10 @@ do_add_client() {
 
   # Исправлено: читаем параметры только из секции [Interface]
   local awg_params_from_srv
-  awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^(Jc|Jmin|Jmax|S[1-4]|H[1-4]) = " | grep -v "^#" || true)
+  # Список включает и параметры AWG 3.0 (HeaderProtectionKey, паддинг,
+  # таймеры). Без них клиент, добавленный к серверу 3.0 уже после создания,
+  # молча получил бы конфиг 2.0 и не подключился бы вовсе.
+  awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^${AWG_PARAM_KEYS_RE} = " | grep -v "^#" || true)
 
   {
     echo "[Interface]"
@@ -3904,7 +4092,7 @@ do_add_client() {
     echo "PresharedKey = $psk"
     echo "Endpoint = $srv_ip:$port"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
-    echo "PersistentKeepalive = 25"
+    echo "PersistentKeepalive = $(awg_keepalive_value)"
   } > "$client_file"
   chmod 600 "$client_file"
 
@@ -4182,7 +4370,10 @@ do_bulk_add_clients() {
 
   # awg-параметры из секции [Interface] сервера — считаем один раз
   local awg_params_from_srv
-  awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^(Jc|Jmin|Jmax|S[1-4]|H[1-4]) = " | grep -v "^#" || true)
+  # Список включает и параметры AWG 3.0 (HeaderProtectionKey, паддинг,
+  # таймеры). Без них клиент, добавленный к серверу 3.0 уже после создания,
+  # молча получил бы конфиг 2.0 и не подключился бы вовсе.
+  awg_params_from_srv=$(sed -n '/^\[Peer\]/q; p' "$SERVER_CONF" | grep -E "^${AWG_PARAM_KEYS_RE} = " | grep -v "^#" || true)
 
   # ── SIGINT handler ──
   _bulk_interrupted=0
@@ -4282,7 +4473,7 @@ do_bulk_add_clients() {
       echo "PresharedKey = $psk"
       echo "Endpoint = $srv_ip:$port"
       echo "AllowedIPs = 0.0.0.0/0, ::/0"
-      echo "PersistentKeepalive = 25"
+      echo "PersistentKeepalive = $(awg_keepalive_value)"
     } > "$client_file"
     chmod 600 "$client_file"
 
@@ -4639,6 +4830,140 @@ do_restart() {
 # 10. СБРОС СЕРВЕРА (чистая переустановка)
 # Удаляет конфиги и правила firewall, но НЕ трогает пакеты/бинарники.
 # После сброса можно сразу Сервер (1) → п.2 — создать новый сервер.
+# Перегенерация параметров обфускации на работающем сервере.
+#
+# Зачем: H1-H4 и S1-S4 — это и есть то, что отличает трафик сервера от обычного
+# WireGuard. Утёк один клиентский конфиг — и у цензора сигнатура ВСЕГО сервера,
+# при целых ключах. Раньше лечилось только пересозданием сервера с потерей всех
+# клиентов; теперь параметры меняются на месте.
+#
+# Ключи, PSK, IP, имена, сроки и I1-I5 не трогаются — меняется только обрамление,
+# которое обязано совпадать у сервера и всех клиентов. Заодно здесь же можно
+# сменить версию протокола: раз уж все конфиги всё равно переписываются.
+do_rotate_awg_params() {
+  [[ -f "$SERVER_CONF" ]] || { err "Сервер не создан — нечего перегенерировать"; return 1; }
+
+  local cur_proto new_proto
+  cur_proto=$(grep -m1 '^# AWG_PROTO=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+  cur_proto="${cur_proto:-2.0}"
+
+  echo ""
+  hdr "↻  Перегенерация параметров обфускации"
+  echo ""
+  echo -e "  Текущая версия протокола: ${W}AWG ${cur_proto}${N}"
+  echo ""
+  echo -e "  ${D}Меняются Jc/Jmin/Jmax, S1-S4, H1-H4${N}"
+  [[ "$cur_proto" == "3.0" ]] &&     echo -e "  ${D}плюс HeaderProtectionKey, паддинг и таймеры 3.0${N}"
+  echo -e "  ${D}Ключи, IP, имена, сроки и мимикрия I1-I5 сохраняются.${N}"
+  echo ""
+
+  # Раз конфиги всё равно переписываются — предлагаем сменить и версию
+  echo -e "  ${W}Версия протокола после перегенерации:${N}"
+  echo -e "  ${G}1)${N} Оставить AWG ${cur_proto}"
+  if [[ "$cur_proto" == "3.0" ]]; then
+    echo -e "  ${G}2)${N} Перейти на AWG 2.0 ${D}(шире совместимость клиентов)${N}"
+  else
+    echo -e "  ${G}2)${N} Перейти на AWG 3.0 ${D}(нужен клиент с поддержкой 3.0)${N}"
+  fi
+  echo ""
+  local _pc
+  read_choice _pc "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 "1"
+  if [[ "$_pc" == "2" ]]; then
+    [[ "$cur_proto" == "3.0" ]] && new_proto="2.0" || new_proto="3.0"
+  else
+    new_proto="$cur_proto"
+  fi
+
+  # Считаем клиентов, которых это заденет
+  local clients=() f
+  while IFS= read -r -d '' f; do clients+=("$f"); done     < <(find /root -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
+
+  echo ""
+  echo -e "${Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  warn "ВСЕ клиенты потеряют связь до получения нового конфига"
+  echo -e "  ${Y}Затронуто клиентов: ${W}${#clients[@]}${N}"
+  echo -e "  ${Y}Файлы в /root будут обновлены автоматически, но доставить${N}"
+  echo -e "  ${Y}их на устройства придётся вручную — или выдать через бота.${N}"
+  [[ "$new_proto" != "$cur_proto" ]] &&     echo -e "  ${R}Версия меняется: AWG ${cur_proto} → AWG ${new_proto}${N}"
+  echo -e "${Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo ""
+  read_confirm "$(echo -e "${R}  Перегенерировать параметры? (введи yes): ${N}")" ||     { info "Отменено"; return 0; }
+
+  auto_backup "rotate" || warn "Авто-бэкап не удался — продолжаем"
+
+  # Генерируем новый набор под выбранную версию
+  local AWG_PROTO="$new_proto"
+  local _saved_profile
+  _saved_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+  AWG_PROFILE="${_saved_profile:-pro}"
+  gen_awg_params || { err "Не удалось сгенерировать параметры"; return 1; }
+
+  local params
+  params=$(echo -e "$AWG_PARAMS_LINES")
+  [[ -n "$params" ]] || { err "Параметры пусты — отмена"; return 1; }
+
+  info "Обновляю серверный конфиг..."
+  if ! _replace_awg_params "$SERVER_CONF" "$params"; then
+    err "Не удалось обновить $SERVER_CONF"
+    info "Восстановись из бекапа: Бекапы (4) → восстановить"
+    return 1
+  fi
+  # Маркер версии
+  if grep -q '^# AWG_PROTO=' "$SERVER_CONF"; then
+    sed -i "s|^# AWG_PROTO=.*|# AWG_PROTO=${new_proto}|" "$SERVER_CONF"
+  else
+    sed -i "1a # AWG_PROTO=${new_proto}" "$SERVER_CONF"
+  fi
+  ok "Серверный конфиг обновлён"
+
+  # Клиентские конфиги
+  local updated=0 failed=0 ka
+  ka=$(awg_keepalive_value)
+  for f in ${clients[@]+"${clients[@]}"}; do
+    if _replace_awg_params "$f" "$params"; then
+      # PersistentKeepalive живёт в секции [Peer] и зависит от версии:
+      # на 3.0 это диапазон, на 2.0 — фиксированные 25.
+      sed -i "s|^PersistentKeepalive = .*|PersistentKeepalive = ${ka}|" "$f"
+      updated=$((updated + 1))
+    else
+      warn "Не удалось обновить $(basename "$f")"
+      failed=$((failed + 1))
+    fi
+  done
+  ok "Клиентских конфигов обновлено: ${updated}"
+  [[ $failed -gt 0 ]] && warn "Не обновлено: ${failed}"
+
+  info "Перезапускаю awg0..."
+  awg-quick down "$SERVER_CONF" 2>/dev/null || true
+  if awg-quick up "$SERVER_CONF" 2>/dev/null; then
+    ok "Интерфейс поднят с новыми параметрами"
+  else
+    err "awg0 не поднялся"
+    info "Проверь: awg-quick up $SERVER_CONF"
+    info "Откат: Бекапы (4) → восстановить"
+    return 1
+  fi
+
+  echo ""
+  success_box "Параметры перегенерированы"
+  echo -e "  ${W}Версия  : ${N}AWG ${new_proto}"
+  echo -e "  ${W}Клиентов: ${N}${updated}"
+  echo ""
+  echo -e "${Y}  Каждому клиенту нужен НОВЫЙ конфиг — до этого связи не будет.${N}"
+  echo ""
+  if [[ ${#clients[@]} -gt 0 ]]; then
+    echo -e "  ${W}Кому раздать:${N}"
+    for f in "${clients[@]}"; do
+      echo -e "    ${D}$(basename "$f" _awg2.conf)${N}"
+    done
+    echo ""
+    echo -e "  ${C}Собрать всё в архив: Клиенты (2) → Экспорт конфигов${N}"
+    echo -e "  ${C}Либо выдать по одному через Telegram-бота${N}"
+  fi
+  log_info "Параметры перегенерированы, версия $new_proto, клиентов $updated"
+  return 0
+}
+
 do_reset_server() {
   echo ""
   hdr "↺  Сброс настроек сервера (чистая переустановка)"
@@ -8334,7 +8659,6 @@ do_restore() {
 
 CHOICE=""
 CLIENT_DNS="1.1.1.1, 1.0.0.1"
-AWG_VERSION="2.0"   # единственная поддерживаемая версия
 I1=""
 I2=""
 I3=""
