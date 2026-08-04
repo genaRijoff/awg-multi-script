@@ -25,26 +25,70 @@ info(){ echo -e "${C}  → $*${N}"; }
 
 [[ $EUID -ne 0 ]] && { err "Нужен root (запусти через sudo awg2)"; exit 1; }
 
+# ── Источник кода бота ──
+# По умолчанию — git clone. Но код бота лежит рядом с этим установщиком в
+# распакованном архиве awg-toolza, и при проверке правок тянуть версию из
+# GitHub бессмысленно: там ещё старый код. Поэтому:
+#   --src <dir>  или  BOT_SRC=<dir>  — взять код из каталога (сам awg_bot/ либо
+#                                      корень репозитория, где он лежит);
+#   без аргумента — если рядом с установщиком есть awg_bot/awgbot, берём его,
+#                   иначе клонируем с GitHub.
+LOCAL_SRC="${BOT_SRC:-}"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --src)  LOCAL_SRC="${2:-}"; shift 2 ;;
+    --src=*) LOCAL_SRC="${1#--src=}"; shift ;;
+    *) shift ;;
+  esac
+done
+
+# Приводим переданный путь к каталогу с awgbot/ и run.py
+_normalize_src() {
+  local d="${1%/}"
+  [[ -z "$d" ]] && return 1
+  if [[ -d "$d/awgbot" && -f "$d/run.py" ]]; then echo "$d"; return 0; fi
+  if [[ -d "$d/$REPO_SUBDIR/awgbot" && -f "$d/$REPO_SUBDIR/run.py" ]]; then
+    echo "$d/$REPO_SUBDIR"; return 0
+  fi
+  return 1
+}
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -z "$LOCAL_SRC" ]]; then
+  LOCAL_SRC="$(_normalize_src "$SELF_DIR" || true)"
+else
+  LOCAL_SRC="$(_normalize_src "$LOCAL_SRC" || true)"
+  [[ -z "$LOCAL_SRC" ]] && { err "В указанном каталоге нет кода бота (awgbot/, run.py)"; exit 1; }
+fi
+
 echo -e "${W}━━━ Установка awgToolza Bot (через awg2) ━━━${N}"
 
-# 1. зависимости
-info "Проверяю зависимости (git, python3-venv)…"
-command -v git >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y -qq git; }
+# 1. зависимости (git нужен только при установке из GitHub)
+info "Проверяю зависимости (python3-venv…)"
+if [[ -z "$LOCAL_SRC" ]]; then
+  command -v git >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y -qq git; }
+fi
 command -v python3 >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y -qq python3 python3-venv; }
 dpkg -s python3-venv >/dev/null 2>&1 || apt-get install -y -qq python3-venv
 ok "Зависимости готовы"
 
-# 2. клон и деплой кода
+# 2. код бота: локальный каталог или клон
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-info "Скачиваю код бота из ${REPO_URL} (${REPO_SUBDIR}/)…"
-if ! git clone --depth 1 "$REPO_URL" "$TMP/repo" >/dev/null 2>&1; then
-  err "git clone не удался. Проверь доступ к GitHub."
-  exit 1
+if [[ -n "$LOCAL_SRC" ]]; then
+  SRC="$LOCAL_SRC"
+  ok "Код бота беру локально: ${SRC}"
+else
+  info "Скачиваю код бота из ${REPO_URL} (${REPO_SUBDIR}/)…"
+  if ! git clone --depth 1 "$REPO_URL" "$TMP/repo" >/dev/null 2>&1; then
+    err "git clone не удался. Проверь доступ к GitHub."
+    info "Можно поставить из локальной копии: bash $(basename "${BASH_SOURCE[0]}") --src /путь/к/awg_bot"
+    exit 1
+  fi
+  SRC="$TMP/repo/$REPO_SUBDIR"
 fi
-SRC="$TMP/repo/$REPO_SUBDIR"
 if [[ ! -d "$SRC/awgbot" || ! -f "$SRC/run.py" ]]; then
-  err "В репозитории нет кода бота в папке ${REPO_SUBDIR}/ (awgbot/, run.py)."
+  err "В источнике нет кода бота (${SRC}: awgbot/, run.py)."
   exit 1
 fi
 
@@ -89,6 +133,20 @@ if [[ ! -f "$CONF" ]] || ! grep -q '^BOT_TOKEN=' "$CONF" 2>/dev/null; then
   ok "Конфиг записан (${CONF}, chmod 600)"
 else
   ok "Конфиг ${CONF} уже содержит токен — оставляю как есть"
+fi
+
+# 4b. Запоминаем источник кода.
+# Иначе «Обновить бота» (кнопка в боте и awg-bot update) склонирует репозиторий
+# и накатит его поверх локальной сборки — то есть откатит правки, которых в
+# репозитории ещё нет. Ставили локально → обновляемся оттуда же.
+touch "$CONF"; chmod 600 "$CONF"
+sed -i '/^LOCAL_SRC=/d' "$CONF"
+if [[ -n "$LOCAL_SRC" ]]; then
+  echo "LOCAL_SRC=${SRC}" >> "$CONF"
+  ok "Обновления будут браться из ${SRC}"
+  info "Переключить на GitHub: awg-bot src --github"
+else
+  info "Обновления будут браться с GitHub (${REPO_URL})"
 fi
 
 # 5. management-скрипт awg-bot

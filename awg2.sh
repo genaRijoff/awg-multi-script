@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.4"
+VERSION="v0.7.5"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -910,12 +910,12 @@ choose_awg_profile() {
   AWG_PROFILE=""
   echo ""
   hdr "⚙  Профиль AmneziaWG"
-  echo -e "  ${G}1${N}  ${W}Lite${N}     — оригинальная Amnezia, DNS мимикрия"
-  echo -e "  ${G}2${N}  ${W}Standard${N} — сбалансированный, TLS мимикрия"
-  echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита, I1-I5 на выбор"
+  echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита, I1-I5 на выбор ${C}(рекомендуется)${N}"
+  echo -e "  ${D}1   Lite     — параметры как у оригинальной Amnezia, DNS мимикрия${N}"
+  echo -e "  ${D}2   Standard — усечённые диапазоны, TLS мимикрия${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   local _choice
-  read_choice _choice "$(echo -e "${C}  Выбор [1-3] (Enter = 2): ${N}")" 1 3 2
+  read_choice _choice "$(echo -e "${C}  Выбор [1-3] (Enter = 3 Pro): ${N}")" 1 3 3
 
   case "$_choice" in
     1)
@@ -970,14 +970,14 @@ choose_obf_level() {
   OBF_LEVEL=""
   echo ""
   hdr "⛊  Уровень обфускации"
-  echo -e "  ${G}1${N}  Базовый — H ranges + S1-S4 + Jc junk"
-  echo -e "     ${D}Без I1-I5. Максимальная совместимость. Рекомендуется.${N}"
-  echo -e "  ${G}2${N}  + I1 — добавляет 1 сигнатурный пакет"
+  echo -e "  ${G}3${N}  + I1-I5 полный CPS chain ${C}(рекомендуется)${N}"
+  echo -e "     ${D}Максимум DPI bypass. QR не влезет — конфиг раздаётся текстом.${N}"
+  echo -e "  ${D}2   + I1 — добавляет 1 сигнатурный пакет${N}"
   echo -e "     ${D}I1 = снимок реального TLS/QUIC/DTLS протокола${N}"
-  echo -e "  ${Y}3${N}  + I1-I5 полный CPS chain"
-  echo -e "     ${D}Максимум DPI bypass. Некоторые клиенты могут глючить.${N}"
+  echo -e "  ${D}1   Базовый — H ranges + S1-S4 + Jc junk, без I1-I5${N}"
+  echo -e "     ${D}Максимальная совместимость со старыми клиентами.${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" 1 3 1
+  read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = 3 полный CPS): ${N}")" 1 3 3
   local label
   case $OBF_LEVEL in
     1) label="Базовый (без CPS)" ;;
@@ -1490,6 +1490,274 @@ auto_backup() {
   return 1
 }
 
+# Печатает причину, по которой сервер надо перезагрузить, и возвращает 0.
+# Если перезагрузка не нужна — печатает пустую строку и возвращает 1.
+#
+# Проверяем три вещи, каждая из которых валит подъём awg0:
+#   • модуль не загружен в текущее ядро;
+#   • работает ядро старее самого нового установленного (apt upgrade из п.1
+#     принёс новое, модуль DKMS собран под него);
+#   • сама система просит перезагрузку (/run/reboot-required).
+awg_reboot_reason() {
+  local running newest k
+  running="$(uname -r)"
+
+  if [[ ! -d /sys/module/amneziawg ]] && \
+     ! grep -qE '^amneziawg\s' /proc/modules 2>/dev/null; then
+    echo "модуль amneziawg не загружен в текущее ядро ($running)"
+    return 0
+  fi
+
+  # Самое новое установленное ядро: берём только те, для которых есть vmlinuz
+  newest=$(for k in /lib/modules/*/; do
+             k=${k%/}; k=${k##*/}
+             [[ -e "/boot/vmlinuz-$k" ]] && echo "$k"
+           done | sort -V | tail -1)
+  if [[ -n "$newest" && "$newest" != "$running" ]]; then
+    echo "работает ядро $running, а установлено более новое $newest"
+    return 0
+  fi
+
+  if [[ -f /run/reboot-required || -f /var/run/reboot-required ]]; then
+    echo "система сообщает о необходимости перезагрузки (обновлялось ядро или libc)"
+    return 0
+  fi
+
+  echo ""
+  return 1
+}
+
+# Кто держит UDP-порт $1. Пустой вывод — держатель неизвестен (нет ss или
+# порт свободен). Отдельной функцией, чтобы диагностику можно было проверять
+# без живого сокета.
+_port_holder() {
+  local p="$1"
+  [[ -n "$p" ]] || return 0
+  command -v ss &>/dev/null || return 0
+  ss -lunp 2>/dev/null | grep -E "[:.]${p}\b" || true
+}
+
+# Разбирает вывод неудавшегося awg-quick up и называет причину.
+#
+# Смысл в том, чтобы человек не гадал: сообщения awg-quick короткие, но
+# однозначные, и каждому соответствует ровно одно действие. $1 = вывод
+# команды (stdout+stderr), $2 = конфиг.
+awg_diagnose_up_failure() {
+  local out="$1" conf="${2:-$SERVER_CONF}"
+  local low; low=$(printf '%s' "$out" | tr '[:upper:]' '[:lower:]')
+
+  echo ""
+
+  # Установленные tools не знают строку из конфига. Типовой случай: сервер
+  # переведён на 3.0, а awg собран из версии, где этих ключей ещё нет.
+  if [[ "$low" == *"line unrecognized"* ]]; then
+    local bad
+    bad=$(printf '%s' "$out" | grep -oiE 'line unrecognized: .?([A-Za-z0-9_]+)' \
+          | head -1 | grep -oE '[A-Za-z0-9_]+$' || true)
+    err "amneziawg-tools не понимает параметр ${bad:-из конфига}"
+    if [[ -n "$bad" ]] && [[ "$bad" =~ ^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts)$ ]]; then
+      info "Это параметр AWG 3.0 — установленный awg собран без его поддержки"
+      info "Варианты:"
+      info "  • обновить компоненты: Сервер (1) → п.1 (пересборка tools и модуля)"
+      info "  • вернуть сервер на 2.0: Сервер (1) → п.5 → выбрать AWG 2.0"
+    else
+      info "Смотри строку в конфиге: grep -n '${bad:-=}' $conf"
+    fi
+    return 0
+  fi
+
+  # Ядро отвергло параметры: tools их отправили, модуль о них не знает.
+  # Так выглядит рассинхрон «tools из master + модуль от прошлой установки».
+  if [[ "$low" == *"unable to modify interface"* || "$low" == *"invalid argument"* ]]; then
+    err "Ядро отвергло параметры интерфейса"
+    if grep -qE '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts) ' "$conf" 2>/dev/null; then
+      info "В конфиге параметры AWG 3.0, а загруженный модуль их не поддерживает"
+      info "Модуль в DKMS мог остаться от прошлой установки — пересобери его:"
+      info "  Сервер (1) → п.1 (переустановка компонентов)"
+      info "Либо верни сервер на 2.0: Сервер (1) → п.5 → выбрать AWG 2.0"
+    else
+      info "Проверь параметры обфускации в $conf (Jc/Jmin/Jmax, S1-S4, H1-H4)"
+      info "Подробности ядра: dmesg | tail -20"
+    fi
+    return 0
+  fi
+
+  # Тип устройства amneziawg ядру неизвестен — модуль не тот или не загружен
+  if [[ "$low" == *"protocol not supported"* || "$low" == *"unknown device type"* || \
+        "$low" == *"operation not supported"* ]]; then
+    err "Ядро не умеет создавать интерфейсы amneziawg"
+    info "Модуль не загружен или собран под другое ядро ($(uname -r))"
+    info "Проверь:  dkms status ; uname -r ; dmesg | tail -20"
+    info "Пересборка: dkms autoinstall && modprobe amneziawg"
+    return 0
+  fi
+
+  # Порт занят: чаще всего висит второй интерфейс или старый wg
+  if [[ "$low" == *"address already in use"* ]]; then
+    local p holder="" _l
+    p=$(grep -m1 '^ListenPort' "$conf" 2>/dev/null | tr -dc '0-9' || true)
+    err "Порт ${p:-из конфига} уже занят другим процессом"
+    # Показываем держателя сразу: подсказать команду мало — её всё равно
+    # запускают следующим шагом, а имя процесса и есть ответ.
+    holder=$(_port_holder "$p")
+    if [[ -n "$holder" ]]; then
+      info "Держит порт:"
+      while IFS= read -r _l; do
+        [[ -n "$_l" ]] && echo -e "  ${D}│ ${_l}${N}"
+      done <<< "$holder"
+    else
+      info "Кто держит: ss -lunp | grep ':${p:-порт}'"
+    fi
+    info "Если это старый интерфейс — сними его: awg-quick down awg0 ; wg-quick down wg0"
+    return 0
+  fi
+
+  # PostUp с iptables упал — awg-quick в этом случае откатывает интерфейс
+  if [[ "$low" == *"iptables"* ]]; then
+    err "Правила iptables из PostUp не применились"
+    info "Проверь бэкенд: iptables -V (на Ubuntu 24.04 это nf_tables)"
+    info "Пакеты: apt-get install -y iptables"
+    return 0
+  fi
+
+  if [[ "$low" == *"resolvconf"* ]]; then
+    err "awg-quick не нашёл resolvconf (строка DNS в конфиге)"
+    info "Поставь: apt-get install -y openresolv"
+    return 0
+  fi
+
+  if [[ "$low" == *"command not found"* ]]; then
+    err "Не найдены бинарники amneziawg (awg / awg-quick)"
+    info "Переустанови компоненты: Сервер (1) → п.1"
+    return 0
+  fi
+
+  # Ничего не распознали — не выдумываем причину, а даём точки проверки
+  warn "Причина не распознана по выводу — смотри строки выше"
+  info "Дополнительно: dmesg | tail -20 ; awg-quick up $conf"
+  return 0
+}
+
+# Поднимает интерфейс из $1 (по умолчанию серверный конфиг) и, если не
+# получилось, ПОКАЗЫВАЕТ вывод awg-quick и разбирает причину.
+#
+# До этого все вызовы глушили stderr в /dev/null, и на руках оставалось только
+# «awg-quick up провалился» — по такому сообщению чинить нечего. Возвращает код
+# awg-quick.
+awg_up_diag() {
+  local conf="${1:-$SERVER_CONF}" out rc line
+  out=$(awg-quick up "$conf" 2>&1); rc=$?
+
+  # Остаток предыдущего запуска: интерфейс есть, но конфиг к нему не применён.
+  # Единственный случай, когда повтор осмысленно делать самим.
+  if [[ $rc -ne 0 && "$out" == *"File exists"* ]] && ip link show awg0 &>/dev/null; then
+    log_info "awg_up_diag: снимаю остаточный awg0 и пробую снова"
+    info "Интерфейс awg0 остался с прошлого запуска — снимаю и пробую снова"
+    awg-quick down "$conf" &>/dev/null || ip link del awg0 &>/dev/null || true
+    out=$(awg-quick up "$conf" 2>&1); rc=$?
+  fi
+
+  if [[ $rc -eq 0 ]]; then
+    log_info "awg_up_diag: awg-quick up успешно ($conf)"
+    return 0
+  fi
+
+  log_err "awg_up_diag: awg-quick up rc=$rc: $(printf '%s' "$out" | tr '\n' ';')"
+  echo ""
+  echo -e "  ${D}── вывод awg-quick up ──${N}"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && echo -e "  ${D}│ ${line}${N}"
+  done <<< "$out"
+  echo -e "  ${D}────────────────────────${N}"
+  awg_diagnose_up_failure "$out" "$conf"
+  return "$rc"
+}
+
+# Проверяет, тянет ли текущая пара tools+модуль параметры AWG 3.0.
+#
+# Коды: 0 — поддерживает, 1 — точно НЕ поддерживает, 2 — проверить не удалось.
+#
+# Единственный признак, по которому можно уверенно сказать «нет» — бинарник awg
+# не знает ключа 3.0: он парсит конфиг сам, и без ключа в нём ни один сервер
+# 3.0 не поднимется. Всё остальное — свидетельства в пользу «да»:
+#   • работающий awg0, в котором 3.0-параметры уже применены;
+#   • успешный setconf на временном интерфейсе.
+# Неудача этих проверок означает ровно «не смогли убедиться» (код 2), а не
+# «не поддерживает»: временный интерфейс может не создаться, setconf — упасть
+# по причинам, к версии протокола отношения не имеющим. Ошибочное «не
+# поддерживает» пугает на пустом месте, поэтому этот вывод здесь запрещён.
+awg_probe_awg3() {
+  [[ -n "${_AWG3_PROBE:-}" ]] && return "$_AWG3_PROBE"
+
+  # Имя интерфейса ограничено 15 символами — короткий префикс плюс PID влезает
+  local awg_bin dev="awgprb$$" tmp key hpk out rc
+  awg_bin=$(command -v awg 2>/dev/null) || { _AWG3_PROBE=2; return 2; }
+
+  # 1. Знает ли сам бинарник ключ 3.0 — единственный надёжный «нет»
+  if ! grep -qa 'HeaderProtectionKey' "$awg_bin" 2>/dev/null; then
+    log_info "awg_probe_awg3: в $awg_bin нет HeaderProtectionKey → tools без 3.0"
+    _AWG3_PROBE=1; return 1
+  fi
+
+  # 2. Живой awg0 с применёнными параметрами 3.0 — доказательство сильнее пробы
+  if awg showconf awg0 2>/dev/null | grep -qE '^HeaderProtectionKey'; then
+    log_info "awg_probe_awg3: awg0 уже работает с параметрами 3.0"
+    _AWG3_PROBE=0; return 0
+  fi
+
+  # 3. Проба на временном интерфейсе
+  if ! ip link add dev "$dev" type amneziawg 2>/dev/null; then
+    log_info "awg_probe_awg3: не удалось создать $dev — проверка невозможна"
+    _AWG3_PROBE=2; return 2
+  fi
+  tmp=$(mktemp) || { ip link del "$dev" &>/dev/null; _AWG3_PROBE=2; return 2; }
+  key=$(awg genkey 2>/dev/null) || key=""
+  hpk=$(awg genkey 2>/dev/null) || hpk=""
+  printf '[Interface]\nPrivateKey = %s\nHeaderProtectionKey = %s\n' "$key" "$hpk" > "$tmp"
+  out=$(awg setconf "$dev" "$tmp" 2>&1) && rc=0 || rc=2
+  rm -f "$tmp"
+  ip link del "$dev" &>/dev/null || true
+
+  # Причину неудачи пишем в лог: она понадобится, если сервер потом не встанет
+  if [[ $rc -ne 0 ]]; then
+    log_info "awg_probe_awg3: setconf не прошёл — $(printf '%s' "$out" | tr '\n' ';')"
+    # «Line unrecognized» на 3.0-ключе — уже приговор, а не неясность
+    if [[ "$out" == *"Line unrecognized"* && "$out" == *"HeaderProtectionKey"* ]]; then
+      _AWG3_PROBE=1; return 1
+    fi
+  else
+    log_info "awg_probe_awg3: setconf прошёл — 3.0 поддерживается"
+  fi
+  _AWG3_PROBE=$rc
+  return "$rc"
+}
+
+# Предупреждает, если сервер собираются переводить на 3.0 на компонентах,
+# которые этого точно не умеют. Возвращает 1, если пользователь отказался.
+awg3_compat_gate() {
+  awg_probe_awg3
+  case $? in
+    0) return 0 ;;
+    2)
+      # Проверить не смогли — это не повод пугать: серверы на 3.0 поднимаются
+      # и там, где проба не сработала. Если что-то пойдёт не так, причину
+      # назовёт awg_up_diag при подъёме.
+      log_info "awg3_compat_gate: поддержка 3.0 не подтверждена, продолжаем молча"
+      return 0
+      ;;
+  esac
+
+  echo ""
+  err "Установленный awg не знает параметров AWG 3.0"
+  info "Он сам разбирает конфиг, поэтому сервер 3.0 с ним не поднимется"
+  info "Обнови компоненты: Сервер (1) → п.1 (пересборка tools и модуля)"
+  echo ""
+  local _go
+  read_yesno _go "$(echo -e "${Y}  Всё равно продолжить с 3.0? [y/N]: ${N}")" "n"
+  [[ "$_go" == "y" ]] && return 0
+  return 1
+}
+
 # Проверяет состояние awg0 и пытается починить:
 #   - конфиг есть, но интерфейс не запущен → awg-quick up
 #   - конфиг есть и интерфейс запущен, но peer'ов нет → reload
@@ -1589,6 +1857,48 @@ do_repair() {
   fi
   ok "Серверный конфиг на месте"
 
+  # 2.2. Маркер уровня CPS: по нему бот решает, сколько пакетов I1-I5 положить
+  # клиенту. У серверов, созданных до появления маркера, его нет — восстановим
+  # по уже выданным конфигам, иначе бот выдаёт один I1 там, где скрипт даёт пять.
+  if ! grep -q '^# AWG_OBF_LEVEL=' "$SERVER_CONF" 2>/dev/null; then
+    local _lvl=0
+    if grep -qE '^I[2-5] = ' /root/*_awg2.conf 2>/dev/null; then
+      _lvl=3
+    elif grep -qE '^I1 = ' /root/*_awg2.conf 2>/dev/null; then
+      _lvl=2
+    fi
+    if [[ $_lvl -gt 0 ]]; then
+      if sed -i "1a # AWG_OBF_LEVEL=$_lvl" "$SERVER_CONF" 2>/dev/null; then
+        ok "Восстановлен маркер уровня CPS по клиентским конфигам (=$_lvl)"
+      else
+        warn "Не удалось записать маркер уровня CPS в $SERVER_CONF"
+      fi
+    else
+      info "Уровень CPS определить не по чему — клиентских конфигов с I1 нет"
+    fi
+  else
+    ok "Маркер уровня CPS на месте ($(grep -m1 '^# AWG_OBF_LEVEL=' "$SERVER_CONF" | cut -d= -f2))"
+  fi
+
+  # 2.5. Конфиг просит 3.0 — умеют ли это установленные tools и модуль?
+  # Проверяем до попытки подъёма: иначе видно только «awg-quick up провалился»,
+  # а настоящая причина — что модуль или awg старее конфига.
+  if grep -qE '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts) ' "$SERVER_CONF" 2>/dev/null; then
+    awg_probe_awg3
+    case $? in
+      0) ok "Компоненты поддерживают AWG 3.0 (как в конфиге)" ;;
+      1)
+        err "Конфиг на AWG 3.0, но установленный awg не знает его параметров"
+        issues=$((issues+1))
+        info "Интерфейс с такими параметрами не поднимется. Варианты:"
+        info "  • обновить компоненты: Сервер (1) → п.1 (пересборка tools и модуля)"
+        info "  • вернуть сервер на 2.0: Сервер (1) → п.5 → выбрать AWG 2.0"
+        ;;
+      # Проверить не смогли — молчим: ложная тревога здесь хуже пропущенной
+      *) log_info "do_repair: поддержка AWG 3.0 не подтверждена пробой" ;;
+    esac
+  fi
+
   # 3. IP forwarding
   local ipfwd
   ipfwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
@@ -1628,7 +1938,7 @@ do_repair() {
       info "Перезапуск awg0 для синхронизации..."
       awg-quick down "$SERVER_CONF" 2>/dev/null || true
       sleep 1
-      if awg-quick up "$SERVER_CONF" 2>/dev/null; then
+      if awg_up_diag "$SERVER_CONF"; then
         ok "awg0 перезапущен — пиры синхронизированы"
         fixed=$((fixed+1))
       else
@@ -1641,12 +1951,11 @@ do_repair() {
     warn "Интерфейс awg0 НЕ существует"
     issues=$((issues+1))
     info "Запускаю: awg-quick up $SERVER_CONF"
-    if awg-quick up "$SERVER_CONF" 2>/dev/null; then
+    if awg_up_diag "$SERVER_CONF"; then
       ok "awg0 запущен"
       fixed=$((fixed+1))
     else
-      err "awg-quick up провалился"
-      info "Подробности: awg-quick up $SERVER_CONF"
+      err "awg-quick up провалился — причина выше"
     fi
   fi
 
@@ -2177,8 +2486,14 @@ show_submenu_6() {
     hdr "Telegram-бот управления"
     echo ""
 
+    # Считаем ботом любые его следы, а не только маркер: после частичного
+    # удаления маркера может не быть, а сервис и код в /opt остаются — и их
+    # надо чем-то добить, иначе пункт удаления недоступен.
     local installed=false
-    [[ -f "$BOT_PY" ]] && installed=true
+    if [[ -f "$BOT_PY" || -d /opt/awg-bot ]] || \
+       [[ -f /etc/systemd/system/awg-bot.service ]]; then
+      installed=true
+    fi
 
     if $installed; then
       if systemctl is-active --quiet awg-bot 2>/dev/null; then
@@ -2197,6 +2512,7 @@ show_submenu_6() {
       echo -e "  ${G}3)${N} Остановить"
       echo -e "  ${G}4)${N} Перезапустить"
       echo -e "  ${C}5)${N} Логи (последние 40 строк)"
+      echo -e "  ${R}6)${N} Полностью удалить бота ${D}(сервис, код, venv, токен)${N}"
     else
       echo -e "  ${C}1)${N} Установить бота"
     fi
@@ -2205,7 +2521,7 @@ show_submenu_6() {
 
     # Набор пунктов зависит от того, установлен ли бот
     local _bc _bc_max=1
-    $installed && _bc_max=5
+    $installed && _bc_max=6
     read_choice _bc "$(echo -e "${C}  Выбор [0-${_bc_max}]: ${N}")" 0 "$_bc_max" "0"
 
     case "${_bc:-}" in
@@ -2213,13 +2529,43 @@ show_submenu_6() {
         if [[ $EUID -ne 0 ]]; then
           err "Установка требует root. Запусти: ${W}sudo awg2${N}"
         else
-          info "Скачиваю и запускаю установщик бота..."
-          if curl -fsSL "$BOT_INSTALL_URL" -o /tmp/awg-bot-install.sh; then
-            bash /tmp/awg-bot-install.sh || warn "Установщик завершился с ошибкой"
-            rm -f /tmp/awg-bot-install.sh 2>/dev/null || true
+          # Локальная копия рядом (распакованный архив awg-toolza) важнее
+          # GitHub: при проверке правок в репозитории ещё старый код бота.
+          local _local_src _use_local="n"
+          _local_src=$(_find_local_bot_src || true)
+          if [[ -n "$_local_src" ]]; then
+            echo ""
+            info "Найден локальный код бота: ${W}${_local_src}${N}"
+            read_yesno _use_local "$(echo -e "${G}  Ставить из него (иначе с GitHub)? [Y/n]: ${N}")" "y"
+          fi
+
+          if [[ "$_use_local" == "y" ]]; then
+            local _local_installer="${_local_src%/awg_bot}/awg-bot-install.sh"
+            if [[ -f "$_local_installer" ]]; then
+              bash "$_local_installer" --src "$_local_src" || \
+                warn "Установщик завершился с ошибкой"
+            else
+              # Установщик рядом не лежит — берём с GitHub, но код из копии
+              info "Локального установщика нет, беру его с GitHub (код бота — локальный)"
+              if curl -fsSL "$BOT_INSTALL_URL" -o /tmp/awg-bot-install.sh; then
+                bash /tmp/awg-bot-install.sh --src "$_local_src" || \
+                  warn "Установщик завершился с ошибкой"
+                rm -f /tmp/awg-bot-install.sh 2>/dev/null || true
+              else
+                err "Не удалось скачать установщик с GitHub"
+              fi
+            fi
           else
-            err "Не удалось скачать установщик с GitHub"
-            info "Проверь интернет/доступ к raw.githubusercontent.com"
+            info "Скачиваю и запускаю установщик бота..."
+            if curl -fsSL "$BOT_INSTALL_URL" -o /tmp/awg-bot-install.sh; then
+              bash /tmp/awg-bot-install.sh || warn "Установщик завершился с ошибкой"
+              rm -f /tmp/awg-bot-install.sh 2>/dev/null || true
+            else
+              err "Не удалось скачать установщик с GitHub"
+              info "Проверь интернет/доступ к raw.githubusercontent.com"
+              [[ -n "$_local_src" ]] && \
+                info "Локальная копия рядом: bash ${_local_src%/awg_bot}/awg-bot-install.sh --src $_local_src"
+            fi
           fi
         fi
         ;;
@@ -2254,6 +2600,13 @@ show_submenu_6() {
           warn "Бот не установлен"
         fi
         ;;
+      6)
+        if $installed; then
+          do_bot_uninstall || true
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -2276,7 +2629,7 @@ show_submenu_7() {
     else
       echo -e "  ${D}1) Очистить клиентов (нужен пункт Сервер → 2)${N}"
     fi
-    echo -e "  ${R}2)${N} Удалить всё (пакеты + конфиги)"
+    echo -e "  ${R}2)${N} Удалить всё ${D}(пакеты, конфиги, бот, сам awg2)${N}"
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
@@ -2353,7 +2706,15 @@ choose_awg_proto() {
   local _proto_choice
   read_choice _proto_choice "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 "1"
   case "$_proto_choice" in
-    2) AWG_PROTO="3.0"; ok "Выбран AmneziaWG 3.0" ;;
+    2)
+      # Проверяем до генерации конфигов: с несовместимыми tools/модулем
+      # сервер 3.0 просто не поднимется, а конфиги уже будут перезаписаны.
+      if awg3_compat_gate; then
+        AWG_PROTO="3.0"; ok "Выбран AmneziaWG 3.0"
+      else
+        AWG_PROTO="2.0"; info "Остаёмся на AmneziaWG 2.0"
+      fi
+      ;;
     *) AWG_PROTO="2.0"; ok "Выбран AmneziaWG 2.0" ;;
   esac
   log_info "AWG_PROTO=$AWG_PROTO"
@@ -3099,6 +3460,38 @@ EOF
   # Поднимаем expire-таймер (срок действия клиентов работает с момента установки)
   _expire_install || true
 
+  # ── Перезагрузка после сборки модуля ──
+  # Установка делает apt upgrade, а он приносит новое ядро. Модуль DKMS собран
+  # под него, но работает пока прежнее — и создание сервера падает на пустом
+  # месте. Говорим об этом прямо здесь, а не оставляем выяснять по ошибке.
+  echo ""
+  local _rb_reason
+  _rb_reason=$(awg_reboot_reason || true)
+  if [[ -n "$_rb_reason" ]]; then
+    hdr "⟳  Нужна перезагрузка"
+    warn "Причина: $_rb_reason"
+    echo -e "  ${Y}Без неё awg0 может не подняться: модуль собран под другое ядро,${N}"
+    echo -e "  ${Y}чем то, которое сейчас работает.${N}"
+    echo ""
+    info "После перезагрузки: awg2 → Сервер (1) → п.2 — Создать сервер"
+    echo ""
+    local _do_rb
+    read_yesno _do_rb "$(echo -e "${G}  Перезагрузить сейчас? [Y/n]: ${N}")" "y"
+    if [[ "$_do_rb" == "y" ]]; then
+      ok "Перезагружаюсь. Заходи через минуту и запускай: awg2"
+      log_info "do_install: reboot по согласию пользователя ($_rb_reason)"
+      sleep 2
+      reboot
+      return 0
+    fi
+    warn "Перезагрузка отложена — если создание сервера упадёт, сделай reboot"
+  else
+    hdr "⟳  Перезагрузка"
+    ok "Не требуется: модуль загружен под текущее ядро $(uname -r)"
+    info "Если создание сервера всё же упадёт — reboot и повтори п.2"
+  fi
+
+  echo ""
   info "Следующий шаг: Сервер (1) → п.2 — Создать сервер"
   break
   done
@@ -3123,6 +3516,27 @@ do_gen() {
     info "  • Удаление (7) → п.2 — Удалить всё (пакеты + конфиги)"
     info "После этого выбери Сервер (1) → п.2 заново и укажи нужный профиль."
     return 0
+  fi
+
+  # Ставили компоненты и не перезагрузились — awg-quick up ляжет на модуле,
+  # собранном под другое ядро. Спрашиваем до генерации ключей и конфигов.
+  local _rb_reason
+  _rb_reason=$(awg_reboot_reason || true)
+  if [[ -n "$_rb_reason" ]]; then
+    echo ""
+    warn "Сервер не перезагружен после установки: $_rb_reason"
+    info "Обычно именно из-за этого awg0 не поднимается сразу после п.1"
+    echo ""
+    local _rb_now
+    read_yesno _rb_now "$(echo -e "${G}  Перезагрузить сейчас (создать сервер после)? [Y/n]: ${N}")" "y"
+    if [[ "$_rb_now" == "y" ]]; then
+      ok "Перезагружаюсь. Заходи через минуту: awg2 → Сервер (1) → п.2"
+      log_info "do_gen: reboot по согласию пользователя ($_rb_reason)"
+      sleep 2
+      reboot
+      return 0
+    fi
+    warn "Продолжаю без перезагрузки — если подъём упадёт, причину назову"
   fi
 
   local bak_ts
@@ -3313,6 +3727,12 @@ do_gen() {
     echo "# AmneziaWG Toolza — AWG 2.0 server config"
     echo "# Region: ${SERVER_REGION:-world}"
     echo "# AWG_PROTO=${AWG_PROTO:-2.0}"
+    # Сколько CPS-пакетов получает клиент (1 = без I1-I5, 2 = только I1,
+    # 3 = полный I1-I5) и какой профиль мимикрии. Сами I1-I5 в серверный
+    # конфиг не пишутся — они клиентские, поэтому без этих маркеров бот не
+    # знает, что выдавать, и раньше давал один I1 на сервере с полным CPS.
+    echo "# AWG_OBF_LEVEL=${OBF_LEVEL:-1}"
+    echo "# AWG_MIMICRY=${MIMICRY_PROFILE:-none}"
     echo "[Interface]"
     echo "PrivateKey = $srv_priv"
     echo "Address = $SERVER_ADDR"
@@ -3357,16 +3777,11 @@ do_gen() {
   } > "/root/${FIRST_CLIENT_NAME}_awg2.conf"
   chmod 600 "/root/${FIRST_CLIENT_NAME}_awg2.conf"
 
-  if awg-quick up "$SERVER_CONF"; then
+  if awg_up_diag "$SERVER_CONF"; then
     log_info "do_gen: awg-quick up успешно"
   else
     log_err "do_gen: awg-quick up провалился"
     warn "awg-quick up не удался"
-    echo ""
-    echo -e "  ${Y}→ Возможные причины:${N}"
-    echo -e "  ${Y}  • Модуль amneziawg не загружен → reboot${N}"
-    echo -e "  ${Y}  • Конфликт iptables правил → Сервер (1) → п.6 (сброс сервера) и заново${N}"
-    echo -e "  ${Y}  • Порт $PORT заблокирован → ufw allow $PORT/udp${N}"
     if [[ -n "$bak_ts" && -f "$bak_ts" ]]; then
       echo -e "  ${Y}  • Предыдущий конфиг сохранён: $bak_ts${N}"
       read_yesno RESTORE_BAK "$(echo -e "${C}  Восстановить предыдущий конфиг? [y/N]: ${N}")" "n"
@@ -4836,15 +5251,10 @@ do_restart() {
   fi
   restart "Перезапуск awg0..."
   awg-quick down "$SERVER_CONF" 2>/dev/null || true
-  if awg-quick up "$SERVER_CONF"; then
+  if awg_up_diag "$SERVER_CONF"; then
     ok "awg0 перезапущен"
   else
     err "Не удалось поднять awg0"
-    echo -e "  ${Y}→ Проверь:${N}"
-    echo -e "  ${Y}  • cat $SERVER_CONF${N}"
-    echo -e "  ${Y}  • lsmod | grep amneziawg${N}"
-    echo -e "  ${Y}  • dmesg | tail -20${N}"
-    echo -e "  ${Y}  • reboot и попробовать снова${N}"
     return 1
   fi
 }
@@ -4894,6 +5304,12 @@ do_rotate_awg_params() {
     [[ "$cur_proto" == "3.0" ]] && new_proto="2.0" || new_proto="3.0"
   else
     new_proto="$cur_proto"
+  fi
+
+  # Переход на 3.0 на несовместимых компонентах положит рабочий сервер:
+  # конфиги перепишутся, а awg-quick up на них упадёт. Проверяем заранее.
+  if [[ "$new_proto" == "3.0" && "$cur_proto" != "3.0" ]]; then
+    awg3_compat_gate || { info "Отменено — сервер остался на AWG ${cur_proto}"; return 0; }
   fi
 
   # Считаем клиентов, которых это заденет
@@ -4957,11 +5373,10 @@ do_rotate_awg_params() {
 
   info "Перезапускаю awg0..."
   awg-quick down "$SERVER_CONF" 2>/dev/null || true
-  if awg-quick up "$SERVER_CONF" 2>/dev/null; then
+  if awg_up_diag "$SERVER_CONF"; then
     ok "Интерфейс поднят с новыми параметрами"
   else
     err "awg0 не поднялся"
-    info "Проверь: awg-quick up $SERVER_CONF"
     info "Откат: Бекапы (4) → восстановить"
     return 1
   fi
@@ -8184,9 +8599,127 @@ do_dns_menu() {
 }
 
 
+# Ищет код бота в распакованном рядом архиве awg-toolza.
+#
+# Зачем: установщик бота клонирует репозиторий с GitHub, и пока правки не
+# запушены, оттуда приезжает старый код. В распакованном .run код бота лежит
+# в awg_bot/ — его и берём. Печатает путь к каталогу с awgbot/ и run.py.
+_find_local_bot_src() {
+  local d cand=""
+  # Сначала каталог самого скрипта: если awg2.sh запущен прямо из распаковки
+  d=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")")" 2>/dev/null && pwd) || d=""
+  [[ -n "$d" && -d "$d/awg_bot/awgbot" && -f "$d/awg_bot/run.py" ]] && { echo "$d/awg_bot"; return 0; }
+
+  # Затем типовые места распаковки — берём самую свежую версию
+  shopt -s nullglob
+  local dirs=( /opt/awg-toolza-*/ /root/awg-toolza-*/ /opt/awg-toolza/ )
+  shopt -u nullglob
+  local best="" best_ts=0 ts
+  for d in "${dirs[@]}"; do
+    d="${d%/}"
+    [[ -d "$d/awg_bot/awgbot" && -f "$d/awg_bot/run.py" ]] || continue
+    ts=$(stat -c %Y "$d/awg_bot/run.py" 2>/dev/null || echo 0)
+    if [[ "$ts" -ge "$best_ts" ]]; then best="$d/awg_bot"; best_ts="$ts"; fi
+  done
+  cand="$best"
+
+  [[ -n "$cand" ]] || return 1
+  echo "$cand"
+  return 0
+}
+
+# Все следы Telegram-бота. Единый список: удаление и проверка «а он вообще
+# стоит?» должны смотреть в одно место, иначе после «удалено» остаётся venv на
+# сотню мегабайт или мёртвый сервис.
+_bot_artifacts() {
+  cat <<'EOF'
+/opt/awg-bot
+/var/lib/awg-bot
+/usr/local/bin/awg-bot
+/usr/local/bin/awg-bot.py
+/etc/systemd/system/awg-bot.service
+/etc/awg-bot.conf
+EOF
+}
+
+# Полное удаление бота: сервис, код, venv, management-скрипт, состояние
+# мониторинга и конфиг с токеном.
+#
+# Токен перед удалением копируется в папку бэкапов: терять его больно (новый
+# у @BotFather заводить не надо, но старый уже не вернуть), а удаление «фул»
+# по определению сносит /etc/awg-bot.conf.
+# $1 = "quiet" — без вопросов, вызывается из do_uninstall, где подтверждение
+# уже получено.
+do_bot_uninstall() {
+  local quiet="${1:-}"
+  local conf="/etc/awg-bot.conf" p saved=""
+
+  if [[ "$quiet" != "quiet" ]]; then
+    echo ""
+    hdr "⌧  Полное удаление Telegram-бота"
+    warn "Будет удалено:"
+    while IFS= read -r p; do
+      [[ -e "$p" ]] && echo -e "  ${R}—${N} $p" || echo -e "  ${D}—${N} ${D}$p (нет)${N}"
+    done < <(_bot_artifacts)
+    echo ""
+    echo -e "  ${D}Токен будет сохранён в папку бэкапов, если конфиг на месте.${N}"
+    echo -e "  ${D}Сервер AmneziaWG и клиенты не затрагиваются.${N}"
+    echo ""
+    read_confirm "$(echo -e "${R}  Подтверди удаление бота (введи yes): ${N}")" || \
+      { warn "Отменено."; return 0; }
+  fi
+
+  # Токен в бэкап — до того, как что-то удаляем
+  if [[ -f "$conf" ]]; then
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    saved="${BACKUP_DIR}/awg-bot.conf.$(date +%Y%m%d_%H%M%S)"
+    if cp "$conf" "$saved" 2>/dev/null; then
+      chmod 600 "$saved" 2>/dev/null || true
+    else
+      saved=""
+      warn "Не удалось сохранить копию конфига — токен будет потерян"
+    fi
+  fi
+
+  trash "Останавливаем сервис awg-bot..."
+  systemctl stop awg-bot 2>/dev/null || true
+  systemctl disable awg-bot 2>/dev/null || true
+
+  trash "Удаляем файлы бота..."
+  while IFS= read -r p; do
+    rm -rf "$p" 2>/dev/null || true
+  done < <(_bot_artifacts)
+
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed awg-bot 2>/dev/null || true
+
+  # Проверяем, что действительно ничего не осталось
+  local left=()
+  while IFS= read -r p; do
+    [[ -e "$p" ]] && left+=("$p")
+  done < <(_bot_artifacts)
+
+  if [[ ${#left[@]} -eq 0 ]]; then
+    ok "Бот удалён полностью"
+  else
+    warn "Осталось удалить вручную:"
+    for p in "${left[@]}"; do echo -e "  ${Y}—${N} $p"; done
+  fi
+  [[ -n "$saved" ]] && info "Токен сохранён: $saved"
+  log_info "do_bot_uninstall: осталось ${#left[@]} путей"
+  return 0
+}
+
 do_uninstall() {
   echo ""
   hdr "⌧  Удаление AmneziaWG"
+  # Что тут вообще есть — считаем до вопросов, чтобы список был честным
+  local bot_present=false
+  if [[ -f /usr/local/bin/awg-bot.py || -d /opt/awg-bot ]] || \
+     [[ -f /etc/systemd/system/awg-bot.service ]]; then
+    bot_present=true
+  fi
+
   warn "Будет удалено:"
   echo -e "  ${R}—${N} Интерфейс awg0"
   echo -e "  ${R}—${N} Пакеты amneziawg, amneziawg-tools"
@@ -8194,9 +8727,25 @@ do_uninstall() {
   echo -e "  ${R}—${N} /root/*_awg2.conf"
   echo -e "  ${R}—${N} Автозапуск awg-quick@awg0"
   echo -e "  ${R}—${N} NAT-персистентность (hook / awg-nat.service)"
+  $bot_present && echo -e "  ${R}—${N} Telegram-бот целиком (спрошу отдельно)"
+  echo -e "  ${R}—${N} Сам скрипт ${W}${SCRIPT_PATH}${N} — команда awg2 (спрошу отдельно)"
+  echo ""
+  echo -e "  ${D}Бэкапы в ${BACKUP_DIR} остаются — их удаляй руками.${N}"
   echo ""
   read_confirm "$(echo -e "${R}  Подтверди удаление (введи yes): ${N}")" || \
     { warn "Отменено."; return 0; }
+
+  # Бот — отдельным вопросом: его могли ставить не ради этого сервера
+  local _del_bot="n"
+  if $bot_present; then
+    echo ""
+    read_yesno _del_bot "$(echo -e "${R}  Удалить и Telegram-бота (сервис, код, venv, токен)? [Y/n]: ${N}")" "y"
+  fi
+
+  # Сам скрипт: после удаления команды awg2 больше не будет
+  echo ""
+  local _del_self
+  read_yesno _del_self "$(echo -e "${R}  Удалить сам скрипт ${SCRIPT_PATH} и следы установки? [Y/n]: ${N}")" "y"
 
   # v6.4: авто-бэкап перед удалением (последний шанс восстановиться)
   if [[ -f "$SERVER_CONF" ]]; then
@@ -8238,9 +8787,43 @@ do_uninstall() {
     done
   fi
 
-  echo ""
-  ok "Всё удалено"
+  if [[ "$_del_bot" == "y" ]]; then
+    echo ""
+    trash "Удаляем Telegram-бота..."
+    do_bot_uninstall quiet || warn "Бот удалён не полностью — смотри вывод выше"
+  fi
+
   _DEPS_CACHED=""  # сбрасываем кэш — awg больше нет
+
+  if [[ "$_del_self" != "y" ]]; then
+    echo ""
+    ok "Всё удалено"
+    info "Скрипт остался: ${SCRIPT_PATH} (команда awg2)"
+    return 0
+  fi
+
+  # ── Удаление самого скрипта ──
+  # Следы доставки: распакованные каталоги и self-extract архивы, которые
+  # приезжали на сервер. Без них после «удалить всё» в /root и /opt остаётся
+  # мусор, из которого awg2 запускается снова и выглядит как «не удалилось».
+  trash "Удаляем лог и следы установки..."
+  rm -f "$LOG_FILE" 2>/dev/null || true
+  rm -f /root/awg-toolza-*.run 2>/dev/null || true
+  rm -rf /opt/awg-toolza-* 2>/dev/null || true
+  rm -f /tmp/awg_domain_cache.txt 2>/dev/null || true
+
+  echo ""
+  ok "Всё удалено, включая ${SCRIPT_PATH}"
+  echo -e "  ${D}Бэкапы остались: ${BACKUP_DIR}${N}"
+  echo -e "  ${D}Установить снова: curl -fsSL <URL>/awg2.sh -o ${SCRIPT_PATH} && chmod +x ${SCRIPT_PATH}${N}"
+  echo ""
+  log_info "do_uninstall: удаляю себя ($SCRIPT_PATH) и выхожу"
+
+  # Файл сносим из отдельного процесса: bash дочитывает скрипт с диска по ходу
+  # исполнения, и удалить его «под собой» — верный способ получить синтаксис-
+  # ошибку вместо чистого выхода.
+  ( sleep 1; rm -f "$SCRIPT_PATH" ) >/dev/null 2>&1 &
+  exit 0
 }
 
 # Параллельный пинг всех доменов из 4 пулов.
@@ -8465,7 +9048,7 @@ do_clean_clients() {
   rm -f /root/*_awg2.conf 2>/dev/null || true
   
   info "Перезапускаем awg0..."
-  if ! awg-quick up "$SERVER_CONF" 2>/dev/null; then
+  if ! awg_up_diag "$SERVER_CONF"; then
     err "Не удалось перезапустить awg0"
     warn "Восстанавливаем из backup..."
     cp "$clean_bak" "$SERVER_CONF"
@@ -8667,7 +9250,7 @@ do_restore() {
 
   # Поднимаем интерфейс
   info "Запускаем awg0..."
-  if awg-quick up "$SERVER_CONF" 2>/dev/null; then
+  if awg_up_diag "$SERVER_CONF"; then
     ok "Интерфейс awg0 запущен"
   else
     err "Не удалось поднять awg0. Проверь конфиг: $SERVER_CONF"
