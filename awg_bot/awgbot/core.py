@@ -111,6 +111,7 @@ class ServerInfo:
     proto: str = ""            # версия протокола AmneziaWG: "2.0" или "3.0"
     obf_level: int = 0         # 1 = без I1-I5, 2 = только I1, 3 = полный I1-I5
     mimicry: str = ""          # профиль мимикрии сервера: tls/dns/sip/quic/none
+    endpoint_domain: str = ""  # домен для Endpoint; пусто — используется IP
     region: str = ""
     peers_count: int = 0
     extra: dict = field(default_factory=dict)
@@ -125,6 +126,22 @@ def _split_blocks(text: str) -> tuple[str, list[str]]:
     """Делит конфиг на header (до первого [Peer]) и список peer-блоков."""
     parts = re.split(r"(?=\[Peer\])", text)
     return parts[0], parts[1:]
+
+
+def endpoint_domain() -> str:
+    """Домен из маркера # AWG_ENDPOINT= в конфиге сервера. Пусто — значит IP."""
+    try:
+        text = Path(SERVER_CONF).read_text()
+    except OSError:
+        return ""
+    m = re.search(r"^#\s*AWG_ENDPOINT=(\S+)", text, re.M)
+    if not m:
+        return ""
+    d = m.group(1).strip()
+    # IP в этом маркере смысла не имеет — таким конфигам верить не надо
+    if re.match(r"^\d+\.\d+\.\d+\.\d+$", d):
+        return ""
+    return d
 
 
 def _public_ip_from_peers() -> str:
@@ -162,6 +179,10 @@ def get_server_info() -> ServerInfo:
         info.region = m.group(1).strip()
     if m := re.search(r"^#\s*AWG_MIMICRY=(\S+)", text, re.M):
         info.mimicry = m.group(1).strip()
+    # Домен для Endpoint: если задан в awg2, клиенты от бота должны получать
+    # его же, иначе конфиги одного сервера указывают в разные места
+    if m := re.search(r"^#\s*AWG_ENDPOINT=(\S+)", text, re.M):
+        info.endpoint_domain = m.group(1).strip()
     if m := re.search(r"^#\s*AWG_OBF_LEVEL=(\d+)", text, re.M):
         info.obf_level = int(m.group(1))
     else:
@@ -547,7 +568,7 @@ def add_client(name: str, expires: int | None = None,
         "[Peer]",
         f"PublicKey = {srv_pub}",
         f"PresharedKey = {psk}",
-        f"Endpoint = {public_ip}:{listen_port}",
+        f"Endpoint = {endpoint_domain() or public_ip}:{listen_port}",
         "AllowedIPs = 0.0.0.0/0, ::/0",
         f"PersistentKeepalive = {_keepalive_value(text)}",
     ]
