@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.5"
+VERSION="v0.7.6"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -1407,6 +1407,113 @@ get_public_ip() {
   return 0
 }
 
+# ── Endpoint для клиентских конфигов: IP или домен ──
+#
+# По умолчанию в конфиг пишется публичный IP. Если у сервера есть доменное имя,
+# его удобнее держать в Endpoint: при смене IP (переезд, смена провайдера)
+# достаточно поправить DNS-запись, а не перевыпускать все клиентские конфиги.
+# Домен хранится маркером «# AWG_ENDPOINT=<host>» в шапке awg0.conf, чтобы его
+# видели и скрипт, и бот.
+
+# Проверяет, похоже ли $1 на доменное имя. Заодно отсекает IP: для него домен
+# задавать бессмысленно, а путаницу создаёт.
+valid_domain() {
+  local d="$1"
+  [[ -n "$d" && ${#d} -le 253 ]] || return 1
+  [[ "$d" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 1
+  [[ "$d" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$ ]] || return 1
+  return 0
+}
+
+# Домен из маркера в конфиге сервера. Пусто — значит используется IP.
+endpoint_domain() {
+  local conf="${1:-$SERVER_CONF}" d=""
+  [[ -f "$conf" ]] || { echo ""; return 0; }
+  d=$(grep -m1 '^# AWG_ENDPOINT=' "$conf" 2>/dev/null | cut -d= -f2- | tr -d ' ' || true)
+  valid_domain "$d" && echo "$d" || echo ""
+  return 0
+}
+
+# Что писать в Endpoint клиентам: домен, если задан, иначе публичный IP.
+# $1 — публичный IP, если он уже известен вызывающему (чтобы не дёргать сеть).
+endpoint_host() {
+  local known_ip="${1:-}" d
+  d=$(endpoint_domain)
+  if [[ -n "$d" ]]; then echo "$d"; return 0; fi
+  if [[ -n "$known_ip" ]]; then echo "$known_ip"; return 0; fi
+  get_public_ip
+}
+
+# Спрашивает домен при создании сервера. Результат — глобальная ENDPOINT_DOMAIN
+# (пусто = писать IP). Сервера ещё нет, поэтому маркер здесь не пишем.
+ask_endpoint_domain() {
+  ENDPOINT_DOMAIN=""
+  echo ""
+  hdr "◈  Endpoint для клиентов"
+  echo ""
+  echo -e "  ${D}Что клиенты увидят в строке Endpoint: адрес сервера.${N}"
+  echo -e "  ${D}С доменом переезд на другой IP не требует новых конфигов —${N}"
+  echo -e "  ${D}достаточно поправить DNS-запись.${N}"
+  echo ""
+  local _use
+  read_yesno _use "$(echo -e "${C}  Использовать домен вместо IP? [y/N]: ${N}")" "n"
+  [[ "$_use" == "y" ]] || { info "Endpoint: IP сервера"; return 0; }
+
+  local d
+  while true; do
+    read -rp "$(echo -e "${C}  Домен (например vpn.example.com, пусто = отмена): ${N}")" d
+    d=$(echo "${d:-}" | tr -d ' ')
+    [[ -z "$d" ]] && { info "Endpoint: IP сервера"; return 0; }
+    if valid_domain "$d"; then break; fi
+    warn "Не похоже на домен. Нужно имя вида vpn.example.com, не IP."
+  done
+
+  check_domain_resolves "$d" || {
+    local _go
+    read_yesno _go "$(echo -e "${Y}  Всё равно использовать этот домен? [y/N]: ${N}")" "n"
+    [[ "$_go" == "y" ]] || { info "Endpoint: IP сервера"; return 0; }
+  }
+
+  ENDPOINT_DOMAIN="$d"
+  ok "Endpoint: $d"
+  return 0
+}
+
+# Сверяет A-запись домена с публичным IP сервера. Возвращает 1, если домен не
+# резолвится или ведёт не сюда — это не запрет, а предупреждение: DNS могли
+# ещё не прописать, а за Cloudflare-прокси адрес и вовсе будет чужой.
+check_domain_resolves() {
+  local d="$1" ips srv_ip
+  info "Проверяю DNS для $d..."
+  ips=$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ')
+  if [[ -z "$ips" ]]; then
+    warn "Домен $d не резолвится с этого сервера"
+    info "Клиенты не смогут подключиться, пока не появится A-запись"
+    return 1
+  fi
+  srv_ip=$(get_public_ip 2>/dev/null || true)
+  if [[ -n "$srv_ip" ]] && ! grep -qw "$srv_ip" <<< "$ips"; then
+    warn "Домен ведёт на ${ips% }, а публичный IP сервера — $srv_ip"
+    info "Так бывает за Cloudflare-прокси; для WireGuard/AWG проксирование UDP"
+    info "не работает — нужна A-запись прямо на IP сервера (DNS only)"
+    return 1
+  fi
+  ok "Домен ведёт на этот сервер (${ips% })"
+  return 0
+}
+
+# Записывает (или убирает) маркер домена в конфиге сервера.
+# $1 = домен либо пустая строка для возврата к IP.
+set_endpoint_domain() {
+  local d="$1"
+  [[ -f "$SERVER_CONF" ]] || { err "Сервер не создан"; return 1; }
+  sed -i '/^# AWG_ENDPOINT=/d' "$SERVER_CONF" || return 1
+  if [[ -n "$d" ]]; then
+    sed -i "1a # AWG_ENDPOINT=${d}" "$SERVER_CONF" || return 1
+  fi
+  return 0
+}
+
 rand_range() {
   local lo="$1" hi="$2"
   # Защита: если lo > hi, возвращаем lo (избегаем ошибки python randint)
@@ -2021,6 +2128,129 @@ do_repair() {
   fi
 }
 
+# Версия в сравниваемое число: "v0.7.5" → "0007005".
+# Ведущий ноль делает строку восьмеричной для bash, поэтому все сравнения с
+# результатом обязаны идти через 10# — см. tests/test_version.sh.
+ver_num() {
+  echo "${1#v}" | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }'
+}
+
+# ── Уведомление о новой версии ──
+#
+# Про релизы узнавали только из телеграма. Теперь скрипт сам раз в 6 часов
+# смотрит версию на GitHub — в фоне, чтобы запуск не ждал сеть, — и кладёт
+# ответ в кэш. Шапка читает кэш, никуда не обращаясь.
+UPDATE_CACHE="/var/lib/awg2/update_check"   # "<версия> <unixtime>"
+UPDATE_CHECK_TTL=21600                      # 6 часов
+
+update_check_async() {
+  [[ -n "${AWG_NO_UPDATE_CHECK:-}" ]] && return 0
+  command -v curl &>/dev/null || return 0
+
+  local ts=0 now
+  now=$(date +%s)
+  [[ -f "$UPDATE_CACHE" ]] && ts=$(awk '{print $2+0; exit}' "$UPDATE_CACHE" 2>/dev/null || echo 0)
+  [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
+  (( now - ts < UPDATE_CHECK_TTL )) && return 0
+
+  mkdir -p "$(dirname "$UPDATE_CACHE")" 2>/dev/null || return 0
+
+  # Тянем только начало файла: VERSION= стоит в первых строках, качать ради
+  # него полмегабайта незачем. Если сервер не понял Range — придёт всё, но
+  # это фон, никто не ждёт.
+  (
+    local v
+    v=$(curl -fsSL --connect-timeout 5 --max-time 10 -r 0-4095 \
+          -H "Cache-Control: no-cache" "${UPDATE_URL}?nocache=${now}" 2>/dev/null \
+        | grep -m1 '^VERSION=' | cut -d'"' -f2)
+    [[ -n "$v" ]] && printf '%s %s\n' "$v" "$(date +%s)" > "$UPDATE_CACHE"
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  return 0
+}
+
+# Печатает версию из кэша, если она новее текущей. Иначе молчит и возвращает 1.
+update_available() {
+  [[ -f "$UPDATE_CACHE" ]] || return 1
+  local v cur new
+  v=$(awk '{print $1; exit}' "$UPDATE_CACHE" 2>/dev/null || true)
+  [[ -n "$v" && "$v" != "?" ]] || return 1
+  cur=$(ver_num "$VERSION"); new=$(ver_num "$v")
+  [[ "$cur" =~ ^[0-9]+$ && "$new" =~ ^[0-9]+$ ]] || return 1
+  (( 10#$new > 10#$cur )) || return 1
+  echo "$v"
+}
+
+# Запоминает версию как актуальную — чтобы бейдж «доступно обновление» исчез
+# сразу после установки, а не жил до следующей фоновой проверки.
+update_cache_set() {
+  local v="$1"
+  [[ -n "$v" ]] || return 0
+  mkdir -p "$(dirname "$UPDATE_CACHE")" 2>/dev/null || return 0
+  printf '%s %s\n' "$v" "$(date +%s)" > "$UPDATE_CACHE" 2>/dev/null || true
+}
+
+# Скачивает $1 в $2, рисуя шкалу прогресса.
+#
+# curl уходит в фон, а размер на диске сверяется с Content-Length из заголовков
+# ЭТОГО ЖЕ ответа (--dump-header), а не отдельного HEAD-запроса: на HEAD сервер
+# может ответить иначе, и тогда шкала считает проценты от чужой длины —
+# показывала 100% на первых килобайтах.
+#
+# Своя шкала, а не `curl --progress-bar`: та не знает про наши отступы и цвета.
+# Если Content-Length не пришёл (chunked), показываем накопленные килобайты без
+# процентов — качать в полной тишине хуже.
+# Возвращает код curl.
+download_with_progress() {
+  local url="$1" dest="$2"
+  local total=0 pid rc got pct filled width=32 bar
+  local hdr="${dest}.hdr"
+  : > "$hdr"
+
+  curl -fsSL --connect-timeout 10 --max-time 60 \
+    -H "Cache-Control: no-cache, no-store" -H "Pragma: no-cache" \
+    -D "$hdr" "$url" -o "$dest" &
+  pid=$!
+
+  while kill -0 "$pid" 2>/dev/null; do
+    # Заголовки приходят раньше тела, поэтому длину пробуем читать до неё
+    if [[ $total -eq 0 && -s "$hdr" ]]; then
+      total=$(awk 'BEGIN{IGNORECASE=1}
+                   /^HTTP\// {code=$2}
+                   /^content-length:/ {v=$2}
+                   END{gsub(/\r/,"",v); gsub(/\r/,"",code)
+                       if (code ~ /^2/) print v+0; else print 0}' "$hdr" 2>/dev/null)
+      [[ "$total" =~ ^[0-9]+$ ]] || total=0
+    fi
+    got=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+    if [[ $total -gt 0 ]]; then
+      pct=$(( got * 100 / total ))
+      (( pct > 100 )) && pct=100
+      filled=$(( pct * width / 100 ))
+      bar=$(printf '%*s' "$filled" '' | tr ' ' '#')$(printf '%*s' $(( width - filled )) '' | tr ' ' '.')
+      printf '\r  %s[%s]%s %3d%%  %s KB' "$G" "$bar" "$N" "$pct" \
+        "$(awk -v b="$got" 'BEGIN{printf "%.0f", b/1024}')"
+    else
+      printf '\r  %sСкачано: %s KB%s' "$C" \
+        "$(awk -v b="$got" 'BEGIN{printf "%.0f", b/1024}')" "$N"
+    fi
+    sleep 0.2
+  done
+  wait "$pid"; rc=$?
+  rm -f "$hdr"
+
+  # Финальная отрисовка: при успехе шкала должна остаться полной, а не на 97%
+  got=$(stat -c%s "$dest" 2>/dev/null || echo 0)
+  if [[ $rc -eq 0 ]]; then
+    bar=$(printf '%*s' "$width" '' | tr ' ' '#')
+    printf '\r  %s[%s]%s 100%%  %s KB\n' "$G" "$bar" "$N" \
+      "$(awk -v b="$got" 'BEGIN{printf "%.0f", b/1024}')"
+  else
+    printf '\r%*s\r' 60 ''   # стираем недорисованную шкалу
+  fi
+  return "$rc"
+}
+
 do_self_update() {
   echo ""
   hdr "⬇  Обновление скрипта"
@@ -2059,10 +2289,7 @@ do_self_update() {
   local fetch_url
   fetch_url="${UPDATE_URL}?nocache=$(date +%s)"
   info "Скачиваем (с обходом CDN кеша)..."
-  if ! curl -fsSL --connect-timeout 10 --max-time 60 \
-       -H "Cache-Control: no-cache, no-store" \
-       -H "Pragma: no-cache" \
-       "$fetch_url" -o "$tmp_file"; then
+  if ! download_with_progress "$fetch_url" "$tmp_file"; then
     err "Не удалось скачать обновление"
     info "Проверь соединение или URL"
     rm -f "$tmp_file"
@@ -2124,8 +2351,8 @@ do_self_update() {
   # падает с "value too great for base", проваливаясь не в ту ветку.
   # Отсюда 10# во всех сравнениях ниже.
   local cur_num new_num
-  cur_num=$(echo "$VERSION" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
-  new_num=$(echo "$new_ver" | sed 's/^v//' | awk -F. '{ printf "%d%03d%03d\n", $1, $2, $3 ? $3 : 0 }')
+  cur_num=$(ver_num "$VERSION")
+  new_num=$(ver_num "$new_ver")
   cur_num=${cur_num:-0}; new_num=${new_num:-0}
 
   if [[ "$new_ver" == "?" ]]; then
@@ -2188,6 +2415,9 @@ do_self_update() {
   chmod +x "$tmp_file"
   if mv "$tmp_file" "$target"; then
     ok "Скрипт обновлён до $new_ver"
+    # Бейдж «доступно обновление» должен исчезнуть сразу, не дожидаясь
+    # следующей фоновой проверки
+    update_cache_set "$new_ver"
 
     # Раньше здесь стоял гейт "новая версия >= 6.7". После смены схемы нумерации
     # на 0.x он стал бы навсегда ложным — и чистка отключилась бы ровно у тех,
@@ -2201,12 +2431,37 @@ do_self_update() {
     # иначе при следующем запуске awg2 может выполниться старый кеш.
     hash -r 2>/dev/null || true
 
+    # ───── 9. Перезапуск ─────
+    # Файл на диске уже новый, а в памяти живёт прежний код: bash дочитывает
+    # скрипт по ходу исполнения, поэтому продолжать работу в этом процессе
+    # нельзя — часть функций будет старой, часть новой. Предлагаем exec: он
+    # заменяет процесс на месте, и человеку не надо ничего набирать заново.
     echo ""
-    echo -e "  ${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-    echo -e "  ${W}  ВАЖНО: текущий процесс продолжает работать в старой версии${N}"
-    echo -e "  ${G}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  ${Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+    echo -e "  ${W}  Нужен перезапуск: этот процесс всё ещё работает на старой${N}"
+    echo -e "  ${W}  версии, новая лежит в ${target}${N}"
+    echo -e "  ${Y}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
     echo ""
-    echo -e "  Выйди из меню (${W}0${N}) и запусти снова: ${W}sudo awg2${N}"
+
+    local _restart
+    read_yesno _restart "$(echo -e "${G}  Перезапустить сейчас? [Y/n]: ${N}")" "y"
+    if [[ "$_restart" == "y" ]]; then
+      # --post-update передаёт прежнюю версию новому процессу: иначе после
+      # мгновенного обновления в шапке видна прежняя версия и непонятно,
+      # случилось ли что-нибудь вообще.
+      if [[ -x "$target" ]]; then
+        log_info "do_self_update: exec $target после обновления до $new_ver"
+        info "Перезапускаюсь..."
+        sleep 1
+        exec "$target" --post-update "$VERSION"
+      fi
+      # На всякий случай: файл не исполняемый — запускаем через bash
+      log_info "do_self_update: exec bash $target (нет +x)"
+      exec bash "$target" --post-update "$VERSION"
+    fi
+
+    warn "Перезапуск отложен — до него меню работает на старой версии"
+    info "Запусти заново: ${W}sudo awg2${N}"
     echo ""
     return 0
   else
@@ -2240,8 +2495,17 @@ show_header() {
     profile_label="${profile_label} ${D}/ AWG ${proto_raw:-2.0}${N}"
   fi
 
+  # Бейдж новой версии — из кэша, без обращения к сети (см. update_check_async)
+  local _upd _ver_line
+  _upd=$(update_available || true)
+  if [[ -n "$_upd" ]]; then
+    _ver_line="  ${W}AwgToolza $VERSION${N}   ${G}⬆ есть $_upd${N} ${D}— пункт 8${N}"
+  else
+    _ver_line="  ${W}AwgToolza $VERSION${N}"
+  fi
+
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  echo -e "  ${W}AwgToolza $VERSION${N}"
+  echo -e "$_ver_line"
   echo -e "  ${C}TG: @awgToolza${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  IP сервера : ${W}$ip${N}"
@@ -2304,22 +2568,27 @@ show_submenu_1() {
     fi
     if $HAS_SERVER_CONF; then
       echo -e "  ${C}5)${N} Перегенерировать параметры обфускации"
-      echo -e "  ${Y}6)${N} Сбросить настройки сервера (чистая переустановка)"
+      local _ep_now
+      _ep_now=$(endpoint_domain)
+      echo -e "  ${C}6)${N} Endpoint для клиентов  ${D}${_ep_now:-IP сервера}${N}"
+      echo -e "  ${Y}7)${N} Сбросить настройки сервера (чистая переустановка)"
     else
       echo -e "  ${D}5) Перегенерировать параметры (нужен пункт 2)${N}"
-      echo -e "  ${D}6) Сбросить сервер (нет сервера)${N}"
+      echo -e "  ${D}6) Endpoint для клиентов (нужен пункт 2)${N}"
+      echo -e "  ${D}7) Сбросить сервер (нет сервера)${N}"
     fi
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-6]: ${N}")" 0 6 "0"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-7]: ${N}")" 0 7 "0"
     case "${SUB_CHOICE:-}" in
       1) do_install || true ;;
       2) do_gen || true ;;
       3) do_restart || true ;;
       4) do_repair || true ;;
       5) do_rotate_awg_params || true ;;
-      6) do_reset_server || true ;;
+      6) do_endpoint_menu || true ;;
+      7) do_reset_server || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -3512,7 +3781,7 @@ do_gen() {
     warn "Текущий профиль: ${W}${_current_profile}${N}"
     echo ""
     info "Для смены профиля сначала удали текущий сервер:"
-    info "  • Сервер (1) → п.6 — Сбросить настройки сервера (чистая переустановка)"
+    info "  • Сервер (1) → п.7 — Сбросить настройки сервера (чистая переустановка)"
     info "  • Удаление (7) → п.2 — Удалить всё (пакеты + конфиги)"
     info "После этого выбери Сервер (1) → п.2 заново и укажи нужный профиль."
     return 0
@@ -3642,6 +3911,10 @@ do_gen() {
     warn "Порт должен быть числом 1024-65535. Попробуй ещё раз."
   done
 
+  # Домен вместо IP в Endpoint — спрашиваем здесь, рядом с портом: вместе они
+  # и составляют Endpoint клиентского конфига.
+  ask_endpoint_domain
+
   local obf_label
   case ${OBF_LEVEL:-1} in
     1) obf_label="Базовый (без CPS)" ;;
@@ -3660,6 +3933,7 @@ do_gen() {
   echo -e "  ${W}Сервер     : ${N}$SERVER_ADDR"
   echo -e "  ${W}MTU        : ${N}$MTU"
   echo -e "  ${W}Порт       : ${N}$PORT"
+  echo -e "  ${W}Endpoint   : ${N}${ENDPOINT_DOMAIN:-IP сервера}:$PORT"
   echo ""
   read_yesno CONFIRM "$(echo -e "${C}  Продолжить? [Y/n]: ${N}")" "y"
   [[ "$CONFIRM" == "y" ]] || { warn "Отменено."; return 0; }
@@ -3733,6 +4007,9 @@ do_gen() {
     # знает, что выдавать, и раньше давал один I1 на сервере с полным CPS.
     echo "# AWG_OBF_LEVEL=${OBF_LEVEL:-1}"
     echo "# AWG_MIMICRY=${MIMICRY_PROFILE:-none}"
+    # Домен для Endpoint: строку пишем только если он задан, иначе клиентам
+    # уходит IP (см. endpoint_host)
+    [[ -n "${ENDPOINT_DOMAIN:-}" ]] && echo "# AWG_ENDPOINT=${ENDPOINT_DOMAIN}"
     echo "[Interface]"
     echo "PrivateKey = $srv_priv"
     echo "Address = $SERVER_ADDR"
@@ -3771,7 +4048,7 @@ do_gen() {
     echo "[Peer]"
     echo "PublicKey = $srv_pub"
     echo "PresharedKey = $psk"
-    echo "Endpoint = $srv_ip:$PORT"
+    echo "Endpoint = $(endpoint_host "$srv_ip"):$PORT"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = $(awg_keepalive_value)"
   } > "/root/${FIRST_CLIENT_NAME}_awg2.conf"
@@ -4527,7 +4804,7 @@ do_add_client() {
     echo "[Peer]"
     echo "PublicKey = $srv_pub"
     echo "PresharedKey = $psk"
-    echo "Endpoint = $srv_ip:$port"
+    echo "Endpoint = $(endpoint_host "$srv_ip"):$port"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = $(awg_keepalive_value)"
   } > "$client_file"
@@ -4908,7 +5185,7 @@ do_bulk_add_clients() {
       echo "[Peer]"
       echo "PublicKey = $srv_pub"
       echo "PresharedKey = $psk"
-      echo "Endpoint = $srv_ip:$port"
+      echo "Endpoint = $(endpoint_host "$srv_ip"):$port"
       echo "AllowedIPs = 0.0.0.0/0, ::/0"
       echo "PersistentKeepalive = $(awg_keepalive_value)"
     } > "$client_file"
@@ -5257,6 +5534,103 @@ do_restart() {
     err "Не удалось поднять awg0"
     return 1
   fi
+}
+
+# Endpoint для клиентов: показать текущий, задать домен или вернуть IP.
+#
+# Смена не трогает ключи и не требует перезапуска интерфейса: Endpoint живёт
+# только в клиентских конфигах. Поэтому здесь же предлагаем переписать уже
+# выданные — иначе старые клиенты останутся на IP, новые на домене, и понять,
+# что у кого, потом сложно.
+do_endpoint_menu() {
+  [[ -f "$SERVER_CONF" ]] || { err "Сервер не создан"; return 1; }
+
+  local cur srv_ip port
+  cur=$(endpoint_domain)
+  srv_ip=$(get_public_ip 2>/dev/null || true)
+  port=$(grep -m1 '^ListenPort' "$SERVER_CONF" 2>/dev/null | tr -dc '0-9' || true)
+
+  echo ""
+  hdr "◈  Endpoint для клиентов"
+  echo ""
+  if [[ -n "$cur" ]]; then
+    echo -e "  Сейчас: ${W}${cur}:${port}${N} ${D}(домен)${N}"
+  else
+    echo -e "  Сейчас: ${W}${srv_ip:-?}:${port}${N} ${D}(IP сервера)${N}"
+  fi
+  echo ""
+  echo -e "  ${D}Домен удобнее при переезде: меняешь A-запись, а конфиги${N}"
+  echo -e "  ${D}у клиентов остаются рабочими. Требуется прямая A-запись${N}"
+  echo -e "  ${D}на IP сервера — проксирование UDP через Cloudflare не работает.${N}"
+  echo ""
+  echo -e "  ${C}1)${N} Задать домен"
+  [[ -n "$cur" ]] && echo -e "  ${C}2)${N} Вернуться на IP сервера" \
+                  || echo -e "  ${D}2) Вернуться на IP (уже IP)${N}"
+  echo -e "  ${W}0)${N} ← Назад"
+  echo ""
+
+  local _c
+  read_choice _c "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
+  case "$_c" in
+    1)
+      local d
+      while true; do
+        read -rp "$(echo -e "${C}  Домен (пусто = отмена): ${N}")" d
+        d=$(echo "${d:-}" | tr -d ' ')
+        [[ -z "$d" ]] && { info "Отменено"; return 0; }
+        valid_domain "$d" && break
+        warn "Нужно имя вида vpn.example.com (не IP)"
+      done
+      check_domain_resolves "$d" || {
+        local _go
+        read_yesno _go "$(echo -e "${Y}  Всё равно задать? [y/N]: ${N}")" "n"
+        [[ "$_go" == "y" ]] || { info "Отменено"; return 0; }
+      }
+      set_endpoint_domain "$d" || { err "Не удалось записать домен в конфиг"; return 1; }
+      ok "Endpoint для новых конфигов: ${d}:${port}"
+      _endpoint_rewrite_clients "${d}:${port}"
+      ;;
+    2)
+      [[ -n "$cur" ]] || { info "Уже используется IP"; return 0; }
+      set_endpoint_domain "" || { err "Не удалось убрать домен из конфига"; return 1; }
+      ok "Endpoint для новых конфигов: ${srv_ip:-IP сервера}:${port}"
+      [[ -n "$srv_ip" ]] && _endpoint_rewrite_clients "${srv_ip}:${port}"
+      ;;
+    *) info "Отменено" ;;
+  esac
+  return 0
+}
+
+# Предлагает переписать Endpoint в уже выданных конфигах. $1 = "host:port".
+_endpoint_rewrite_clients() {
+  local ep="$1" files=() f
+  shopt -s nullglob
+  files=( /root/*_awg2.conf )
+  shopt -u nullglob
+  [[ ${#files[@]} -gt 0 ]] || return 0
+
+  echo ""
+  info "Уже выданных конфигов: ${#files[@]}"
+  echo -e "  ${D}Они продолжат работать со старым Endpoint, пока он доступен.${N}"
+  echo ""
+  local _upd
+  read_yesno _upd "$(echo -e "${C}  Переписать Endpoint в них на ${ep}? [Y/n]: ${N}")" "y"
+  [[ "$_upd" == "y" ]] || { info "Файлы не тронуты"; return 0; }
+
+  local done_n=0 fail_n=0
+  for f in "${files[@]}"; do
+    if sed -i "s|^Endpoint = .*|Endpoint = ${ep}|" "$f" 2>/dev/null; then
+      done_n=$((done_n+1))
+    else
+      warn "Не удалось обновить $(basename "$f")"
+      fail_n=$((fail_n+1))
+    fi
+  done
+  ok "Обновлено конфигов: $done_n"
+  [[ $fail_n -gt 0 ]] && warn "Не обновлено: $fail_n"
+  echo -e "  ${Y}Клиентам нужно забрать новый конфиг — старый Endpoint у них${N}"
+  echo -e "  ${Y}останется до замены файла на устройстве.${N}"
+  return 0
 }
 
 # 10. СБРОС СЕРВЕРА (чистая переустановка)
@@ -8808,6 +9182,7 @@ do_uninstall() {
   # мусор, из которого awg2 запускается снова и выглядит как «не удалилось».
   trash "Удаляем лог и следы установки..."
   rm -f "$LOG_FILE" 2>/dev/null || true
+  rm -rf /var/lib/awg2 2>/dev/null || true   # кэш проверки обновлений
   rm -f /root/awg-toolza-*.run 2>/dev/null || true
   rm -rf /opt/awg-toolza-* 2>/dev/null || true
   rm -f /tmp/awg_domain_cache.txt 2>/dev/null || true
@@ -11073,9 +11448,32 @@ _global_cleanup() {
 trap '_global_cleanup' EXIT
 trap '_global_cleanup; echo ""; warn "Прервано пользователем"; exit 130' INT TERM
 
+# --post-update <прежняя версия> — скрипт сам себя перезапустил после
+# обновления. Показываем это один раз: обновление занимает секунду, и без
+# явного сообщения непонятно, произошло ли оно.
+POST_UPDATE_FROM=""
+case "${1:-}" in
+  --post-update) POST_UPDATE_FROM="${2:-}" ;;
+esac
+
+# Фоновая проверка новой версии — один раз за запуск, результат в кэш.
+# Шапка читает кэш и в сеть не ходит, поэтому меню не ждёт ничего.
+update_check_async || true
+
 while true; do
   check_deps
   show_header
+
+  if [[ -n "$POST_UPDATE_FROM" ]]; then
+    echo ""
+    if [[ "$POST_UPDATE_FROM" == "$VERSION" ]]; then
+      success_box "✓ Скрипт обновлён и перезапущен ($VERSION)"
+    else
+      success_box "✓ Обновление установлено: $POST_UPDATE_FROM → $VERSION"
+    fi
+    POST_UPDATE_FROM=""
+  fi
+
   show_menu
   # show_menu читает CHOICE через read_choice — валидация внутри
 
