@@ -1963,7 +1963,7 @@ do_repair() {
   local ext_if
   ext_if=$(ip route | awk '/default/ {print $5; exit}')
   if [[ -n "$ext_if" ]]; then
-    if iptables -t nat -C POSTROUTING -o "$ext_if" -j MASQUERADE 2>/dev/null; then
+    if iptables -t nat -C POSTROUTING -o "$ext_if" -j MASQUERADE >/dev/null 2>&1; then
       ok "iptables NAT MASQUERADE на $ext_if"
     else
       warn "iptables NAT MASQUERADE отсутствует"
@@ -1972,7 +1972,7 @@ do_repair() {
         ok "MASQUERADE добавлен" && fixed=$((fixed+1))
     fi
 
-    if iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null; then
+    if iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1; then
       ok "iptables FORWARD -i awg0 ACCEPT"
     else
       warn "iptables FORWARD -i awg0 отсутствует"
@@ -2438,7 +2438,7 @@ show_submenu_5() {
     # DNS статус
     if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null && \
        iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT \
-         --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
+         --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" >/dev/null 2>&1; then
       echo -e "  ${C}2)${N} DNS-шифрование  ${G}● включено${N}"
     elif command -v dnscrypt-proxy &>/dev/null; then
       echo -e "  ${C}2)${N} DNS-шифрование  ${D}○ установлен, выключен${N}"
@@ -2652,7 +2652,7 @@ choose_dns() {
 
   # Если включено DNS-шифрование (п.5 → Туннели и DNS) — показать подсказку
   if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null && \
-     iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" 2>/dev/null; then
+     iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR:-127.0.2.1}:${DNS_PROXY_PORT:-53}" >/dev/null 2>&1; then
     echo -e "  ${G}⚡ Шифрованный DNS включён${N} ${D}(п.5 → Туннели и DNS)${N}"
     echo -e "  ${D}→ Любой выбор будет автоматически перенаправлен через DoH${N}"
     echo -e "  ${D}→ Реальные запросы пойдут через Cloudflare/Google/Cisco${N}"
@@ -3062,10 +3062,10 @@ _nat_install_persist() {
   if [[ -d /etc/network/if-pre-up.d ]]; then
     cat > "$hook" <<EOF
 #!/bin/sh
-iptables -t nat -C POSTROUTING -o ${ext_if} -j MASQUERADE 2>/dev/null || \
+iptables -t nat -C POSTROUTING -o ${ext_if} -j MASQUERADE >/dev/null 2>&1 || \
 iptables -t nat -A POSTROUTING -o ${ext_if} -j MASQUERADE
-iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -j ACCEPT
-iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o awg0 -j ACCEPT
+iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i awg0 -j ACCEPT
+iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o awg0 -j ACCEPT
 EOF
     if [[ -s "$hook" ]]; then
       chmod +x "$hook"
@@ -3087,10 +3087,10 @@ set -u
 IFACE=\$(ip -4 route show default 2>/dev/null | awk '/default/ {print \$5; exit}')
 [ -z "\$IFACE" ] && IFACE="${ext_if}"
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE 2>/dev/null || \\
+iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE >/dev/null 2>&1 || \\
   iptables -t nat -A POSTROUTING -o "\$IFACE" -j MASQUERADE
-iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -j ACCEPT
-iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o awg0 -j ACCEPT
+iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i awg0 -j ACCEPT
+iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o awg0 -j ACCEPT
 exit 0
 EOF
   chmod +x "$NAT_PERSIST_SCRIPT"
@@ -3413,11 +3413,11 @@ EOF
   [[ -z "$ext_if" ]] && { err "Не найден default интерфейс"; info "Проверь: ip route | grep default"; prompt_retry || return 1; continue; }
   ok "Интерфейс: $ext_if"
 
-  iptables -t nat -C POSTROUTING -o "$ext_if" -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -C POSTROUTING -o "$ext_if" -j MASQUERADE >/dev/null 2>&1 || \
     iptables -t nat -A POSTROUTING -o "$ext_if" -j MASQUERADE
-  iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || \
+  iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || \
     iptables -A FORWARD -i awg0 -j ACCEPT
-  iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || \
+  iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || \
     iptables -A FORWARD -o awg0 -j ACCEPT
   ok "NAT и FORWARD правила добавлены"
 
@@ -3742,7 +3742,7 @@ do_gen() {
     # I1-I5 НЕ записываем в серверный конфиг — это клиентские параметры.
     # Сервер не нуждается в CPS signature packets.
     echo ""
-    echo "PostUp   = ip link set dev awg0 mtu $MTU; echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE; iptables -C FORWARD -i awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -i awg0 -j ACCEPT; iptables -C FORWARD -o awg0 -j ACCEPT 2>/dev/null || iptables -A FORWARD -o awg0 -j ACCEPT"
+    echo "PostUp   = ip link set dev awg0 mtu $MTU; echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE >/dev/null 2>&1 || iptables -t nat -A POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE; iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i awg0 -j ACCEPT; iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o awg0 -j ACCEPT"
     echo "PostDown = iptables -t nat -D POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
     echo ""
     echo "[Peer]"
@@ -5869,12 +5869,12 @@ log "MTU интерфейса $IFACE = ${mtu:-неизвестен}"
 if [[ "$mtu" =~ ^[0-9]+$ ]] && (( mtu > 100 )); then
   mss=$((mtu - 40))   # IPv4 (20) + TCP (20)
   iptables -t mangle -C FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-    -j TCPMSS --set-mss "$mss" 2>/dev/null || \
+    -j TCPMSS --set-mss "$mss" >/dev/null 2>&1 || \
   iptables -t mangle -A FORWARD -o "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
     -j TCPMSS --set-mss "$mss" 2>/dev/null && log "MSS ограничен до $mss"
   # Обратное направление: ответы из туннеля клиенту
   iptables -t mangle -C FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
-    -j TCPMSS --set-mss "$mss" 2>/dev/null || \
+    -j TCPMSS --set-mss "$mss" >/dev/null 2>&1 || \
   iptables -t mangle -A FORWARD -i "$IFACE" -p tcp --tcp-flags SYN,RST SYN \
     -j TCPMSS --set-mss "$mss" 2>/dev/null || true
 fi
@@ -5889,13 +5889,13 @@ fi
 
 # 4) NAT: клиенты сидят в приватной подсети, у туннеля внутренний CGNAT-адрес,
 # без MASQUERADE их пакеты уйдут наружу с приватным src и будут отброшены.
-iptables -t nat -C POSTROUTING -s "$client_net" -o "$IFACE" -j MASQUERADE 2>/dev/null ||   iptables -t nat -A POSTROUTING -s "$client_net" -o "$IFACE" -j MASQUERADE
+iptables -t nat -C POSTROUTING -s "$client_net" -o "$IFACE" -j MASQUERADE >/dev/null 2>&1 ||   iptables -t nat -A POSTROUTING -s "$client_net" -o "$IFACE" -j MASQUERADE
 # Fallback наружу для клиентов ВНЕ WARP — они идут по main через ext_if
 if [[ -n "$ext_if" ]]; then
-  iptables -t nat -C POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE 2>/dev/null ||     iptables -t nat -A POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE
+  iptables -t nat -C POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE >/dev/null 2>&1 ||     iptables -t nat -A POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE
 fi
-iptables -C FORWARD -i awg0 -o "$IFACE" -j ACCEPT 2>/dev/null ||   iptables -A FORWARD -i awg0 -o "$IFACE" -j ACCEPT
-iptables -C FORWARD -i "$IFACE" -o awg0 -j ACCEPT 2>/dev/null ||   iptables -A FORWARD -i "$IFACE" -o awg0 -j ACCEPT
+iptables -C FORWARD -i awg0 -o "$IFACE" -j ACCEPT >/dev/null 2>&1 ||   iptables -A FORWARD -i awg0 -o "$IFACE" -j ACCEPT
+iptables -C FORWARD -i "$IFACE" -o awg0 -j ACCEPT >/dev/null 2>&1 ||   iptables -A FORWARD -i "$IFACE" -o awg0 -j ACCEPT
 
 # rp_filter loose только на VPN-интерфейсах; all.rp_filter не трогаем, иначе
 # ослабнет защита от спуфинга на внешнем интерфейсе.
@@ -6077,7 +6077,7 @@ warp_usque_down() {
     iptables -D FORWARD -i "$WARP_IFACE_NAME" -o awg0 -j ACCEPT 2>/dev/null || true
     # Прямой выход клиентам оставляем — иначе они потеряют интернет совсем
     if [[ -n "$ext_if" ]]; then
-      iptables -t nat -C POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -C POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE >/dev/null 2>&1 || \
         iptables -t nat -A POSTROUTING -s "$client_net" -o "$ext_if" -j MASQUERADE
     fi
   fi
@@ -6839,7 +6839,7 @@ if [[ $fails -ge $MAX_FAILS ]]; then
 
     # Восстанавливаем MASQUERADE через основной интерфейс
     if [[ -n "$iface" ]]; then
-      iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || \
+      iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
         iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
     fi
   fi
@@ -7126,17 +7126,17 @@ EOF
   # для клиентов которые НЕ в warp_peers (идут через main table → eth0).
   # Иначе их пакеты уйдут наружу с приватным src (10.x.x.x) → дропнутся провайдером.
   # Гарантируем что eth0-MASQUERADE существует:
-  iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
     iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
 
   # Добавляем MASQUERADE через warp0 (для клиентов с ip rule lookup 200)
-  iptables -t nat -C POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE 2>/dev/null || \
+  iptables -t nat -C POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE >/dev/null 2>&1 || \
     iptables -t nat -A POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE
 
   # FORWARD правила
-  iptables -C FORWARD -i awg0 -o warp0 -j ACCEPT 2>/dev/null || \
+  iptables -C FORWARD -i awg0 -o warp0 -j ACCEPT >/dev/null 2>&1 || \
     iptables -A FORWARD -i awg0 -o warp0 -j ACCEPT
-  iptables -C FORWARD -i warp0 -o awg0 -j ACCEPT 2>/dev/null || \
+  iptables -C FORWARD -i warp0 -o awg0 -j ACCEPT >/dev/null 2>&1 || \
     iptables -A FORWARD -i warp0 -o awg0 -j ACCEPT
 
   # rp_filter loose mode только для VPN интерфейсов
@@ -7288,13 +7288,13 @@ sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1 || true
 sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
 
 # MASQUERADE: warp0 для пометленных + eth0 для остальных (fallback)
-iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || \
+iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
   iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
-iptables -t nat -C POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE 2>/dev/null || \
+iptables -t nat -C POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE >/dev/null 2>&1 || \
   iptables -t nat -A POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE
-iptables -C FORWARD -i awg0 -o warp0 -j ACCEPT 2>/dev/null || \
+iptables -C FORWARD -i awg0 -o warp0 -j ACCEPT >/dev/null 2>&1 || \
   iptables -A FORWARD -i awg0 -o warp0 -j ACCEPT
-iptables -C FORWARD -i warp0 -o awg0 -j ACCEPT 2>/dev/null || \
+iptables -C FORWARD -i warp0 -o awg0 -j ACCEPT >/dev/null 2>&1 || \
   iptables -A FORWARD -i warp0 -o awg0 -j ACCEPT
 
 # Policy routing — таблица 200
@@ -7360,7 +7360,7 @@ _warp_down() {
 
       # Восстанавливаем MASQUERADE через основной интерфейс
       if [[ -n "$iface" ]]; then
-        iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || \
+        iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
           iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
       fi
     fi
@@ -7856,13 +7856,13 @@ _dns_proxy_status() {
   if systemctl is-active --quiet dnscrypt-proxy 2>/dev/null; then
     echo -e "  Статус     : ${G}● активен${N}"
     # DNAT IPv4
-    if iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null; then
+    if iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" >/dev/null 2>&1; then
       echo -e "  DNAT IPv4  : ${G}● настроен${N} ${D}(awg0 → ${DNS_PROXY_ADDR}:${DNS_PROXY_PORT})${N}"
     else
       echo -e "  DNAT IPv4  : ${R}✗ правило отсутствует${N}"
     fi
     # DoT блокировка
-    if iptables -C FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null; then
+    if iptables -C FORWARD -i awg0 -p tcp --dport 853 -j DROP >/dev/null 2>&1; then
       echo -e "  DoT block  : ${G}● заблокирован${N} ${D}(порт 853)${N}"
     else
       echo -e "  DoT block  : ${D}○ не настроен${N}"
@@ -8078,10 +8078,10 @@ EOF
   info "Настраиваем iptables DNAT IPv4 для awg0 → ${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}..."
 
   # Удаляем старые правила (если были)
-  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" >/dev/null 2>&1 || true
 
   # Добавляем DNAT
   iptables -t nat -A PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}"
@@ -8160,8 +8160,8 @@ if ! ip link show awg0 &>/dev/null; then
 fi
 
 # Удаляем старые правила (на случай если уже есть)
-iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
-iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
+iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" >/dev/null 2>&1 || true
+iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" >/dev/null 2>&1 || true
 iptables -D FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null || true
 iptables -D FORWARD -i awg0 -p udp --dport 853 -j DROP 2>/dev/null || true
 while iptables -D INPUT -i awg0 -d "${DNS_PROXY_ADDR}" -p udp --dport "${DNS_PROXY_PORT}" -j ACCEPT 2>/dev/null; do :; done
@@ -8246,7 +8246,7 @@ if command -v dig &>/dev/null; then
 fi
 
 # 3. Проверка DNAT правил
-if ! iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null; then
+if ! iptables -t nat -C PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" >/dev/null 2>&1; then
   echo "[\$TIMESTAMP] FAIL: DNAT правило отсутствует — восстанавливаю" >> "\$LOG"
   $DNS_PERSIST_SCRIPT 2>&1 | tee -a "\$LOG" >/dev/null
 fi
@@ -8337,11 +8337,11 @@ _dns_proxy_remove() {
   systemctl daemon-reload 2>/dev/null || true
 
   # 3. iptables IPv4 DNAT — убираем все варианты
-  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "${DNS_PROXY_ADDR}:${DNS_PROXY_PORT}" >/dev/null 2>&1 || true
   # Старые правила (для совместимости с прошлыми версиями)
-  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" 2>/dev/null || true
-  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" >/dev/null 2>&1 || true
+  iptables -t nat -D PREROUTING -i awg0 -p tcp --dport 53 -j DNAT --to-destination "127.0.0.1:5300" >/dev/null 2>&1 || true
 
   # 4. iptables — DoT блокировка
   iptables -D FORWARD -i awg0 -p tcp --dport 853 -j DROP 2>/dev/null || true
