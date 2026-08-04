@@ -52,6 +52,76 @@ validate_src() {
   [[ -d "$src/awgbot" && -f "$src/run.py" && -f "$src/requirements.txt" ]]
 }
 
+# ── Локальный источник кода ──
+#
+# Бот можно поставить из распакованного архива awg-toolza, минуя GitHub. Но
+# обновление продолжало клонировать репозиторий — и накатывало поверх локальной
+# сборки то, что лежит в репозитории, то есть откатывало непушенные правки.
+# Поэтому путь запоминается в конфиге строкой LOCAL_SRC=… (пишет установщик или
+# команда `awg-bot src <каталог>`), и update/reinstall берут код оттуда.
+
+# Приводит путь к каталогу с awgbot/: принимает и корень пакета, и сам awg_bot/
+normalize_src() {
+  local d="${1%/}" sub
+  [[ -z "$d" ]] && return 1
+  sub=$(get_repo_subdir)
+  if validate_src "$d"; then echo "$d"; return 0; fi
+  if [[ -n "$sub" ]] && validate_src "$d/$sub"; then echo "$d/$sub"; return 0; fi
+  return 1
+}
+
+get_local_src() {
+  local s=""
+  [[ -f "$CONF" ]] && s=$(grep -m1 '^LOCAL_SRC=' "$CONF" 2>/dev/null | cut -d= -f2- | tr -d '"'"'"' ' || true)
+  echo "$s"
+}
+
+# $1 = каталог | "--github" (сбросить на клонирование)
+set_local_src() {
+  local val="$1" norm
+  touch "$CONF" 2>/dev/null || true
+  chmod 600 "$CONF" 2>/dev/null || true
+  if [[ "$val" == "--github" || -z "$val" ]]; then
+    sed -i '/^LOCAL_SRC=/d' "$CONF"
+    ok "Источник кода: GitHub ($(get_repo_url))"
+    return 0
+  fi
+  if ! norm=$(normalize_src "$val"); then
+    err "В каталоге нет кода бота (awgbot/, run.py, requirements.txt): $val"
+    return 1
+  fi
+  sed -i '/^LOCAL_SRC=/d' "$CONF"
+  echo "LOCAL_SRC=${norm}" >> "$CONF"
+  ok "Источник кода: локальный каталог ${norm}"
+}
+
+# Отдаёт каталог с кодом бота: локальный источник или свежий клон в $1.
+# $2 (необязательно) — разовый путь, важнее записанного в конфиге.
+resolve_src() {
+  local tmp="$1" once="${2:-}" src=""
+
+  if [[ -n "$once" ]]; then
+    if src=$(normalize_src "$once"); then
+      info "Код бота: ${src} (указан явно)" >&2
+      echo "$src"; return 0
+    fi
+    err "В указанном каталоге нет кода бота: $once" >&2
+    return 1
+  fi
+
+  local saved; saved=$(get_local_src)
+  if [[ -n "$saved" ]]; then
+    if src=$(normalize_src "$saved"); then
+      info "Код бота: ${src} (локальный источник из ${CONF})" >&2
+      echo "$src"; return 0
+    fi
+    warn "Локальный источник ${saved} пропал — беру код с GitHub" >&2
+    warn "Задать заново: awg-bot src /путь/к/awg_bot" >&2
+  fi
+
+  clone_repo "$tmp"
+}
+
 # Клонирует репо в $1 (mktemp -d) и эхает путь к корню кода (с учётом REPO_SUBDIR).
 # Возвращает 1 при ошибке клона или если структура не похожа на бота.
 clone_repo() {
@@ -84,19 +154,22 @@ deploy_code() {
 }
 
 ensure_deps() {
-  command -v git >/dev/null 2>&1 || { info "Ставлю git…"; apt-get install -y -qq git >/dev/null; }
+  # git нужен только для клонирования: при локальном источнике не трогаем apt
+  [[ -n "$(get_local_src)" ]] || command -v git >/dev/null 2>&1 || \
+    { info "Ставлю git…"; apt-get install -y -qq git >/dev/null; }
   command -v python3 >/dev/null 2>&1 || { apt-get update -qq; apt-get install -y -qq python3 python3-venv; }
 }
 
 # ── 1) Переустановить (с нуля, спросит токен) ──
 do_reinstall() {
+  local once="${1:-}"
   hdr "Переустановка с нуля"
   warn "Будет перезаписан код в ${DEST} и переспрошены токен/ID."
   read -rp "$(echo -e "${C}  Продолжить? [y/N]: ${N}")" c; [[ "${c,,}" == y* ]] || { warn "Отмена"; return; }
   ensure_deps
   local tmp; tmp=$(mktemp -d)
   local src
-  if ! src=$(clone_repo "$tmp"); then rm -rf "$tmp"; return 1; fi
+  if ! src=$(resolve_src "$tmp" "$once"); then rm -rf "$tmp"; return 1; fi
   systemctl stop "$SERVICE" 2>/dev/null || true
   mkdir -p "$DEST"
   deploy_code "$src"
@@ -119,12 +192,13 @@ do_reinstall() {
 
 # ── 2) Обновить (сохраняя токен и chat_id) ──
 do_update() {
+  local once="${1:-}"
   hdr "Обновление (токен и ID сохраняются)"
   [[ -f "$CONF" ]] || { err "Нет ${CONF}. Сначала установи (п.1)."; return 1; }
   ensure_deps
   local tmp; tmp=$(mktemp -d)
   local src
-  if ! src=$(clone_repo "$tmp"); then rm -rf "$tmp"; return 1; fi
+  if ! src=$(resolve_src "$tmp" "$once"); then rm -rf "$tmp"; return 1; fi
   # бэкап текущего кода на случай отката
   local bak="${DEST}.bak.$(date +%s)"
   cp -r "$DEST" "$bak" 2>/dev/null && info "Бэкап старой версии: $bak"
@@ -167,7 +241,16 @@ do_status() {
   systemctl is-enabled --quiet "$SERVICE" 2>/dev/null && echo -e "  Автозапуск: ${G}включён${N}" || echo -e "  Автозапуск: ${Y}выключен${N}"
   echo -e "  Версия awg-bot: ${W}${VERSION}${N}"
   echo -e "  Код: ${D}${DEST}${N}"
-  echo -e "  Репо: ${D}$(get_repo_url)${N}"
+  local _ls; _ls=$(get_local_src)
+  if [[ -n "$_ls" ]]; then
+    if validate_src "$_ls"; then
+      echo -e "  Источник: ${W}локальный${N} ${D}${_ls}${N}"
+    else
+      echo -e "  Источник: ${Y}локальный, но каталог пропал${N} ${D}${_ls}${N}"
+    fi
+  else
+    echo -e "  Источник: ${D}GitHub $(get_repo_url)${N}"
+  fi
   echo ""
   systemctl status "$SERVICE" --no-pager -n 5 2>/dev/null || true
 }
@@ -179,20 +262,64 @@ do_logs() {
 }
 
 # ── 6) Удалить ──
-do_uninstall() {
-  hdr "Удаление бота"
-  warn "Будут удалены: сервис, код в ${DEST}."
-  read -rp "$(echo -e "${C}  Удалить также конфиг с токеном (${CONF})? [y/N]: ${N}")" delconf
-  read -rp "$(echo -e "${R}  Точно удалить бота? [y/N]: ${N}")" c
-  [[ "${c,,}" == y* ]] || { warn "Отмена"; return; }
+#
+# Два уровня:
+#   remove — сервис, код в /opt, маркер для awg2. Конфиг с токеном остаётся,
+#            чтобы переустановка не спрашивала его заново.
+#   purge  — плюс состояние мониторинга, конфиг с токеном и сам этот скрипт.
+#            Именно это имеется в виду под «удалить полностью»: после remove в
+#            системе оставались команда awg-bot, /var/lib/awg-bot и токен.
+# $1 = "purge" — полная очистка.
+bot_remove_files() {
+  local mode="${1:-remove}"
   systemctl stop "$SERVICE" 2>/dev/null || true
   systemctl disable "$SERVICE" 2>/dev/null || true
   rm -f "/etc/systemd/system/$SERVICE"
-  systemctl daemon-reload
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed "$SERVICE" 2>/dev/null || true
   rm -rf "$DEST"
   rm -f /usr/local/bin/awg-bot.py   # маркер для awg2 (пункт 6)
-  [[ "${delconf,,}" == y* ]] && { rm -f "$CONF"; info "Конфиг удалён"; }
-  ok "Бот удалён"
+
+  [[ "$mode" == "purge" ]] || return 0
+
+  # Копию токена оставляем в папке бэкапов: «удалить полностью» не должно
+  # означать «потерять токен» — иначе переустановка требует нового у BotFather.
+  # То же делает awg2 в своём пункте удаления бота.
+  if [[ -f "$CONF" ]]; then
+    local bdir="${HOME:-/root}/awg_backup" saved
+    mkdir -p "$bdir" 2>/dev/null || true
+    saved="${bdir}/awg-bot.conf.$(date +%Y%m%d_%H%M%S)"
+    if cp "$CONF" "$saved" 2>/dev/null; then
+      chmod 600 "$saved" 2>/dev/null || true
+      info "Токен сохранён: $saved"
+    else
+      warn "Не удалось сохранить копию токена — он будет потерян"
+    fi
+  fi
+
+  rm -rf /var/lib/awg-bot
+  rm -f "$CONF"
+  # Себя удаляем последним и из отдельного процесса: bash дочитывает скрипт с
+  # диска по ходу исполнения.
+  ( sleep 1; rm -f "$SELF" ) >/dev/null 2>&1 &
+  return 0
+}
+
+do_uninstall() {
+  hdr "Удаление бота"
+  warn "Будут удалены: сервис, код в ${DEST}, маркер для awg2."
+  echo -e "  ${D}Конфиг VPN и клиенты не трогаются — только бот.${N}"
+  read -rp "$(echo -e "${C}  Удалить всё под корень (токен ${CONF}, /var/lib/awg-bot, команду awg-bot)? [y/N]: ${N}")" purge
+  read -rp "$(echo -e "${R}  Точно удалить бота? [y/N]: ${N}")" c
+  [[ "${c,,}" == y* ]] || { warn "Отмена"; return; }
+
+  if [[ "${purge,,}" == y* ]]; then
+    bot_remove_files purge
+    ok "Бот удалён полностью (вместе с токеном и командой awg-bot)"
+  else
+    bot_remove_files remove
+    ok "Бот удалён (токен ${CONF} оставлен для переустановки)"
+  fi
 }
 
 install_service() {
@@ -218,6 +345,36 @@ EOF
   systemctl enable "$SERVICE" >/dev/null 2>&1 || true
 }
 
+# ── 7) Источник кода ──
+do_src_menu() {
+  hdr "Источник кода бота"
+  local cur; cur=$(get_local_src)
+  if [[ -n "$cur" ]]; then
+    echo -e "  Сейчас: ${W}локальный каталог${N} ${D}${cur}${N}"
+    validate_src "$cur" || warn "Каталог не найден или в нём нет кода бота"
+  else
+    echo -e "  Сейчас: ${W}GitHub${N} ${D}$(get_repo_url)${N}"
+  fi
+  echo ""
+  echo -e "  ${D}Локальный источник нужен, когда правки ещё не в репозитории:${N}"
+  echo -e "  ${D}иначе «Обновить» накатит поверх них версию с GitHub.${N}"
+  echo ""
+  echo -e "  ${C}1)${N} Указать локальный каталог"
+  echo -e "  ${C}2)${N} Вернуться на GitHub"
+  echo -e "  ${C}0)${N} Отмена"
+  echo ""
+  local ch dir
+  read -rp "$(echo -e "${C}  Выбор [0-2]: ${N}")" ch
+  case "$ch" in
+    1)
+      read -rp "$(echo -e "${C}  Путь (например /opt/awg-toolza-v0.7.5): ${N}")" dir
+      [[ -n "$dir" ]] && set_local_src "$dir" || warn "Пусто — отмена"
+      ;;
+    2) set_local_src --github ;;
+    *) warn "Отмена" ;;
+  esac
+}
+
 show_menu() {
   clear 2>/dev/null || true
   hdr "awgToolza Bot — управление  (v${VERSION})"
@@ -228,26 +385,51 @@ show_menu() {
   echo -e "  ${C}4)${N} Статус"
   echo -e "  ${C}5)${N} Логи (последние 50 строк)"
   echo -e "  ${C}6)${N} Удалить"
+  echo -e "  ${C}7)${N} Источник кода (локальный каталог / GitHub)"
   echo -e "  ${C}0)${N} Выход"
   echo ""
 }
 
 # Неинтерактивный режим: awg-bot update | restart | status | logs ...
+# Разбор разового --src <каталог> для update/reinstall
+_once_src=""
+_args=("$@")
+for _n in "${!_args[@]}"; do
+  case "${_args[$_n]}" in
+    --src)   _once_src="${_args[$((_n+1))]:-}" ;;
+    --src=*) _once_src="${_args[$_n]#--src=}" ;;
+  esac
+done
+
 case "${1:-}" in
-  reinstall) do_reinstall; exit 0 ;;
-  update)    do_update;    exit 0 ;;
+  reinstall) do_reinstall "$_once_src"; exit 0 ;;
+  update)    do_update "$_once_src";    exit 0 ;;
+  src)
+    # awg-bot src                → показать текущий источник
+    # awg-bot src <каталог>      → запомнить локальный источник
+    # awg-bot src --github       → вернуться на клонирование
+    if [[ -z "${2:-}" ]]; then
+      _ls=$(get_local_src)
+      if [[ -n "$_ls" ]]; then echo "local $_ls"; else echo "github $(get_repo_url)"; fi
+      exit 0
+    fi
+    set_local_src "$2"; exit $? ;;
   restart)   do_restart;   exit 0 ;;
   status)    do_status;    exit 0 ;;
   logs)      do_logs;      exit 0 ;;
   uninstall)
-    if [[ "${2:-}" == "--yes" || "${2:-}" == "-y" ]]; then
-      # неинтерактивное удаление (вызов из бота): без вопросов, конфиг сохраняем
-      systemctl stop "$SERVICE" 2>/dev/null || true
-      systemctl disable "$SERVICE" 2>/dev/null || true
-      rm -f "/etc/systemd/system/$SERVICE"
-      systemctl daemon-reload
-      rm -rf "$DEST"
-      rm -f /usr/local/bin/awg-bot.py
+    # Неинтерактивные вызовы из бота:
+    #   awg-bot uninstall --yes            — сервис и код, токен остаётся
+    #   awg-bot uninstall --purge --yes    — всё, включая токен и сам awg-bot
+    _purge=false; _yes=false
+    for _a in "${@:2}"; do
+      case "$_a" in
+        --purge|--full) _purge=true ;;
+        --yes|-y)       _yes=true ;;
+      esac
+    done
+    if $_yes; then
+      if $_purge; then bot_remove_files purge; else bot_remove_files remove; fi
       exit 0
     fi
     do_uninstall; exit 0 ;;
@@ -255,7 +437,7 @@ esac
 
 while true; do
   show_menu
-  read -rp "$(echo -e "${C}  Выбор [0-6]: ${N}")" CH
+  read -rp "$(echo -e "${C}  Выбор [0-7]: ${N}")" CH
   case "$CH" in
     1) do_reinstall ;;
     2) do_update ;;
@@ -263,6 +445,7 @@ while true; do
     4) do_status ;;
     5) do_logs ;;
     6) do_uninstall; exit 0 ;;
+    7) do_src_menu ;;
     0) exit 0 ;;
     *) warn "Неверный выбор" ;;
   esac
