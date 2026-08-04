@@ -1007,6 +1007,40 @@ async def cb_bot_uninstall_ok(cq: CallbackQuery) -> None:
     )
 
 
+@dp.callback_query(F.data == "bot_purge_confirm")
+async def cb_bot_purge_confirm(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    await safe_edit(cq,
+        "💀 <b>Удалить бота под корень?</b>\n\n"
+        "Дополнительно к обычному удалению будут снесены:\n"
+        "• токен в <code>/etc/awg-bot.conf</code>\n"
+        "• состояние мониторинга <code>/var/lib/awg-bot</code>\n"
+        "• сама команда <code>awg-bot</code>\n\n"
+        "Копия токена останется в <code>/root/awg_backup/</code>, но бот его "
+        "больше не читает — переустановка спросит токен заново.\n"
+        "Конфиг VPN и клиенты <b>не трогаются</b>.",
+        kb.confirm(yes_cb="bot_purge_ok", no_cb="botctl", danger=True))
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "bot_purge_ok")
+async def cb_bot_purge_ok(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    await cq.answer("Удаляю бота полностью…")
+    await safe_edit(cq,
+        "💀 Удаляю бота под корень…\n\nОтвечать он больше не будет. "
+        "Поставить заново: awg2 → пункт 6 → «Установить бота».", None)
+    # --purge добавляет к обычному удалению токен, /var/lib/awg-bot и сам
+    # management-скрипт. setsid — чтобы процесс пережил остановку нашего сервиса.
+    await asyncio.to_thread(
+        core.run,
+        ["bash", "-c",
+         "setsid awg-bot uninstall --purge --yes >/var/log/awg-bot-uninstall.log 2>&1 &"]
+    )
+
+
 @dp.callback_query(F.data == "backup")
 async def cb_backup_menu(cq: CallbackQuery) -> None:
     if not authorized(cq.from_user.id):

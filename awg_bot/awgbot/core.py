@@ -109,6 +109,8 @@ class ServerInfo:
     iface_up: bool = False
     profile: str = ""
     proto: str = ""            # версия протокола AmneziaWG: "2.0" или "3.0"
+    obf_level: int = 0         # 1 = без I1-I5, 2 = только I1, 3 = полный I1-I5
+    mimicry: str = ""          # профиль мимикрии сервера: tls/dns/sip/quic/none
     region: str = ""
     peers_count: int = 0
     extra: dict = field(default_factory=dict)
@@ -158,6 +160,15 @@ def get_server_info() -> ServerInfo:
     info.proto = m.group(1).strip() if m else "2.0"
     if m := re.search(r"^#\s*Region:\s*(.+)$", text, re.M):
         info.region = m.group(1).strip()
+    if m := re.search(r"^#\s*AWG_MIMICRY=(\S+)", text, re.M):
+        info.mimicry = m.group(1).strip()
+    if m := re.search(r"^#\s*AWG_OBF_LEVEL=(\d+)", text, re.M):
+        info.obf_level = int(m.group(1))
+    else:
+        # Сервер создан до появления маркера: смотрим, что получили уже
+        # выданные клиенты. Иначе бот выдаёт свой набор, не совпадающий с
+        # остальными конфигами того же сервера.
+        info.obf_level = _obf_level_from_clients()
 
     _, peers = _split_blocks(text)
     info.peers_count = len(peers)
@@ -166,6 +177,24 @@ def get_server_info() -> ServerInfo:
     info.iface_up = rc == 0 and bool(out.strip())
     info.public_ip = _public_ip_from_peers()
     return info
+
+
+def _obf_level_from_clients() -> int:
+    """
+    Уровень CPS по уже выданным клиентским конфигам: 3 — если есть I2..I5,
+    2 — если только I1, 0 — если конфигов нет (значит и судить не по чему).
+    """
+    best = 0
+    for f in Path(CLIENT_DIR).glob("*_awg2.conf"):
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        if re.search(r"^I[2-5]\s*=", text, re.M):
+            return 3
+        if re.search(r"^I1\s*=", text, re.M):
+            best = max(best, 2)
+    return best
 
 
 def _parse_runtime(peers: dict[str, Peer]) -> None:
@@ -483,19 +512,36 @@ def add_client(name: str, expires: int | None = None,
         f"MTU = {mtu}",
     ]
     cli_lines += awg_params
-    # I1-мимикрия по выбранному профилю (генерируется тем же кодом, что в awg2).
-    # I1 — клиентский параметр, в серверный конфиг не пишется.
+    # CPS-мимикрия по выбранному профилю (тем же генератором, что в awg2).
+    # I1-I5 — клиентские параметры, в серверный конфиг не пишутся.
+    #
+    # Сколько пакетов давать, решает сервер: на уровне 3 клиенту нужен полный
+    # I1-I5, иначе конфиг от бота отличается от выданных скриптом — раньше бот
+    # всегда клал один I1, и на сервере с полным CPS клиенты получали разное.
     note_profile = ""
     if profile and profile != "basic":
         from . import cps
-        i1 = cps.gen_i1(profile, domain)
-        if i1:
-            # не дублируем, если awg_params уже принёс I1 откуда-то
-            if not any(l.startswith("I1 ") or l.startswith("I1=") for l in cli_lines):
+        srv_level = get_server_info().obf_level
+        # уровень неизвестен (старый сервер без клиентов) — ведём себя как раньше
+        want_full = srv_level >= 3
+        already = any(l.startswith("I1 ") or l.startswith("I1=") for l in cli_lines)
+        if already:
+            pass  # I1 уже пришёл из серверного конфига — не дублируем
+        elif want_full:
+            packets = cps.gen_full(profile, domain)
+            if packets:
+                for n, pkt in enumerate(packets[:5], start=1):
+                    cli_lines.append(f"I{n} = {pkt}")
+                note_profile = f"{profile}, I1-I{min(len(packets), 5)}"
+            else:
+                note_profile = "basic (генерация I1-I5 не удалась)"
+        else:
+            i1 = cps.gen_i1(profile, domain)
+            if i1:
                 cli_lines.append(f"I1 = {i1}")
                 note_profile = profile
-        else:
-            note_profile = "basic (генерация I1 не удалась)"
+            else:
+                note_profile = "basic (генерация I1 не удалась)"
     cli_lines += [
         "",
         "[Peer]",

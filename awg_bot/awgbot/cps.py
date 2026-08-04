@@ -98,7 +98,11 @@ def gen_i1(profile: str, domain: str = "") -> str | None:
 
 
 def gen_full(profile: str, domain: str = "") -> list[str]:
-    """Полный набор I1..I5 (для будущего использования). Список строк."""
+    """
+    Полный набор I1..I5 одним вызовом генератора. Нужен для серверов уровня
+    «полный CPS»: клиент от бота должен получать столько же пакетов, сколько
+    выдаёт awg2, иначе конфиги одного сервера различаются.
+    """
     if profile == "basic" or profile not in PROFILES:
         return []
     code = _extract_generator()
