@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.6"
+VERSION="v0.7.7"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -1630,8 +1630,36 @@ awg_reboot_reason() {
     return 0
   fi
 
+  # Модуль на диске пересобран уже ПОСЛЕ того, как он был вставлен в текущее
+  # ядро (например, повторной установкой/пересборкой в рамках этой же сессии).
+  # dkms install кладёт новый .ko на диск, но в память ядра его никто не
+  # переподгружает — awg-quick up продолжает работать со старым модулем и
+  # падает на параметрах, которых старая версия не знает ("Invalid argument").
+  # Ловим это по времени: /sys/module/amneziawg появляется в момент insmod,
+  # а mtime файла .ko — в момент последней сборки/установки.
+  if awg_module_stale; then
+    echo "модуль amneziawg на диске новее, чем загруженный в ядро (пересобирался после загрузки)"
+    return 0
+  fi
+
   echo ""
   return 1
+}
+
+# Возвращает 0 (true), если файл .ko модуля amneziawg на диске новее момента
+# его последней загрузки в ядро — то есть в памяти сидит устаревшая версия.
+# Возвращает 1 (false), если сравнить не удалось или модуль актуален.
+awg_module_stale() {
+  [[ -d /sys/module/amneziawg ]] || return 1
+
+  local ko_path load_time mod_time
+  ko_path=$(modinfo -n amneziawg 2>/dev/null) || return 1
+  [[ -n "$ko_path" && -f "$ko_path" ]] || return 1
+
+  load_time=$(stat -c %Y /sys/module/amneziawg 2>/dev/null) || return 1
+  mod_time=$(stat -c %Y "$ko_path" 2>/dev/null) || return 1
+
+  (( mod_time > load_time ))
 }
 
 # Кто держит UDP-порт $1. Пустой вывод — держатель неизвестен (нет ss или
@@ -1679,8 +1707,14 @@ awg_diagnose_up_failure() {
     err "Ядро отвергло параметры интерфейса"
     if grep -qE '^(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts) ' "$conf" 2>/dev/null; then
       info "В конфиге параметры AWG 3.0, а загруженный модуль их не поддерживает"
-      info "Модуль в DKMS мог остаться от прошлой установки — пересобери его:"
-      info "  Сервер (1) → п.1 (переустановка компонентов)"
+      if awg_module_stale 2>/dev/null; then
+        info "На диске модуль новее того, что сейчас в памяти ядра — быстрее всего:"
+        info "  rmmod amneziawg && modprobe amneziawg"
+        info "Если rmmod не даёт (интерфейс занят): ip link delete dev awg0 ; затем rmmod"
+      else
+        info "Модуль в DKMS мог остаться от прошлой установки — пересобери его:"
+        info "  Сервер (1) → п.1 (переустановка компонентов)"
+      fi
       info "Либо верни сервер на 2.0: Сервер (1) → п.5 → выбрать AWG 2.0"
     else
       info "Проверь параметры обфускации в $conf (Jc/Jmin/Jmax, S1-S4, H1-H4)"
@@ -3739,8 +3773,8 @@ EOF
   if [[ -n "$_rb_reason" ]]; then
     hdr "⟳  Нужна перезагрузка"
     warn "Причина: $_rb_reason"
-    echo -e "  ${Y}Без неё awg0 может не подняться: модуль собран под другое ядро,${N}"
-    echo -e "  ${Y}чем то, которое сейчас работает.${N}"
+    echo -e "  ${Y}Без неё awg0 может не подняться: в памяти ядра сидит модуль,${N}"
+    echo -e "  ${Y}не совпадающий с тем, что сейчас на диске.${N}"
     echo ""
     info "После перезагрузки: awg2 → Сервер (1) → п.2 — Создать сервер"
     echo ""
@@ -3754,6 +3788,7 @@ EOF
       return 0
     fi
     warn "Перезагрузка отложена — если создание сервера упадёт, сделай reboot"
+    info "Быстрее без ребута: rmmod amneziawg && modprobe amneziawg"
   else
     hdr "⟳  Перезагрузка"
     ok "Не требуется: модуль загружен под текущее ядро $(uname -r)"
@@ -9097,6 +9132,7 @@ do_uninstall() {
   warn "Будет удалено:"
   echo -e "  ${R}—${N} Интерфейс awg0"
   echo -e "  ${R}—${N} Пакеты amneziawg, amneziawg-tools"
+  echo -e "  ${R}—${N} DKMS-модуль (dkms remove, /usr/src, /var/lib/dkms)"
   echo -e "  ${R}—${N} /etc/amnezia/amneziawg/"
   echo -e "  ${R}—${N} /root/*_awg2.conf"
   echo -e "  ${R}—${N} Автозапуск awg-quick@awg0"
@@ -9142,6 +9178,23 @@ do_uninstall() {
   rm -f "$NAT_PERSIST_SERVICE" "$NAT_PERSIST_SCRIPT" 2>/dev/null || true
   rm -f /etc/network/if-pre-up.d/iptables-nat 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
+
+  # Модуль ставится через git+DKMS, а не apt — apt-get remove его не видит.
+  # Без явного dkms remove в /var/lib/dkms и /usr/src остаётся старая сборка,
+  # и следующая установка молча переиспользует её ("already built, skip")
+  # вместо актуального кода из свежего git-клона.
+  trash "Удаляем DKMS-модуль..."
+  if command -v dkms &>/dev/null; then
+    local _dkms_ver
+    _dkms_ver=$(dkms status 2>/dev/null | grep -oP '^amneziawg/\K[0-9.]+' | head -1)
+    [[ -z "$_dkms_ver" ]] && _dkms_ver="1.0.0"
+    dkms remove -m amneziawg -v "$_dkms_ver" --all 2>/dev/null || true
+  fi
+  rmmod amneziawg 2>/dev/null || true
+  rm -rf /usr/src/amneziawg-* 2>/dev/null || true
+  rm -rf /var/lib/dkms/amneziawg 2>/dev/null || true
+  rm -rf /tmp/amneziawg-linux-kernel-module /tmp/amneziawg-tools 2>/dev/null || true
+  depmod -a 2>/dev/null || true
 
   trash "Удаляем пакеты..."
   apt-get remove -y -q amneziawg amneziawg-tools 2>/dev/null || true
