@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.7"
+VERSION="v0.7.8"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -230,6 +230,13 @@ WARP_HEALTH_LOG="/var/log/awg-warp-health.log"
 WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
 WARP_HEALTH_TIMER="/etc/systemd/system/awg-warp-healthcheck.timer"
 WARP_HEALTH_SERVICE="/etc/systemd/system/awg-warp-healthcheck.service"
+
+# warpscout (https://github.com/vernette/warpscout) — сканер эндпоинтов Cloudflare
+# WARP для бэкенда wg. Отдельный аккаунт от wgcf-account.toml выше — своя
+# регистрация в Cloudflare, не путать одно с другим.
+WARPSCOUT_BIN="/usr/local/bin/warpscout"
+WARPSCOUT_DIR="/etc/warpscout"
+WARPSCOUT_ACCOUNT="$WARPSCOUT_DIR/warpscout-account.json"
 
 # Шифрованный DNS (dnscrypt-proxy) — Туннели (5)
 # Используем системный сокет Debian/Ubuntu: 127.0.2.1:53 (socket activation)
@@ -7792,112 +7799,223 @@ _warp_down() {
   return 0
 }
 
-# Перебор Cloudflare endpoint'ов — для случаев когда стандартный 2408 блокируется DPI
-# (типично на РФ хостингах). Пробует разные порты на разных IP пока не найдёт рабочий.
-_warp_endpoint_finder() {
+# ── warpscout: сканер эндпоинтов Cloudflare WARP ──────────────────
+# Заменяет прежний перебор фиксированного списка IP:порт (проверка «пришли ли
+# байты» после ping) на настоящий сканер: реальный handshake на каждый
+# эндпоинт, определение видимой страны выхода (SEEN AS) и edge-узла Cloudflare
+# (NODE), с фильтрами по стране/узлу. https://github.com/vernette/warpscout
+
+_warpscout_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)  echo "amd64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    *) echo "" ;;
+  esac
+}
+
+# Ставит/обновляет warpscout через официальный install.sh проекта (сам
+# определяет ОС/архитектуру и качает нужный релиз с GitHub) — не дублируем
+# эту логику руками, чтобы не разойтись с апстримом при новых архитектурах.
+_warpscout_install_bin() {
+  if [[ -z "$(_warpscout_arch)" ]]; then
+    err "Архитектура $(uname -m) не поддерживается warpscout (нужна amd64 или arm64)"
+    return 1
+  fi
+
+  if command -v "$WARPSCOUT_BIN" &>/dev/null && "$WARPSCOUT_BIN" version &>/dev/null; then
+    info "warpscout уже установлен: $("$WARPSCOUT_BIN" version 2>/dev/null)"
+    return 0
+  fi
+
+  info "Ставлю warpscout в $WARPSCOUT_BIN..."
+  # INSTALL_DIR должен быть в окружении sh, а не curl — раздельные команды
+  # в пайпе не делят env между собой, поэтому переменную ставим перед всей
+  # конструкцией, а не префиксом к curl.
+  if ! (export INSTALL_DIR="$(dirname "$WARPSCOUT_BIN")"
+        curl -4 -fsSL --connect-timeout 10 --max-time 60 \
+          https://raw.githubusercontent.com/vernette/warpscout/master/install.sh \
+          | sh -s -- -y); then
+    err "Установка warpscout не удалась"
+    info "Вручную: curl -fsSL https://raw.githubusercontent.com/vernette/warpscout/master/install.sh | sh"
+    return 1
+  fi
+
+  if ! "$WARPSCOUT_BIN" version &>/dev/null; then
+    # install.sh мог всё же положить бинарь в свой собственный дефолт
+    # (например, если export не сработал в каком-то экзотическом shell) —
+    # прежде чем падать, поищем его по PATH и переиспользуем найденный путь.
+    local _found
+    _found=$(command -v warpscout 2>/dev/null || true)
+    if [[ -n "$_found" && "$_found" != "$WARPSCOUT_BIN" ]]; then
+      warn "Бинарь встал в $_found, а не в $WARPSCOUT_BIN — использую найденный путь"
+      WARPSCOUT_BIN="$_found"
+    fi
+  fi
+
+  if ! "$WARPSCOUT_BIN" version &>/dev/null; then
+    err "Бинарь warpscout не запускается после установки"
+    info "Проверь вручную: command -v warpscout && warpscout version"
+    return 1
+  fi
+  ok "warpscout установлен: $("$WARPSCOUT_BIN" version 2>/dev/null)"
+  return 0
+}
+
+# Отдельный WARP-аккаунт для сканера — не тот же, что wgcf-account.toml выше.
+_warpscout_register() {
+  mkdir -p "$WARPSCOUT_DIR" && chmod 700 "$WARPSCOUT_DIR"
+
+  if [[ -s "$WARPSCOUT_ACCOUNT" ]]; then
+    info "Аккаунт warpscout уже есть — регистрацию пропускаем"
+    chmod 600 "$WARPSCOUT_ACCOUNT" 2>/dev/null || true
+    return 0
+  fi
+
+  info "Регистрирую аккаунт warpscout в Cloudflare..."
+  if ! "$WARPSCOUT_BIN" register -a "$WARPSCOUT_ACCOUNT"; then
+    err "Регистрация warpscout не удалась"
+    return 1
+  fi
+  chmod 600 "$WARPSCOUT_ACCOUNT" 2>/dev/null || true
+  ok "Аккаунт создан: $WARPSCOUT_ACCOUNT"
+  return 0
+}
+
+# Убеждается, что бинарь и аккаунт на месте — ставит/регистрирует при
+# необходимости. Возврат 1 = продолжать нельзя, вызывающий должен выйти.
+_warpscout_ensure_ready() {
+  command -v "$WARPSCOUT_BIN" &>/dev/null || _warpscout_install_bin || return 1
+  [[ -s "$WARPSCOUT_ACCOUNT" ]] || _warpscout_register || return 1
+  return 0
+}
+
+# Применяет найденный warpscout'ом endpoint к живому warp0 + сохраняет
+# в профиль/конфиг, чтобы он пережил рестарт — тем же способом, что раньше
+# делал _warp_endpoint_finder.
+_warpscout_apply_endpoint() {
+  local found_endpoint="$1"
+  [[ -n "$found_endpoint" ]] || { err "Пустой endpoint — нечего применять"; return 1; }
+
+  if [[ -f "$WARP_PROFILE" ]]; then
+    sed -i "s|^Endpoint = .*|Endpoint = $found_endpoint|" "$WARP_PROFILE"
+  fi
+  if [[ -f "$WARP_CONF" ]]; then
+    sed -i "s|^Endpoint = .*|Endpoint = $found_endpoint|" "$WARP_CONF"
+  fi
+
+  if ip link show warp0 &>/dev/null; then
+    local peer_pub
+    peer_pub=$(wg show warp0 peers 2>/dev/null | head -1)
+    if [[ -n "$peer_pub" ]]; then
+      wg set warp0 peer "$peer_pub" endpoint "$found_endpoint" 2>/dev/null || true
+    fi
+  fi
+
+  ok "Endpoint применён: $found_endpoint"
+  info "Проверяем туннель..."
+  if timeout 5 ping -c 2 -W 2 -I warp0 1.1.1.1 &>/dev/null; then
+    ok "Туннель работает! Через Warp проходит трафик"
+  else
+    warn "Handshake есть, но ping ещё не идёт. Подожди 10-30 секунд, либо перезапусти (4 → 3)"
+  fi
+  return 0
+}
+
+# Режим 1: сканирует и сразу применяет лучший найденный endpoint (-best).
+_warpscout_scan_auto() {
+  _warpscout_ensure_ready || return 1
+
+  echo ""
+  hdr "🛰  warpscout — автовыбор лучшего endpoint"
+  echo ""
+  local _filters=()
+  local _country
+  read -rp "$(echo -e "${C}  Ограничить страной выхода (напр. DE,NL, Enter — без фильтра): ${N}")" _country
+  [[ -n "$_country" ]] && _filters+=(-country "$_country")
+
+  info "Сканирую (может занять минуту)..."
+  local best
+  best=$("$WARPSCOUT_BIN" scan -p awg -a "$WARPSCOUT_ACCOUNT" -best "${_filters[@]}" 2>/dev/null)
+  if [[ -z "$best" ]]; then
+    err "Ни один endpoint не прошёл сканирование"
+    warn "Скорее всего провайдер блокирует UDP-трафик к Cloudflare, либо фильтр отсёк всё"
+    info "Попробуй без фильтра по стране, либо: п.4 — выключить Warp"
+    return 1
+  fi
+
+  ok "Лучший endpoint: $best"
+  _warpscout_apply_endpoint "$best"
+}
+
+# Режим 2: показывает таблицу всех рабочих endpoint'ов, даёт выбрать вручную.
+_warpscout_scan_manual() {
+  _warpscout_ensure_ready || return 1
+
+  echo ""
+  hdr "🛰  warpscout — сканирование, ручной выбор"
+  echo ""
+  info "Сканирую (может занять минуту)..."
+  echo ""
+
+  local report
+  report=$(mktemp) || return 1
+  if ! "$WARPSCOUT_BIN" scan -p awg -a "$WARPSCOUT_ACCOUNT" -plain -o "$report" 2>/dev/null; then
+    err "Сканирование не удалось"
+    rm -f "$report"
+    return 1
+  fi
+
+  # Живой построчный вывод -plain уже показан на экране самим warpscout;
+  # из файла отчёта строим нумерованный список ip:port для выбора.
+  mapfile -t _lines < <(grep -oE '[0-9.]+:[0-9]+' "$report" | sort -u)
+  rm -f "$report"
+
+  if [[ ${#_lines[@]} -eq 0 ]]; then
+    err "В отчёте нет рабочих endpoint'ов"
+    return 1
+  fi
+
+  echo ""
+  hdr "Рабочие endpoint'ы"
+  local i
+  for i in "${!_lines[@]}"; do
+    printf "  %2d) %s\n" "$((i+1))" "${_lines[$i]}"
+  done
+  echo ""
+
+  local _sel
+  read -rp "$(echo -e "${C}  Выбор [1-${#_lines[@]}, 0 — отмена]: ${N}")" _sel
+  [[ "$_sel" == "0" || -z "$_sel" ]] && { info "Отменено"; return 0; }
+  if ! [[ "$_sel" =~ ^[0-9]+$ ]] || (( _sel < 1 || _sel > ${#_lines[@]} )); then
+    err "Неверный выбор"
+    return 1
+  fi
+
+  _warpscout_apply_endpoint "${_lines[$((_sel-1))]}"
+}
+
+# Подменю: выбор между автовыбором и ручным выбором из таблицы.
+_warpscout_endpoint_finder() {
   if ! ip link show warp0 &>/dev/null; then
     err "warp0 не активен — сначала включи туннель (пункт 3)"
     return 1
   fi
 
-  # Pubkey peer'а для wg set
-  local peer_pub
-  peer_pub=$(wg show warp0 peers 2>/dev/null | head -1)
-  if [[ -z "$peer_pub" ]]; then
-    err "Не могу получить pubkey peer'а из warp0"
-    return 1
-  fi
-
   echo ""
-  hdr "🔍  Поиск рабочего Cloudflare endpoint"
+  hdr "🔍  Поиск рабочего Cloudflare endpoint (warpscout)"
   echo ""
-  echo -e "  Если стандартный 2408 не работает — пробуем альтернативы."
-  echo -e "  ${D}Список из NTC.party — портов которые иногда проходят через DPI${N}"
+  echo -e "  1) Автовыбор  ${D}— найти лучший и сразу применить${N}"
+  echo -e "  2) Вручную    ${D}— показать таблицу, выбрать самому${N}"
+  echo -e "  0) Отмена"
   echo ""
-
-  # Топ-портов которые часто работают (взято из NTC.party и обсуждений)
-  local TOP_PORTS=(2408 1701 4500 500 1002 854 859 894 955 7156 7281 891 943 4198 8854)
-  # IP блоки Cloudflare Warp (только начало диапазонов 162.159.192.x и 195.x)
-  local TOP_IPS=(162.159.192.1 162.159.193.10 162.159.195.1 162.159.192.10 162.159.192.5 162.159.195.5)
-
-  local found_endpoint=""
-  local attempts=0
-  local max_attempts=30
-
-  echo -e "  Начинаю перебор (макс $max_attempts попыток)..."
-  echo ""
-
-  for ip in "${TOP_IPS[@]}"; do
-    for port in "${TOP_PORTS[@]}"; do
-      attempts=$((attempts+1))
-      [[ $attempts -gt $max_attempts ]] && break 2
-
-      local endpoint="${ip}:${port}"
-      printf "  [%2d/%d] %-26s ... " "$attempts" "$max_attempts" "$endpoint"
-
-      # Меняем endpoint
-      wg set warp0 peer "$peer_pub" endpoint "$endpoint" 2>/dev/null || {
-        echo -e "${R}set fail${N}"
-        continue
-      }
-
-      # Сбрасываем счётчик received (узнаем стартовое значение)
-      local rx_before
-      rx_before=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}' | head -1 || echo "0")
-
-      # Триггерим handshake — отправляем 1 ping чтобы wireguard попытался connect
-      timeout 1 ping -c 1 -W 1 -I warp0 1.1.1.1 &>/dev/null || true
-
-      # Ждём 4 секунды для handshake
-      sleep 4
-
-      # Проверяем — есть ли новые байты в received
-      local rx_after
-      rx_after=$(wg show warp0 transfer 2>/dev/null | awk '{print $2}' | head -1 || echo "0")
-
-      if [[ "$rx_after" -gt "$rx_before" ]]; then
-        echo -e "${G}✓ работает!${N} (received: $rx_after)"
-        found_endpoint="$endpoint"
-        break 2
-      else
-        echo -e "${D}нет ответа${N}"
-      fi
-    done
-  done
-
-  echo ""
-  if [[ -n "$found_endpoint" ]]; then
-    ok "Найден рабочий endpoint: $found_endpoint"
-    echo ""
-    info "Сохраняю в state и в профиль..."
-
-    # Обновляем wgcf-profile.conf чтобы при следующем рестарте использовался этот endpoint
-    if [[ -f "$WARP_PROFILE" ]]; then
-      sed -i "s|^Endpoint = .*|Endpoint = $found_endpoint|" "$WARP_PROFILE"
-    fi
-    if [[ -f "$WARP_CONF" ]]; then
-      sed -i "s|^Endpoint = .*|Endpoint = $found_endpoint|" "$WARP_CONF"
-    fi
-
-    # Делаем ping для проверки реальной связности
-    info "Проверяем туннель..."
-    if timeout 5 ping -c 2 -W 2 -I warp0 1.1.1.1 &>/dev/null; then
-      ok "Туннель работает! Через Warp проходит трафик"
-    else
-      warn "Handshake есть, но ping ещё не идёт. Подожди 10-30 секунд"
-    fi
-  else
-    err "Ни один endpoint не ответил за $attempts попыток"
-    echo ""
-    warn "Скорее всего твой провайдер ($(curl -s ipinfo.io/org 2>/dev/null || echo 'хостер')) блокирует UDP-трафик к Cloudflare"
-    echo ""
-    info "Рекомендации:"
-    info "  • Сменить хостинг (российские VPS часто блокируют Cloudflare)"
-    info "  • Использовать AWG без Warp (пункт 4 — выключить Warp)"
-    info "  • Попробовать MASQUE-клиент (usque) — он ходит через 443/HTTPS"
-  fi
-
-  return 0
+  local _mode
+  read -rp "$(echo -e "${C}  Выбор [0-2]: ${N}")" _mode
+  case "$_mode" in
+    1) _warpscout_scan_auto ;;
+    2) _warpscout_scan_manual ;;
+    0|"") info "Отменено"; return 0 ;;
+    *) warn "Неверный выбор"; return 1 ;;
+  esac
 }
 
 
@@ -8177,7 +8295,7 @@ do_warp_menu() {
     echo -e "  ${C}7) Health-check (вкл/выкл авто-failover)${N}"
     if [[ "$_be" == "wg" ]]; then
       echo -e "  ${C}8) Импорт wgcf-profile.conf (если регистрация не работает)${N}"
-      echo -e "  ${C}9) Поиск рабочего endpoint (если 2408 заблокирован DPI)${N}"
+      echo -e "  ${C}9) Поиск рабочего endpoint (warpscout)${N}"
     else
       echo -e "  ${D}8) Импорт wgcf-profile.conf (только для бэкенда wg)${N}"
       echo -e "  ${D}9) Поиск рабочего endpoint (только для бэкенда wg)${N}"
@@ -8238,7 +8356,7 @@ do_warp_menu() {
         else warn "Импорт wgcf-profile.conf применим только к бэкенду wg"; fi
         read -rp "Enter..." ;;
       9)
-        if [[ "$_be" == "wg" ]]; then _warp_endpoint_finder
+        if [[ "$_be" == "wg" ]]; then _warpscout_endpoint_finder
         else warn "Поиск endpoint применим только к бэкенду wg"; fi
         read -rp "Enter..." ;;
       b|B) do_warp_backend_menu || true ;;
