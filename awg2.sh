@@ -1,8 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.9"
-UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
+VERSION="v0.7.10"
+UPDATE_URL="https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Цвета ──────────────────────────────────────────────────
@@ -2807,7 +2807,7 @@ show_submenu_5() {
 
 # ── Подменю 6: Telegram-бот ────────────────────────────
 show_submenu_6() {
-  local BOT_INSTALL_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh"
+  local BOT_INSTALL_URL="https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg-bot-install.sh"
   local BOT_PY="/usr/local/bin/awg-bot.py"
 
   while true; do

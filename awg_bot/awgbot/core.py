@@ -773,7 +773,7 @@ def fmt_uptime(seconds: int) -> str:
 
 
 # ───────────────────────── версии (бот и awg2) ─────────────────────────
-REPO_RAW = "https://raw.githubusercontent.com/pumbaX/awg-multi-script/main"
+REPO_RAW = "https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main"
 AWG2_BIN_PATH = "/usr/local/bin/awg2"
 
 

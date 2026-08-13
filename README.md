@@ -24,7 +24,7 @@
 ## Быстрый старт
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
+sudo curl -fsSL https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
 ```
 
 Запуск в любой момент:
@@ -199,7 +199,7 @@ d) Удалить Warp полностью
 Или вручную:
 
 ```bash
-sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
+sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
 ```
 
 В процессе установщик спросит:

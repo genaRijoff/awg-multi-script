@@ -3,7 +3,7 @@
 #
 # Этот файл лежит в КОРНЕ репозитория awg-multi-script и качается самим awg2
 # (пункт 6 → «Установить/Переустановить бота») по URL:
-#   https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh
+#   https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg-bot-install.sh
 #
 # Запускается в терминале awg2 (read работает), от root. Делает:
 #   1. клонирует репо, берёт код бота из подпапки awg_bot/
@@ -13,7 +13,7 @@
 #      (awg2 проверяет именно его, чтобы показать «бот установлен»)
 set -euo pipefail
 
-REPO_URL="https://github.com/pumbaX/awg-multi-script"
+REPO_URL="https://github.com/genaRijoff/awg-multi-script"
 REPO_SUBDIR="awg_bot"
 DEST="/opt/awg-bot"
 CONF="/etc/awg-bot.conf"
