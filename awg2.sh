@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.8"
+VERSION="v0.7.9"
 UPDATE_URL="https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
@@ -518,6 +518,11 @@ select_random_domain() {
 # [PATCHED v3] TLS+QUIC из payloadGen: GREASE, Chrome-fingerprint, реальное
 # шифрование QUIC (RFC9001+fallback), лёгкий TLS-паддинг (доставка I5),
 # --only-i1 распознаётся в любой позиции argv. Контракт вывода не изменён.
+#
+# CPS_GENERATOR_BEGIN v1 — якорь для awg_bot/awgbot/cps.py: бот вырезает тело
+# генератора из установленного awg2, чтобы не дублировать криптологику у себя.
+# Маркеры BEGIN/END не удалять и не переименовывать; при несовместимом
+# изменении контракта вывода поднимать номер версии в обоих маркерах.
 _CPS_GENERATOR='
 import sys, secrets, struct, random, signal
 try:
@@ -526,6 +531,15 @@ except Exception:
     pass
 
 # == Utilities ==
+_WARNED = set()
+def _warn_once(msg):
+    # Один и тот же дефект не должен засорять вывод: генератор строит до 5
+    # пакетов за запуск, а причина деградации у них общая.
+    if msg in _WARNED:
+        return
+    _WARNED.add(msg)
+    sys.stderr.write("[CPS] WARN: %s\n" % msg)
+
 def rh(n):  return secrets.token_bytes(n)
 def ri(a, b):
     if a > b: a, b = b, a
@@ -715,6 +729,9 @@ def _try_quic_encrypt(dcid, header_wo_pn, pn, pn_len, payload):
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
         import hmac as _hmac, hashlib as _hashlib
     except Exception:
+        _warn_once("нет python3-cryptography — QUIC Initial уйдёт БЕЗ шифрования "
+                   "(payload не похож на шифротекст, DPI отличит от Chrome). "
+                   "Ставится так: apt-get install -y python3-cryptography")
         return None
     try:
         INITIAL_SALT = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
@@ -744,7 +761,9 @@ def _try_quic_encrypt(dcid, header_wo_pn, pn, pn_len, payload):
         first = header_wo_pn[0] ^ (mask[0] & 0x0f)
         prot_pn = bytes(pn[i] ^ mask[1 + i] for i in range(pn_len))
         return bytes([first]) + header_wo_pn[1:] + prot_pn + ct
-    except Exception:
+    except Exception as e:
+        _warn_once("сбой QUIC-шифрования (%s: %s) — Initial уйдёт БЕЗ шифрования, "
+                   "мимикрия слабее" % (type(e).__name__, e))
         return None
 
 def gen_quic_initial(domain=None):
@@ -884,6 +903,7 @@ else:  # quic
         for _ in range(3):
             print(to_cps(gen_quic_short()))
 '
+# CPS_GENERATOR_END v1
 
 
 # Генерация I1-I5 через Python
@@ -898,10 +918,11 @@ gen_cps_i1() {
 
 # Алгоритм:
 # 1. Профиль 1-4: выбираем домен из пула через scan_pool → select_random_domain
-#    Fallback-каскад: если целевой пул пуст → пробуем следующий → ... → none
-#    Порядок fallback: tls → dtls → sip → none (профиль 1),
-#                       dtls → tls → sip → none (профиль 2),
-#                       sip → tls → dtls → none (профиль 3)
+#    Fallback при пустом пуле: домен НЕ подменяется на другой профиль — в
+#    генератор уходит пустая строка, и он берёт случайный домен из своего
+#    встроенного DOMAIN_POOL. Профиль мимикрии (tls/dtls/sip/quic) при этом
+#    сохраняется: смена профиля из-за недоступности пула поменяла бы сигнатуру
+#    на протокол, который пользователь не выбирал.
 # 2. Профиль 5: ручной ввод домена + выбор CPS-профиля (tls/dtls/sip/dns)
 # 3. OBF_LEVEL=1 отключает мимикрию (I1="", MIMICRY_PROFILE="none")
 #
@@ -6059,7 +6080,11 @@ USQUE_DOWN_HOOK="$USQUE_DIR/on-disconnect.sh"
 USQUE_SERVICE="/etc/systemd/system/awg-usque.service"
 USQUE_SYSCTL="/etc/sysctl.d/99-awg-usque.conf"
 USQUE_LOG="/var/log/awg-usque.log"
-USQUE_FALLBACK_VER="4.2.1"   # если GitHub API недоступен
+# Версия на случай недоступного GitHub API. Сверена с последним релизом
+# Diniboy1123/usque 2026-08-13. Проверять при каждом релизе awg2:
+#   curl -s https://api.github.com/repos/Diniboy1123/usque/releases/latest | jq -r .tag_name
+# Протухшее значение здесь не ломает установку сразу, но тянет старый бинарь.
+USQUE_FALLBACK_VER="4.2.1"
 
 warp_usque_iface() { echo "$WARP_IFACE_NAME"; }
 
