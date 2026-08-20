@@ -32,6 +32,8 @@ sudo curl -fsSL https://raw.githubusercontent.com/genaRijoff/awg-multi-script/ma
 sudo awg2
 ```
 
+История версий — [CHANGELOG.md](CHANGELOG.md).
+
 ### Канал обновлений
 
 По умолчанию скрипт обновляется из основного репозитория (`pumbaX/awg-multi-script`) —
