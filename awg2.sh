@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.16"
+VERSION="v0.7.17"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -1315,7 +1315,7 @@ choose_obf_level() {
   echo ""
   hdr "⛊  Уровень обфускации"
   echo -e "  ${G}3${N}  + I1-I5 полный CPS chain ${C}(рекомендуется)${N}"
-  echo -e "     ${D}Максимум DPI bypass. QR не влезет — конфиг раздаётся текстом.${N}"
+  echo -e "     ${D}Максимум DPI bypass. Конфиг длинный — в QR может не влезть.${N}"
   echo -e "  ${D}2   + I1 — добавляет 1 сигнатурный пакет${N}"
   echo -e "     ${D}I1 = снимок реального TLS/QUIC/DTLS протокола${N}"
   echo -e "  ${D}1   Базовый — H ranges + S1-S4 + Jc junk, без I1-I5${N}"
@@ -3979,42 +3979,48 @@ _apply_config() {
   awg-quick up "$SERVER_CONF" 2>/dev/null
 }
 
-# Стратегия:
-#   - Конфиг БЕЗ I1-I5 → QR код (компактный, влезает)
-#   - Конфиг С I1-I5 → только текст конфига (QR не делаем — слишком большой)
+# Выдаёт готовый конфиг. $1 = файл, $2 = "qr" — показать QR вместо текста.
+#
+# По умолчанию печатается ТЕКСТ: после создания клиента нужен именно он —
+# скопировать, положить в файл, отправить. QR остаётся отдельным осознанным
+# действием (Клиенты → «Показать QR клиента»), а не тем, что заслоняет собой
+# конфиг в половине случаев.
 _share_config() {
-  local conf_file="$1"
+  local conf_file="$1" mode="${2:-text}"
   [[ -f "$conf_file" ]] || return 1
 
-  # Проверяем наличие I1-I5 в конфиге и общий размер
-  local has_i1 conf_size
-  has_i1=$(grep -cE "^I[1-5] = " "$conf_file" 2>/dev/null || echo 0)
+  local conf_size
   conf_size=$(wc -c < "$conf_file")
 
-  # QR лимит (с запасом) ~2800 байт
-  local qr_fits=1
-  [[ "$conf_size" -gt 2800 ]] && qr_fits=0
-
-  if [[ "$qr_fits" -eq 1 ]] && command -v qrencode &>/dev/null; then
-    # Влезает в QR
+  if [[ "$mode" == "qr" ]]; then
+    # QR-лимит (с запасом) ~2800 байт: выше начинается версия символа, которую
+    # камеры телефонов уже не берут с экрана терминала.
+    if [[ "$conf_size" -le 2800 ]] && command -v qrencode &>/dev/null; then
+      echo ""
+      qrencode -t ansiutf8 -s 1 -m 1 < "$conf_file"
+      echo -e "${D}  ↑ QR-код конфига (${conf_size} байт) — сканируй в AmneziaVPN${N}"
+      return 0
+    fi
     echo ""
-    qrencode -t ansiutf8 -s 1 -m 1 < "$conf_file"
-    echo -e "${D}  ↑ QR-код конфига (${conf_size} байт) — сканируй в AmneziaVPN${N}"
-  else
-    # Большой конфиг → только текст
-    echo ""
-    echo -e "${Y}  ──────────────────────────────────────────────${N}"
-    echo -e "${W}  ≡ Текст конфига (сохрани как client.conf):${N}"
-    echo -e "${Y}  ──────────────────────────────────────────────${N}"
-    echo ""
-    cat "$conf_file"
-    echo ""
-    echo -e "${Y}  ──────────────────────────────────────────────${N}"
-    echo -e "${D}  (QR не показан: конфиг ${conf_size} байт > 2800 лимит)${N}"
-    if [[ "$has_i1" -gt 0 ]]; then
-      echo -e "${D}  Используй DNS или SIP профиль — у них I1 значительно меньше${N}"
+    if ! command -v qrencode &>/dev/null; then
+      warn "qrencode не установлен — показываю текст конфига"
+    else
+      warn "Конфиг ${conf_size} байт > 2800 — в читаемый QR не влезет, показываю текст"
+      local has_i1
+      has_i1=$(grep -cE "^I[1-5] = " "$conf_file" 2>/dev/null || echo 0)
+      [[ "$has_i1" -gt 0 ]] && \
+        info "Уменьшить: профиль DNS или уровень «+I1» — цепочка станет короче"
     fi
   fi
+
+  echo ""
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
+  echo -e "${W}  ≡ Текст конфига (сохрани как client.conf):${N}"
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
+  echo ""
+  cat "$conf_file"
+  echo ""
+  echo -e "${Y}  ──────────────────────────────────────────────${N}"
 }
 
 # Удаляет остатки APT-репозиториев от версий, когда установка шла через PPA.
@@ -5583,7 +5589,7 @@ do_add_client() {
     fi
   fi
 
-  # Раздача конфига (QR без I1-I5 или текст)
+  # Выдаём текст конфига; QR — отдельным пунктом меню, если понадобится
   _share_config "$client_file"
 
   echo ""
@@ -6265,7 +6271,8 @@ do_show_qr() {
   local chosen="${unique[$((QR_CHOICE - 1))]}"
   [[ -f "$chosen" ]] || { warn "Файл не найден"; return 0; }
 
-  _share_config "$chosen"
+  # Пункт меню «Показать QR» — единственное место, где QR запрашивают явно
+  _share_config "$chosen" qr
   echo ""
   echo -e "${D}  Конфиг: $chosen${N}"
 }
