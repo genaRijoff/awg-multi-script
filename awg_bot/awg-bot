@@ -3,13 +3,13 @@
 # Ставится в /usr/local/bin/awg-bot. Запуск: sudo awg-bot
 set -euo pipefail
 
-VERSION="2.1.2"
+VERSION="2.1.3"
 
 # ── откуда тянуть обновления (по аналогии с awg2 UPDATE_URL) ──
 # Можно переопределить в /etc/awg-bot.conf строкой:  REPO_URL=https://github.com/USER/REPO
 # Код бота лежит в подпапке awg_bot репозитория awg-multi-script
 # (там же, где сам awg2.sh). Структура подпапки: awgbot/, run.py, requirements.txt, ...
-DEFAULT_REPO_URL="https://github.com/genaRijoff/awg-multi-script"
+DEFAULT_REPO_URL="https://github.com/pumbaX/awg-multi-script"
 # Подпапка с кодом бота внутри репо (пусто = корень репо).
 # Переопределяется строкой REPO_SUBDIR=... в /etc/awg-bot.conf
 DEFAULT_REPO_SUBDIR="awg_bot"

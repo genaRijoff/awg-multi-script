@@ -24,13 +24,26 @@
 ## Быстрый старт
 
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
+sudo curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg2.sh -o /usr/local/bin/awg2 && sudo chmod +x /usr/local/bin/awg2 && sudo awg2
 ```
 
 Запуск в любой момент:
 ```bash
 sudo awg2
 ```
+
+### Канал обновлений
+
+По умолчанию скрипт обновляется из основного репозитория (`pumbaX/awg-multi-script`) —
+это стабильный канал. Ранние сборки живут в бета-репозитории
+(`genaRijoff/awg-multi-script`): `sudo awg2` → **8) Обновить скрипт** → **2) Переключиться
+на бета-канал**. Выбор сохраняется в `/var/lib/awg2/channel` и переживает обновление;
+вернуться на стабильный канал можно там же (если бета-версия окажется новее, обновление
+предложит откат). Разовый запуск на бета-канале без сохранения:
+`AWG2_UPDATE_CHANNEL=beta sudo -E awg2`.
+
+Канал влияет и на Telegram-бота: установка из пункта 6 берёт его код из того же
+репозитория.
 
 --- 
 ## ☁ Warp туннель Cloudflare
@@ -199,7 +212,7 @@ d) Удалить Warp полностью
 Или вручную:
 
 ```bash
-sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
+sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-script/main/awg-bot-install.sh -o /tmp/awg-bot-install.sh && bash /tmp/awg-bot-install.sh'
 ```
 
 В процессе установщик спросит:

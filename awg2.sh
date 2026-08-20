@@ -1,9 +1,69 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.10"
-UPDATE_URL="https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg2.sh"
+VERSION="v0.7.11"
 SCRIPT_PATH="/usr/local/bin/awg2"
+
+# ── Канал обновлений ───────────────────────────────────────
+# stable — основной репозиторий проекта, оттуда обновляются все по умолчанию.
+# beta   — репозиторий с ранними сборками: правки приезжают туда раньше и могут
+#          быть сырыми. Переключается в меню «Обновить скрипт» (пункт 8).
+# Выбор хранится в файле, чтобы переживать перезапуск и само обновление.
+UPDATE_REPO_STABLE="pumbaX/awg-multi-script"
+UPDATE_REPO_BETA="genaRijoff/awg-multi-script"
+UPDATE_CHANNEL_FILE="/var/lib/awg2/channel"
+
+# Кэш фоновой проверки версии — свой у каждого канала. Общий кэш после
+# переключения сравнивал бы текущую версию с версией чужого репозитория
+# (см. update_check_async).
+UPDATE_CACHE_STABLE="/var/lib/awg2/update_check"
+UPDATE_CACHE_BETA="/var/lib/awg2/update_check.beta"
+
+# Выставляет UPDATE_CHANNEL и все производные от него URL. Единственное место,
+# где собираются адреса репозитория, — менять источник надо здесь.
+update_channel_apply() {
+  case "${1:-stable}" in
+    beta)
+      UPDATE_CHANNEL="beta"
+      UPDATE_REPO="$UPDATE_REPO_BETA"
+      UPDATE_CACHE="$UPDATE_CACHE_BETA"
+      ;;
+    *)
+      UPDATE_CHANNEL="stable"
+      UPDATE_REPO="$UPDATE_REPO_STABLE"
+      UPDATE_CACHE="$UPDATE_CACHE_STABLE"
+      ;;
+  esac
+  UPDATE_REPO_GIT="https://github.com/${UPDATE_REPO}"
+  UPDATE_URL="https://raw.githubusercontent.com/${UPDATE_REPO}/main/awg2.sh"
+  BOT_INSTALL_URL="https://raw.githubusercontent.com/${UPDATE_REPO}/main/awg-bot-install.sh"
+}
+
+# Читает сохранённый канал. Любое неизвестное/битое значение — stable.
+update_channel_read() {
+  local ch=""
+  if [[ -f "$UPDATE_CHANNEL_FILE" ]]; then
+    ch=$(tr -d '[:space:]' < "$UPDATE_CHANNEL_FILE" 2>/dev/null || true)
+  fi
+  [[ "$ch" == "beta" ]] && echo "beta" || echo "stable"
+}
+
+# Сохраняет канал на диск и сразу применяет его в текущем процессе.
+update_channel_set() {
+  local ch="$1"
+  [[ "$ch" == "beta" || "$ch" == "stable" ]] || return 1
+  mkdir -p "$(dirname "$UPDATE_CHANNEL_FILE")" 2>/dev/null || return 1
+  printf '%s\n' "$ch" > "$UPDATE_CHANNEL_FILE" 2>/dev/null || return 1
+  update_channel_apply "$ch"
+}
+
+# Человекочитаемое имя канала для меню и шапки.
+update_channel_label() {
+  [[ "${1:-$UPDATE_CHANNEL}" == "beta" ]] && echo "бета" || echo "стабильный"
+}
+
+# AWG2_UPDATE_CHANNEL=beta — разовый запуск на другом канале, без записи файла.
+update_channel_apply "${AWG2_UPDATE_CHANNEL:-$(update_channel_read)}"
 
 # ── Цвета ──────────────────────────────────────────────────
 # shellcheck disable=SC2034  # цветовая палитра — часть публичного API функций
@@ -2202,7 +2262,8 @@ ver_num() {
 # Про релизы узнавали только из телеграма. Теперь скрипт сам раз в 6 часов
 # смотрит версию на GitHub — в фоне, чтобы запуск не ждал сеть, — и кладёт
 # ответ в кэш. Шапка читает кэш, никуда не обращаясь.
-UPDATE_CACHE="/var/lib/awg2/update_check"   # "<версия> <unixtime>"
+# UPDATE_CACHE ("<версия> <unixtime>") задаётся update_channel_apply в шапке —
+# у каждого канала обновлений свой файл кэша.
 UPDATE_CHECK_TTL=21600                      # 6 часов
 
 update_check_async() {
@@ -2338,6 +2399,7 @@ do_self_update() {
     return 1
   fi
 
+  info "Канал: $(update_channel_label) ${D}(${UPDATE_REPO})${N}"
   info "URL: $UPDATE_URL"
   info "Файл: $target"
   echo ""
@@ -2441,8 +2503,6 @@ do_self_update() {
     if cmp -s "$target" "$tmp_file"; then
       ok "У тебя уже последняя версия ($VERSION) — обновление не требуется"
       rm -f "$tmp_file"
-      echo ""
-      read -rp "$(echo -e "${D}  Нажми Enter для возврата в меню...${N}")" _ || true
       return 0
     fi
     info "Версия совпадает, но содержимое отличается (обновление через git без bump VERSION?)"
@@ -2558,12 +2618,15 @@ show_header() {
   fi
 
   # Бейдж новой версии — из кэша, без обращения к сети (см. update_check_async)
-  local _upd _ver_line
+  local _upd _ver_line _ch_badge=""
+  # На бета-канале это должно быть видно с первого экрана — иначе непонятно,
+  # откуда приехала версия, которой нет у остальных.
+  [[ "$UPDATE_CHANNEL" == "beta" ]] && _ch_badge=" ${Y}[beta]${N}"
   _upd=$(update_available || true)
   if [[ -n "$_upd" ]]; then
-    _ver_line="  ${W}AwgToolza $VERSION${N}   ${G}⬆ есть $_upd${N} ${D}— пункт 8${N}"
+    _ver_line="  ${W}AwgToolza $VERSION${N}${_ch_badge}   ${G}⬆ есть $_upd${N} ${D}— пункт 8${N}"
   else
-    _ver_line="  ${W}AwgToolza $VERSION${N}"
+    _ver_line="  ${W}AwgToolza $VERSION${N}${_ch_badge}"
   fi
 
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
@@ -2595,7 +2658,11 @@ show_menu() {
   echo -e "  ${C}5)${N}  Туннели и DNS   ${D}— Warp, DNS, каскад${N}"
   echo -e "  ${C}6)${N}  Telegram-бот    ${D}— управление ботом${N}"
   echo -e "  ${R}7)${N}  Удаление и сброс ${D}—  вроде понятно${N}"
-  echo -e "  ${M}8)${N}  Обновить скрипт  ${D}— загрузить с GitHub${N}"
+  if [[ "$UPDATE_CHANNEL" == "beta" ]]; then
+    echo -e "  ${M}8)${N}  Обновить скрипт  ${D}— GitHub, канал:${N} ${Y}бета${N}"
+  else
+    echo -e "  ${M}8)${N}  Обновить скрипт  ${D}— загрузить с GitHub${N}"
+  fi
   echo ""
   echo -e "  ${W}0)${N}  Выход"
   echo ""
@@ -2807,7 +2874,7 @@ show_submenu_5() {
 
 # ── Подменю 6: Telegram-бот ────────────────────────────
 show_submenu_6() {
-  local BOT_INSTALL_URL="https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main/awg-bot-install.sh"
+  # BOT_INSTALL_URL — глобальный, зависит от канала обновлений (см. шапку)
   local BOT_PY="/usr/local/bin/awg-bot.py"
 
   while true; do
@@ -2887,9 +2954,12 @@ show_submenu_6() {
               fi
             fi
           else
-            info "Скачиваю и запускаю установщик бота..."
+            info "Скачиваю и запускаю установщик бота... ${D}(канал: $(update_channel_label))${N}"
             if curl -fsSL "$BOT_INSTALL_URL" -o /tmp/awg-bot-install.sh; then
-              bash /tmp/awg-bot-install.sh || warn "Установщик завершился с ошибкой"
+              # Код бота берём из того же репозитория, что и сам скрипт: иначе на
+              # бета-канале бот приедет из стабильного репо и разъедется с awg2.
+              AWG_REPO_URL="$UPDATE_REPO_GIT" bash /tmp/awg-bot-install.sh || \
+                warn "Установщик завершился с ошибкой"
               rm -f /tmp/awg-bot-install.sh 2>/dev/null || true
             else
               err "Не удалось скачать установщик с GitHub"
@@ -2968,6 +3038,88 @@ show_submenu_7() {
     case "${SUB_CHOICE:-}" in
       1) do_clean_clients || true ;;
       2) do_uninstall || true ;;
+      0|"") return 0 ;;
+      *) warn "Неверный выбор" ;;
+    esac
+    echo ""
+    read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
+  done
+}
+
+# ── Подменю 8: Обновление скрипта ──────────────────────
+# Раньше пункт 8 сразу качал обновление. Теперь здесь же переключается канал
+# источника — чтобы не плодить пункты в главном меню.
+do_switch_update_channel() {
+  local target label
+  if [[ "$UPDATE_CHANNEL" == "beta" ]]; then target="stable"; else target="beta"; fi
+  label=$(update_channel_label "$target")
+
+  echo ""
+  if [[ "$target" == "beta" ]]; then
+    warn "Бета-канал — ранние сборки из ${UPDATE_REPO_BETA}"
+    warn "Они не проходят полный цикл проверки: на боевом сервере — на свой риск"
+    echo ""
+    if ! read_confirm "$(echo -e "${Y}  Переключиться на бета-канал? (введи yes): ${N}")"; then
+      info "Отменено — канал прежний ($(update_channel_label))"
+      return 0
+    fi
+  else
+    local _yn
+    read_yesno _yn "$(echo -e "${C}  Вернуться на стабильный канал? [Y/n]: ${N}")" "y"
+    if [[ ! "$_yn" =~ ^[Yy]$ ]]; then
+      info "Отменено — канал прежний ($(update_channel_label))"
+      return 0
+    fi
+  fi
+
+  if update_channel_set "$target"; then
+    ok "Канал обновлений: ${label} ${D}(${UPDATE_REPO})${N}"
+    log_info "Канал обновлений переключён на ${target} (${UPDATE_REPO})"
+    if [[ "$target" == "stable" ]]; then
+      info "Если текущая версия новее стабильной — обновление предложит откат"
+    fi
+    # Кэш у каждого канала свой, поэтому бейдж в шапке обновится только после
+    # проверки нового канала — запускаем её сразу, в фоне.
+    update_check_async || true
+  else
+    err "Не удалось сохранить канал в ${UPDATE_CHANNEL_FILE}"
+    info "Проверь права на /var/lib/awg2"
+    return 1
+  fi
+  return 0
+}
+
+show_submenu_8() {
+  while true; do
+    check_deps
+    show_header
+    echo ""
+    hdr "Обновление скрипта"
+    echo ""
+    echo -e "  Текущая версия : ${W}${VERSION}${N}"
+    if [[ "$UPDATE_CHANNEL" == "beta" ]]; then
+      echo -e "  Канал          : ${Y}бета${N} ${D}(${UPDATE_REPO})${N}"
+    else
+      echo -e "  Канал          : ${G}стабильный${N} ${D}(${UPDATE_REPO})${N}"
+    fi
+    local _upd
+    _upd=$(update_available || true)
+    [[ -n "$_upd" ]] && echo -e "  Доступна       : ${G}${_upd}${N}"
+    echo ""
+    echo -e "  ${C}1)${N} Обновить скрипт ${D}— скачать с GitHub${N}"
+    if [[ "$UPDATE_CHANNEL" == "beta" ]]; then
+      echo -e "  ${C}2)${N} Вернуться на стабильный канал"
+    else
+      echo -e "  ${C}2)${N} Переключиться на бета-канал ${D}(ранние сборки)${N}"
+    fi
+    echo ""
+    echo -e "  ${W}0)${N} ← Назад"
+    echo ""
+    local _uc
+    read_choice _uc "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
+    case "${_uc:-}" in
+      1) do_self_update || true ;;
+      2) do_switch_update_channel || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -9378,7 +9530,7 @@ do_uninstall() {
   # мусор, из которого awg2 запускается снова и выглядит как «не удалилось».
   trash "Удаляем лог и следы установки..."
   rm -f "$LOG_FILE" 2>/dev/null || true
-  rm -rf /var/lib/awg2 2>/dev/null || true   # кэш проверки обновлений
+  rm -rf /var/lib/awg2 2>/dev/null || true   # кэш проверки обновлений и канал
   rm -f /root/awg-toolza-*.run 2>/dev/null || true
   rm -rf /opt/awg-toolza-* 2>/dev/null || true
   rm -f /tmp/awg_domain_cache.txt 2>/dev/null || true
@@ -11681,7 +11833,7 @@ while true; do
     5) show_submenu_5 ;;
     6) show_submenu_6 ;;
     7) show_submenu_7 ;;
-    8) do_self_update || true ;;
+    8) show_submenu_8 ;;
     0)
       log_info "Выход"
       echo -e "\n${G}  В путь! ${N}"

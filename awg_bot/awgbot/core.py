@@ -773,8 +773,34 @@ def fmt_uptime(seconds: int) -> str:
 
 
 # ───────────────────────── версии (бот и awg2) ─────────────────────────
-REPO_RAW = "https://raw.githubusercontent.com/genaRijoff/awg-multi-script/main"
+DEFAULT_REPO_RAW = "https://raw.githubusercontent.com/pumbaX/awg-multi-script/main"
+BOT_CONF_PATH = "/etc/awg-bot.conf"
 AWG2_BIN_PATH = "/usr/local/bin/awg2"
+
+
+def _repo_raw() -> str:
+    """
+    Куда смотреть за свежими версиями. Установщик пишет REPO_URL в
+    /etc/awg-bot.conf — на бета-канале awg2 это бета-репозиторий, и сравнивать
+    версии надо именно с ним, иначе бот вечно «отстаёт» от чужого стабильного.
+    """
+    url = os.environ.get("REPO_URL", "").strip()
+    if not url:
+        try:
+            with open(BOT_CONF_PATH, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.startswith("REPO_URL="):
+                        url = line.split("=", 1)[1].strip().strip("\"'")
+                        break
+        except OSError:
+            url = ""
+    m = re.match(r"^https://github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", url)
+    if not m:
+        return DEFAULT_REPO_RAW
+    return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/main"
+
+
+REPO_RAW = _repo_raw()
 
 
 def bot_version_local() -> str:
