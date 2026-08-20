@@ -1351,29 +1351,34 @@ choose_mimicry_profile() {
 
   echo ""
   hdr "~  Профили мимикрии I1-I5"
-  echo -e "  ${G}1${N}  ${W}TLS${N}   — браузерный ClientHello (Chrome-like)"
-  echo -e "     ${D}Рекомендуется в РФ 2026. Выглядит как заход на сайт.${N}"
-  echo -e "  ${G}2${N}  ${W}DNS${N}   — DNS Query с EDNS0 + рандомный TXID"
-  echo -e "     ${D}Компактный, надёжный. Хорошая альтернатива TLS.${N}"
-  echo -e "  ${G}3${N}  SIP   — REGISTER запрос (VoIP мимикрия)"
-  echo -e "     ${D}Только I1. Хорошо работает с SIP провайдерами.${N}"
-  echo -e "  ${Y}4${N}  QUIC  — Chrome-like Initial 1200B + Short Header"
-  echo -e "     ${D}⚠ В РФ ловят по сигнатуре Initial — используй с осторожностью.${N}"
+  echo -e "  ${G}1${N}  ${W}QUIC${N}  — Initial 1200 Б по RFC 9000 + короткие заголовки"
+  echo -e "     ${D}Единственный из четырёх, где содержимое — шифротекст: смотреть${N}"
+  echo -e "     ${D}DPI не на что. По UDP это настоящий протокол.${N}"
+  echo -e "  ${G}2${N}  ${W}DNS${N}   — DNS Query с EDNS0 + случайный TXID"
+  echo -e "     ${D}Тоже настоящий UDP-протокол и самый компактный: 40 байт.${N}"
+  echo -e "  ${Y}3${N}  ${W}TLS${N}   — ClientHello (Chrome-подобный)"
+  echo -e "     ${D}⚠ TLS-записи поверх UDP не существует: настоящий UDP-TLS — это${N}"
+  echo -e "     ${D}DTLS, а у него другой формат. Плюс SNI уходит открытым текстом${N}"
+  echo -e "     ${D}и не совпадает с IP сервера. Сообщение из поля: конфиг с этим${N}"
+  echo -e "     ${D}профилем не работал в РФ, но работал в ЕС.${N}"
+  echo -e "  ${Y}4${N}  SIP   — REGISTER-запрос (VoIP)"
+  echo -e "     ${D}Настоящий UDP-протокол, но целиком открытый текст.${N}"
   echo ""
   local _mim_default=1
   if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
+    # Keenetic чувствителен к длинному I1, а DNS — самый короткий пакет
     _mim_default=2
-    echo -e "  ${Y}  Keenetic чувствителен к I1: DNS — самый короткий и простой${N}"
-    echo -e "  ${Y}  пакет из четырёх, поэтому он и предложен.${N}"
+    echo -e "  ${Y}  Keenetic чувствителен к I1: DNS — самый короткий пакет${N}"
+    echo -e "  ${Y}  из четырёх, поэтому он и предложен.${N}"
     echo ""
   fi
   read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [1-4] (Enter = ${_mim_default}): ${N}")" 1 4 "$_mim_default"
 
   case $PROFILE_CHOICE in
-    1) MIMICRY_PROFILE="tls"  ;;
+    1) MIMICRY_PROFILE="quic" ;;
     2) MIMICRY_PROFILE="dns"  ;;
-    3) MIMICRY_PROFILE="sip"  ;;
-    4) MIMICRY_PROFILE="quic" ;;
+    3) MIMICRY_PROFILE="tls"  ;;
+    4) MIMICRY_PROFILE="sip"  ;;
   esac
 
   # Выбираем домен из пула под профиль
@@ -4955,10 +4960,11 @@ do_manage_clients() {
     echo -e "  ${C}7)${N} Срок действия клиента"
     echo -e "  ${C}8)${N} Активность клиентов"
     echo -e "  ${C}9)${N} Экспорт конфигов (zip)"
+    echo -e "  ${C}10)${N} Сменить мимикрию у клиента ${D}— если конфиг не проходит у провайдера${N}"
     echo -e "  ${W}0)${N} Назад в главное меню"
     echo ""
     local MGMT_CHOICE
-    read_choice MGMT_CHOICE "$(echo -e "${C}  Выбор [0-9]: ${N}")" 0 9 "0"
+    read_choice MGMT_CHOICE "$(echo -e "${C}  Выбор [0-10]: ${N}")" 0 10 "0"
     case "${MGMT_CHOICE:-}" in
       1) do_add_client || true ;;
       2) do_rename_client || true ;;
@@ -4969,6 +4975,7 @@ do_manage_clients() {
       7) do_expire_menu || true ;;
       8) do_list_clients || true ;;
       9) do_export_configs || true ;;
+      10) do_change_client_mimicry || true ;;
       0) return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -6237,6 +6244,114 @@ _print_client_info() {
     echo -e "  ${W}│${N}  ⌛ Срок:     ${_exp_color}${_exp_str}${N}"
   fi
   echo -e "  ${W}└─────────────────────────────────────────────────────────────────────────${N}"
+}
+
+# Смена мимикрии у уже выданного клиента.
+#
+# I1-I5 живут только в клиентском конфиге, поэтому профиль меняется у одного
+# устройства, не задевая сервер и остальных клиентов. Это нужная операция, а не
+# удобство: один и тот же конфиг проходит у одного провайдера и не проходит у
+# другого, и перебрать профиль должно быть дешевле, чем пересоздавать клиента.
+_detect_mimicry() {           # $1 = строка I1
+  local line="$1"
+  case "$line" in
+    *"<b 0x16"*)        echo "tls" ;;
+    *"<b 0x52454749"*)  echo "sip" ;;      # "REGI" в hex
+    *"<b 0xc"*|*"<b 0x4"*) echo "quic" ;;
+    *"<r 2><b 0x"*)     echo "dns" ;;
+    "")                 echo "нет" ;;
+    *)                  echo "неизвестно" ;;
+  esac
+}
+
+do_change_client_mimicry() {
+  local found_files=()
+  while IFS= read -r -d '' f; do
+    found_files+=("$f")
+  done < <(find /root -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
+  [[ ${#found_files[@]} -eq 0 ]] && { err "Конфиги клиентов не найдены в /root/"; return 1; }
+
+  local unique
+  mapfile -t unique < <(printf "%s\n" "${found_files[@]}" | sort -u)
+
+  hdr "~  Сменить мимикрию у клиента"
+  echo ""
+  echo -e "  ${D}Меняются только I1-I5 в конфиге этого клиента.${N}"
+  echo -e "  ${D}Сервер и другие клиенты не затрагиваются — переподключать их не надо.${N}"
+  echo ""
+  local i=0 f
+  for f in "${unique[@]}"; do
+    i=$((i+1))
+    local _cur
+    _cur=$(_detect_mimicry "$(grep -m1 '^I1 = ' "$f" 2>/dev/null | cut -d' ' -f3-)")
+    printf "  %d) %-28s ${D}сейчас: %s${N}\n" "$i" "$(basename "$f")" "$_cur"
+  done
+  echo ""
+  local _sel
+  read_choice _sel "$(echo -e "${C}  Выбор [1-${i}] (0 = отмена): ${N}")" 0 "$i" "0"
+  [[ "$_sel" == "0" ]] && { info "Отменено"; return 0; }
+  local chosen="${unique[$((_sel - 1))]}"
+  [[ -f "$chosen" ]] || { warn "Файл не найден"; return 0; }
+
+  # Профиль сервера (Lite/Standard) фиксирует уровень, Pro даёт выбор
+  local _srv_profile
+  _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+  _srv_profile="${_srv_profile:-pro}"
+
+  I1=""; I2=""; I3=""; I4=""; I5=""
+  choose_target_client
+  if ! _target_client_reads_cps; then
+    _warn_cps_unsupported || true
+  else
+    if [[ "$_srv_profile" == "pro" ]]; then
+      choose_obf_level
+    else
+      OBF_LEVEL=2
+      info "Профиль сервера ${_srv_profile}: у клиента только I1"
+    fi
+    choose_mimicry_profile || return 1
+  fi
+
+  # Собираем новые строки. Пустые не пишем: строка «I2 = » ломает разбор.
+  local new_lines="" k v
+  for k in I1 I2 I3 I4 I5; do
+    v="${!k}"
+    [[ -n "$v" ]] || continue
+    new_lines+="${k} = ${v}"$'\n'
+  done
+  new_lines="${new_lines%$'\n'}"
+
+  local bak tmp
+  bak="${chosen}.bak.$(date +%s)"
+  cp "$chosen" "$bak" 2>/dev/null || warn "Резервную копию сделать не удалось"
+  tmp=$(mktemp) || { err "mktemp провалился"; return 1; }
+
+  # Старые I-строки выбрасываем, новые вставляем перед [Peer] — там же, где
+  # они стояли, и внутри секции [Interface], которой они принадлежат.
+  awk -v ins="$new_lines" '
+    /^\[Peer\]/ && !inserted { if (ins != "") print ins; inserted = 1 }
+    !/^I[1-5] = / { print }
+    END { if (!inserted && ins != "") print ins }
+  ' "$chosen" > "$tmp"
+
+  if [[ ! -s "$tmp" ]] || ! grep -q '^\[Interface\]' "$tmp"; then
+    err "Перезапись конфига не удалась — файл не тронут"
+    rm -f "$tmp"
+    return 1
+  fi
+  cat "$tmp" > "$chosen" && rm -f "$tmp"
+  chmod 600 "$chosen" 2>/dev/null || true
+
+  local _n
+  _n=$(grep -cE '^I[1-5] = ' "$chosen" 2>/dev/null || echo 0)
+  ok "Мимикрия обновлена: ${MIMICRY_PROFILE:-нет}, пакетов I: ${_n}"
+  info "Резервная копия: $bak"
+  echo ""
+  warn "Клиенту нужен НОВЫЙ конфиг — до замены он подключается по старому"
+  _share_config "$chosen"
+  echo ""
+  echo -e "${D}  Конфиг: $chosen${N}"
+  return 0
 }
 
 do_show_qr() {
