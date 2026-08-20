@@ -32,7 +32,8 @@ sudo curl -fsSL https://raw.githubusercontent.com/genaRijoff/awg-multi-script/ma
 sudo awg2
 ```
 
-История версий — [CHANGELOG.md](CHANGELOG.md).
+История версий — [CHANGELOG.md](CHANGELOG.md), тексты релизов для канала —
+[docs/releases](docs/releases).
 
 ### Канал обновлений
 
