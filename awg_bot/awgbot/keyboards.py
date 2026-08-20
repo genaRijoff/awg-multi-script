@@ -11,13 +11,18 @@ from . import core
 def profile_choices() -> InlineKeyboardMarkup:
     """Выбор профиля мимикрии при создании клиента (как в awg2 Pro)."""
     b = InlineKeyboardBuilder()
-    b.button(text="🔐 TLS ClientHello (рекомендуется)", callback_data="prof:tls")
+    b.button(text="⚡ QUIC Initial (рекомендуется)", callback_data="prof:quic")
+    b.button(text="🔒 cURL QUIC + ECH", callback_data="prof:curl_quic")
     b.button(text="🌐 DNS Query", callback_data="prof:dns")
+    b.button(text="📡 STUN / TURN", callback_data="prof:stun")
+    b.button(text="🎥 WebRTC", callback_data="prof:webrtc")
     b.button(text="📞 SIP (VoIP)", callback_data="prof:sip")
-    b.button(text="⚡ QUIC", callback_data="prof:quic")
+    b.button(text="🕐 NTP", callback_data="prof:ntp")
+    b.button(text="🎵 RTP", callback_data="prof:rtp")
+    b.button(text="🔎 SSDP", callback_data="prof:ssdp")
     b.button(text="🔇 Базовый (без I1-I5)", callback_data="prof:basic")
     b.button(text="‹ Отмена", callback_data="clients")
-    b.adjust(1, 1, 1, 1, 1, 1)
+    b.adjust(*([1] * 11))
     return b.as_markup()
 
 

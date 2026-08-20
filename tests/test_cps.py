@@ -1,34 +1,61 @@
 """
 test_cps.py — структурная проверка CPS-пакетов I1-I5.
 
-Разбирает каждый сгенерированный пакет так, как разбирал бы его DPI: TLS
-ClientHello, DNS query, SIP REGISTER и QUIC Initial/1-RTT. Смысл теста в том,
-что пакеты урезаны ради экономии трафика, и «короче» не должно означать
-«невалидно»: сломанная длина или отсутствующий обязательный заголовок делают
-мимикрию хуже, чем её отсутствие.
+Разбирает каждый сгенерированный пакет так, как разбирал бы его получатель:
+QUIC Initial расшифровывается ключами из DCID (RFC 9001) и внутри проверяется
+ClientHello, DNS/SIP/STUN/DTLS/NTP/RTP/SSDP проверяются по своим форматам.
+Смысл теста в том, что мимикрия имеет смысл только пока пакет валиден: битая
+длина или отсутствующее обязательное поле выдают подделку вернее, чем её
+отсутствие.
 
 Генератор берётся прямо из awg2.sh (блок _CPS_GENERATOR между якорями
-CPS_GENERATOR_BEGIN/END) — тестируется то, что реально поедет пользователю.
+CPS_GENERATOR_BEGIN/END v2) — тестируется то, что реально поедет пользователю.
 
 Запуск:  python3 tests/test_cps.py [путь/к/awg2.sh]
 Выход:   0 — все пакеты валидны, 1 — есть провалы.
 """
-import os, random, re, subprocess, sys, tempfile
+import os, re, subprocess, sys, tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 AWG2 = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_HERE, "..", "awg2.sh")
 
 _MARKER_RE = re.compile(
-    r"# CPS_GENERATOR_BEGIN v1\b.*?^_CPS_GENERATOR='\n(.*?)\n'\n# CPS_GENERATOR_END v1\b",
+    r"# CPS_GENERATOR_BEGIN v2\b.*?^_CPS_GENERATOR='\n(.*?)\n'\n# CPS_GENERATOR_END v2\b",
     re.S | re.M,
 )
+
+# Профили и домены, с которыми их прогоняем. Домен один на всю цепочку I1-I5 —
+# именно так его передаёт awg2 после выбора в меню.
+CASES = [
+    ("quic", "ya.ru"),
+    ("quic", ""),
+    ("curl_quic", "gosuslugi.ru"),
+    ("dns", "vk.com"),
+    ("dns", ""),
+    ("stun", ""),
+    ("stun", "ozon.ru"),
+    ("webrtc", ""),
+    ("sip", "mail.ru"),
+    ("ntp", ""),
+    ("rtp", ""),
+    ("ssdp", ""),
+    ("dtls", "avito.ru"),
+    ("tls", "dzen.ru"),          # алиас на quic: старые серверы шлют это имя
+]
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    HAVE_CRYPTO = True
+except ImportError:                     # без библиотеки проверяем только структуру
+    HAVE_CRYPTO = False
 
 
 def _extract_generator(path):
     src = open(path, encoding="utf-8").read()
     m = _MARKER_RE.search(src)
     if not m:
-        sys.exit("не нашёл блок _CPS_GENERATOR в %s" % path)
+        sys.exit("не нашёл блок _CPS_GENERATOR (маркеры v2) в %s" % path)
     code = m.group(1)
     compile(code, "<cps>", "exec")          # синтаксис до запуска
     fd, tmp = tempfile.mkstemp(suffix=".py")
@@ -39,60 +66,33 @@ def _extract_generator(path):
 
 GEN = _extract_generator(AWG2)
 
-# Теги, которые понимают ОБА известных движка: amneziawg-go (device/obf.go) и
-# ядерный модуль (src/junk.c). <c> есть только у ядра, <d>/<ds>/<dz> только у
-# go — незнакомый тег отвергается вместе со всем пакетом, поэтому в цепочке их
-# быть не должно.
-PORTABLE_TAGS = ("b", "r", "rc", "rd")
-
-# Чем клиент заполняет модификатор при отправке (см. junk.c):
-#   r  — случайные байты, rc — латинские буквы, rd — цифры
-FILL = {
-    "r": lambda n: bytes(random.randrange(256) for _ in range(n)),
-    "rc": lambda n: bytes(random.choice(b"abcdefghijklmnopqrstuvwxyz"
-                                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-                          for _ in range(n)),
-    "rd": lambda n: bytes(random.choice(b"0123456789") for _ in range(n)),
-}
-
 
 def parse_line(line):
-    """
-    Разбирает цепочку тегов в (список сегментов, собранный пакет).
+    """Строка вида <b 0x...> -> байты пакета. Других тегов в v2 не бывает."""
+    tags = re.findall(r"<([^>]*)>", line)
+    assert tags, "строка не похожа на CPS-пакет: %r" % line[:40]
+    pkt = b""
+    for tag in tags:
+        assert tag.startswith("b 0x"), "неожиданный тег <%s>" % tag[:10]
+        pkt += bytes.fromhex(tag[4:])
+    return pkt
 
-    Модификаторы подставляются так, как это сделал бы клиент, — иначе нельзя
-    проверить главное: что поля длины внутри пакета учитывают байты, которые
-    придут из тега, а не только записанные в <b 0x..>.
-    """
-    segments, pkt = [], b""
-    for tag in re.findall(r"<([^>]*)>", line):
-        if tag.startswith("b 0x"):
-            raw = bytes.fromhex(tag[4:])
-            segments.append(("b", len(raw)))
-            pkt += raw
-            continue
-        kind, _, arg = tag.partition(" ")
-        assert kind in PORTABLE_TAGS, (
-            "тег <%s> понимает не всякий движок — пакет будет отвергнут целиком" % kind)
-        n = int(arg)
-        segments.append((kind, n))
-        pkt += FILL[kind](n)
-    return segments, pkt
 
-def check_tls(pkt):
-    assert pkt[0] == 0x16, "не TLS handshake record"
-    assert pkt[1:3] == b"\x03\x01", "legacy record version не 0x0301"
-    rec_len = int.from_bytes(pkt[3:5], "big")
-    assert rec_len == len(pkt) - 5, "длина record не совпадает (%d vs %d)" % (rec_len, len(pkt) - 5)
-    hs = pkt[5:]
+# ── TLS ClientHello: общий разбор для QUIC, DTLS и ECH ──
+def parse_client_hello(hs, dtls=False):
     assert hs[0] == 0x01, "не ClientHello"
     hs_len = int.from_bytes(hs[1:4], "big")
     assert hs_len == len(hs) - 4, "длина handshake не совпадает"
     b = hs[4:]
-    assert b[:2] == b"\x03\x03", "legacy_version не 0x0303"
+    if dtls:
+        assert b[:2] == b"\xfe\xfd", "DTLS: legacy_version не 1.2"
+    else:
+        assert b[:2] == b"\x03\x03", "legacy_version не 0x0303"
     o = 2 + 32
     sid_len = b[o]; o += 1 + sid_len
-    assert sid_len in (0, 32), "странная длина session_id"
+    if dtls:
+        # у DTLS между session_id и списком шифров стоит cookie (RFC 6347 §4.2.1)
+        cookie_len = b[o]; o += 1 + cookie_len
     cs_len = int.from_bytes(b[o:o+2], "big"); o += 2
     assert cs_len % 2 == 0 and cs_len > 0, "битый список шифров"
     o += cs_len
@@ -102,109 +102,267 @@ def check_tls(pkt):
     assert ext_len == len(b) - o, "длина блока расширений не совпадает"
     exts, end = {}, o + ext_len
     while o < end:
-        et = int.from_bytes(b[o:o+2], "big"); el = int.from_bytes(b[o+2:o+4], "big")
-        exts[et] = b[o+4:o+4+el]; o += 4 + el
+        et = int.from_bytes(b[o:o+2], "big")
+        el = int.from_bytes(b[o+2:o+4], "big")
+        exts[et] = b[o+4:o+4+el]
+        o += 4 + el
     assert o == end, "расширения вышли за границу блока"
-    assert 0x0000 in exts, "нет SNI"
-    host = exts[0x0000][5:].decode()
-    assert re.fullmatch(r"[a-z0-9.\-]+\.[a-z]{2,}", host), "SNI не похож на домен: %r" % host
-    assert 0x002b in exts and b"\x03\x04" in exts[0x002b], "нет supported_versions с TLS 1.3"
-    ks = exts.get(0x0033); assert ks, "нет key_share"
-    assert b"\x00\x1d\x00\x20" in ks, "нет x25519-ключа длиной 32"
-    assert 0x000d in exts and len(exts[0x000d]) >= 4, "нет signature_algorithms"
-    assert 0x0010 in exts and b"h2" in exts[0x0010], "нет ALPN h2"
-    assert 0x000a in exts, "нет supported_groups"
-    return "TLS ClientHello ok: SNI=%s, ext=%d, шифров=%d" % (host, len(exts), cs_len // 2)
+    host = ""
+    if 0x0000 in exts:
+        host = exts[0x0000][5:].decode()
+        assert re.fullmatch(r"[a-z0-9.\-]+\.[a-z]{2,}", host), "SNI не похож на домен: %r" % host
+    return host, exts, cs_len // 2
 
-def check_dns(segments, pkt):
-    assert segments[0] == ("r", 2), "нет случайного transaction ID (<r 2>)"
-    pkt = pkt[2:]
-    assert pkt[0:2] == b"\x01\x00", "флаги не standard query+RD"
-    qd, an, ns, ar = (int.from_bytes(pkt[i:i+2], "big") for i in (2, 4, 6, 8))
+
+def read_varint(b, o):
+    prefix = b[o] >> 6
+    length = 1 << prefix
+    value = b[o] & 0x3F
+    for i in range(1, length):
+        value = (value << 8) | b[o + i]
+    return value, o + length
+
+
+def check_quic(pkt, expect_host=None, expect_ech=False):
+    fb = pkt[0]
+    assert fb & 0x80 and fb & 0x40, "не long header с установленным fixed bit"
+    assert (fb >> 4) & 0x03 == 0, "long header, но не Initial"
+    assert pkt[1:5] == b"\x00\x00\x00\x01", "версия не QUIC v1"
+    o = 5
+    dl = pkt[o]; o += 1 + dl
+    sl = pkt[o]; o += 1 + sl
+    assert 0 < dl <= 20 and sl <= 20, "странные длины CID"
+    token_len, o = read_varint(pkt, o)
+    assert token_len == 0, "у клиентского Initial должен быть пустой token"
+    length_off = o
+    plen, o = read_varint(pkt, length_off)
+    assert o + plen == len(pkt), "поле length не сходится с датаграммой"
+    assert len(pkt) >= 1200, "RFC 9000 §14.1: клиентский Initial < 1200 байт"
+    if not HAVE_CRYPTO:
+        return "QUIC Initial ok: %d байт (без расшифровки)" % len(pkt)
+
+    # снимаем header protection и расшифровываем — ключи выводятся из DCID
+    import hmac, hashlib
+    dcid = pkt[6:6+dl]
+    salt = bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a")
+    def expand(secret, label, length):
+        lb = b"tls13 " + label
+        info = length.to_bytes(2, "big") + bytes([len(lb)]) + lb + b"\x00"
+        out, block, counter = b"", b"", 1
+        while len(out) < length:
+            block = hmac.new(secret, block + info + bytes([counter]), hashlib.sha256).digest()
+            out += block; counter += 1
+        return out[:length]
+    initial = hmac.new(salt, dcid, hashlib.sha256).digest()
+    client = expand(initial, b"client in", 32)
+    key, iv, hp = (expand(client, b"quic key", 16), expand(client, b"quic iv", 12),
+                   expand(client, b"quic hp", 16))
+    pn_off = o
+    sample = pkt[pn_off+4:pn_off+4+16]
+    enc = Cipher(algorithms.AES(hp), modes.ECB()).encryptor()
+    mask = enc.update(sample) + enc.finalize()
+    first = pkt[0] ^ (mask[0] & 0x0F)
+    pn_len = (first & 0x03) + 1
+    pn = bytes(pkt[pn_off+i] ^ mask[1+i] for i in range(pn_len))
+    header = bytes([first]) + pkt[1:pn_off] + pn
+    nonce = bytearray(iv)
+    for i, byte in enumerate(pn):
+        nonce[len(nonce)-len(pn)+i] ^= byte
+    plain = AESGCM(key).decrypt(bytes(nonce), pkt[pn_off+pn_len:], header)
+    assert plain[0] == 0x06, "первый фрейм не CRYPTO"
+    frame_off, p = read_varint(plain, 1)
+    frame_len, p = read_varint(plain, p)
+    assert frame_off == 0, "CRYPTO-фрейм с ненулевым offset"
+    host, exts, ciphers = parse_client_hello(plain[p:p+frame_len])
+    assert set(plain[p+frame_len:]) <= {0}, "хвост датаграммы не PADDING"
+    assert 0x0039 in exts, "нет quic_transport_parameters"
+    assert 0x0010 in exts and b"h3" in exts[0x0010], "нет ALPN h3"
+    if expect_ech:
+        assert 0xFE0D in exts, "профиль curl_quic без расширения ECH"
+    if expect_host and not expect_ech:
+        assert host == expect_host, "SNI %r вместо %r" % (host, expect_host)
+    return "QUIC Initial ok: %d Б, SNI=%s, шифров=%d%s" % (
+        len(pkt), host or "-", ciphers, ", ECH" if 0xFE0D in exts else "")
+
+
+def check_dns(pkt, expect_host=None):
+    assert pkt[2:4] == b"\x01\x00", "флаги не standard query+RD"
+    qd, an, ns, ar = (int.from_bytes(pkt[i:i+2], "big") for i in (4, 6, 8, 10))
     assert (qd, an, ns, ar) == (1, 0, 0, 1), "counts не 1/0/0/1: %s" % ((qd, an, ns, ar),)
-    o, labels = 10, []
+    o, labels = 12, []
     while pkt[o]:
-        ln = pkt[o]; assert ln <= 63, "label > 63"
+        ln = pkt[o]
+        assert ln <= 63, "label > 63"
         labels.append(pkt[o+1:o+1+ln].decode()); o += 1 + ln
     o += 1
     qt, qc = int.from_bytes(pkt[o:o+2], "big"), int.from_bytes(pkt[o+2:o+4], "big")
-    assert qt in (1, 28, 16, 65), "qtype %d не A/AAAA/TXT/HTTPS" % qt
+    assert qt in (1, 28, 65), "qtype %d не A/AAAA/HTTPS" % qt
     assert qc == 1, "qclass не IN"
     o += 4
     assert pkt[o] == 0 and int.from_bytes(pkt[o+1:o+3], "big") == 41, "нет OPT RR (EDNS0)"
     assert o + 11 == len(pkt), "хвост после OPT RR"
-    return "DNS query ok: %s, qtype=%d, EDNS0" % (".".join(labels), qt)
+    host = ".".join(labels)
+    if expect_host:
+        assert host == expect_host, "QNAME %r вместо %r" % (host, expect_host)
+    return "DNS query ok: %s, qtype=%d, EDNS0" % (host, qt)
 
-def check_sip(pkt):
+
+def check_sip(pkt, expect_host=None):
     txt = pkt.decode()
-    # Пустая строка отделяет заголовки от тела; тело может быть непустым —
-    # в нём едет модификатор, объявленный в Content-Length.
     assert "\r\n\r\n" in txt, "нет пустой строки между заголовками и телом"
     head, _, body = txt.partition("\r\n\r\n")
     lines = head.split("\r\n")
-    m = re.fullmatch(r"(REGISTER|OPTIONS) sip:[a-z0-9.\-]+ SIP/2\.0", lines[0])
-    assert m, "битая request-line: %r" % lines[0]
-    method = m.group(1)
+    m = re.fullmatch(r"(REGISTER|OPTIONS|INVITE) sip:[a-zA-Z0-9.@\-]+ SIP/2\.0", lines[0]) or \
+        re.fullmatch(r"SIP/2\.0 100 CONNECTING", lines[0])
+    assert m, "битая первая строка: %r" % lines[0]
+    method = lines[0].split(" ")[0]
     hdr = {k.lower(): v.strip() for k, v in (l.split(":", 1) for l in lines[1:])}
-    for need in ("via", "from", "to", "call-id", "cseq", "max-forwards", "content-length"):
+    for need in ("via", "from", "to", "call-id", "cseq", "content-length"):
         assert need in hdr, "нет обязательного заголовка %s" % need
     assert hdr["via"].startswith("SIP/2.0/"), "битый Via"
     assert "branch=z9hG4bK" in hdr["via"], "branch не по RFC 3261 (magic cookie)"
     assert ";tag=" in hdr["from"], "нет tag в From"
-    assert re.fullmatch(r"\d+ " + method, hdr["cseq"]), "CSeq не совпадает с методом"
     assert hdr["content-length"].isdigit(), "Content-Length не число"
     assert int(hdr["content-length"]) == len(body.encode()), (
         "Content-Length %s не совпадает с телом (%d байт)"
         % (hdr["content-length"], len(body.encode())))
-    if method == "REGISTER":
-        assert "contact" in hdr, "REGISTER без Contact"
+    if expect_host:
+        assert expect_host in hdr["call-id"], "домен %r не попал в Call-ID" % expect_host
     return "SIP %s ok: заголовков=%d" % (method, len(hdr))
 
-def check_quic(pkt, first=False):
-    fb = pkt[0]
-    if fb & 0x80:
-        assert fb & 0x40, "fixed bit не установлен"
-        ptype = (fb >> 4) & 0x03
-        assert ptype == 0, "long header, но не Initial"
-        assert pkt[1:5] == b"\x00\x00\x00\x01", "версия не QUIC v1"
-        dl = pkt[5]; o = 6 + dl
-        sl = pkt[o]; o += 1 + sl
-        assert dl in range(8, 21) and sl <= 20, "странные длины CID"
-        tl = pkt[o]; o += 1 + tl          # token length (varint, у клиента 0)
-        assert tl == 0, "у клиентского Initial должен быть пустой token"
-        assert pkt[o] & 0xC0 == 0x40, "длина payload не 2-байтный varint"
-        plen = int.from_bytes(pkt[o:o+2], "big") & 0x3FFF; o += 2
-        assert o + plen == len(pkt), "поле length не сходится с датаграммой"
-        assert len(pkt) >= 1200, "RFC 9000 §14.1: клиентский Initial < 1200 байт"
-        return "QUIC Initial ok: %d байт, dcid=%d, length сходится" % (len(pkt), dl)
-    assert fb & 0x40, "fixed bit не установлен (1-RTT)"
-    assert not first, "первым пакетом обязан идти Initial"
-    assert len(pkt) >= 1 + 8 + 1, "слишком короткий 1-RTT"
-    return "QUIC 1-RTT ok: %d байт" % len(pkt)
+
+def check_stun(pkt, expect_host=None, offset=0, allow_tail=False):
+    mt = int.from_bytes(pkt[offset:offset+2], "big")
+    assert mt in (0x0001, 0x000A), "тип сообщения %#06x не Binding и не Allocate" % mt
+    mlen = int.from_bytes(pkt[offset+2:offset+4], "big")
+    assert pkt[offset+4:offset+8] == b"\x21\x12\xa4\x42", "нет magic cookie"
+    end = offset + 20 + mlen
+    if not allow_tail:
+        assert end == len(pkt), "длина STUN не сходится (%d vs %d)" % (end, len(pkt))
+    o, attrs = offset + 20, {}
+    while o + 4 <= end:
+        at = int.from_bytes(pkt[o:o+2], "big")
+        al = int.from_bytes(pkt[o+2:o+4], "big")
+        attrs[at] = pkt[o+4:o+4+al]
+        o += 4 + al + ((4 - (al % 4)) % 4)
+    assert o == end, "атрибуты вышли за границу сообщения"
+    assert 0x0006 in attrs, "нет USERNAME"
+    assert 0x8022 in attrs, "нет SOFTWARE"
+    assert 0x8028 in attrs, "нет FINGERPRINT"
+    import zlib
+    crc = (zlib.crc32(pkt[offset:end-8]) ^ 0x5354554E) & 0xFFFFFFFF
+    assert int.from_bytes(attrs[0x8028], "big") == crc, "FINGERPRINT не сходится с CRC32"
+    if mt == 0x000A:
+        assert 0x0019 in attrs, "Allocate без REQUESTED-TRANSPORT"
+        assert 0x000D in attrs, "Allocate без LIFETIME"
+    if expect_host:
+        assert expect_host.encode() in attrs[0x0006], "домен не попал в USERNAME"
+    return "STUN %s ok: атрибутов=%d, FINGERPRINT сходится" % (
+        "Allocate" if mt == 0x000A else "Binding", len(attrs)), end
+
+
+def check_dtls(pkt, expect_host=None, offset=0):
+    assert pkt[offset] == 0x16, "не DTLS handshake record"
+    assert pkt[offset+1:offset+3] == b"\xfe\xfd", "версия записи не DTLS 1.2"
+    rec_len = int.from_bytes(pkt[offset+11:offset+13], "big")
+    end = offset + 13 + rec_len
+    hs = pkt[offset+13:end]
+    assert hs[0] == 0x01, "не ClientHello"
+    body_len = int.from_bytes(hs[1:4], "big")
+    frag_len = int.from_bytes(hs[9:12], "big")
+    assert body_len == frag_len, "фрагмент DTLS не равен длине сообщения"
+    host, exts, ciphers = parse_client_hello(hs[:4] + hs[12:], dtls=True)
+    assert 0x000E in exts, "нет use_srtp — для DTLS-SRTP это обязательный признак"
+    if expect_host:
+        assert host == expect_host, "SNI %r вместо %r" % (host, expect_host)
+    return "DTLS ClientHello ok: SNI=%s, шифров=%d" % (host or "-", ciphers), end
+
+
+def check_ntp(pkt):
+    assert len(pkt) == 48, "NTP-пакет должен быть 48 байт, а он %d" % len(pkt)
+    li_vn_mode = pkt[0]
+    assert (li_vn_mode >> 3) & 0x07 == 4, "версия NTP не 4"
+    assert li_vn_mode & 0x07 == 3, "режим не client (3)"
+    assert pkt[12:16] == b"INIT", "нет reference id INIT"
+    return "NTP client ok: 48 Б, v4 mode 3"
+
+
+def check_rtp(pkt):
+    assert (pkt[0] >> 6) == 2, "версия RTP не 2"
+    assert pkt[0] & 0x0F == 0, "CSRC count должен быть 0"
+    pt = pkt[1] & 0x7F
+    assert pt in (0, 8, 96), "payload type %d не из профиля" % pt
+    assert len(pkt) > 12, "RTP без полезной нагрузки"
+    return "RTP ok: pt=%d, %d Б payload" % (pt, len(pkt) - 12)
+
+
+def check_ssdp(pkt):
+    txt = pkt.decode()
+    assert txt.startswith("M-SEARCH * HTTP/1.1\r\n"), "не M-SEARCH"
+    assert txt.endswith("\r\n\r\n"), "нет завершающей пустой строки"
+    hdr = {}
+    for line in txt.split("\r\n")[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            hdr[k.lower()] = v.strip()
+    for need in ("host", "man", "st", "mx"):
+        assert need in hdr, "нет обязательного заголовка %s" % need
+    assert hdr["host"] == "239.255.255.250:1900", "HOST не мультикастовый адрес SSDP"
+    assert hdr["man"] == '"ssdp:discover"', "MAN не ssdp:discover"
+    assert hdr["mx"].isdigit() and 1 <= int(hdr["mx"]) <= 5, "MX вне 1-5"
+    return "SSDP M-SEARCH ok: ST=%s" % hdr["st"]
+
+
+def check_webrtc(pkt):
+    # STUN Binding + DTLS ClientHello + RTP + RTCP одним пакетом
+    msg, end = check_stun(pkt, offset=0, allow_tail=True)
+    dtls_msg, end = check_dtls(pkt, offset=end)
+    rtp_off = end
+    assert (pkt[rtp_off] >> 6) == 2, "после DTLS нет RTP"
+    assert pkt[-1:] != b"", "пустой хвост"
+    return "WebRTC ok: %s + %s + RTP/RTCP, %d Б" % (msg, dtls_msg, len(pkt))
+
 
 fail = 0
-for profile in ("tls", "dns", "sip", "quic"):
-    for mode in ("--full", ""):
-        args = ["python3", GEN, profile] + ([mode] if mode else [])
-        out = subprocess.run(args, capture_output=True, text=True).stdout.strip().split("\n")
-        label = "%s/%s" % (profile, mode or "compact")
-        assert len(out) == 5, "%s: ожидали 5 пакетов, получили %d" % (label, len(out))
-        for i, line in enumerate(out, 1):
-            segments, pkt = parse_line(line)
-            try:
-                if profile == "tls":  msg = check_tls(pkt)
-                elif profile == "dns": msg = check_dns(segments, pkt)
-                elif profile == "sip": msg = check_sip(pkt)
-                else:                  msg = check_quic(pkt, first=(i == 1))
-                # Пакет целиком из <b 0x..> уходит байт в байт одинаковым перед
-                # каждым рукопожатием — это межсессионная сигнатура.
-                mods = [k for k, _ in segments if k != "b"]
-                assert mods, "пакет статичный: ни одного тега-модификатора"
-                print("  OK  %-14s I%d %4dB  %s [%s]"
-                      % (label, i, len(pkt), msg, ",".join(mods)))
-            except AssertionError as e:
-                fail += 1
-                print("  FAIL %-13s I%d %4dB  %s" % (label, i, len(pkt), e))
+for profile, domain in CASES:
+    args = ["python3", GEN, profile] + ([domain] if domain else [])
+    proc = subprocess.run(args, capture_output=True, text=True)
+    out = [l for l in proc.stdout.splitlines() if l.strip()]
+    label = "%s/%s" % (profile, domain or "auto")
+    if len(out) != 5:
+        fail += 1
+        print("  FAIL %-22s ожидали 5 пакетов, получили %d (%s)"
+              % (label, len(out), proc.stderr.strip()[:60]))
+        continue
+    for i, line in enumerate(out, 1):
+        try:
+            pkt = parse_line(line)
+            if profile in ("quic", "tls"):
+                msg = check_quic(pkt, expect_host=domain or None)
+            elif profile == "curl_quic":
+                msg = check_quic(pkt, expect_host=domain or None, expect_ech=True)
+            elif profile == "dns":
+                msg = check_dns(pkt, expect_host=domain or None)
+            elif profile == "sip":
+                msg = check_sip(pkt, expect_host=domain or None)
+            elif profile == "stun":
+                msg = check_stun(pkt, expect_host=domain or None)[0]
+            elif profile == "webrtc":
+                msg = check_webrtc(pkt)
+            elif profile == "dtls":
+                msg = check_dtls(pkt, expect_host=domain or None)[0]
+            elif profile == "ntp":
+                msg = check_ntp(pkt)
+            elif profile == "rtp":
+                msg = check_rtp(pkt)
+            else:
+                msg = check_ssdp(pkt)
+            print("  OK  %-22s I%d %5dB  %s" % (label, i, len(pkt), msg))
+        except Exception as e:
+            fail += 1
+            print("  FAIL %-21s I%d %5dB  %s: %s"
+                  % (label, i, len(line) // 2, type(e).__name__, e))
+
 os.unlink(GEN)
 print("\nпровалов:", fail)
 sys.exit(1 if fail else 0)

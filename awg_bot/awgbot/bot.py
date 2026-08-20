@@ -455,8 +455,10 @@ async def cb_add_profile(cq: CallbackQuery, state: FSMContext) -> None:
 async def _create_with_profile(target, state: FSMContext, name: str, profile: str) -> None:
     """Общий код создания клиента с выбранным профилем."""
     await state.clear()
-    label = {"tls": "TLS", "dns": "DNS", "sip": "SIP",
-             "quic": "QUIC", "basic": "базовый"}.get(profile, profile)
+    label = {"quic": "QUIC", "curl_quic": "cURL QUIC + ECH", "dns": "DNS",
+             "stun": "STUN/TURN", "webrtc": "WebRTC", "sip": "SIP",
+             "ntp": "NTP", "rtp": "RTP", "ssdp": "SSDP",
+             "tls": "QUIC (бывший TLS)", "basic": "базовый"}.get(profile, profile)
     wait = await target.answer(f"⏳ Создаю <b>{esc(name)}</b> (профиль: {label})…")
     ok, text, conf_path = await asyncio.to_thread(core.add_client, name, None, profile)
     await wait.edit_text(("✅ " if ok else "❌ ") + esc(text))

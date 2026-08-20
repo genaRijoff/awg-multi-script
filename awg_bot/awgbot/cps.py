@@ -6,15 +6,19 @@ cps.py — генерация I1 (CPS-мимикрия) тем же кодом, 
 и выполняем его. Так I1 всегда соответствует версии awg2 на сервере и
 обновляется вместе со скриптом.
 
-Границы блока awg2 размечает якорями «# CPS_GENERATOR_BEGIN v1» /
-«# CPS_GENERATOR_END v1» — это контракт между двумя файлами, а не догадка
+Границы блока awg2 размечает якорями «# CPS_GENERATOR_BEGIN vN» /
+«# CPS_GENERATOR_END vN» — это контракт между двумя файлами, а не догадка
 по кавычкам. Для awg2 старее v0.7.9 остались прежние эвристики, а любой
 извлечённый блок проверяется compile() перед запуском.
 
-Контракт генератора (как в awg2):
+Контракт генератора (как в awg2, маркер v2):
     python3 -c "<код>" <profile> [<domain>] [--only-i1]
-    profile ∈ {tls, dns, sip, quic}
+    profile ∈ {quic, curl_quic, dns, stun, webrtc, sip, ntp, rtp, ssdp, dtls}
     stdout: 1 строка на пакет; с --only-i1 — только I1 (первая строка).
+
+Генератор v2 — порт payloadGen; строки отдаются чистым hex (<b 0x..>).
+Старое имя профиля tls генератор принимает как алиас на quic: TLS-записи
+поверх UDP не существует, а на серверах остались конфиги с AWG_MIMICRY=tls.
 """
 
 from __future__ import annotations
@@ -29,15 +33,27 @@ log = logging.getLogger("awgbot.cps")
 
 AWG2_BIN = shutil.which("awg2") or "/usr/local/bin/awg2"
 
-# профили, которые поддерживает CPS-генератор awg2
-PROFILES = ("tls", "dns", "sip", "quic")
+# профили, которые поддерживает CPS-генератор awg2 (v2 = порт payloadGen).
+# tls оставлен ради серверов, установленных до перехода: генератор v2 сам
+# превращает его в quic, а генератор v1 понимает его напрямую.
+PROFILES = ("quic", "curl_quic", "dns", "stun", "webrtc", "sip",
+            "ntp", "rtp", "ssdp", "dtls", "tls")
 
 # Якоря, которые awg2 (v0.7.9+) ставит вокруг генератора специально для нас.
 # Версия в маркере поднимается вместе с несовместимым изменением контракта
 # вывода — тогда старый бот честно не найдёт блок вместо генерации мусора.
-_MARKER_RE = re.compile(
-    r"# CPS_GENERATOR_BEGIN v1\b.*?^_CPS_GENERATOR='\n(.*?)\n'\n# CPS_GENERATOR_END v1\b",
-    re.S | re.M,
+# Версия в маркере поднимается вместе с несовместимым изменением контракта,
+# поэтому ищем сначала v2 (текущий генератор), затем v1 — на серверах, где
+# awg2 ещё не обновлён, бот должен продолжать выдавать I1 старого формата.
+_MARKER_RES = (
+    re.compile(
+        r"# CPS_GENERATOR_BEGIN v2\b.*?^_CPS_GENERATOR='\n(.*?)\n'\n# CPS_GENERATOR_END v2\b",
+        re.S | re.M,
+    ),
+    re.compile(
+        r"# CPS_GENERATOR_BEGIN v1\b.*?^_CPS_GENERATOR='\n(.*?)\n'\n# CPS_GENERATOR_END v1\b",
+        re.S | re.M,
+    ),
 )
 
 _cached_code: str | None = None
@@ -67,7 +83,11 @@ def _extract_generator() -> str | None:
     # Порядок важен: сначала явные якоря awg2 (v0.7.9+), они не зависят от
     # оформления кавычек; затем — старые эвристики, чтобы бот продолжал
     # работать с уже установленными на серверах версиями awg2 без маркеров.
-    m = _MARKER_RE.search(text)
+    m = None
+    for marker_re in _MARKER_RES:
+        m = marker_re.search(text)
+        if m:
+            break
     if not m:
         # _CPS_GENERATOR='...многострочный python...'
         # значение в одинарных кавычках; берём до закрывающей одиночной кавычки,
