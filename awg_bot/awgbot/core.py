@@ -38,13 +38,13 @@ SUSPEND_IP = "127.0.0.2/32"  # AllowedIPs у заблокированных по
 def _keepalive_value(server_conf_text: str) -> str:
     """PersistentKeepalive для клиента.
 
-    На AWG 3.0 — диапазон: ядро выбирает значение заново на каждой отправке,
+    На AWG 3.x — диапазон: ядро выбирает значение заново на каждой отправке,
     а фиксированные 25 дают пакет ровно раз в 25 секунд, то есть стабильную
-    временную сигнатуру — ровно то, что 3.0 призван скрывать. Держим диапазон
+    временную сигнатуру — ровно то, что 3.x призван скрывать. Держим диапазон
     вокруг привычных 25 с, иначе рвётся проход через домашние NAT.
     На 2.0 — как было, 25.
     """
-    if not re.search(r"^#\s*AWG_PROTO=3\.0\s*$", server_conf_text, re.M):
+    if not re.search(r"^#\s*AWG_PROTO=3\.\d+\s*$", server_conf_text, re.M):
         return "25"
     return f"{random.randint(18, 24)}-{random.randint(26, 34)}"
 
@@ -468,9 +468,10 @@ def add_client(name: str, expires: int | None = None,
     mtu_m = re.search(r"^MTU\s*=\s*(\S+)", text, re.M)
     mtu = mtu_m.group(1) if mtu_m else "1320"
 
-    # AWG-параметры копируем из [Interface] сервера. Список включает и 3.0
-    # (HeaderProtectionKey, паддинг, таймеры): без них клиент, выданный ботом
-    # для сервера 3.0, молча получил бы конфиг 2.0 и не подключился.
+    # AWG-параметры копируем из [Interface] сервера. Список включает и 3.x
+    # (HeaderProtectionKey, паддинг, таймеры, RandomTrailers/DisableCookies):
+    # без них клиент, выданный ботом для сервера 3.x, молча получил бы конфиг
+    # 2.0 и не подключился.
     iface_block = _split_blocks(text)[0]
     awg_params = []
     for key in ("Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4",
@@ -478,7 +479,8 @@ def add_client(name: str, expires: int | None = None,
                 "Itime", "T1", "T2", "T3", "T4", "T5",
                 "HeaderProtectionKey", "ContentPaddingAddition",
                 "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime",
-                "KeepaliveTimeout", "MaxHandshakeAttempts"):
+                "KeepaliveTimeout", "MaxHandshakeAttempts",
+                "RandomTrailers", "DisableCookies"):
         km = re.search(rf"^{key}\s*=\s*(.+)$", iface_block, re.M)
         if km:
             awg_params.append(f"{key} = {km.group(1).strip()}")
