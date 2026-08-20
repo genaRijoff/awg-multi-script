@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.14"
+VERSION="v0.7.15"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -627,6 +627,45 @@ def u32(v): return struct.pack(">I", v & 0xFFFFFFFF)
 def u24(v): return struct.pack(">I", v)[1:]
 def to_cps(raw): return "<b 0x%s>" % raw.hex()
 
+def to_cps_parts(parts):
+    """
+    Собирает цепочку I-пакета из кусков. Кусок — это либо bytes (уходит как
+    <b 0x..>), либо ("r"|"rc"|"rd", n) — модификатор, который КЛИЕНТ заполняет
+    заново при каждой отправке: <r> случайными байтами, <rc> латинскими
+    буквами, <rd> цифрами.
+
+    Зачем: пакет, целиком записанный как <b 0x..>, уходит байт в байт одинаковым
+    перед каждым рукопожатием — это межсессионная сигнатура, ровно то, от чего
+    мимикрия и защищает. Модификаторы делают его каждый раз другим, не меняя ни
+    длины, ни структуры, и попутно резко укорачивают строку в конфиге: <r 900>
+    вместо 1800 hex-символов.
+
+    Теги b/r/rc/rd понимают оба известных движка (amneziawg-go device/obf.go и
+    ядерный модуль src/junk.c). <c> есть только у ядра, <d>/<ds>/<dz> только у
+    go, поэтому здесь их нет: незнакомый тег отвергается вместе со всем пакетом,
+    а не сам по себе. Порядок кусков сохраняется (jp_spec_setup собирает список
+    в обратном порядке вставки, то есть в порядке записи).
+    """
+    out = []
+    for p in parts:
+        if isinstance(p, tuple):
+            out.append("<%s %d>" % (p[0], p[1]))
+        elif p:
+            out.append("<b 0x%s>" % p.hex())
+    return "".join(out)
+
+
+# Смещение поля random в ClientHello: record(5) + handshake(4) + legacy_version(2).
+# 32 байта, которые настоящий клиент разыгрывает на каждое соединение.
+_TLS_RANDOM_OFFSET = 11
+_TLS_RANDOM_LEN = 32
+
+def tls_chain(domain=None):
+    pkt = gen_tls_clienthello(domain)
+    head = _TLS_RANDOM_OFFSET
+    tail = head + _TLS_RANDOM_LEN
+    return to_cps_parts([pkt[:head], ("r", _TLS_RANDOM_LEN), pkt[tail:]])
+
 def secure_shuffle(lst):
     for i in range(len(lst) - 1, 0, -1):
         j = secrets.randbelow(i + 1)
@@ -922,14 +961,24 @@ SIP_UA_POOL = [
     "Linphone/5.2.5 (belle-sip/5.2.0)", "Zoiper rv2.10.20.4",
     "MicroSIP/3.21.4", "Bria 6.5.1", "PortSIP UA 16.4",
 ]
+# Плейсхолдер под тег-модификатор внутри текстового сообщения. Байт 0x01 в
+# SIP-запросе появиться не может, поэтому по нему безопасно резать.
+_SIP_MARK = "\x01"
+
 def gen_sip():
     host = rc(SIP_POOL)
     user = rc(["alice","bob","100","200","sip","user","client"]) + str(ri(10,9999))
     lip = rand_private_ip()
     lport = rc([5060, 5062, 5080, 5160, ri(10000, 65000)])
-    branch = "z9hG4bK" + secrets.token_hex(7)
-    tag = secrets.token_hex(4)
-    callid = "%s@%s" % (secrets.token_hex(8), host)
+    # branch, tag и Call-ID — токены, уникальные для каждой транзакции. Если
+    # запечь их в <b 0x..>, клиент будет слать один и тот же Call-ID перед
+    # каждым рукопожатием: для наблюдателя это отпечаток устройства, заметный
+    # лучше, чем сам факт VPN. Уходят тегами <rc N> — буквы допустимы в token
+    # по RFC 3261 §25.1.
+    branch_len, tag_len, callid_len = 14, 8, 16
+    branch = "z9hG4bK" + _SIP_MARK
+    tag = _SIP_MARK
+    callid = "%s@%s" % (_SIP_MARK, host)
     cseq = ri(1, 50)
     transport = rc(["udp","udp","udp","udp","tcp"])
     ua = rc(SIP_UA_POOL)
@@ -960,8 +1009,27 @@ def gen_sip():
             "Supported: replaces, outbound, gruu, path",
             "Expires: %d" % rc([300,600,1800,3600]),
         ]
-    lines += ["Content-Length: 0", "", ""]
-    return "\r\n".join(lines).encode()
+    # Тело из случайных букв: клиент заполняет его заново на каждую отправку,
+    # поэтому одинаковых REGISTER подряд не бывает. Длина объявлена в
+    # Content-Length честно, иначе сообщение перестанет быть валидным.
+    body_len = ri(16, 48)
+    lines += ["Content-Length: %d" % body_len, "", ""]
+
+    # Режем текст по плейсхолдерам и вставляем модификаторы на их места.
+    # Порядок совпадает с порядком появления: branch, tag, Call-ID.
+    text = "\r\n".join(lines)
+    specs = [("rc", branch_len), ("rc", tag_len), ("rc", callid_len)]
+    chunks = text.split(_SIP_MARK)
+    if len(chunks) != len(specs) + 1:
+        # плейсхолдер потерялся — отдаём сообщение целиком, без модификаторов
+        return [text.replace(_SIP_MARK, "").encode(), ("rc", body_len)]
+    parts = []
+    for i, chunk in enumerate(chunks):
+        parts.append(chunk.encode())
+        if i < len(specs):
+            parts.append(specs[i])
+    parts.append(("rc", body_len))
+    return parts
 
 # ================================================================
 # DNS Query w/ EDNS0 (unchanged from legacy engine)
@@ -984,10 +1052,12 @@ def gen_dns(domain=None):
 
 # == Dispatch (identical contract: 1 line per packet, up to 5) ==
 if PROFILE == "sip":
-    print(to_cps(gen_sip()))
+    def _sip_line():
+        return to_cps_parts(gen_sip())
+    print(_sip_line())
     if not ONLY_I1:
         for _ in range(4):
-            print(to_cps(gen_sip()))
+            print(_sip_line())
 
 elif PROFILE == "dns":
     print("<r 2><b 0x%s>" % gen_dns(DOMAIN).hex())
@@ -998,16 +1068,30 @@ elif PROFILE == "dns":
             print("<r 2><b 0x%s>" % gen_dns(pool[i % len(pool)]).hex())
 
 elif PROFILE == "tls":
-    print(to_cps(gen_tls_clienthello(DOMAIN)))
+    print(tls_chain(DOMAIN))
     if not ONLY_I1:
         pool = DOMAIN_POOL.copy()
         secure_shuffle(pool)
         for i in range(4):
-            print(to_cps(gen_tls_clienthello(pool[i % len(pool)])))
+            print(tls_chain(pool[i % len(pool)]))
 
 else:  # quic
+    def _quic_initial_line(pkt):
+        # Всё после заголовка и первых байт шифротекста — для наблюдателя
+        # неразличимый шум (AEAD), поэтому хвост отдаём тегом <r>: пакет
+        # остаётся ровно 1200 байт и валидным по RFC 9000 §14.1, но каждый раз
+        # другим, а строка в конфиге короче примерно вчетверо.
+        tail = ri(700, 1000)
+        return to_cps_parts([pkt[:len(pkt) - tail], ("r", tail)])
+
+    def _quic_short_line():
+        # У короткого заголовка структурный только первый байт (fixed bit,
+        # spin, key phase, длина номера пакета) — остальное шум.
+        pkt = gen_quic_short()
+        return to_cps_parts([pkt[:1], ("r", len(pkt) - 1)])
+
     i1_pkt, dcid, ver = gen_quic_initial(DOMAIN)
-    print(to_cps(i1_pkt))
+    print(_quic_initial_line(i1_pkt))
     if not ONLY_I1:
         # RFC 9000 §14.1: КЛИЕНТСКАЯ датаграмма с Initial-пакетом обязана быть
         # не меньше 1200 байт. Короткий второй Initial — не «экономия», а
@@ -1015,11 +1099,11 @@ else:  # quic
         # режиме вместо него идёт 1-RTT пакет с коротким заголовком: он
         # валиден при любой длине и вчетверо короче.
         if COMPACT:
-            print(to_cps(gen_quic_short()))
+            print(_quic_short_line())
         else:
-            print(to_cps(gen_quic_second_initial(dcid, ver)))
+            print(_quic_initial_line(gen_quic_second_initial(dcid, ver)))
         for _ in range(3):
-            print(to_cps(gen_quic_short()))
+            print(_quic_short_line())
 '
 # CPS_GENERATOR_END v1
 
@@ -3438,10 +3522,119 @@ AWG31_KEYS_RE="(RandomTrailers|DisableCookies)"
 # «Unable to modify interface: Invalid argument» при подъёме awg0.
 AWG_HP_MIN_S=12
 
+# Размеры сообщений WireGuard до паддинга (messages.h модуля). S1-S3
+# прибавляются к ним, поэтому два типа сообщений становятся ОДНОЙ длины, когда
+# S отличаются ровно на разницу базовых размеров:
+#   148 + S1 == 92 + S2  →  S2 = S1 + 56   (initiation против response)
+#   148 + S1 == 64 + S3  →  S3 = S1 + 84   (initiation против cookie)
+#    92 + S2 == 64 + S3  →  S3 = S2 + 28   (response против cookie)
+# Совпавшая длина возвращает наблюдателю ровно то, что паддинг прятал, — тип
+# пакета. Раньше проверялось только первое совпадение, а третье достижимо в
+# профиле Pro примерно в одной генерации из 350.
+AWG_S_DELTA_INIT_RESP=56
+AWG_S_DELTA_INIT_COOKIE=84
+AWG_S_DELTA_RESP_COOKIE=28
+AWG_S_GAP=10                # запас с каждой стороны от совпадения
+
+# Потолки из реализаций, а не из советов:
+#   S4  — amneziawg-tools src/config.c
+#   Jc  — модуль принимает 0..128; свыше 64 рукопожатие заметно медленнее,
+#         потому что все junk-пакеты уходят перед initiation
+AWG_S4_MAX=32
+AWG_JC_MAX=128
+AWG_JC_SLOW=64
+
 # Все ключи параметров AmneziaWG, которые клиент обязан получить от сервера.
 # Единый источник: любой новый параметр добавляется здесь, а не в трёх местах.
 # 2.0 — Jc/Jmin/Jmax, S1-S4, H1-H4. 3.x — см. AWG3_KEYS_RE.
 AWG_PARAM_KEYS_RE="(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)"
+
+# Диапазон S по профилю — единственное место, где эти числа записаны.
+# Раньше они дублировались: один набор в блоке профиля, второй — в цикле
+# коррекции S2, и разойтись им ничто не мешало.
+_awg_rand_s() {
+  case "${AWG_PROFILE:-pro}" in
+    lite)
+      # Образец оригинальной Amnezia: S1=102, S2=22, S3=21, S4=7 (±5)
+      case "$1" in
+        S1) rand_range 97 107 ;; S2) rand_range 17 27 ;;
+        S3) rand_range 16 26 ;;  S4) rand_range 4 10 ;;
+      esac ;;
+    standard)
+      case "$1" in
+        S1) rand_range 30 80 ;; S2) rand_range 30 80 ;;
+        S3) rand_range 15 32 ;; S4) rand_range 10 20 ;;
+      esac ;;
+    pro|*)
+      case "$1" in
+        S1) rand_range 15 150 ;; S2) rand_range 15 150 ;;
+        S3) rand_range 8 64 ;;  S4) rand_range 6 31 ;;
+      esac ;;
+  esac
+}
+
+# Истина, если два числа ближе друг к другу, чем AWG_S_GAP.
+_s_too_close() {
+  local d=$(( $1 - $2 ))
+  (( d < 0 )) && d=$(( -d ))
+  (( d < AWG_S_GAP ))
+}
+
+# Разводит S1-S3 от всех трёх совпадений длин (см. AWG_S_DELTA_*).
+# Сначала перебор в рамках профиля — так значения остаются характерными для
+# него; если за 20 попыток не сошлось (узкие диапазоны Lite/Standard), доводим
+# детерминированным сдвигом вверх. Порядок важен: сперва S2 относительно S1,
+# потом S3 относительно обоих, иначе правка S2 ломает уже разведённый S3.
+_awg_fix_s_collisions() {
+  local tries=0
+  while (( tries < 20 )); do
+    _s_too_close $(( S1 + AWG_S_DELTA_INIT_RESP ))   "$S2" || \
+    _s_too_close $(( S1 + AWG_S_DELTA_INIT_COOKIE )) "$S3" || \
+    _s_too_close $(( S2 + AWG_S_DELTA_RESP_COOKIE )) "$S3" || break
+    S2=$(_awg_rand_s S2)
+    S3=$(_awg_rand_s S3)
+    _awg_apply_hp_min_s
+    tries=$(( tries + 1 ))
+  done
+
+  local guard=0 shifted=""
+  while (( guard < 30 )) && _s_too_close $(( S1 + AWG_S_DELTA_INIT_RESP )) "$S2"; do
+    S2=$(( S2 + AWG_S_GAP )); guard=$(( guard + 1 )); shifted="S2=$S2"
+  done
+  guard=0
+  while (( guard < 30 )) && \
+        { _s_too_close $(( S1 + AWG_S_DELTA_INIT_COOKIE )) "$S3" || \
+          _s_too_close $(( S2 + AWG_S_DELTA_RESP_COOKIE )) "$S3"; }; do
+    S3=$(( S3 + AWG_S_GAP )); guard=$(( guard + 1 )); shifted="${shifted} S3=$S3"
+  done
+
+  if (( tries > 0 )) || [[ -n "$shifted" ]]; then
+    log_info "gen_awg_params: разведение длин (попыток=$tries${shifted:+, сдвиг: $shifted}) — S1=$S1 S2=$S2 S3=$S3"
+  fi
+  return 0
+}
+
+# Прижимает параметры к потолкам реализаций. Наши диапазоны в них укладываются,
+# но правка диапазона не должна тихо выпускать конфиг, который отвергнет клиент.
+_awg_clamp_limits() {
+  if (( S4 > AWG_S4_MAX )); then
+    log_info "gen_awg_params: S4=$S4 выше потолка tools ($AWG_S4_MAX) — прижат"
+    S4=$AWG_S4_MAX
+  fi
+  if (( Jc > AWG_JC_MAX )); then
+    log_info "gen_awg_params: Jc=$Jc выше потолка модуля ($AWG_JC_MAX) — прижат"
+    Jc=$AWG_JC_MAX
+  elif (( Jc > AWG_JC_SLOW )); then
+    log_info "gen_awg_params: Jc=$Jc — рукопожатие будет заметно медленнее (>$AWG_JC_SLOW)"
+  fi
+  # Jmax больше MTU означает фрагментацию junk-пакетов: на части маршрутов это
+  # рвёт связь и само по себе заметно.
+  local _mtu="${MTU:-1280}"
+  if [[ "$_mtu" =~ ^[0-9]+$ ]] && (( Jmax >= _mtu )); then
+    log_info "gen_awg_params: Jmax=$Jmax не меньше MTU=$_mtu — junk будет фрагментироваться"
+  fi
+  return 0
+}
 
 # Поднимает S1-S4 до минимума, который требует ядро при защите заголовков.
 # Работает только на 3.x: на 2.0 HeaderProtectionKey нет и ограничения тоже.
@@ -3485,30 +3678,24 @@ gen_awg_params() {
       Jc=$(rand_range 3 5)              # 4 ±1
       Jmin=$(rand_range 5 15)           # 10 ±5
       Jmax=$(rand_range 45 55)          # 50 ±5
-      S1=$(rand_range 97 107)           # 102 ±5
-      S2=$(rand_range 17 27)            # 22 ±5
-      S3=$(rand_range 16 26)            # 21 ±5
-      S4=$(rand_range 4 10)             # 7 ±3 (нельзя ±5: ниже 0 уйдём)
+      S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
+      S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     standard)
       # ── Standard: промежуточные значения ──
       Jc=$(rand_range 5 8)
       Jmin=$(rand_range 30 80)
       Jmax=$(rand_range 100 250)
-      S1=$(rand_range 30 80)
-      S2=$(rand_range 30 80)
-      S3=$(rand_range 15 32)
-      S4=$(rand_range 10 20)
+      S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
+      S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     pro|*)
       # ── Pro: текущие полные диапазоны (без изменений) ──
       Jc=$(rand_range 4 16)
       Jmin=$(rand_range 50 256)
       Jmax=$(rand_range 300 1000)
-      S1=$(rand_range 15 150)
-      S2=$(rand_range 15 150)
-      S3=$(rand_range 8 64)
-      S4=$(rand_range 6 31)
+      S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
+      S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
   esac
 
@@ -3526,37 +3713,16 @@ gen_awg_params() {
     Jmax=$((Jmin + $(rand_range 100 500)))
   fi
 
-  # S1 + 56 ≠ S2 (требование мануала). Усиливаем: gap >= 10
-  # для защиты от off-by-one в реализации awg.
-  # Если за 10 попыток не вышло — оставляем последнее значение
-  # (математически в наших диапазонах такого не должно случиться,
-  # но логируем для отладки).
-  local tries=0 max_tries=10 gap=10
-  local S1_plus_56=$((S1 + 56))
-  while [[ $tries -lt $max_tries ]]; do
-    local diff=$((S1_plus_56 - S2))
-    [[ $diff -lt 0 ]] && diff=$((-diff))
-    [[ $diff -ge $gap ]] && break
-    # Перегенерируем S2 в рамках того же профиля
-    case "${AWG_PROFILE:-pro}" in
-      lite)     S2=$(rand_range 17 27) ;;
-      standard) S2=$(rand_range 30 80) ;;
-      pro|*)    S2=$(rand_range 15 150) ;;
-    esac
-    tries=$((tries + 1))
-  done
-  if [[ $tries -gt 0 ]]; then
-    log_info "gen_awg_params: S1+56=$S1_plus_56 vs S2=$S2 — корректировка за $tries попыток (gap=$gap)"
-  fi
-  # Финальная страховка от прямого равенства S1+56==S2
-  if [[ $S1_plus_56 -eq $S2 ]]; then
-    S2=$((S2 + gap))
-    log_info "gen_awg_params: применён ручной сдвиг S2 → $S2 (страховка от S1+56=S2)"
-  fi
+  # Длины сообщений не должны совпадать ни в одной из трёх пар (см.
+  # AWG_S_DELTA_*). Раньше проверялась только пара initiation/response.
+  _awg_fix_s_collisions
 
-  # Цикл выше перегенерировал S2 в рамках профиля — проверяем границу ещё раз,
-  # чтобы правка диапазонов профиля не вернула ошибку ядра незаметно.
+  # Разведение перегенерировало S2/S3 — граница ядра проверяется ещё раз,
+  # чтобы правка диапазонов профиля не вернула ошибку setconf незаметно.
   _awg_apply_hp_min_s
+
+  # Потолки реализаций (S4, Jc) и фрагментация junk по MTU
+  _awg_clamp_limits
 
   # ── H1-H4: уникальные диапазоны в рамках recommended [5 .. 2^31-1] ──
   # Мануал: H1/H2/H3/H4 must be unique, recommended range 5 ≤ H ≤ 2147483647

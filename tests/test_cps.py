@@ -13,7 +13,7 @@ CPS_GENERATOR_BEGIN/END) — тестируется то, что реально 
 Запуск:  python3 tests/test_cps.py [путь/к/awg2.sh]
 Выход:   0 — все пакеты валидны, 1 — есть провалы.
 """
-import os, re, subprocess, sys, tempfile
+import os, random, re, subprocess, sys, tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 AWG2 = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_HERE, "..", "awg2.sh")
@@ -39,17 +39,45 @@ def _extract_generator(path):
 
 GEN = _extract_generator(AWG2)
 
+# Теги, которые понимают ОБА известных движка: amneziawg-go (device/obf.go) и
+# ядерный модуль (src/junk.c). <c> есть только у ядра, <d>/<ds>/<dz> только у
+# go — незнакомый тег отвергается вместе со всем пакетом, поэтому в цепочке их
+# быть не должно.
+PORTABLE_TAGS = ("b", "r", "rc", "rd")
+
+# Чем клиент заполняет модификатор при отправке (см. junk.c):
+#   r  — случайные байты, rc — латинские буквы, rd — цифры
+FILL = {
+    "r": lambda n: bytes(random.randrange(256) for _ in range(n)),
+    "rc": lambda n: bytes(random.choice(b"abcdefghijklmnopqrstuvwxyz"
+                                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+                          for _ in range(n)),
+    "rd": lambda n: bytes(random.choice(b"0123456789") for _ in range(n)),
+}
+
+
 def parse_line(line):
-    """<r N><b 0x..> -> (префикс случайных байт, пакет)"""
-    rnd, pkt = 0, b""
+    """
+    Разбирает цепочку тегов в (список сегментов, собранный пакет).
+
+    Модификаторы подставляются так, как это сделал бы клиент, — иначе нельзя
+    проверить главное: что поля длины внутри пакета учитывают байты, которые
+    придут из тега, а не только записанные в <b 0x..>.
+    """
+    segments, pkt = [], b""
     for tag in re.findall(r"<([^>]*)>", line):
         if tag.startswith("b 0x"):
-            pkt += bytes.fromhex(tag[4:])
-        elif tag.startswith("r "):
-            rnd += int(tag[2:])
-        else:
-            raise AssertionError("неизвестный тег <%s>" % tag)
-    return rnd, pkt
+            raw = bytes.fromhex(tag[4:])
+            segments.append(("b", len(raw)))
+            pkt += raw
+            continue
+        kind, _, arg = tag.partition(" ")
+        assert kind in PORTABLE_TAGS, (
+            "тег <%s> понимает не всякий движок — пакет будет отвергнут целиком" % kind)
+        n = int(arg)
+        segments.append((kind, n))
+        pkt += FILL[kind](n)
+    return segments, pkt
 
 def check_tls(pkt):
     assert pkt[0] == 0x16, "не TLS handshake record"
@@ -88,8 +116,9 @@ def check_tls(pkt):
     assert 0x000a in exts, "нет supported_groups"
     return "TLS ClientHello ok: SNI=%s, ext=%d, шифров=%d" % (host, len(exts), cs_len // 2)
 
-def check_dns(rnd, pkt):
-    assert rnd == 2, "нет случайного transaction ID (<r 2>)"
+def check_dns(segments, pkt):
+    assert segments[0] == ("r", 2), "нет случайного transaction ID (<r 2>)"
+    pkt = pkt[2:]
     assert pkt[0:2] == b"\x01\x00", "флаги не standard query+RD"
     qd, an, ns, ar = (int.from_bytes(pkt[i:i+2], "big") for i in (2, 4, 6, 8))
     assert (qd, an, ns, ar) == (1, 0, 0, 1), "counts не 1/0/0/1: %s" % ((qd, an, ns, ar),)
@@ -108,7 +137,9 @@ def check_dns(rnd, pkt):
 
 def check_sip(pkt):
     txt = pkt.decode()
-    assert txt.endswith("\r\n\r\n"), "нет пустой строки в конце"
+    # Пустая строка отделяет заголовки от тела; тело может быть непустым —
+    # в нём едет модификатор, объявленный в Content-Length.
+    assert "\r\n\r\n" in txt, "нет пустой строки между заголовками и телом"
     head, _, body = txt.partition("\r\n\r\n")
     lines = head.split("\r\n")
     m = re.fullmatch(r"(REGISTER|OPTIONS) sip:[a-z0-9.\-]+ SIP/2\.0", lines[0])
@@ -121,7 +152,10 @@ def check_sip(pkt):
     assert "branch=z9hG4bK" in hdr["via"], "branch не по RFC 3261 (magic cookie)"
     assert ";tag=" in hdr["from"], "нет tag в From"
     assert re.fullmatch(r"\d+ " + method, hdr["cseq"]), "CSeq не совпадает с методом"
-    assert hdr["content-length"] == "0" and body == "", "Content-Length не соответствует телу"
+    assert hdr["content-length"].isdigit(), "Content-Length не число"
+    assert int(hdr["content-length"]) == len(body.encode()), (
+        "Content-Length %s не совпадает с телом (%d байт)"
+        % (hdr["content-length"], len(body.encode())))
     if method == "REGISTER":
         assert "contact" in hdr, "REGISTER без Contact"
     return "SIP %s ok: заголовков=%d" % (method, len(hdr))
@@ -156,16 +190,21 @@ for profile in ("tls", "dns", "sip", "quic"):
         label = "%s/%s" % (profile, mode or "compact")
         assert len(out) == 5, "%s: ожидали 5 пакетов, получили %d" % (label, len(out))
         for i, line in enumerate(out, 1):
-            rnd, pkt = parse_line(line)
+            segments, pkt = parse_line(line)
             try:
                 if profile == "tls":  msg = check_tls(pkt)
-                elif profile == "dns": msg = check_dns(rnd, pkt)
+                elif profile == "dns": msg = check_dns(segments, pkt)
                 elif profile == "sip": msg = check_sip(pkt)
                 else:                  msg = check_quic(pkt, first=(i == 1))
-                print("  OK  %-14s I%d %4dB  %s" % (label, i, len(pkt) + rnd, msg))
+                # Пакет целиком из <b 0x..> уходит байт в байт одинаковым перед
+                # каждым рукопожатием — это межсессионная сигнатура.
+                mods = [k for k, _ in segments if k != "b"]
+                assert mods, "пакет статичный: ни одного тега-модификатора"
+                print("  OK  %-14s I%d %4dB  %s [%s]"
+                      % (label, i, len(pkt), msg, ",".join(mods)))
             except AssertionError as e:
                 fail += 1
-                print("  FAIL %-13s I%d %4dB  %s" % (label, i, len(pkt) + rnd, e))
+                print("  FAIL %-13s I%d %4dB  %s" % (label, i, len(pkt), e))
 os.unlink(GEN)
 print("\nпровалов:", fail)
 sys.exit(1 if fail else 0)
