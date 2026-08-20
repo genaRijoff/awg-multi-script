@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.13"
+VERSION="v0.7.14"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -1198,7 +1198,7 @@ choose_mimicry_profile() {
       [[ -n "$I3" ]] && nonempty=$((nonempty+1))
       [[ -n "$I4" ]] && nonempty=$((nonempty+1))
       [[ -n "$I5" ]] && nonempty=$((nonempty+1))
-      echo -e "${G}  √ ${nonempty}/5 пакетов: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
+      echo -e "${G}  √ ${nonempty}/5 пакетов ${D}(символов строки)${G}: I1=${#I1} I2=${#I2} I3=${#I3} I4=${#I4} I5=${#I5}${N}"
     else
       I2=""; I3=""; I4=""; I5=""
       echo -e "${G}  √ I1 готов (${#I1} сим)${N}"
@@ -1821,6 +1821,23 @@ _port_holder() {
   ss -lunp 2>/dev/null | grep -E "[:.]${p}\b" || true
 }
 
+# Возвращает список S-параметров конфига, нарушающих требование ядра
+# (S1-S4 >= AWG_HP_MIN_S при заданном HeaderProtectionKey). Пусто = всё в
+# порядке. Код возврата 1, если нарушения есть — удобно для if.
+awg_check_hp_min_s() {
+  local conf="${1:-$SERVER_CONF}" key val bad=""
+  [[ -f "$conf" ]] || return 0
+  grep -q '^HeaderProtectionKey = ' "$conf" 2>/dev/null || return 0
+  for key in S1 S2 S3 S4; do
+    val=$(grep -m1 "^${key} = " "$conf" 2>/dev/null | awk '{print $3}')
+    [[ "$val" =~ ^[0-9]+$ ]] || continue
+    (( val < AWG_HP_MIN_S )) && bad+=" ${key}=${val}"
+  done
+  [[ -z "$bad" ]] && return 0
+  echo "$bad"
+  return 1
+}
+
 # Разбирает вывод неудавшегося awg-quick up и называет причину.
 #
 # Смысл в том, чтобы человек не гадал: сообщения awg-quick короткие, но
@@ -1859,6 +1876,21 @@ awg_diagnose_up_failure() {
   # Так выглядит рассинхрон «tools из master + модуль от прошлой установки».
   if [[ "$low" == *"unable to modify interface"* || "$low" == *"invalid argument"* ]]; then
     err "Ядро отвергло параметры интерфейса"
+
+    # Первая по частоте причина, и она не про версию модуля: при заданном
+    # HeaderProtectionKey ядро требует S1-S4 >= AWG_HP_MIN_S. Проверяем до
+    # разговоров о пересборке — иначе человек идёт пересобирать исправный DKMS.
+    local _bad_s
+    _bad_s=$(awg_check_hp_min_s "$conf" || true)
+    if [[ -n "$_bad_s" ]]; then
+      info "Причина: при защите заголовков (AWG 3.x) ядро требует"
+      info "S1-S4 не меньше ${AWG_HP_MIN_S} — в этот паддинг прячется nonce."
+      info "В конфиге меньше:${_bad_s}"
+      info "Лечится перегенерацией параметров: Сервер (1) → п.5"
+      info "(в версиях до v0.7.14 генератор мог выдать S ниже границы)"
+      return 0
+    fi
+
     if grep -qE "^${AWG3_KEYS_RE} " "$conf" 2>/dev/null; then
       info "В конфиге параметры AWG 3.x, а загруженный модуль их не поддерживает"
       if awg_module_stale 2>/dev/null; then
@@ -2196,6 +2228,20 @@ do_repair() {
     fi
   else
     ok "Маркер уровня CPS на месте ($(grep -m1 '^# AWG_OBF_LEVEL=' "$SERVER_CONF" | cut -d= -f2))"
+  fi
+
+  # 2.4. S1-S4 против требования ядра к защите заголовков. Конфиг с таким
+  # нарушением не поднимется никогда — и по сообщению awg-quick это не видно.
+  local _hp_bad
+  _hp_bad=$(awg_check_hp_min_s "$SERVER_CONF" || true)
+  if [[ -n "$_hp_bad" ]]; then
+    err "S-параметры ниже минимума для AWG 3.x:${_hp_bad} (нужно >= ${AWG_HP_MIN_S})"
+    issues=$((issues+1))
+    info "Ядро отвергнет такой конфиг: в паддинг S1-S4 прячется nonce защиты заголовков"
+    info "Починка: Сервер (1) → п.5 (перегенерировать параметры)"
+  else
+    [[ -f "$SERVER_CONF" ]] && grep -q '^HeaderProtectionKey = ' "$SERVER_CONF" 2>/dev/null && \
+      ok "S1-S4 не ниже минимума для защиты заголовков (${AWG_HP_MIN_S})"
   fi
 
   # 2.5. Конфиг просит 3.x — умеют ли это установленные tools и модуль?
@@ -3384,10 +3430,41 @@ AWG3_KEYS_RE="(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTi
 # Ключи, которые отличают именно 3.1: по ним выбирается версия пробы.
 AWG31_KEYS_RE="(RandomTrailers|DisableCookies)"
 
+# Нижняя граница S1-S4 при включённой защите заголовков.
+# Ядро (netlink.c модуля: «S1 must be more then %d to use headerProtection»)
+# отвергает setconf, если при заданном HeaderProtectionKey хоть одно из S1-S4
+# меньше HEADER_PROTECTION_NONCE_SIZE — в этот паддинг прячется nonce защиты
+# заголовков (header_protection.h: NONCE_SIZE = 12). Наружу это выглядит как
+# «Unable to modify interface: Invalid argument» при подъёме awg0.
+AWG_HP_MIN_S=12
+
 # Все ключи параметров AmneziaWG, которые клиент обязан получить от сервера.
 # Единый источник: любой новый параметр добавляется здесь, а не в трёх местах.
 # 2.0 — Jc/Jmin/Jmax, S1-S4, H1-H4. 3.x — см. AWG3_KEYS_RE.
 AWG_PARAM_KEYS_RE="(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)"
+
+# Поднимает S1-S4 до минимума, который требует ядро при защите заголовков.
+# Работает только на 3.x: на 2.0 HeaderProtectionKey нет и ограничения тоже.
+# Значение не прибивается к 12 гвоздями — иначе у всех серверов 3.x получался
+# бы одинаковый паддинг, то есть сигнатура. Берём случайное из [12; 24].
+_awg_apply_hp_min_s() {
+  case "${AWG_PROTO:-2.0}" in
+    3.0|3.1) ;;
+    *) return 0 ;;
+  esac
+  local name val raised=""
+  for name in S1 S2 S3 S4; do
+    val="${!name}"
+    [[ "$val" =~ ^[0-9]+$ ]] || continue
+    if (( val < AWG_HP_MIN_S )); then
+      printf -v "$name" '%s' "$(rand_range "$AWG_HP_MIN_S" $((AWG_HP_MIN_S + 12)))"
+      raised+=" ${name}: ${val}→${!name}"
+    fi
+  done
+  [[ -n "$raised" ]] && \
+    log_info "gen_awg_params: S под 3.x подняты до >= ${AWG_HP_MIN_S} —${raised}"
+  return 0
+}
 
 gen_awg_params() {
   AWG_PARAMS_LINES=""
@@ -3437,6 +3514,13 @@ gen_awg_params() {
 
   # ── Инварианты мануала (применяются для всех профилей) ──
 
+  # Нижняя граница S1-S4 для 3.x — жёсткое требование ядра, а не рекомендация.
+  # Диапазоны профилей его не гарантировали: Pro брал S3 от 8 и S4 от 6, Lite —
+  # S4 в 4..10. То есть сервер 3.x создавался через раз, а на Lite не
+  # создавался вовсе: awg-quick падал на «Invalid argument» уже после того, как
+  # конфиги записаны.
+  _awg_apply_hp_min_s
+
   # Jmin < Jmax
   if [[ $Jmin -ge $Jmax ]]; then
     Jmax=$((Jmin + $(rand_range 100 500)))
@@ -3469,6 +3553,10 @@ gen_awg_params() {
     S2=$((S2 + gap))
     log_info "gen_awg_params: применён ручной сдвиг S2 → $S2 (страховка от S1+56=S2)"
   fi
+
+  # Цикл выше перегенерировал S2 в рамках профиля — проверяем границу ещё раз,
+  # чтобы правка диапазонов профиля не вернула ошибку ядра незаметно.
+  _awg_apply_hp_min_s
 
   # ── H1-H4: уникальные диапазоны в рамках recommended [5 .. 2^31-1] ──
   # Мануал: H1/H2/H3/H4 must be unique, recommended range 5 ≤ H ≤ 2147483647
@@ -3960,17 +4048,34 @@ EOF
   local running_k newest_k k
   running_k="$(uname -r)"
   newest_k=""
+  local _kernels=()
   for k in /lib/modules/*/; do
     k=${k%/}; k=${k##*/}
     [[ -e "/boot/vmlinuz-$k" ]] || continue
     # заголовки нужны, иначе DKMS не соберёт
     [[ -d "/lib/modules/$k/build" ]] || apt-get install -y -q "linux-headers-$k" >/dev/null 2>&1 || true
-    newest_k="$k"
+    _kernels+=("$k")
   done
+  # Самое новое ядро — по ВЕРСИИ, а не по алфавиту. Раньше брался последний
+  # элемент glob: "6.8.0-31-generic" сортируется строкой после "6.8.0-137",
+  # и скрипт объявлял старое ядро новым, а заодно не замечал настоящее новое.
+  if (( ${#_kernels[@]} > 0 )); then
+    newest_k=$(printf '%s\n' "${_kernels[@]}" | sort -V | tail -1)
+  fi
   if dkms autoinstall >/dev/null 2>&1; then
     ok "Модуль собран под все установленные ядра"
   else
     warn "dkms autoinstall отработал с ошибкой — проверь: dkms status"
+  fi
+
+  # autoinstall молча пропускает ядро без заголовков, поэтому «всё собрано»
+  # проверяем по факту, а не по коду возврата
+  if [[ -n "$newest_k" ]] && ! dkms status 2>/dev/null | grep -q "$newest_k"; then
+    if dkms autoinstall -k "$newest_k" >/dev/null 2>&1; then
+      ok "Модуль дособран под $newest_k"
+    else
+      warn "Модуль под $newest_k собрать не удалось (нет linux-headers-$newest_k?)"
+    fi
   fi
 
   # Если загружено не самое новое ядро — предупреждаем прямо, а не постфактум
@@ -4271,7 +4376,7 @@ do_gen() {
   echo -e "  ${W}Обфускация : ${N}$obf_label"
   echo -e "  ${W}DNS        : ${N}$CLIENT_DNS"
   echo -e "  ${W}Мимикрия   : ${N}${MIMICRY_PROFILE:-none}"
-  echo -e "  ${W}I1         : ${N}${I1:+получен (${#I1} байт)}"
+  echo -e "  ${W}I1         : ${N}${I1:+получен (${#I1} симв. ≈ $(( (${#I1} - 8) / 2 )) байт пакета)}"
   echo -e "  ${W}Клиент     : ${N}$CLIENT_ADDR"
   echo -e "  ${W}Сервер     : ${N}$SERVER_ADDR"
   echo -e "  ${W}MTU        : ${N}$MTU"
