@@ -218,6 +218,8 @@ def client_card_text(p: core.Peer) -> str:
         f"Статус: {st}\n"
         f"Маршрут: {route}\n"
         f"Срок: {exp}\n"
+        f"Мимикрия: {kb.mimicry_label(p.mimicry)}"
+        + ("" if p.mimicry else " <i>(метки нет — конфиг выдан раньше)</i>") + "\n"
         f"{note_line}"
         f"Трафик ↓{core.fmt_bytes(p.rx)} ↑{core.fmt_bytes(p.tx)}\n"
         + (f"Endpoint: <code>{esc(p.endpoint)}</code>\n" if p.endpoint else "")
@@ -455,10 +457,7 @@ async def cb_add_profile(cq: CallbackQuery, state: FSMContext) -> None:
 async def _create_with_profile(target, state: FSMContext, name: str, profile: str) -> None:
     """Общий код создания клиента с выбранным профилем."""
     await state.clear()
-    label = {"quic": "QUIC", "curl_quic": "cURL QUIC + ECH", "dns": "DNS",
-             "stun": "STUN/TURN", "webrtc": "WebRTC", "sip": "SIP",
-             "ntp": "NTP", "rtp": "RTP", "ssdp": "SSDP",
-             "tls": "QUIC (бывший TLS)", "basic": "базовый"}.get(profile, profile)
+    label = kb.mimicry_label(profile)
     wait = await target.answer(f"⏳ Создаю <b>{esc(name)}</b> (профиль: {label})…")
     ok, text, conf_path = await asyncio.to_thread(core.add_client, name, None, profile)
     await wait.edit_text(("✅ " if ok else "❌ ") + esc(text))
@@ -479,6 +478,67 @@ async def _create_with_profile(target, state: FSMContext, name: str, profile: st
                 "импортируй .conf файл выше.")
     peers = core.list_peers()
     await target.answer(f"<b>👥 Клиенты ({len(peers)})</b>", reply_markup=kb.clients_menu(peers))
+
+
+# ── смена мимикрии у выданного клиента ──
+@dp.callback_query(F.data.startswith("cl_mim:"))
+async def cb_client_mimicry(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    idx = int(cq.data.split(":")[1])
+    p = _peer_by_idx(idx)
+    if not p:
+        return await cq.answer("Клиент не найден", show_alert=True)
+    if not os.path.isfile(p.conf_path):
+        return await cq.answer("Файл конфига не найден", show_alert=True)
+    cur = kb.mimicry_label(p.mimicry) if p.mimicry else "неизвестна"
+    await safe_edit(
+        cq,
+        f"<b>🎭 Мимикрия — {esc(p.name)}</b>\n\n"
+        f"Сейчас: <b>{esc(cur)}</b>\n\n"
+        "Меняются только I1-I5 в конфиге этого клиента. Сервер и остальные "
+        "клиенты не затрагиваются — переподключать их не надо.\n"
+        "<b>Клиенту нужен новый конфиг</b>: до замены он ходит по старому.",
+        kb.mimicry_choices(idx),
+    )
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("cl_mim_set:"))
+async def cb_client_mimicry_set(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    parts = cq.data.split(":")
+    if len(parts) != 3:
+        return await cq.answer("Некорректный запрос", show_alert=True)
+    idx, profile = int(parts[1]), parts[2]
+    p = _peer_by_idx(idx)
+    if not p:
+        return await cq.answer("Клиент не найден", show_alert=True)
+    await cq.answer()
+    wait = await cq.message.answer(
+        f"⏳ Меняю мимикрию у <b>{esc(p.name)}</b> → {esc(kb.mimicry_label(profile))}…")
+    ok, text, conf_path = await asyncio.to_thread(
+        core.change_client_mimicry, p.name, profile)
+    await wait.edit_text(("✅ " if ok else "❌ ") + esc(text))
+    if ok and conf_path and os.path.isfile(conf_path):
+        data = open(conf_path, "rb").read()
+        await cq.message.answer_document(
+            BufferedInputFile(data, filename=f"{p.name}.conf"),
+            caption=f"Новый конфиг <b>{esc(p.name)}</b> — замените старый на устройстве.",
+        )
+        png = make_qr_png(data.decode())
+        if png:
+            await cq.message.answer_photo(
+                BufferedInputFile(png, filename=f"{p.name}_qr.png"),
+                caption="QR для AmneziaWG")
+        else:
+            await cq.message.answer(
+                "ℹ️ Конфиг великоват для QR-кода (длинный профиль маскировки) — "
+                "импортируйте .conf файл выше.")
+    fresh = _peer_by_idx(idx)
+    if fresh:
+        await cq.message.answer(client_card_text(fresh), reply_markup=_card_kb(idx, fresh))
 
 
 # ── переименование (FSM) ──

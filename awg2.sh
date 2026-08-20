@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.20"
+VERSION="v0.7.21"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -5962,6 +5962,7 @@ do_gen() {
     echo ""
     echo "[Peer]"
     echo "# $FIRST_CLIENT_NAME"
+    echo "# mimicry=$(_mimicry_tag "${I1:-}")"
     echo "PublicKey = $cli_pub"
     echo "PresharedKey = $psk"
     echo "AllowedIPs = $CLIENT_ADDR"
@@ -6104,8 +6105,10 @@ _mgmt_scan_clients() {
     elif [[ $in_peer -eq 1 ]]; then
       if [[ "$line" =~ ^#[[:space:]](.+) ]]; then
         local _cmt="${BASH_REMATCH[1]}"
-        # Пропускаем служебные метки expires= и orig_ips=
-        if [[ "$_cmt" != expires=* && "$_cmt" != orig_ips=* ]]; then
+        # Имя клиента — первый комментарий без "=" (валидатор имён знак "="
+        # не пропускает). Так пропускаются все служебные метки разом:
+        # expires=, orig_ips=, mimicry=, note= от бота.
+        if [[ -z "$cur_name" && "$_cmt" != *=* ]]; then
           cur_name="$_cmt"
         fi
       elif [[ "$line" =~ ^PublicKey[[:space:]]=[[:space:]](.+) ]]; then
@@ -6725,6 +6728,7 @@ do_add_client() {
     echo ""
     echo "[Peer]"
     echo "# $client_name"
+    echo "# mimicry=$(_mimicry_tag "$i1_line")"
     echo "PublicKey = $cli_pub"
     echo "PresharedKey = $psk"
     echo "AllowedIPs = $client_addr"
@@ -7112,11 +7116,16 @@ do_bulk_add_clients() {
     cli_pub=$(echo "$cli_priv" | awg pubkey)
     psk=$(awg genpsk)
 
-    # Дописываем [Peer] в SERVER_CONF (6 строк: пустая, [Peer], #name, PublicKey, PresharedKey, AllowedIPs)
+    # Дописываем [Peer] в SERVER_CONF. Размер блока запоминаем числом строк
+    # до записи: откат ниже отрезает ровно дописанное, не завися от того,
+    # сколько строк в блоке сейчас (метки вроде mimicry= его меняют).
+    local _peer_mark
+    _peer_mark=$(wc -l < "$SERVER_CONF")
     {
       echo ""
       echo "[Peer]"
       echo "# $name"
+      echo "# mimicry=$(_mimicry_tag "$i1_line")"
       echo "PublicKey = $cli_pub"
       echo "PresharedKey = $psk"
       echo "AllowedIPs = $client_addr"
@@ -7129,11 +7138,10 @@ do_bulk_add_clients() {
     if ! awg set awg0 peer "$cli_pub" preshared-key "$psk_tmp" allowed-ips "$client_addr" 2>/dev/null; then
       rm -f "$psk_tmp"
       warn "[${idx}/${count}] ${name}: awg set не удался, откат записи"
-      # Откат: удаляем последние 6 строк из SERVER_CONF
-      local total_lines
-      total_lines=$(wc -l < "$SERVER_CONF")
-      if (( total_lines > 6 )); then
-        head -n $((total_lines - 6)) "$SERVER_CONF" > "${SERVER_CONF}.tmp" && mv "${SERVER_CONF}.tmp" "$SERVER_CONF"
+      # Откат: возвращаем файл к размеру, снятому перед дописыванием блока
+      if [[ "$_peer_mark" =~ ^[0-9]+$ ]] && (( _peer_mark > 0 )); then
+        head -n "$_peer_mark" "$SERVER_CONF" > "${SERVER_CONF}.tmp" \
+          && mv "${SERVER_CONF}.tmp" "$SERVER_CONF"
       fi
       skipped=$((skipped+1))
       idx=$((idx+1))
@@ -7312,8 +7320,9 @@ do_list_clients() {
       expire_ts="${BASH_REMATCH[1]}"
     elif [[ "$line" =~ ^#[[:space:]](.+) ]]; then
       _cmt="${BASH_REMATCH[1]}"
-      # Пропускаем служебные метки expires= и orig_ips=
-      if [[ "$_cmt" != expires=* && "$_cmt" != orig_ips=* ]]; then
+      # Имя клиента — первый комментарий без "=" (см. комментарий выше):
+      # так метки expires=/orig_ips=/mimicry=/note= не подменяют имя.
+      if [[ -z "$name" && "$_cmt" != *=* ]]; then
         name="$_cmt"
       fi
     elif [[ "$line" =~ ^PublicKey[[:space:]]=[[:space:]](.+) ]]; then
@@ -7448,8 +7457,102 @@ _print_client_info() {
 # устройства, не задевая сервер и остальных клиентов. Это нужная операция, а не
 # удобство: один и тот же конфиг проходит у одного провайдера и не проходит у
 # другого, и перебрать профиль должно быть дешевле, чем пересоздавать клиента.
-_detect_mimicry() {           # $1 = строка I1
-  local line="$1"
+# Прочитать служебную метку "# <key>=<value>" из peer-блока клиента.
+# Stdout: значение или пустая строка. Один вызов awk на весь конфиг —
+# функция дёргается в цикле по списку клиентов, поэтому python здесь избыточен.
+_peer_meta_get() {            # $1 = имя клиента, $2 = ключ метки
+  local name="$1" key="$2"
+  [[ -n "$name" && -n "$key" && -f "$SERVER_CONF" ]] || return 0
+  awk -v target="$name" -v key="$key" '
+    /^\[Peer\]/ { cur = ""; next }
+    /^#[[:space:]]/ {
+      c = $0
+      sub(/^#[[:space:]]+/, "", c); sub(/[[:space:]]+$/, "", c)
+      # Имя клиента "=" не содержит (валидатор имён его не пропускает),
+      # поэтому первая строка без "=" в блоке — это имя, остальные — метки.
+      if (c !~ /=/) { cur = c; next }
+      if (cur == target && index(c, key "=") == 1) {
+        print substr(c, length(key) + 2); exit
+      }
+    }
+  ' "$SERVER_CONF" 2>/dev/null
+}
+
+# Записать/обновить служебную метку в peer-блоке. Пустое значение — удалить.
+# Пишем атомарно, как _expire_set_client: конфиг сервера рвать нельзя.
+_peer_meta_set() {            # $1 = имя клиента, $2 = ключ, $3 = значение
+  local name="$1" key="$2" val="${3:-}"
+  [[ -n "$name" && -n "$key" && -f "$SERVER_CONF" ]] || return 1
+  python3 - "$SERVER_CONF" "$name" "$key" "$val" << 'PYEOF'
+import sys, re, os, pathlib, tempfile
+conf, target, key, val = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+try:
+    text = pathlib.Path(conf).read_text()
+except Exception as e:
+    print(f"read failed: {e}", file=sys.stderr); sys.exit(1)
+
+parts = re.split(r'(?=\[Peer\])', text)
+header, peers = parts[0], parts[1:]
+
+found = False
+out_peers = []
+for block in peers:
+    nm = re.search(r'^#\s+(\S+)\s*$', block, re.M)
+    if nm and nm.group(1) == target:
+        found = True
+        block = re.sub(rf'^#\s*{re.escape(key)}=.*$\n?', '', block, flags=re.M)
+        if val:
+            block = re.sub(
+                r'(^#\s+' + re.escape(target) + r'\s*$)',
+                lambda m: m.group(1) + f'\n# {key}={val}',
+                block, count=1, flags=re.M
+            )
+    out_peers.append(block)
+
+if not found:
+    print("client not found", file=sys.stderr); sys.exit(2)
+
+new_text = header + ''.join(out_peers)
+d = os.path.dirname(conf)
+fd, tmp = tempfile.mkstemp(dir=d, prefix='.awg0.', suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f: f.write(new_text)
+    os.chmod(tmp, 0o600)
+    os.rename(tmp, conf)
+except Exception as e:
+    try: os.unlink(tmp)
+    except Exception: pass
+    print(f"write failed: {e}", file=sys.stderr); sys.exit(3)
+PYEOF
+}
+
+# Значение метки mimicry для нового клиента. Профиль знает только тот код,
+# который сгенерировал I1 — по байтам он не восстанавливается: сигнатуры
+# профилей пересекаются (sip и quic оба начинаются с 0x4..), а stun/webrtc/
+# ntp/rtp/ssdp неотличимы вовсе. Нет I1 — нет и профиля.
+_mimicry_tag() {              # $1 = непустая строка => клиент получил I1
+  if [[ -n "${1:-}" ]]; then
+    echo "${MIMICRY_PROFILE:-none}"
+  else
+    echo "none"
+  fi
+}
+
+# Профиль мимикрии выданного клиента для показа в меню.
+# Достоверный источник — метка "# mimicry=" в peer-блоке (пишется при
+# создании и при смене профиля). Для конфигов, выданных до появления метки,
+# остаётся эвристика по сигнатуре I1: она различает не все девять профилей,
+# поэтому идёт только запасным путём.
+_detect_mimicry() {           # $1 = путь к конфигу клиента
+  local conf="$1" name tag line
+  name=$(basename "$conf" _awg2.conf)
+  tag=$(_peer_meta_get "$name" "mimicry")
+  if [[ -n "$tag" ]]; then
+    if [[ "$tag" == "none" ]]; then echo "нет"; else echo "$tag"; fi
+    return 0
+  fi
+
+  line=$(grep -m1 '^I1 = ' "$conf" 2>/dev/null | cut -d' ' -f3-)
   case "$line" in
     *"<b 0x16"*)        echo "tls" ;;
     *"<b 0x52454749"*)  echo "sip" ;;      # "REGI" в hex
@@ -7479,7 +7582,7 @@ do_change_client_mimicry() {
   for f in "${unique[@]}"; do
     i=$((i+1))
     local _cur
-    _cur=$(_detect_mimicry "$(grep -m1 '^I1 = ' "$f" 2>/dev/null | cut -d' ' -f3-)")
+    _cur=$(_detect_mimicry "$f")
     printf "  %d) %-28s ${D}сейчас: %s${N}\n" "$i" "$(basename "$f")" "$_cur"
   done
   echo ""
@@ -7537,6 +7640,14 @@ do_change_client_mimicry() {
   fi
   cat "$tmp" > "$chosen" && rm -f "$tmp"
   chmod 600 "$chosen" 2>/dev/null || true
+
+  # Метка в peer-блоке — единственный источник профиля для меню и для бота,
+  # поэтому её обновляем в той же операции, что и сами I1-I5.
+  local _cli_name
+  _cli_name=$(basename "$chosen" _awg2.conf)
+  if ! _peer_meta_set "$_cli_name" "mimicry" "$(_mimicry_tag "${I1:-}")"; then
+    warn "Профиль записан в конфиг, но метку в конфиге сервера обновить не удалось"
+  fi
 
   local _n
   _n=$(grep -cE '^I[1-5] = ' "$chosen" 2>/dev/null || echo 0)
@@ -9123,7 +9234,11 @@ _warp_get_client_net() {
 _warp_list_awg_clients() {
   [[ ! -f "$SERVER_CONF" ]] && return 0
   awk '
-    /^# /{ if ($2 !~ /^expires=/ && $2 !~ /^orig_ips=/) name=$2 }
+    # Сброс на границе блока обязателен: в шапке конфига тоже есть
+    # комментарии без "=" ("# AmneziaWG Toolza ...", "# Region: ..."),
+    # и без сброса первый peer унаследовал бы имя из них.
+    /^\[Peer\]/{ name="" }
+    /^# /{ if (name == "" && $2 !~ /=/) name=$2 }
     /^AllowedIPs/{
       if (name) {
         gsub(/\/32.*/, "", $3)

@@ -7,8 +7,8 @@ core.py — низкоуровневая работа с AmneziaWG.
 Совместимость с awg2 (v6.9.x):
   • сервер:        /etc/amnezia/amneziawg/awg0.conf
   • клиент-файлы:  /root/<name>_awg2.conf
-  • метка имени:   строка-комментарий "# <name>" внутри [Peer]
-  • служебки:      "# expires=<ts>"  и  "# orig_ips=<ip>"  внутри [Peer]
+  • метка имени:   первый комментарий без "=" внутри [Peer] — "# <name>"
+  • служебки:      "# expires=<ts>", "# orig_ips=<ip>", "# mimicry=<profile>"
   • интерфейс:     awg0
   • применение:    awg syncconf awg0 <(awg-quick strip awg0)
 """
@@ -76,6 +76,7 @@ class Peer:
     expires: int | None = None          # unix-ts срока действия (None = бессрочно)
     orig_ips: str | None = None         # сохранённый IP, если заблокирован сроком
     note: str = ""                      # заметка (хранится в conf как # note=<b64>)
+    mimicry: str = ""                   # профиль CPS клиента (# mimicry=<profile>)
     # рантайм-статистика (из `awg show`)
     rx: int = 0                         # принято сервером от клиента (download у клиента — наоборот)
     tx: int = 0
@@ -108,9 +109,9 @@ class ServerInfo:
     public_ip: str = ""
     iface_up: bool = False
     profile: str = ""
-    proto: str = ""            # версия протокола AmneziaWG: "2.0" или "3.0"
+    proto: str = ""            # версия протокола AmneziaWG: "2.0", "3.0", "3.1"
     obf_level: int = 0         # 1 = без I1-I5, 2 = только I1, 3 = полный I1-I5
-    mimicry: str = ""          # профиль мимикрии сервера: tls/dns/sip/quic/none
+    mimicry: str = ""          # профиль мимикрии сервера (# AWG_MIMICRY=)
     endpoint_domain: str = ""  # домен для Endpoint; пусто — используется IP
     region: str = ""
     peers_count: int = 0
@@ -126,6 +127,22 @@ def _split_blocks(text: str) -> tuple[str, list[str]]:
     """Делит конфиг на header (до первого [Peer]) и список peer-блоков."""
     parts = re.split(r"(?=\[Peer\])", text)
     return parts[0], parts[1:]
+
+
+def _block_name(block: str) -> str:
+    """
+    Имя клиента из peer-блока: первый комментарий без "=".
+
+    Валидатор имён (NAME_RE) знак "=" не пропускает, поэтому признак
+    надёжнее перечисления известных ключей — новая служебная метка не
+    подменит имя клиента задним числом, как это было бы со списком
+    expires=/orig_ips=/note=.
+    """
+    for m in re.finditer(r"^#\s+(\S.*?)\s*$", block, re.M):
+        c = m.group(1).strip()
+        if "=" not in c:
+            return c
+    return ""
 
 
 def endpoint_domain() -> str:
@@ -254,11 +271,14 @@ def list_peers(with_runtime: bool = True) -> list[Peer]:
     order: list[str] = []
 
     for block in blocks:
-        name = ""
         expires = None
         orig_ips = None
-        # имя — первый "# слово" без =. Старый "# note=" (из ранних версий)
-        # игнорируем здесь — заметки теперь в отдельном файле.
+        mimicry = ""
+        # Имя берём через _block_name (первый коммент без "="), остальные
+        # строки разбираем как служебные метки key=value.
+        name = _block_name(block)
+        if not name:
+            continue
         for m in re.finditer(r"^#\s+(\S.*?)\s*$", block, re.M):
             c = m.group(1).strip()
             if c.startswith("expires="):
@@ -266,14 +286,10 @@ def list_peers(with_runtime: bool = True) -> list[Peer]:
                 expires = int(v) if v.isdigit() else None
             elif c.startswith("orig_ips="):
                 orig_ips = c.split("=", 1)[1] or None
-            elif c.startswith("note="):
-                continue  # legacy, не имя
-            elif not name:
-                name = c
-        if not name:
-            continue
+            elif c.startswith("mimicry="):
+                mimicry = c.split("=", 1)[1].strip()
         p = Peer(name=name, expires=expires, orig_ips=orig_ips,
-                 note=_load_notes().get(name, ""))
+                 mimicry=mimicry, note=_load_notes().get(name, ""))
         if m := re.search(r"^PublicKey\s*=\s*(\S+)", block, re.M):
             p.public_key = m.group(1)
         if m := re.search(r"^PresharedKey\s*=\s*(\S+)", block, re.M):
@@ -375,6 +391,23 @@ def _write_conf_atomic(text: str) -> None:
         f.write(text)
     os.chmod(tmp, 0o600)
     os.replace(tmp, SERVER_CONF)
+
+
+def _write_text_atomic(path: str, text: str, mode: int = 0o600) -> None:
+    """Запись через временный файл в том же каталоге + os.replace."""
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".awgbot.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def apply_syncconf() -> tuple[bool, str]:
@@ -542,6 +575,10 @@ def add_client(name: str, expires: int | None = None,
     # I1-I5, иначе конфиг от бота отличается от выданных скриптом — раньше бот
     # всегда клал один I1, и на сервере с полным CPS клиенты получали разное.
     note_profile = ""
+    # Что реально уехало клиенту — значение метки mimicry.
+    # None означает «профиль неизвестен»: метку тогда не пишем вовсе, иначе
+    # соврём про "none" (= мимикрии нет) там, где I1 на самом деле есть.
+    used_profile: str | None = "none"
     if profile and profile != "basic":
         from . import cps
         srv_level = get_server_info().obf_level
@@ -549,13 +586,17 @@ def add_client(name: str, expires: int | None = None,
         want_full = srv_level >= 3
         already = any(l.startswith("I1 ") or l.startswith("I1=") for l in cli_lines)
         if already:
-            pass  # I1 уже пришёл из серверного конфига — не дублируем
+            # I1 уже пришёл из серверного конфига — не дублируем. Каким
+            # профилем он сгенерирован, отсюда не видно, поэтому метку
+            # оставляем непроставленной, а не выдаём "none" за факт.
+            used_profile = None
         elif want_full:
             packets = cps.gen_full(profile, domain)
             if packets:
                 for n, pkt in enumerate(packets[:5], start=1):
                     cli_lines.append(f"I{n} = {pkt}")
                 note_profile = f"{profile}, I1-I{min(len(packets), 5)}"
+                used_profile = profile
             else:
                 note_profile = "basic (генерация I1-I5 не удалась)"
         else:
@@ -563,6 +604,7 @@ def add_client(name: str, expires: int | None = None,
             if i1:
                 cli_lines.append(f"I1 = {i1}")
                 note_profile = profile
+                used_profile = profile
             else:
                 note_profile = "basic (генерация I1 не удалась)"
     cli_lines += [
@@ -578,9 +620,102 @@ def add_client(name: str, expires: int | None = None,
     Path(conf_path).write_text("\n".join(cli_lines) + "\n")
     os.chmod(conf_path, 0o600)
 
+    # Метка профиля в peer-блоке: по байтам I1 профиль не восстанавливается
+    # (сигнатуры пересекаются), а awg2 и бот показывают его в списке клиентов
+    # и предлагают сменить — источник должен быть один и явный.
+    if used_profile is not None:
+        _set_peer_comment(name, "mimicry", used_profile)
+
     ok, msg = apply_syncconf()
     prof_suffix = f" Профиль: {note_profile}." if note_profile else ""
     return True, ("Клиент создан." + prof_suffix + " " + msg), conf_path
+
+
+def change_client_mimicry(name: str, profile: str,
+                          domain: str = "") -> tuple[bool, str, str | None]:
+    """
+    Меняет профиль CPS-мимикрии у уже выданного клиента.
+
+    I1-I5 живут только в клиентском конфиге, поэтому операция не задевает
+    сервер и остальных клиентов — переподключать их не нужно. Клиенту
+    требуется новый файл: до замены он ходит по старому.
+
+    profile='basic' — снять мимикрию (I1-I5 удаляются).
+    Возвращает (ok, message, conf_path|None).
+    """
+    from . import cps
+
+    if not server_installed():
+        return False, "Сервер не установлен", None
+    peer = get_peer(name)
+    if not peer:
+        return False, f"Клиент '{name}' не найден", None
+    if profile != "basic" and profile not in cps.PROFILES:
+        return False, f"Неизвестный профиль: {profile}", None
+
+    conf_path = peer.conf_path
+    if not os.path.isfile(conf_path):
+        return False, f"Файл конфига не найден: {conf_path}", None
+    try:
+        text = Path(conf_path).read_text()
+    except OSError as exc:
+        return False, f"Не удалось прочитать конфиг: {exc}", None
+
+    # Сколько пакетов давать — решает сервер, как и при создании клиента:
+    # на уровне «полный CPS» конфиг от бота обязан совпадать с тем, что
+    # выдаёт awg2, иначе у клиентов одного сервера разная длина цепочки.
+    new_lines: list[str] = []
+    used_profile = "none"
+    if profile != "basic":
+        if get_server_info().obf_level >= 3:
+            packets = cps.gen_full(profile, domain)
+            if not packets:
+                return False, "Генератор I1-I5 недоступен (проверьте awg2)", None
+            new_lines = [f"I{n} = {pkt}" for n, pkt in enumerate(packets[:5], start=1)]
+        else:
+            i1 = cps.gen_i1(profile, domain)
+            if not i1:
+                return False, "Генератор I1 недоступен (проверьте awg2)", None
+            new_lines = [f"I1 = {i1}"]
+        used_profile = profile
+
+    # Старые I-строки выбрасываем, новые ставим перед [Peer] — там же, где
+    # они стояли, и внутри секции [Interface], которой принадлежат.
+    out: list[str] = []
+    inserted = False
+    for line in text.splitlines():
+        if line.strip().startswith("[Peer]") and not inserted:
+            out.extend(new_lines)
+            inserted = True
+        if re.match(r"^I[1-5]\s*=", line):
+            continue
+        out.append(line)
+    if not inserted:
+        out.extend(new_lines)
+
+    new_text = "\n".join(out).rstrip("\n") + "\n"
+    if "[Interface]" not in new_text:
+        return False, "Разбор конфига не удался — файл не тронут", None
+
+    bak = f"{conf_path}.bak.{int(time.time())}"
+    try:
+        shutil.copy2(conf_path, bak)
+    except OSError:
+        bak = ""
+    try:
+        _write_text_atomic(conf_path, new_text)
+    except OSError as exc:
+        return False, f"Запись конфига не удалась: {exc}", None
+
+    # Метка в peer-блоке — единственный источник профиля для меню awg2 и
+    # для бота, поэтому обновляется в той же операции, что и сами I1-I5.
+    _set_peer_comment(name, "mimicry", used_profile)
+
+    human = "снята" if profile == "basic" else profile
+    msg = f"Мимикрия обновлена: {human}, пакетов I: {len(new_lines)}."
+    if bak:
+        msg += f" Копия: {os.path.basename(bak)}."
+    return True, msg, conf_path
 
 
 def delete_client(name: str) -> tuple[bool, str]:
@@ -591,14 +726,7 @@ def delete_client(name: str) -> tuple[bool, str]:
     kept = []
     removed = False
     for block in blocks:
-        m = re.search(r"^#\s+(\S.*?)\s*$", block, re.M)
-        # имя — первый коммент, не expires=/orig_ips=
-        nm = None
-        for cm in re.finditer(r"^#\s+(\S.*?)\s*$", block, re.M):
-            c = cm.group(1).strip()
-            if not c.startswith(("expires=", "orig_ips=", "note=")):
-                nm = c
-                break
+        nm = _block_name(block)
         if nm == name:
             removed = True
             continue
@@ -630,12 +758,7 @@ def rename_client(old: str, new: str) -> tuple[bool, str]:
     header, blocks = _split_blocks(text)
     out_blocks = []
     for block in blocks:
-        nm = None
-        for cm in re.finditer(r"^#\s+(\S.*?)\s*$", block, re.M):
-            c = cm.group(1).strip()
-            if not c.startswith(("expires=", "orig_ips=", "note=")):
-                nm = c
-                break
+        nm = _block_name(block)
         if nm == old:
             block = re.sub(rf"^#\s+{re.escape(old)}\s*$", f"# {new}", block, count=1, flags=re.M)
         out_blocks.append(block)
@@ -660,12 +783,7 @@ def _set_peer_comment(name: str, key: str, value: str | None) -> bool:
     changed = False
     out = []
     for block in blocks:
-        nm = None
-        for cm in re.finditer(r"^#\s+(\S.*?)\s*$", block, re.M):
-            c = cm.group(1).strip()
-            if not c.startswith(("expires=", "orig_ips=", "note=")):
-                nm = c
-                break
+        nm = _block_name(block)
         if nm == name:
             block = re.sub(rf"^#\s*{key}=.*$\n?", "", block, flags=re.M)
             if value is not None:
@@ -708,12 +826,7 @@ def _restore_allowed_ip(name: str, orig: str) -> None:
     header, blocks = _split_blocks(text)
     out = []
     for block in blocks:
-        nm = None
-        for cm in re.finditer(r"^#\s+(\S.*?)\s*$", block, re.M):
-            c = cm.group(1).strip()
-            if not c.startswith(("expires=", "orig_ips=", "note=")):
-                nm = c
-                break
+        nm = _block_name(block)
         if nm == name:
             block = re.sub(r"^AllowedIPs\s*=\s*.+$", f"AllowedIPs = {orig}", block, count=1, flags=re.M)
         out.append(block)
@@ -978,12 +1091,7 @@ def _replace_allowed_ip(name: str, new_ip: str) -> None:
     header, blocks = _split_blocks(text)
     out = []
     for block in blocks:
-        nm = None
-        for cm in re.finditer(r"^#\s+(\S.*?)\s*$", block, re.M):
-            c = cm.group(1).strip()
-            if not c.startswith(("expires=", "orig_ips=", "note=")):
-                nm = c
-                break
+        nm = _block_name(block)
         if nm == name:
             block = re.sub(r"^AllowedIPs\s*=\s*.+$", f"AllowedIPs = {new_ip}",
                            block, count=1, flags=re.M)

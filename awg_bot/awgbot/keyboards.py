@@ -8,21 +8,54 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from . import core
 
 
+# Профили CPS-мимикрии: (ключ, подпись кнопки, короткое имя для текста).
+# Набор обязан совпадать с генератором awg2 (cps.PROFILES); один список на
+# все клавиатуры и подписи, чтобы новый профиль добавлялся в одном месте.
+MIMICRY_PROFILES: tuple[tuple[str, str, str], ...] = (
+    ("quic",      "⚡ QUIC Initial (рекомендуется)", "QUIC"),
+    ("curl_quic", "🔒 cURL QUIC + ECH",              "cURL QUIC + ECH"),
+    ("dns",       "🌐 DNS Query",                    "DNS"),
+    ("stun",      "📡 STUN / TURN",                  "STUN/TURN"),
+    ("webrtc",    "🎥 WebRTC",                       "WebRTC"),
+    ("sip",       "📞 SIP (VoIP)",                   "SIP"),
+    ("ntp",       "🕐 NTP",                          "NTP"),
+    ("rtp",       "🎵 RTP",                          "RTP"),
+    ("ssdp",      "🔎 SSDP",                         "SSDP"),
+    ("basic",     "🔇 Базовый (без I1-I5)",          "базовый"),
+)
+
+
+def mimicry_label(profile: str) -> str:
+    """Человекочитаемое имя профиля для текста сообщений."""
+    for key, _btn, short in MIMICRY_PROFILES:
+        if key == profile:
+            return short
+    if profile == "tls":
+        # Конфиги, созданные до перехода на payloadGen: генератор сводит tls
+        # к quic, поэтому показываем это явно, а не сырым ключом.
+        return "QUIC (бывший TLS)"
+    if profile in ("", "none"):
+        return "нет"
+    return profile
+
+
 def profile_choices() -> InlineKeyboardMarkup:
     """Выбор профиля мимикрии при создании клиента (как в awg2 Pro)."""
     b = InlineKeyboardBuilder()
-    b.button(text="⚡ QUIC Initial (рекомендуется)", callback_data="prof:quic")
-    b.button(text="🔒 cURL QUIC + ECH", callback_data="prof:curl_quic")
-    b.button(text="🌐 DNS Query", callback_data="prof:dns")
-    b.button(text="📡 STUN / TURN", callback_data="prof:stun")
-    b.button(text="🎥 WebRTC", callback_data="prof:webrtc")
-    b.button(text="📞 SIP (VoIP)", callback_data="prof:sip")
-    b.button(text="🕐 NTP", callback_data="prof:ntp")
-    b.button(text="🎵 RTP", callback_data="prof:rtp")
-    b.button(text="🔎 SSDP", callback_data="prof:ssdp")
-    b.button(text="🔇 Базовый (без I1-I5)", callback_data="prof:basic")
+    for key, label, _short in MIMICRY_PROFILES:
+        b.button(text=label, callback_data=f"prof:{key}")
     b.button(text="‹ Отмена", callback_data="clients")
-    b.adjust(*([1] * 11))
+    b.adjust(*([1] * (len(MIMICRY_PROFILES) + 1)))
+    return b.as_markup()
+
+
+def mimicry_choices(idx: int) -> InlineKeyboardMarkup:
+    """Смена мимикрии у выданного клиента (п.10 меню клиентов в awg2)."""
+    b = InlineKeyboardBuilder()
+    for key, label, _short in MIMICRY_PROFILES:
+        b.button(text=label, callback_data=f"cl_mim_set:{idx}:{key}")
+    b.button(text="‹ Отмена", callback_data=f"client:{idx}")
+    b.adjust(*([1] * (len(MIMICRY_PROFILES) + 1)))
     return b.as_markup()
 
 
@@ -129,10 +162,11 @@ def client_card(idx: int, monitored: bool = False, warp_state=None) -> InlineKey
         b.button(text="☁ WARP (не установлен)", callback_data="warp_not_installed")
     note_label = "📝 Заметка" + (" 🔔" if monitored else "")
     b.button(text=note_label, callback_data=f"cl_note:{idx}")
+    b.button(text="🎭 Мимикрия", callback_data=f"cl_mim:{idx}")
     b.button(text="✏️ Переименовать", callback_data=f"cl_ren:{idx}")
     b.button(text="🗑 Удалить", callback_data=f"cl_del:{idx}")
     b.button(text="‹ К списку", callback_data="clients")
-    b.adjust(2, 2, 2, 1, 1)
+    b.adjust(2, 2, 2, 1, 1, 1)
     return b.as_markup()
 
 
