@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.15"
+VERSION="v0.7.16"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -1139,8 +1139,93 @@ gen_cps_i1() {
 #   - уровень обфускации (OBF_LEVEL)
 #   - профиль мимикрии (MIMICRY_PROFILE)
 # Маркер пишется первой строкой awg0.conf: "# AWG_PROFILE=<value>"
+# ── Целевой клиент ────────────────────────────────────────
+# От клиента зависит не «сколько параметров он потянет», а что он вообще
+# читает. Здесь только проверенное:
+#  • WireSock (форк BoringTun под Windows) не читает I1-I5 совсем. По
+#    документации вендора поля «silently ignored»: туннель поднимется, мимикрии
+#    в трафике не будет, ошибки тоже не будет. Худший вид поломки — тихий.
+#  • Keenetic OS 4.x: чем именно разбирается цепочка, по исходникам установить
+#    не удалось, поэтому цепочку держим короткой (I1, профиль DNS).
+#  • AmneziaWG для Windows до v2.0.2 не принимал H выше 2^31-1. Мы и так
+#    генерируем внутри этой границы, отдельного действия не нужно.
+#  • Теги b/r/rc/rd читают оба известных движка (amneziawg-go device/obf.go и
+#    модуль ядра src/junk.c), поэтому цепочка переносима между всеми
+#    клиентами, которые её вообще разбирают.
+# Диапазоны Jc/S/H — параметры УСТРОЙСТВА: они одинаковы у сервера и всех
+# клиентов, поэтому клиентом их не сузить. Выбор влияет только на I1-I5.
+TARGET_CLIENT="amnezia"
+
+_target_client_label() {
+  case "${1:-${TARGET_CLIENT:-amnezia}}" in
+    kmod)     echo "Linux / OpenWrt (модуль ядра)" ;;
+    keenetic) echo "Keenetic (нативный AmneziaWG)" ;;
+    wiresock) echo "WireSock (Windows)" ;;
+    mixed)    echo "разные клиенты" ;;
+    *)        echo "Amnezia VPN / AmneziaWG" ;;
+  esac
+}
+
+# Ложь, если выбранный клиент цепочку I1-I5 не читает.
+_target_client_reads_cps() {
+  [[ "${TARGET_CLIENT:-amnezia}" != "wiresock" ]]
+}
+
+# Печатает предупреждение и возвращает 0, если CPS для этого клиента бесполезен.
+# Вызывающий в этом случае обязан оставить конфиг без I1-I5. Текст печатается
+# один раз на выбор клиента: он длинный, а проверка стоит в нескольких местах.
+_warn_cps_unsupported() {
+  _target_client_reads_cps && return 1
+  [[ -n "${_CPS_UNSUPPORTED_WARNED:-}" ]] && return 0
+  _CPS_UNSUPPORTED_WARNED=1
+  echo ""
+  warn "WireSock не читает I1-I5 — по документации вендора поля молча игнорируются"
+  warn "Туннель поднимется, мимикрии в трафике не будет, и об этом никто не сообщит"
+  info "Поэтому конфиг делается без CPS. Обфускация H/S/Jc у WireSock работает полностью"
+  return 0
+}
+
+# Спрашивает, куда поедет конфиг. Влияет только на цепочку I1-I5.
+choose_target_client() {
+  TARGET_CLIENT="amnezia"
+  _CPS_UNSUPPORTED_WARNED=""
+  echo ""
+  hdr "▣  Куда поедет конфиг"
+  echo -e "  ${G}1${N}  ${W}Amnezia VPN / AmneziaWG${N} ${D}— Android, iOS, Windows, macOS, Linux${N} ${C}(по умолчанию)${N}"
+  echo -e "  ${G}2${N}  ${W}Linux / OpenWrt${N} ${D}— модуль ядра amneziawg${N}"
+  echo -e "  ${G}3${N}  ${W}Keenetic${N} ${D}— нативный AmneziaWG в KeeneticOS 4.x${N}"
+  echo -e "  ${R}4${N}  ${W}WireSock${N} ${D}— Windows; мимикрию I1-I5 не поддерживает${N}"
+  echo -e "  ${G}5${N}  Не знаю / разные клиенты"
+  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  local _tc
+  read_choice _tc "$(echo -e "${C}  Выбор [1-5] (Enter = 1): ${N}")" 1 5 1
+  case "$_tc" in
+    2) TARGET_CLIENT="kmod" ;;
+    3) TARGET_CLIENT="keenetic" ;;
+    4) TARGET_CLIENT="wiresock" ;;
+    5) TARGET_CLIENT="mixed" ;;
+    *) TARGET_CLIENT="amnezia" ;;
+  esac
+  ok "Клиент: $(_target_client_label)"
+
+  case "$TARGET_CLIENT" in
+    keenetic)
+      info "Длинная цепочка на Keenetic ненадёжна — предложу I1 и профиль DNS"
+      ;;
+    wiresock)
+      _warn_cps_unsupported || true
+      ;;
+    mixed)
+      info "Цепочка будет из тегов, которые читают оба движка — она переносима"
+      ;;
+  esac
+  log_info "TARGET_CLIENT=$TARGET_CLIENT"
+  return 0
+}
+
 choose_awg_profile() {
   AWG_PROFILE=""
+  choose_target_client
   echo ""
   hdr "⚙  Профиль AmneziaWG"
   echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита, I1-I5 на выбор ${C}(рекомендуется)${N}"
@@ -1153,6 +1238,12 @@ choose_awg_profile() {
   case "$_choice" in
     1)
       AWG_PROFILE="lite"
+      if _warn_cps_unsupported; then
+        OBF_LEVEL=1; MIMICRY_PROFILE="none"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        info "Профиль: Lite без CPS (клиент его не читает)"
+        return 0
+      fi
       OBF_LEVEL=2                # клиентам кладём I1
       MIMICRY_PROFILE="dns"
       # Домен не передаём — Python выбирает случайный из DOMAIN_POOL
@@ -1169,6 +1260,12 @@ choose_awg_profile() {
       ;;
     2)
       AWG_PROFILE="standard"
+      if _warn_cps_unsupported; then
+        OBF_LEVEL=1; MIMICRY_PROFILE="none"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        info "Профиль: Standard без CPS (клиент его не читает)"
+        return 0
+      fi
       OBF_LEVEL=2                # клиентам кладём I1
       MIMICRY_PROFILE="tls"
       info "Профиль: Standard (I1 = TLS ClientHello)"
@@ -1201,6 +1298,20 @@ choose_obf_level() {
   #   2 = +I1 — добавить только I1 (снимок протокола)
   #   3 = +I1-I5 — полный CPS chain (максимум DPI bypass)
   OBF_LEVEL=""
+
+  # У WireSock цепочки не будет вовсе, у Keenetic длинная ненадёжна — меняем
+  # предложение по умолчанию, но выбор оставляем за человеком.
+  local _lvl_default=3
+  if _warn_cps_unsupported; then
+    OBF_LEVEL=1; MIMICRY_PROFILE="none"
+    I1=""; I2=""; I3=""; I4=""; I5=""
+    ok "Уровень обфускации: Базовый (H/S/Jc), без I1-I5"
+    return 0
+  fi
+  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
+    _lvl_default=2
+  fi
+
   echo ""
   hdr "⛊  Уровень обфускации"
   echo -e "  ${G}3${N}  + I1-I5 полный CPS chain ${C}(рекомендуется)${N}"
@@ -1209,8 +1320,12 @@ choose_obf_level() {
   echo -e "     ${D}I1 = снимок реального TLS/QUIC/DTLS протокола${N}"
   echo -e "  ${D}1   Базовый — H ranges + S1-S4 + Jc junk, без I1-I5${N}"
   echo -e "     ${D}Максимальная совместимость со старыми клиентами.${N}"
+  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
+    echo -e "  ${Y}  Keenetic: чем он разбирает цепочку — по исходникам неизвестно.${N}"
+    echo -e "  ${Y}  Надёжнее уровень 2 (один I1), поэтому он и предложен.${N}"
+  fi
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = 3 полный CPS): ${N}")" 1 3 3
+  read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = ${_lvl_default}): ${N}")" 1 3 "$_lvl_default"
   local label
   case $OBF_LEVEL in
     1) label="Базовый (без CPS)" ;;
@@ -1245,7 +1360,14 @@ choose_mimicry_profile() {
   echo -e "  ${Y}4${N}  QUIC  — Chrome-like Initial 1200B + Short Header"
   echo -e "     ${D}⚠ В РФ ловят по сигнатуре Initial — используй с осторожностью.${N}"
   echo ""
-  read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [1-4] (Enter = 1): ${N}")" 1 4 1
+  local _mim_default=1
+  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
+    _mim_default=2
+    echo -e "  ${Y}  Keenetic чувствителен к I1: DNS — самый короткий и простой${N}"
+    echo -e "  ${Y}  пакет из четырёх, поэтому он и предложен.${N}"
+    echo ""
+  fi
+  read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [1-4] (Enter = ${_mim_default}): ${N}")" 1 4 "$_mim_default"
 
   case $PROFILE_CHOICE in
     1) MIMICRY_PROFILE="tls"  ;;
@@ -5309,12 +5431,27 @@ do_add_client() {
 
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
+  # Цепочка I1-I5 — клиентская: у каждого устройства она своя, поэтому
+  # спрашиваем на каждого клиента, а не один раз на сервер.
+  choose_target_client
+
   # Читаем профиль сервера — определяет поведение для клиентского I1
   local _srv_profile
   _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
   _srv_profile="${_srv_profile:-pro}"
 
+  # Клиент, который цепочку не читает, делает профиль сервера неважным:
+  # генерировать I1-I5 не для кого.
+  if ! _target_client_reads_cps; then
+    _warn_cps_unsupported || true
+    _srv_profile="nocps"
+  fi
+
   case "$_srv_profile" in
+    nocps)
+      I1=""; I2=""; I3=""; I4=""; I5=""
+      i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+      ;;
     lite)
       # Lite-сервер: клиенту всегда I1=DNS (icloud.com), без I2-I5
       info "Профиль сервера: Lite — клиент получит I1=DNS (icloud.com)"
@@ -5627,7 +5764,17 @@ do_bulk_add_clients() {
   # ── I1 (один раз для всех) ──
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
+  choose_target_client
+  if ! _target_client_reads_cps; then
+    _warn_cps_unsupported || true
+    _srv_profile="nocps"
+  fi
+
   case "$_srv_profile" in
+    nocps)
+      I1=""; I2=""; I3=""; I4=""; I5=""
+      i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+      ;;
     lite)
       info "Профиль сервера Lite — клиенты получат I1=DNS (icloud.com)"
       local cps_out
