@@ -180,7 +180,7 @@ do_reinstall() {
   "$DEST/venv/bin/pip" install -q -r "$DEST/requirements.txt"
   # токен/ID
   read -rp "$(echo -e "${C}  Токен бота (@BotFather): ${N}")" BOT_TOKEN
-  read -rp "$(echo -e "${C}  Твой Telegram ID (@userinfobot): ${N}")" ADMIN_ID
+  read -rp "$(echo -e "${C}  Твой Telegram ID (@userinfobot; несколько — через запятую): ${N}")" ADMIN_ID
   touch "$CONF"; chmod 600 "$CONF"
   sed -i '/^BOT_TOKEN=/d;/^ADMIN_ID=/d' "$CONF"
   { echo "BOT_TOKEN=${BOT_TOKEN}"; echo "ADMIN_ID=${ADMIN_ID}"; } >> "$CONF"

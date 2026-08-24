@@ -129,7 +129,7 @@ if [[ ! -f "$CONF" ]] || ! grep -q '^BOT_TOKEN=' "$CONF" 2>/dev/null; then
   echo ""
   echo -e "${W}  Нужен Telegram-бот. Создай его у @BotFather и вставь токен.${N}"
   read -rp "$(echo -e "${C}  Токен бота: ${N}")" BOT_TOKEN
-  read -rp "$(echo -e "${C}  Твой Telegram ID (узнать у @userinfobot): ${N}")" ADMIN_ID
+  read -rp "$(echo -e "${C}  Твой Telegram ID (@userinfobot; несколько — через запятую): ${N}")" ADMIN_ID
   touch "$CONF"; chmod 600 "$CONF"
   sed -i '/^BOT_TOKEN=/d;/^ADMIN_ID=/d' "$CONF"
   { echo "BOT_TOKEN=${BOT_TOKEN}"; echo "ADMIN_ID=${ADMIN_ID}"; } >> "$CONF"

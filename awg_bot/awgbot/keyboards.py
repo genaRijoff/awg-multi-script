@@ -247,17 +247,48 @@ def maint_menu() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def botctl_menu() -> InlineKeyboardMarkup:
-    """Меню управления самим ботом (аналог консольного awg-bot)."""
+def botctl_menu(is_owner: bool = False) -> InlineKeyboardMarkup:
+    """
+    Меню управления самим ботом (аналог консольного awg-bot).
+    Пункт «Админы» видит только владелец — приглашённый админ список не правит.
+    """
     b = InlineKeyboardBuilder()
+    rows = 6
     b.button(text="⬆️ Обновить бота (сохранив токен)", callback_data="bot_update")
     b.button(text="📊 Статус бота", callback_data="bot_status")
     b.button(text="📜 Логи бота (50 строк)", callback_data="bot_logs")
+    if is_owner:
+        b.button(text="👮 Админы бота", callback_data="admins")
+        rows += 1
     b.button(text="↻ Перезапустить бота", callback_data="bot_restart_confirm")
     b.button(text="🗑 Удалить бота (токен оставить)",
              callback_data="bot_uninstall_confirm")
     b.button(text="💀 Удалить полностью (с токеном)",
              callback_data="bot_purge_confirm")
     b.button(text="‹ Назад", callback_data="maint")
-    b.adjust(1, 1, 1, 1, 1, 1, 1)
+    b.adjust(*([1] * (rows + 1)))
+    return b.as_markup()
+
+
+def admins_menu(invited, pending: int) -> InlineKeyboardMarkup:
+    """Список приглашённых админов: кнопка на каждого — отзыв доступа."""
+    b = InlineKeyboardBuilder()
+    for a in invited:
+        who = f"@{a.username}" if a.username else str(a.uid)
+        b.button(text=f"🚫 Отозвать · {who}", callback_data=f"adm_del:{a.uid}")
+    b.button(text="➕ Добавить админа", callback_data="adm_add")
+    if pending:
+        b.button(text=f"🔗 Отозвать приглашения ({pending})",
+                 callback_data="adm_revoke")
+    b.button(text="‹ Назад", callback_data="botctl")
+    b.adjust(*([1] * (len(invited) + 2 + (1 if pending else 0))))
+    return b.as_markup()
+
+
+def admin_add_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="🔗 Ссылка-приглашение (одноразовая)", callback_data="adm_invite")
+    b.button(text="🆔 По Telegram ID", callback_data="adm_by_id")
+    b.button(text="‹ Назад", callback_data="admins")
+    b.adjust(1, 1, 1)
     return b.as_markup()

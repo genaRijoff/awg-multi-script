@@ -18,7 +18,7 @@ from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -28,7 +28,7 @@ from aiogram.types import (
     Message,
 )
 
-from . import core, keyboards as kb, wrapper
+from . import admins, core, keyboards as kb, wrapper
 from .config import load_config
 
 logging.basicConfig(
@@ -76,11 +76,24 @@ class Flow(StatesGroup):
     expire_date = State()
     note_text = State()
     await_backup = State()
+    add_admin_id = State()
 
 
 # ───────────────────────── auth ─────────────────────────
-def authorized(uid: int) -> bool:
+# CFG.admins — владельцы из /etc/awg-bot.conf, их набор фиксирован до рестарта.
+# Приглашённые лежат в admins.py и подхватываются на лету, без перезапуска.
+def is_owner(uid: int) -> bool:
+    """Владелец: ADMIN_ID из конфига. Только он правит список админов."""
     return uid in CFG.admins
+
+
+def authorized(uid: int) -> bool:
+    return uid in CFG.admins or uid in admins.invited_ids()
+
+
+def all_admin_ids() -> set[int]:
+    """Все, кому бот шлёт уведомления: владельцы + приглашённые."""
+    return set(CFG.admins) | admins.invited_ids()
 
 
 async def deny(event) -> None:
@@ -88,6 +101,15 @@ async def deny(event) -> None:
         await event.answer("⛔️ Доступ запрещён.")
     else:
         await event.answer("⛔️ Доступ запрещён.", show_alert=True)
+
+
+async def deny_owner(event) -> None:
+    txt = ("⛔️ Управление админами доступно только владельцу "
+           "(ADMIN_ID в /etc/awg-bot.conf).")
+    if isinstance(event, Message):
+        await event.answer(txt)
+    else:
+        await event.answer(txt, show_alert=True)
 
 
 # ───────────────────────── render helpers ─────────────────────────
@@ -240,12 +262,29 @@ async def safe_edit(cq: CallbackQuery, text: str, markup=None) -> None:
 
 # ───────────────────────── /start ─────────────────────────
 @dp.message(CommandStart())
-async def cmd_start(msg: Message, state: FSMContext) -> None:
-    if not authorized(msg.from_user.id):
+async def cmd_start(msg: Message, state: FSMContext, command: CommandObject) -> None:
+    uid = msg.from_user.id
+    payload = (command.args or "").strip()
+    # ссылка-приглашение t.me/<bot>?start=inv_<token>. Уже действующему
+    # админу приглашение не гасим — пусть ссылка достанется тому, кому звали.
+    if payload.startswith(admins.INVITE_PREFIX) and not authorized(uid):
+        ok, res = admins.consume_invite(
+            payload[len(admins.INVITE_PREFIX):], uid, msg.from_user.username or "")
+        if not ok:
+            await msg.answer(f"⛔️ {esc(res)}")
+            return
+        await _notify_owners(
+            f"👮 Новый админ по приглашению: {_admin_label(uid, msg.from_user.username)}")
+        await msg.answer(
+            "✅ Приглашение принято — доступ к боту выдан.\n\n"
+            "Это управление <b>ботом</b>: клиенты, конфиги, бэкап, статус сервера. "
+            "Список админов правит только владелец."
+        )
+    if not authorized(uid):
         # подсказка, как узнать свой ID для настройки
         await msg.answer(
             "⛔️ Доступ запрещён.\n"
-            f"Твой Telegram ID: <code>{msg.from_user.id}</code>\n"
+            f"Твой Telegram ID: <code>{uid}</code>\n"
             "Добавь его в конфиг бота (ADMIN_ID), если это твой сервер."
         )
         return
@@ -929,7 +968,7 @@ async def cb_botctl(cq: CallbackQuery) -> None:
         cq,
         "<b>🤖 Управление ботом</b>\n\n"
         "Те же действия доступны в консоли: <code>sudo awg-bot</code>.",
-        kb.botctl_menu(),
+        kb.botctl_menu(is_owner(cq.from_user.id)),
     )
     await cq.answer()
 
@@ -944,7 +983,8 @@ async def cb_bot_status(cq: CallbackQuery) -> None:
     a2l = core.awg2_version_local()
     head = f"🤖 Версия бота: <b>{esc(bl)}</b>\n🛠 awg2: <b>{esc(a2l)}</b>\n\n"
     body = out.strip() or "awg-bot status недоступен"
-    await safe_edit(cq, head + f"<pre>{esc(body[-3000:])}</pre>", kb.botctl_menu())
+    await safe_edit(cq, head + f"<pre>{esc(body[-3000:])}</pre>",
+                    kb.botctl_menu(is_owner(cq.from_user.id)))
 
 
 @dp.callback_query(F.data == "bot_logs")
@@ -954,7 +994,8 @@ async def cb_bot_logs(cq: CallbackQuery) -> None:
     rc, out, _ = await asyncio.to_thread(
         core.run, ["journalctl", "-u", "awg-bot.service", "--no-pager", "-n", "50"])
     txt = out.strip() or "(лог пуст)"
-    await safe_edit(cq, f"<pre>{esc(txt[-3500:])}</pre>", kb.botctl_menu())
+    await safe_edit(cq, f"<pre>{esc(txt[-3500:])}</pre>",
+                    kb.botctl_menu(is_owner(cq.from_user.id)))
     await cq.answer()
 
 
@@ -1195,10 +1236,202 @@ async def msg_backup_notfile(msg: Message, state: FSMContext) -> None:
                      "или нажми «Назад» в меню бэкапа для отмены.")
 
 
+# ───────────────────────── админы бота ─────────────────────────
+def _admin_label(uid: int, username: str | None) -> str:
+    return f"@{esc(username)} (<code>{uid}</code>)" if username else f"<code>{uid}</code>"
+
+
+async def _notify_owners(text: str) -> None:
+    """Аудит: владельцы видят любое изменение списка админов."""
+    for owner in CFG.admins:
+        try:
+            await bot.send_message(owner, text)
+        except Exception as e:
+            log.warning("Не смог уведомить владельца %s: %s", owner, e)
+
+
+def admins_text() -> str:
+    invited = admins.list_invited()
+    owners = "\n".join(f"• <code>{o}</code>" for o in sorted(CFG.admins))
+    lines = [
+        "<b>👮 Админы бота</b>\n",
+        f"<b>Владельцы</b> ({len(CFG.admins)}) — ADMIN_ID в <code>/etc/awg-bot.conf</code>:",
+        owners,
+        "",
+        f"<b>Приглашённые</b> ({len(invited)}):",
+    ]
+    if invited:
+        for a in invited:
+            who = f"@{esc(a.username)}" if a.username else "без username"
+            when = (datetime.fromtimestamp(a.added_at).strftime("%d.%m.%Y")
+                    if a.added_at else "—")
+            lines.append(f"• {who} · <code>{a.uid}</code> · с {when}")
+    else:
+        lines.append("<i>пока никого</i>")
+    pending = admins.pending_invites()
+    if pending:
+        lines.append(f"\n🔗 Неиспользованных приглашений: <b>{pending}</b>")
+    lines += [
+        "",
+        "⚠️ Админ может всё, что и ты: клиенты, конфиги с приватными ключами, "
+        "бэкап, перезапуск сервера, удаление бота. Разница одна — список "
+        "админов правит только владелец.",
+        "",
+        "<b>Честно о границах:</b>",
+        "• это доступ <b>к боту</b>, а не SSH и не <code>awg2</code> в консоли;",
+        "• владельца из бота не снять — только правкой конфига и рестартом;",
+        "• уведомления бота (офлайн/онлайн, истёкшие) получают все админы;",
+        "• уведомления самого awg2 (таймер истечения в консоли) уходят на один "
+        "<code>ADMIN_CHAT_ID</code> из конфига — приглашённые их не увидят.",
+    ]
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "admins")
+async def cb_admins(cq: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cq.from_user.id):
+        return await deny_owner(cq)
+    await state.clear()
+    await safe_edit(cq, admins_text(),
+                    kb.admins_menu(admins.list_invited(), admins.pending_invites()))
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "adm_add")
+async def cb_admin_add(cq: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cq.from_user.id):
+        return await deny_owner(cq)
+    await state.clear()
+    await safe_edit(cq,
+        "<b>➕ Добавить админа</b>\n\n"
+        "🔗 <b>Ссылка-приглашение</b> — бот выдаст одноразовую ссылку. "
+        f"Живёт {admins.INVITE_TTL // 60} минут, сгорает при первом переходе. "
+        "Узнавать чужой ID не нужно.\n\n"
+        "🆔 <b>По Telegram ID</b> — если ID уже известен "
+        "(человек может узнать свой у @userinfobot).",
+        kb.admin_add_menu())
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "adm_invite")
+async def cb_admin_invite(cq: CallbackQuery) -> None:
+    if not is_owner(cq.from_user.id):
+        return await deny_owner(cq)
+    token, res = admins.create_invite(cq.from_user.id)
+    if token is None:
+        await cq.answer(str(res)[:190], show_alert=True)
+        return
+    try:
+        me = await bot.get_me()
+    except Exception as e:
+        log.warning("get_me: %s", e)
+        await cq.answer("Не смог узнать имя бота у Telegram, попробуй ещё раз.",
+                        show_alert=True)
+        return
+    link = f"https://t.me/{me.username}?start={admins.INVITE_PREFIX}{token}"
+    until = datetime.fromtimestamp(int(res)).strftime("%H:%M")
+    await safe_edit(cq,
+        "<b>🔗 Приглашение готово</b>\n\n"
+        f"<code>{esc(link)}</code>\n\n"
+        f"Одноразовая, действует до <b>{until}</b> "
+        f"(~{admins.INVITE_TTL // 60} мин). Кто первым перейдёт — тот и получит "
+        "доступ, поэтому отправляй её лично, а не в общий чат.\n\n"
+        "Передумал — «Отозвать приглашения» в меню админов.",
+        kb.back_button("admins"))
+    await cq.answer()
+
+
+@dp.callback_query(F.data == "adm_revoke")
+async def cb_admin_revoke(cq: CallbackQuery) -> None:
+    if not is_owner(cq.from_user.id):
+        return await deny_owner(cq)
+    n = admins.revoke_invites()
+    await cq.answer(f"Отозвано приглашений: {n}" if n else "Живых приглашений нет")
+    await safe_edit(cq, admins_text(),
+                    kb.admins_menu(admins.list_invited(), admins.pending_invites()))
+
+
+@dp.callback_query(F.data == "adm_by_id")
+async def cb_admin_by_id(cq: CallbackQuery, state: FSMContext) -> None:
+    if not is_owner(cq.from_user.id):
+        return await deny_owner(cq)
+    await state.set_state(Flow.add_admin_id)
+    await safe_edit(cq,
+        "🆔 Пришли <b>Telegram ID</b> будущего админа — только цифры.\n\n"
+        "Свой ID человек узнаёт у @userinfobot. Ошибёшься в цифре — доступ "
+        "получит посторонний, поэтому сверь ID перед отправкой.\n\n"
+        "Для отмены нажми «Назад».",
+        kb.back_button("admins"))
+    await cq.answer()
+
+
+@dp.message(Flow.add_admin_id)
+async def msg_admin_by_id(msg: Message, state: FSMContext) -> None:
+    if not is_owner(msg.from_user.id):
+        return await deny_owner(msg)
+    raw = (msg.text or "").strip()
+    if not raw.isdigit():
+        await msg.answer("❌ Нужен числовой Telegram ID (только цифры). "
+                         "Пришли ещё раз или нажми «Назад».")
+        return
+    uid = int(raw)
+    await state.clear()
+    if is_owner(uid):
+        await msg.answer("ℹ️ Этот пользователь и так владелец бота (ADMIN_ID в конфиге).",
+                         reply_markup=kb.back_button("admins"))
+        return
+    ok, res = admins.add(uid, added_by=msg.from_user.id)
+    if ok:
+        await _notify_owners(f"👮 Админ добавлен вручную: <code>{uid}</code> "
+                             f"(добавил {_admin_label(msg.from_user.id, msg.from_user.username)})")
+        try:
+            await bot.send_message(uid, "👮 Тебе выдали доступ к боту awgToolza. "
+                                        "Нажми /start.")
+        except Exception as e:
+            # частая причина — пользователь не начинал диалог с ботом
+            log.info("Новому админу %s не доставлено: %s", uid, e)
+            res += ("\nНо написать ему бот не смог — пусть сам нажмёт /start "
+                    "(или ID указан неверно).")
+    await msg.answer(("✅ " if ok else "❌ ") + esc(res),
+                     reply_markup=kb.back_button("admins"))
+
+
+@dp.callback_query(F.data.startswith("adm_del:"))
+async def cb_admin_del(cq: CallbackQuery) -> None:
+    if not is_owner(cq.from_user.id):
+        return await deny_owner(cq)
+    uid = cq.data.split(":", 1)[1]
+    if not uid.isdigit():
+        return await cq.answer("Некорректный ID", show_alert=True)
+    await safe_edit(cq,
+        f"Отозвать доступ у <code>{uid}</code>?\n\n"
+        "Он сразу перестанет управлять ботом и получать уведомления. "
+        "Выданные им конфиги клиентов при этом продолжат работать.",
+        kb.confirm(yes_cb=f"adm_delok:{uid}", no_cb="admins", danger=True))
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_delok:"))
+async def cb_admin_delok(cq: CallbackQuery) -> None:
+    if not is_owner(cq.from_user.id):
+        return await deny_owner(cq)
+    raw = cq.data.split(":", 1)[1]
+    if not raw.isdigit():
+        return await cq.answer("Некорректный ID", show_alert=True)
+    ok, res = admins.remove(int(raw), removed_by=cq.from_user.id)
+    if ok:
+        await _notify_owners(f"🚫 Доступ отозван у <code>{raw}</code> "
+                             f"(отозвал {_admin_label(cq.from_user.id, cq.from_user.username)})")
+    await cq.answer(res[:190], show_alert=not ok)
+    await safe_edit(cq, admins_text(),
+                    kb.admins_menu(admins.list_invited(), admins.pending_invites()))
+
+
 # ───────────────────────── запуск ─────────────────────────
 async def main() -> None:
     from . import monitor
-    log.info("Бот запущен. Админы: %s", CFG.admins)
+    log.info("Бот запущен. Владельцы: %s, приглашённых админов: %s",
+             CFG.admins, len(admins.invited_ids()))
     # одноразовая чистка legacy "# note=" из конфига (баг ранних версий)
     try:
         n = core.cleanup_legacy_notes()
@@ -1207,7 +1440,9 @@ async def main() -> None:
     except Exception as e:
         log.warning("cleanup_legacy_notes: %s", e)
     # фоновый мониторинг активности клиентов с #ping
-    asyncio.create_task(monitor.monitor_loop(bot, CFG.admins))
+    # список получателей — функцией: приглашённый админ начинает получать
+    # уведомления сразу, без перезапуска бота
+    asyncio.create_task(monitor.monitor_loop(bot, all_admin_ids))
     await dp.start_polling(bot)
 
 
