@@ -981,7 +981,9 @@ async def cb_bot_status(cq: CallbackQuery) -> None:
     rc, out, _ = await asyncio.to_thread(core.run, ["awg-bot", "status"])
     bl = core.bot_version_local()
     a2l = core.awg2_version_local()
-    head = f"🤖 Версия бота: <b>{esc(bl)}</b>\n🛠 awg2: <b>{esc(a2l)}</b>\n\n"
+    ch = core.update_channel()
+    head = (f"🤖 Версия бота: <b>{esc(bl)}</b>\n🛠 awg2: <b>{esc(a2l)}</b>\n"
+            f"📡 Канал: <b>{'🧪 бета' if ch == 'beta' else '🛡 стабильный'}</b>\n\n")
     body = out.strip() or "awg-bot status недоступен"
     await safe_edit(cq, head + f"<pre>{esc(body[-3000:])}</pre>",
                     kb.botctl_menu(is_owner(cq.from_user.id)))
@@ -1016,20 +1018,29 @@ async def cb_bot_update(cq: CallbackQuery) -> None:
         return f"<code>{esc(loc)}</code> → <code>{esc(rem)}</code>  ⬆️"
 
     bot_upd = br not in ("?", bl)
+    channel = core.update_channel()
+    src_kind, src_val = core.update_source()
+    badge = "🧪 бета" if channel == "beta" else "🛡 стабильный"
     txt = (
         "⬆️ <b>Обновление</b>\n\n"
         f"🤖 Бот: {arrow(bl, br)}\n"
-        f"🛠 awg2: {arrow(a2l, a2r)}\n\n"
+        f"🛠 awg2: {arrow(a2l, a2r)}\n"
+        f"📡 Канал: <b>{badge}</b>\n"
+        f"<code>{esc(src_val)}</code>\n\n"
     )
+    if src_kind == "local":
+        txt += ("⚠️ Код берётся из локального каталога, а не с GitHub — канал ни на "
+                "что не влияет, пока источник не вернут на GitHub "
+                "(<code>awg-bot src --github</code>).\n\n")
     if bot_upd:
         txt += "Обновить бота до новой версии? Бот перезапустится, токен сохранится."
     else:
-        txt += ("Бот уже актуален. Можно переустановить принудительно "
+        txt += ("Бот уже актуален для этого канала. Можно переустановить принудительно "
                 "(на случай повреждённых файлов).")
     # awg2 обновляется отдельно — через консоль, мы его не трогаем
     if a2r not in ("?", a2l):
         txt += "\n\nℹ️ Для awg2 есть обновление — оно ставится в консоли: <code>sudo awg2</code> → пункт 8."
-    await safe_edit(cq, txt, kb.confirm(yes_cb="bot_update_ok", no_cb="botctl", danger=False))
+    await safe_edit(cq, txt, kb.update_menu(bot_upd, channel))
 
 
 @dp.callback_query(F.data == "bot_update_ok")
@@ -1234,6 +1245,60 @@ async def msg_backup_notfile(msg: Message, state: FSMContext) -> None:
         return await deny(msg)
     await msg.answer("Жду файл бэкапа (.tar.gz). Пришли его как документ "
                      "или нажми «Назад» в меню бэкапа для отмены.")
+
+
+@dp.callback_query(F.data == "bot_channel")
+async def cb_bot_channel(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    channel = core.update_channel()
+    target = "stable" if channel == "beta" else "beta"
+    src_kind, src_val = core.update_source()
+    head = (f"📡 <b>Канал обновлений</b>\n\n"
+            f"Сейчас: <b>{esc(core.channel_label(channel))}</b>\n"
+            f"<code>{esc(core.channel_repo(channel))}</code>\n\n")
+    if target == "beta":
+        body = ("Бета-канал — ранние сборки: правки приезжают туда раньше и могут "
+                "быть сырыми. На боевом сервере — на свой риск.\n\n"
+                f"Репозиторий: <code>{esc(core.UPDATE_REPO_BETA)}</code>")
+    else:
+        body = ("Стабильный канал — основной репозиторий проекта.\n\n"
+                "Если сейчас стоит бета-версия новее стабильной, обновление её не "
+                "тронет: бот просто перестанет получать ранние сборки.\n\n"
+                f"Репозиторий: <code>{esc(core.UPDATE_REPO_STABLE)}</code>")
+    tail = "\n\nПереключение меняет только источник кода — сам бот не обновится, это отдельная кнопка."
+    if src_kind == "local":
+        tail += ("\n\n⚠️ Сейчас код берётся из локального каталога "
+                 f"(<code>{esc(src_val)}</code>) — канал заработает только после "
+                 "<code>awg-bot src --github</code>.")
+    await safe_edit(cq, head + body + tail,
+                    kb.confirm(yes_cb=f"bot_channel_set:{target}",
+                               no_cb="bot_update", danger=False))
+    await cq.answer()
+
+
+@dp.callback_query(F.data.startswith("bot_channel_set:"))
+async def cb_bot_channel_set(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    target = cq.data.split(":", 1)[1]
+    if target not in ("beta", "stable"):
+        return await cq.answer("Неизвестный канал", show_alert=True)
+    await cq.answer("Переключаю канал…")
+    ok, res = await asyncio.to_thread(core.set_update_channel, target)
+    if not ok:
+        await safe_edit(cq, f"❌ Не удалось переключить канал.\n<pre>{esc(res)}</pre>\n"
+                            "То же самое в консоли: <code>sudo awg-bot channel "
+                            f"{esc(target)}</code>", kb.back_button("botctl"))
+        return
+    log.info("Канал обновлений переключён на %s (админ %s)", target, cq.from_user.id)
+    now = core.update_channel()
+    await safe_edit(cq,
+        f"✅ {esc(res)}\n<code>{esc(core.channel_repo(now))}</code>\n\n"
+        "Код ещё не менялся — нажми «Обновить бота», чтобы приехала версия из "
+        "этого канала. Если версии совпадают, поможет принудительная "
+        "переустановка на том же экране.",
+        kb.back_button("bot_update"))
 
 
 # ───────────────────────── админы бота ─────────────────────────

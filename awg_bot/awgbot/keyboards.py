@@ -270,6 +270,19 @@ def botctl_menu(is_owner: bool = False) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def update_menu(has_update: bool, channel: str) -> InlineKeyboardMarkup:
+    """Экран обновления: сама кнопка обновления + переключение канала."""
+    b = InlineKeyboardBuilder()
+    b.button(text="✓ Обновить бота" if has_update else "↻ Переустановить текущую версию",
+             callback_data="bot_update_ok")
+    b.button(text=("🛡 Вернуться на стабильный канал" if channel == "beta"
+                   else "🧪 Перейти на бета-канал"),
+             callback_data="bot_channel")
+    b.button(text="‹ Назад", callback_data="botctl")
+    b.adjust(1, 1, 1)
+    return b.as_markup()
+
+
 def admins_menu(invited, pending: int) -> InlineKeyboardMarkup:
     """Список приглашённых админов: кнопка на каждого — отзыв доступа."""
     b = InlineKeyboardBuilder()

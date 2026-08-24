@@ -887,35 +887,104 @@ def fmt_uptime(seconds: int) -> str:
     return f"{m}м"
 
 
-# ───────────────────────── версии (бот и awg2) ─────────────────────────
+# ───────────────────────── канал обновлений и версии ─────────────────────────
+# Каналы те же, что у awg2 (см. шапку awg2.sh и management-скрипт awg-bot):
+# stable — основной репозиторий, beta — ранние сборки. Переключение делает
+# `awg-bot channel <канал>`: он пишет UPDATE_CHANNEL и REPO_URL в конфиг, а
+# здесь мы только читаем результат — одна реализация записи на бота и консоль.
+UPDATE_REPO_STABLE = "https://github.com/pumbaX/awg-multi-script"
+UPDATE_REPO_BETA = "https://github.com/genaRijoff/awg-multi-script"
 DEFAULT_REPO_RAW = "https://raw.githubusercontent.com/pumbaX/awg-multi-script/main"
 BOT_CONF_PATH = "/etc/awg-bot.conf"
+AWG2_CHANNEL_FILE = "/var/lib/awg2/channel"
 AWG2_BIN_PATH = "/usr/local/bin/awg2"
+
+
+def _conf_value(key: str) -> str:
+    """Значение KEY= из /etc/awg-bot.conf (пусто, если нет файла или ключа)."""
+    try:
+        with open(BOT_CONF_PATH, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith(f"{key}="):
+                    return line.split("=", 1)[1].strip().strip("\"'")
+    except OSError:
+        pass
+    return ""
+
+
+def _norm_repo(url: str) -> str:
+    """github.com/user/repo — чтобы сравнивать адреса с .git и слэшами."""
+    u = url.strip().lower()
+    for pref in ("https://", "http://", "git@"):
+        u = u[len(pref):] if u.startswith(pref) else u
+    u = u.replace(":", "/", 1).rstrip("/")
+    return u.removesuffix(".git").rstrip("/")
+
+
+def channel_repo(channel: str) -> str:
+    return UPDATE_REPO_BETA if channel == "beta" else UPDATE_REPO_STABLE
+
+
+def channel_label(channel: str) -> str:
+    return "бета" if channel == "beta" else "стабильный"
+
+
+def update_channel() -> str:
+    """
+    Канал обновлений бота: явная настройка → вывод из REPO_URL → канал awg2
+    → stable. Порядок повторяет channel_read() в awg-bot, менять надо в обоих.
+    """
+    ch = _conf_value("UPDATE_CHANNEL")
+    if ch in ("beta", "stable"):
+        return ch
+    url = os.environ.get("REPO_URL", "").strip() or _conf_value("REPO_URL")
+    if url:
+        return "beta" if _norm_repo(url) == _norm_repo(UPDATE_REPO_BETA) else "stable"
+    try:
+        if Path(AWG2_CHANNEL_FILE).read_text().strip() == "beta":
+            return "beta"
+    except OSError:
+        pass
+    return "stable"
+
+
+def update_source() -> tuple[str, str]:
+    """
+    Откуда приедет код при обновлении: ("local", путь) либо ("github", url).
+    Локальный источник (LOCAL_SRC в конфиге) сильнее канала — о нём важно
+    сказать вслух, иначе переключение канала выглядит сломанным.
+    """
+    local = _conf_value("LOCAL_SRC")
+    if local:
+        return "local", local
+    url = os.environ.get("REPO_URL", "").strip() or _conf_value("REPO_URL")
+    return "github", url or channel_repo(update_channel())
+
+
+def set_update_channel(channel: str) -> tuple[bool, str]:
+    """Переключает канал через awg-bot (там же пишется конфиг)."""
+    if channel not in ("beta", "stable"):
+        return False, "Канал бывает stable или beta"
+    rc, out, err = run(["awg-bot", "channel", channel], timeout=30)
+    if rc != 0:
+        return False, (err or out or "awg-bot channel завершился с ошибкой").strip()[:300]
+    return True, f"Канал обновлений: {channel_label(channel)}"
 
 
 def _repo_raw() -> str:
     """
-    Куда смотреть за свежими версиями. Установщик пишет REPO_URL в
-    /etc/awg-bot.conf — на бета-канале awg2 это бета-репозиторий, и сравнивать
-    версии надо именно с ним, иначе бот вечно «отстаёт» от чужого стабильного.
+    Куда смотреть за свежими версиями. Явный REPO_URL в /etc/awg-bot.conf
+    главнее (его пишет установщик и переключение канала), иначе берём
+    репозиторий текущего канала — иначе бот на бете вечно «отстаёт» от
+    чужого стабильного.
     """
-    url = os.environ.get("REPO_URL", "").strip()
+    url = os.environ.get("REPO_URL", "").strip() or _conf_value("REPO_URL")
     if not url:
-        try:
-            with open(BOT_CONF_PATH, encoding="utf-8", errors="replace") as f:
-                for line in f:
-                    if line.startswith("REPO_URL="):
-                        url = line.split("=", 1)[1].strip().strip("\"'")
-                        break
-        except OSError:
-            url = ""
+        url = channel_repo(update_channel())
     m = re.match(r"^https://github\.com/([\w.-]+)/([\w.-]+?)(?:\.git)?/?$", url)
     if not m:
         return DEFAULT_REPO_RAW
     return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/main"
-
-
-REPO_RAW = _repo_raw()
 
 
 def bot_version_local() -> str:
@@ -957,13 +1026,13 @@ def _fetch(url: str, timeout: int = 10) -> str | None:
 
 
 def bot_version_remote() -> str:
-    txt = _fetch(f"{REPO_RAW}/awg_bot/awgbot/__init__.py")
+    txt = _fetch(f"{_repo_raw()}/awg_bot/awgbot/__init__.py")
     return _grep_version(txt) if txt else "?"
 
 
 def awg2_version_remote() -> str:
     # читаем только начало awg2.sh, версия в шапке
-    txt = _fetch(f"{REPO_RAW}/awg2.sh")
+    txt = _fetch(f"{_repo_raw()}/awg2.sh")
     if not txt:
         return "?"
     m = re.search(r'(?:SCRIPT_)?VERSION\s*=\s*["\']?v?([0-9][0-9.]*)', txt[:8000])
