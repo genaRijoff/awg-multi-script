@@ -21,7 +21,7 @@
 # сам откатываться, а не падать посреди пересборки с удалённой старой версией.
 set -uo pipefail
 
-VERSION="v1.0.1"
+VERSION="v1.0.2"
 
 REPO="amnezia-vpn/amneziawg-linux-kernel-module"
 REPO_GIT="https://github.com/${REPO}.git"
@@ -39,6 +39,9 @@ SRC_DIR="/usr/src/${DKMS_NAME}-${DKMS_VER}"
 BACKUP_DIR="/var/backups/awg-mod"
 STATE_DIR="/var/lib/awg2"
 TAG_FILE="${STATE_DIR}/module_tag"   # какой тег поставили мы (version.h апстрим не бумпает)
+# Меню перерисовывается через clear, и результат предыдущего действия с экрана
+# уходит. Всё существенное дублируется в журнал, чтобы разбор был по факту.
+LOG_FILE="/var/log/awg-mod-update.log"
 
 KVER="$(uname -r)"
 TMP=""
@@ -52,6 +55,7 @@ err()  { echo -e "${R}  × $*${N}"; }
 warn() { echo -e "${Y}  ▲ $*${N}"; }
 info() { echo -e "${C}  → $*${N}"; }
 dim()  { echo -e "${D}    $*${N}"; }
+log()  { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE" 2>/dev/null || true; }
 hdr()  {
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  ${W}$*${N}"
@@ -222,6 +226,8 @@ restore_backup() {   # $1 = архив
 do_update() {   # $1 = тег
   local tag="$1" backup="" src
   hdr "Обновление модуля до ${tag}"
+  local was; was="$(saved_tag)"
+  log "=== обновление до ${tag} (ядро ${KVER}, было: ${was:-неизвестно}) ==="
 
   ensure_deps || return 1
   check_secureboot || return 1
@@ -240,6 +246,7 @@ do_update() {   # $1 = тег
   # под это ядро, ничего не трогаем и выходим с рабочей системой.
   info "Пробная сборка (старая версия пока не тронута)"
   if ! make -C "$src" >"$TMP/build.log" 2>&1; then
+    log "пробная сборка провалилась, обновление отменено"
     err "Новый код не собирается под ядро ${KVER} — обновление отменено"
     dim "Последние строки лога:"
     tail -15 "$TMP/build.log" | sed 's/^/      /'
@@ -272,6 +279,7 @@ do_update() {   # $1 = тег
 
   mkdir -p "$STATE_DIR" 2>/dev/null
   printf '%s\n' "$tag" > "$TAG_FILE" 2>/dev/null
+  log "установлено: ${tag} под ${KVER}"
   ok "Модуль ${tag} собран и установлен под ядро ${KVER}"
   warn "В памяти пока работает прежний модуль — нужна перезагрузка модуля"
   return 0
@@ -347,10 +355,13 @@ exit \$RC"
   local log rc
   log="$(mktemp)"
   bash -c "$cmd" >"$log" 2>&1; rc=$?
-  sed 's/^/    /' "$log"; rm -f "$log"
+  sed 's/^/    /' "$log"
+  { echo "--- перезагрузка модуля, rc=${rc} ---"; cat "$log"; } >> "$LOG_FILE" 2>/dev/null
+  rm -f "$log"
   sleep 1
 
   if (( rc == 3 )); then
+    log "rmmod не выгрузил модуль (rc=3)"
     err "rmmod не выгрузил модуль — в памяти остался прежний код"
     dim "Обычно мешает ещё один интерфейс (в том числе в netns):"
     dim "  ip -all netns exec ip link show type amneziawg"
@@ -361,6 +372,7 @@ exit \$RC"
     err "Модуль не загрузился — смотри dmesg | tail -20"
     return 1
   fi
+  log "модуль перезагружен, srcversion в памяти: $(cat /sys/module/${DKMS_NAME}/srcversion 2>/dev/null)"
   ok "Модуль перезагружен, версия в памяти: $(module_ver)"
   local back
   back="$(awg_ifaces | tr '\n' ' ')"
@@ -385,8 +397,10 @@ verify() {
     if [[ -z "$mem" || -z "$disk" ]]; then
       warn "srcversion не прочитался — сверить память и диск не вышло"
     elif [[ "$mem" == "$disk" ]]; then
+      log "проверка: память=диск, srcversion ${mem}, тег $(saved_tag)"
       ok "В памяти тот же модуль, что на диске (srcversion ${mem})"
     else
+      log "проверка: расхождение, память ${mem}, диск ${disk}"
       warn "В памяти прежний модуль: ${mem}, на диске ${disk}"
       dim "Нужна перезагрузка модуля (пункт 3) или сервера"
     fi
@@ -458,6 +472,7 @@ main_menu() {
     echo -e "  ${W}4)${N} Откат из резервной копии"
     echo -e "  ${W}5)${N} Проверка"
     echo -e "  ${W}0)${N} Выход"
+    echo -e "  ${D}журнал: ${LOG_FILE}${N}"
     echo
     read_choice choice "  Пункт: " 5
     echo
@@ -490,6 +505,9 @@ awg-mod-update ${VERSION} — обновление ядерного модуля
   sudo awg-mod-update --no-reload     не перезагружать модуль (с --latest/--tag)
   sudo awg-mod-update --list          список доступных тегов
   sudo awg-mod-update --help          эта справка
+
+Ход работы дублируется в /var/log/awg-mod-update.log — меню перерисовывается
+через clear, и с экрана результат уходит.
 
 Перезагрузка модуля кладёт туннель на несколько секунд. Если SSH идёт через
 сам туннель, скрипт уводит перезапуск в systemd-run, чтобы не потерять сервер.
