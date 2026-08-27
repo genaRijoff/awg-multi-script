@@ -228,7 +228,7 @@ def get_server_info() -> ServerInfo:
 # переименовании в awg2 v0.7.22 — они уже записаны у созданных серверов,
 # поэтому переводим их здесь, а не переписываем конфиги.
 PROFILE_LABELS = {
-    "lite": "как в Amnezia",
+    "lite": "AmneziaVPN",
     "pro": "мощный",
     "standard": "standard (устаревший)",
 }

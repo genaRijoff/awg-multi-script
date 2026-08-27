@@ -477,7 +477,7 @@ async def msg_add_name(msg: Message, state: FSMContext) -> None:
     info = core.get_server_info()
     srv_prof = (info.profile or "").lower()
     if srv_prof == "lite":
-        # «Как в Amnezia». У официального конфига строк I нет вовсе, и awg2
+        # «AmneziaVPN». У официального конфига строк I нет вовсе, и awg2
         # с v0.7.22 пишет тогда "# AWG_MIMICRY=none" — клиент от бота тоже
         # идёт без цепочки. Старый lite-сервер метки не имеет: там мимикрия
         # была DNS, её и оставляем.

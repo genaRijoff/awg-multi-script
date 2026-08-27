@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.23"
+VERSION="v0.7.24"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -2319,7 +2319,7 @@ gen_cps_i1() {
 # Все профили генерируют I1-I5 через CPS-генератор (_CPS_GENERATOR).
 # Глобальные переменные на выходе: I1, I2, I3, I4, I5, MIMICRY_PROFILE
 # ── Профили AWG ──────────────────────────────────────────
-# Выбор из двух: «как в Amnezia» (значение lite) и «Мощный» (значение pro).
+# Выбор из двух: «AmneziaVPN» (значение lite) и «Мощный» (значение pro).
 # Имена значений не меняются — они уже записаны в awg0.conf у созданных
 # серверов и читаются ботом. Значение standard больше не предлагается, но
 # по-прежнему распознаётся у серверов, созданных раньше.
@@ -2328,104 +2328,31 @@ gen_cps_i1() {
 #   - уровень обфускации (OBF_LEVEL)
 #   - профиль мимикрии (MIMICRY_PROFILE)
 # Маркер пишется первой строкой awg0.conf: "# AWG_PROFILE=<value>"
-# ── Целевой клиент ────────────────────────────────────────
-# От клиента зависит не «сколько параметров он потянет», а что он вообще
-# читает. Здесь только проверенное:
+# ── Совместимость клиентов с цепочкой I1-I5 ───────────────
+# Раньше здесь спрашивали «куда поедет конфиг». Вопрос убран: диапазоны
+# Jc/S/H — параметры УСТРОЙСТВА, они одинаковы у сервера и всех клиентов и
+# клиентом не сужаются, то есть выбор влиял ровно на одно — на цепочку I1-I5.
+# А у профиля по умолчанию (AmneziaVPN) цепочки нет вовсе, так что вопрос
+# задавался в каждом сценарии и почти всегда ни на что не влиял.
+#
+# То, что он сообщал, никуда не делось — это предупреждения в меню уровня
+# обфускации, где цепочка и выбирается:
 #  • WireSock (форк BoringTun под Windows) не читает I1-I5 совсем. По
 #    документации вендора поля «silently ignored»: туннель поднимется, мимикрии
 #    в трафике не будет, ошибки тоже не будет. Худший вид поломки — тихий.
 #  • Keenetic OS 4.x: чем именно разбирается цепочка, по исходникам установить
-#    не удалось, поэтому цепочку держим короткой (I1, профиль DNS).
+#    не удалось, поэтому длинная цепочка на нём ненадёжна.
 #  • AmneziaWG для Windows до v2.0.2 не принимал H выше 2^31-1. Мы и так
 #    генерируем внутри этой границы, отдельного действия не нужно.
 #  • Теги b/r/rc/rd читают оба известных движка (amneziawg-go device/obf.go и
 #    модуль ядра src/junk.c), поэтому цепочка переносима между всеми
 #    клиентами, которые её вообще разбирают.
-# Диапазоны Jc/S/H — параметры УСТРОЙСТВА: они одинаковы у сервера и всех
-# клиентов, поэтому клиентом их не сузить. Выбор влияет только на I1-I5.
-TARGET_CLIENT="amnezia"
-
-_target_client_label() {
-  case "${1:-${TARGET_CLIENT:-amnezia}}" in
-    kmod)     echo "Linux / OpenWrt (модуль ядра)" ;;
-    keenetic) echo "Keenetic (нативный AmneziaWG)" ;;
-    wiresock) echo "WireSock (Windows)" ;;
-    mixed)    echo "разные клиенты" ;;
-    *)        echo "Amnezia VPN / AmneziaWG" ;;
-  esac
-}
-
-# Профиль мимикрии, записанный в конфиг сервера ("# AWG_MIMICRY=").
-# Пусто/отсутствует — сервер старый и метки не знает: тогда решение остаётся
-# за вызывающим, «none» отсюда выдавать нельзя.
-_server_mimicry() {
-  [[ -f "$SERVER_CONF" ]] || return 0
-  grep -m1 '^# AWG_MIMICRY=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true
-}
-
-# Ложь, если выбранный клиент цепочку I1-I5 не читает.
-_target_client_reads_cps() {
-  [[ "${TARGET_CLIENT:-amnezia}" != "wiresock" ]]
-}
-
-# Печатает предупреждение и возвращает 0, если CPS для этого клиента бесполезен.
-# Вызывающий в этом случае обязан оставить конфиг без I1-I5. Текст печатается
-# один раз на выбор клиента: он длинный, а проверка стоит в нескольких местах.
-_warn_cps_unsupported() {
-  _target_client_reads_cps && return 1
-  [[ -n "${_CPS_UNSUPPORTED_WARNED:-}" ]] && return 0
-  _CPS_UNSUPPORTED_WARNED=1
-  echo ""
-  warn "WireSock не читает I1-I5 — по документации вендора поля молча игнорируются"
-  warn "Туннель поднимется, мимикрии в трафике не будет, и об этом никто не сообщит"
-  info "Поэтому конфиг делается без CPS. Обфускация H/S/Jc у WireSock работает полностью"
-  return 0
-}
-
-# Спрашивает, куда поедет конфиг. Влияет только на цепочку I1-I5.
-choose_target_client() {
-  TARGET_CLIENT="amnezia"
-  _CPS_UNSUPPORTED_WARNED=""
-  echo ""
-  hdr "▣  Куда поедет конфиг"
-  echo -e "  ${G}1${N}  ${W}Amnezia VPN / AmneziaWG${N} ${D}— Android, iOS, Windows, macOS, Linux${N} ${C}(по умолчанию)${N}"
-  echo -e "  ${G}2${N}  ${W}Linux / OpenWrt${N} ${D}— модуль ядра amneziawg${N}"
-  echo -e "  ${G}3${N}  ${W}Keenetic${N} ${D}— нативный AmneziaWG в KeeneticOS 4.x${N}"
-  echo -e "  ${R}4${N}  ${W}WireSock${N} ${D}— Windows; мимикрию I1-I5 не поддерживает${N}"
-  echo -e "  ${G}5${N}  Не знаю / разные клиенты"
-  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-  local _tc
-  read_choice _tc "$(echo -e "${C}  Выбор [1-5] (Enter = 1): ${N}")" 1 5 1
-  case "$_tc" in
-    2) TARGET_CLIENT="kmod" ;;
-    3) TARGET_CLIENT="keenetic" ;;
-    4) TARGET_CLIENT="wiresock" ;;
-    5) TARGET_CLIENT="mixed" ;;
-    *) TARGET_CLIENT="amnezia" ;;
-  esac
-  ok "Клиент: $(_target_client_label)"
-
-  case "$TARGET_CLIENT" in
-    keenetic)
-      info "Длинная цепочка на Keenetic ненадёжна — предложу I1 и профиль DNS"
-      ;;
-    wiresock)
-      _warn_cps_unsupported || true
-      ;;
-    mixed)
-      info "Цепочка будет из тегов, которые читают оба движка — она переносима"
-      ;;
-  esac
-  log_info "TARGET_CLIENT=$TARGET_CLIENT"
-  return 0
-}
 
 choose_awg_profile() {
   AWG_PROFILE=""
-  choose_target_client
   echo ""
   hdr "⚙  Профиль AmneziaWG"
-  echo -e "  ${G}1${N}  ${W}Как в Amnezia${N} ${D}— параметры один в один с официальным клиентом${N} ${C}(рекомендуется)${N}"
+  echo -e "  ${G}1${N}  ${W}AmneziaVPN${N} ${D}— параметры один в один с официальным клиентом${N} ${C}(рекомендуется)${N}"
   echo -e "     ${D}Jc/Jmin/Jmax и S1-S4 как в конфигах Amnezia, на 3.x H1-H4 = 1/2/3/4${N}"
   echo -e "     ${D}(при HeaderProtectionKey заголовок и так шифруется), MTU 1280,${N}"
   echo -e "     ${D}цепочка I1-I5 по умолчанию не добавляется — конфиг короткий.${N}"
@@ -2450,14 +2377,8 @@ choose_awg_profile() {
       # AWG 3.x (паддинг содержимого + S4 + хвост) подходит вплотную к 1500,
       # и на маршруте с меньшим MTU крупные пакеты начинают резаться.
       if [[ "${MTU:-}" =~ ^[0-9]+$ ]] && (( MTU > 1280 )); then
-        info "Профиль «как в Amnezia»: MTU ${MTU} → 1280 (как у официального клиента)"
+        info "Профиль «AmneziaVPN»: MTU ${MTU} → 1280 (как у официального клиента)"
         MTU=1280
-      fi
-      if _warn_cps_unsupported; then
-        OBF_LEVEL=1; MIMICRY_PROFILE="none"
-        I1=""; I2=""; I3=""; I4=""; I5=""
-        info "Профиль: как в Amnezia, без CPS (клиент его не читает)"
-        return 0
       fi
       # У официальной Amnezia строк I вообще нет. Один компактный I1 (DNS,
       # ~90 символов) добавляем только по явному согласию: любая строка I —
@@ -2465,11 +2386,11 @@ choose_awg_profile() {
       echo ""
       echo -e "  ${D}Добавить один компактный пакет мимикрии I1 (DNS-запрос, ~90 симв)?${N}"
       local _add_i1
-      read_choice _add_i1 "$(echo -e "${C}  1 — нет, как в Amnezia (Enter), 2 — да: ${N}")" 1 2 1
+      read_choice _add_i1 "$(echo -e "${C}  1 — нет, AmneziaVPN (Enter), 2 — да: ${N}")" 1 2 1
       if [[ "$_add_i1" == "1" ]]; then
         OBF_LEVEL=1; MIMICRY_PROFILE="none"
         I1=""; I2=""; I3=""; I4=""; I5=""
-        ok "Профиль: как в Amnezia (без I1-I5)"
+        ok "Профиль: AmneziaVPN (без I1-I5)"
         return 0
       fi
       OBF_LEVEL=2                # клиентам кладём один I1
@@ -2485,7 +2406,7 @@ choose_awg_profile() {
         warn "Не удалось сгенерировать I1 — клиенты пойдут без CPS"
         MIMICRY_PROFILE="none"; OBF_LEVEL=1
       else
-        ok "Профиль: как в Amnezia + I1 (${#I1} симв${sel_domain:+, $sel_domain})"
+        ok "Профиль: AmneziaVPN + I1 (${#I1} симв${sel_domain:+, $sel_domain})"
       fi
       ;;
     2)
@@ -2505,18 +2426,7 @@ choose_obf_level() {
   #   3 = +I1-I5 — полный CPS chain (максимум DPI bypass)
   OBF_LEVEL=""
 
-  # У WireSock цепочки не будет вовсе, у Keenetic длинная ненадёжна — меняем
-  # предложение по умолчанию, но выбор оставляем за человеком.
   local _lvl_default=3
-  if _warn_cps_unsupported; then
-    OBF_LEVEL=1; MIMICRY_PROFILE="none"
-    I1=""; I2=""; I3=""; I4=""; I5=""
-    ok "Уровень обфускации: Базовый (H/S/Jc), без I1-I5"
-    return 0
-  fi
-  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
-    _lvl_default=2
-  fi
 
   echo ""
   hdr "⛊  Уровень обфускации"
@@ -2526,10 +2436,13 @@ choose_obf_level() {
   echo -e "     ${D}I1 = снимок реального TLS/QUIC/DTLS протокола${N}"
   echo -e "  ${D}1   Базовый — H ranges + S1-S4 + Jc junk, без I1-I5${N}"
   echo -e "     ${D}Максимальная совместимость со старыми клиентами.${N}"
-  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
-    echo -e "  ${Y}  Keenetic: чем он разбирает цепочку — по исходникам неизвестно.${N}"
-    echo -e "  ${Y}  Надёжнее уровень 2 (один I1), поэтому он и предложен.${N}"
-  fi
+  echo ""
+  echo -e "  ${Y}  Цепочку читают не все клиенты:${N}"
+  echo -e "  ${D}  • WireSock (Windows) не читает I1-I5 совсем — поля молча${N}"
+  echo -e "  ${D}    игнорируются, туннель поднимется без мимикрии и без ошибки.${N}"
+  echo -e "  ${D}    Ему подходит только уровень 1 (H/S/Jc работают полностью).${N}"
+  echo -e "  ${D}  • Keenetic: чем он разбирает цепочку — по исходникам неизвестно,${N}"
+  echo -e "  ${D}    длинная ненадёжна. Надёжнее уровень 2 (один I1).${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   read_choice OBF_LEVEL "$(echo -e "${C}  Выбор [1-3] (Enter = ${_lvl_default}): ${N}")" 1 3 "$_lvl_default"
   local label
@@ -2729,14 +2642,8 @@ choose_mimicry_profile() {
   echo -e "  ${D}0   Назад${N}"
   echo ""
   local _mim_default=1
-  if [[ "${TARGET_CLIENT:-amnezia}" == "keenetic" ]]; then
-    # Keenetic чувствителен к длинному I1, а DNS — самый короткий пакет
-    # из тех, что содержат домен
-    _mim_default=3
-    echo -e "  ${Y}  Keenetic чувствителен к длине I1: DNS — самый компактный${N}"
-    echo -e "  ${Y}  профиль с доменом, поэтому он и предложен.${N}"
-    echo ""
-  fi
+  echo -e "  ${D}  На Keenetic надёжнее DNS (3): он чувствителен к длине I1.${N}"
+  echo ""
   read_choice PROFILE_CHOICE "$(echo -e "${C}  Выбор [0-9] (Enter = ${_mim_default}): ${N}")" 0 9 "$_mim_default"
 
   case $PROFILE_CHOICE in
@@ -4356,7 +4263,7 @@ show_header() {
   if [[ -f "$SERVER_CONF" ]]; then
     profile_raw=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
     case "$profile_raw" in
-      lite)     profile_label="как в Amnezia" ;;
+      lite)     profile_label="AmneziaVPN" ;;
       standard) profile_label="Standard (устаревший)" ;;
       pro)      profile_label="Мощный" ;;
       "")       profile_label="—" ;;
@@ -5205,7 +5112,7 @@ gen_awg_params() {
   # https://docs.amnezia.org/documentation/amnezia-wg/
   # ══════════════════════════════════════════════════════════
   # Ветвление по AWG_PROFILE:
-  #   lite     — «как в Amnezia»: значения вокруг официального конфига
+  #   lite     — «AmneziaVPN»: значения вокруг официального конфига
   #   standard — устаревший, оставлен для серверов, созданных раньше
   #   pro      — «Мощный»: полные диапазоны
 
@@ -5213,7 +5120,7 @@ gen_awg_params() {
 
   case "${AWG_PROFILE:-pro}" in
     lite)
-      # ── «Как в Amnezia»: значения вокруг официального конфига ──
+      # ── «AmneziaVPN»: значения вокруг официального конфига ──
       # Образец конфига официального клиента (AWG 3.1):
       #   Jc=4, Jmin=10, Jmax=50, S1=86, S2=48, S3=16, S4=12, H1..H4 = 1/2/3/4
       Jc=$(rand_range 3 5)              # 4 ±1
@@ -6896,38 +6803,24 @@ do_add_client() {
 
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
-  # Цепочка I1-I5 — клиентская: у каждого устройства она своя, поэтому
-  # спрашиваем на каждого клиента, а не один раз на сервер.
-  choose_target_client
-
-  # Читаем профиль сервера — определяет поведение для клиентского I1
+  # Читаем профиль сервера — определяет поведение для клиентского I1.
+  # Цепочка I1-I5 клиентская: у каждого устройства она своя.
   local _srv_profile
   _srv_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
   _srv_profile="${_srv_profile:-pro}"
 
-  # Клиент, который цепочку не читает, делает профиль сервера неважным:
-  # генерировать I1-I5 не для кого.
-  if ! _target_client_reads_cps; then
-    _warn_cps_unsupported || true
-    _srv_profile="nocps"
-  fi
-
   case "$_srv_profile" in
-    nocps)
-      I1=""; I2=""; I3=""; I4=""; I5=""
-      i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
-      ;;
     lite)
-      # Профиль «как в Amnezia». Строк I у самой Amnezia нет, и с версии, где
+      # Профиль «AmneziaVPN». Строк I у самой Amnezia нет, и с версии, где
       # профиль это учитывает, сервер пишет "# AWG_MIMICRY=none" — тогда клиент
       # тоже идёт без цепочки, иначе конфиги сервера и клиента разошлись бы по
       # смыслу. Старый lite-сервер метки не имеет: для него поведение прежнее.
       if [[ "$(_server_mimicry)" == "none" ]]; then
-        info "Профиль сервера: как в Amnezia, без мимикрии — клиент тоже без I1"
+        info "Профиль сервера: AmneziaVPN, без мимикрии — клиент тоже без I1"
         I1=""; I2=""; I3=""; I4=""; I5=""
         i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
       else
-        info "Профиль сервера: как в Amnezia — клиент получит один I1=DNS"
+        info "Профиль сервера: AmneziaVPN — клиент получит один I1=DNS"
         CPS_BUDGET=0
         choose_cps_domain "dns"
         local cps_out
@@ -7243,24 +7136,14 @@ do_bulk_add_clients() {
   # ── I1 (один раз для всех) ──
   local i1_line="" i2_line="" i3_line="" i4_line="" i5_line=""
 
-  choose_target_client
-  if ! _target_client_reads_cps; then
-    _warn_cps_unsupported || true
-    _srv_profile="nocps"
-  fi
-
   case "$_srv_profile" in
-    nocps)
-      I1=""; I2=""; I3=""; I4=""; I5=""
-      i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
-      ;;
     lite)
       if [[ "$(_server_mimicry)" == "none" ]]; then
-        info "Профиль сервера: как в Amnezia, без мимикрии — клиенты тоже без I1"
+        info "Профиль сервера: AmneziaVPN, без мимикрии — клиенты тоже без I1"
         I1=""; I2=""; I3=""; I4=""; I5=""
         i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
       else
-        info "Профиль сервера: как в Amnezia — клиенты получат один I1=DNS"
+        info "Профиль сервера: AmneziaVPN — клиенты получат один I1=DNS"
         CPS_BUDGET=0
         choose_cps_domain "dns"
         local cps_out
@@ -7874,18 +7757,13 @@ do_change_client_mimicry() {
   _srv_profile="${_srv_profile:-pro}"
 
   I1=""; I2=""; I3=""; I4=""; I5=""
-  choose_target_client
-  if ! _target_client_reads_cps; then
-    _warn_cps_unsupported || true
+  if [[ "$_srv_profile" == "pro" ]]; then
+    choose_obf_level
   else
-    if [[ "$_srv_profile" == "pro" ]]; then
-      choose_obf_level
-    else
-      OBF_LEVEL=2
-      info "Профиль сервера ${_srv_profile}: у клиента только I1"
-    fi
-    choose_mimicry_profile || return 1
+    OBF_LEVEL=2
+    info "Профиль сервера ${_srv_profile}: у клиента только I1"
   fi
+  choose_mimicry_profile || return 1
 
   # Собираем новые строки. Пустые не пишем: строка «I2 = » ломает разбор.
   local new_lines="" k v
@@ -11857,7 +11735,7 @@ do_client_dpi_hint() {
   echo -e "    ${W}Туннели и DNS${N} → DNSCrypt."
   echo -e "  ${C}•${N} Обрыв или просадка ПОСЛЕ первых десятков килобайт — это"
   echo -e "    ограничение потока, а не оверхед параметров: пробуйте профиль"
-  echo -e "    ${W}«как в Amnezia»${N} и цепочку I1-I5 покороче."
+  echo -e "    ${W}«AmneziaVPN»${N} и цепочку I1-I5 покороче."
   echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo ""
   echo -e "  ${D}Проект сторонний, лицензия MIT. awg2 его не ставит и не запускает.${N}"
