@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.22"
+VERSION="v0.7.23"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -334,6 +334,78 @@ _log() {
 log_info()  { _log "INFO"  "$@"; }
 log_warn()  { _log "WARN"  "$@"; }
 log_err()   { _log "ERROR" "$@"; }
+
+# ── Компактный вывод длинных шагов ─────────────────────────
+# Установка тянет apt, git, make и dkms. Каждый из них выдаёт сотни строк, в
+# которых тонет и порядок шагов, и настоящая ошибка: на экране остаётся хвост
+# распаковки пакетов, а не место, где сломалось. run_step прячет весь вывод в
+# $INSTALL_LOG и оставляет одну строку на шаг, а при провале показывает хвост
+# лога — то есть ровно то, что нужно.
+#
+# Полосы выполнения тут быть не может: ни apt, ни dkms не отдают долю
+# сделанного в машиночитаемом виде, а рисовать проценты «на глаз» — врать.
+# Поэтому индикатор честный: крутилка, пока шаг идёт, и его длительность после.
+INSTALL_LOG="/var/log/awg2-install.log"
+
+# Кадры крутилки — ASCII: вывод читают и через PuTTY, и через веб-консоль
+# хостера, где UTF-8 настроен не всегда.
+_SPIN_FRAMES='-\|/'
+_RUN_STEP_PID=""
+
+# Ctrl+C во время шага не должен оставить apt или dkms работать в фоне.
+_run_step_abort() {
+  [[ -n "${_RUN_STEP_PID:-}" ]] && kill "$_RUN_STEP_PID" 2>/dev/null
+  printf '\r\033[K'
+  echo ""
+  warn "Прервано пользователем"
+  exit 130          # общую уборку сделает EXIT-трап
+}
+
+# run_step "Название шага" команда [аргументы...]
+# Код возврата — команды. В терминал уходит только строка результата.
+run_step() {
+  local title="$1"; shift
+  # Хвост при провале показываем только за ЭТОТ шаг: лог общий на всю
+  # установку, и «последние 15 строк» иначе приезжают из предыдущего шага.
+  local from_line=0
+  [[ -f "$INSTALL_LOG" ]] && from_line=$(wc -l < "$INSTALL_LOG" 2>/dev/null || echo 0)
+  printf '[%s] [STEP] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$title" >> "$INSTALL_LOG"
+
+  local t0=$SECONDS rc=0
+  if [[ -t 1 ]]; then
+    # stdin закрываем: за спрятанным выводом никто не должен ждать ответа
+    # Подоболочка обязательна: шаги сборки делают cd, и без неё каталог
+    # менялся бы у самого скрипта.
+    ( "$@" ) </dev/null >>"$INSTALL_LOG" 2>&1 &
+    _RUN_STEP_PID=$!
+    trap '_run_step_abort' INT
+    local i=0
+    while kill -0 "$_RUN_STEP_PID" 2>/dev/null; do
+      printf '\r  %b%s%b %s ' "$C" "${_SPIN_FRAMES:i++%4:1}" "$N" "$title"
+      sleep 0.2
+    done
+    wait "$_RUN_STEP_PID" || rc=$?
+    trap - INT
+    _RUN_STEP_PID=""
+    printf '\r\033[K'
+  else
+    ( "$@" ) </dev/null >>"$INSTALL_LOG" 2>&1 || rc=$?
+  fi
+
+  local secs=$((SECONDS - t0))
+  if (( rc == 0 )); then
+    printf '  %b√%b %s %b(%dс)%b\n' "$G" "$N" "$title" "$D" "$secs" "$N"
+    return 0
+  fi
+
+  printf '  %b×%b %s %b(код %d, %dс)%b\n' "$R" "$N" "$title" "$D" "$rc" "$secs" "$N"
+  echo ""
+  warn "Последние строки шага:"
+  tail -n "+$((from_line + 2))" "$INSTALL_LOG" 2>/dev/null | tail -n 15 | sed 's/^/    /'
+  echo ""
+  info "Полный вывод шага: $INSTALL_LOG"
+  return "$rc"
+}
 
 # Универсальный пул — домены работают И в РФ (не в реестре РКН), И в мире.
 # Используются как для SNI/мимикри TLS, так и для QUIC/SIP/DTLS.
@@ -5474,6 +5546,25 @@ EOF
   return 0
 }
 
+# Шаги сборки вынесены в функции: run_step запускает команду, и подоболочка
+# «( cd ... && make )» ему аргументом не передаётся. Логика та же, что была
+# внутри скобок, включая версию из dkms.conf.
+_build_awg_module() {
+  local src="$1/src"
+  cd "$src" || return 1
+  make dkms-install || return 1
+  local mod_ver
+  mod_ver=$(grep -oP 'version\s*"\K[^"]+' dkms.conf 2>/dev/null || echo "1.0.0")
+  dkms add -m amneziawg -v "$mod_ver" 2>/dev/null || true
+  dkms build -m amneziawg -v "$mod_ver" || return 1
+  dkms install -m amneziawg -v "$mod_ver" || return 1
+}
+
+_build_awg_tools() {
+  cd "$1/src" || return 1
+  make && make install
+}
+
 do_install() {
   while true; do
   # Detect OS
@@ -5570,14 +5661,23 @@ EOF
     ok "DNS работает"
   fi
 
-  hdr "+  Обновление системы"
+  hdr "+  Система и зависимости"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -q || { err "Не удалось обновить репозитории"; prompt_retry || return 1; continue; }
-  apt-get upgrade -y -q \
-    -o Dpkg::Options::="--force-confdef" \
-    -o Dpkg::Options::="--force-confold"
+  # Полный вывод шагов уходит в $INSTALL_LOG, на экране — строка на шаг.
+  # Лог обнуляем на каждый запуск: хвост при провале должен быть от этой
+  # попытки, а не от позавчерашней.
+  : > "$INSTALL_LOG" 2>/dev/null || true
+  chmod 600 "$INSTALL_LOG" 2>/dev/null || true
+  info "Полный вывод: $INSTALL_LOG"
 
-  hdr "+  Установка зависимостей"
+  run_step "Обновление списка пакетов" apt-get update -q || {
+    err "Не удалось обновить репозитории"; prompt_retry || return 1; continue; }
+  run_step "Обновление системы (apt upgrade)" \
+    apt-get upgrade -y -q \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" || \
+    warn "apt upgrade отработал с ошибкой — продолжаю, детали в $INSTALL_LOG"
+
   # iputils-ping — ping не входит в минимальные облачные образы Ubuntu 26.04 /
   # Debian 13, а на нём держатся scan_pool, _probe_host и WARP health-check.
   local base_deps=(python3 net-tools curl ufw iptables qrencode bc ca-certificates gnupg iputils-ping)
@@ -5586,7 +5686,8 @@ EOF
   # do_install вызывается как «do_install || true», то есть errexit внутри не
   # работает. Без явной проверки провал apt проходил молча, а ломалось потом —
   # на сборке DKMS или на отсутствии git, и уже без внятной причины.
-  if ! apt-get install -y -q "${base_deps[@]}"; then
+  if ! run_step "Установка зависимостей (${#base_deps[@]} пакетов)" \
+        apt-get install -y -q "${base_deps[@]}"; then
     err "Не удалось установить зависимости"
     info "Проверь вывод выше — обычно это битое зеркало или нет места на диске"
     info "Повтори вручную: apt-get update && apt-get install -y ${base_deps[*]}"
@@ -5605,10 +5706,9 @@ EOF
     headers_ok=1
   else
     # Пытаемся установить headers под running kernel
-    info "Устанавливаем linux-headers-${running_kernel}..."
-    if apt-get install -y -q "linux-headers-${running_kernel}" 2>&1 | tail -3; then
+    if run_step "linux-headers-${running_kernel}" \
+         apt-get install -y -q "linux-headers-${running_kernel}"; then
       if [[ -d "/lib/modules/${running_kernel}/build" ]]; then
-        ok "Headers установлены"
         headers_ok=1
       fi
     fi
@@ -5616,8 +5716,9 @@ EOF
 
   # Если headers всё ещё нет — пробуем мета-пакеты
   if [[ $headers_ok -eq 0 ]]; then
-    apt-get install -y -q linux-headers-amd64 2>/dev/null || \
-    apt-get install -y -q linux-headers-generic 2>/dev/null || true
+    run_step "Мета-пакет kernel headers" bash -c \
+      'apt-get install -y -q linux-headers-amd64 2>/dev/null ||
+       apt-get install -y -q linux-headers-generic 2>/dev/null || true' || true
 
     if [[ -d "/lib/modules/${running_kernel}/build" ]]; then
       headers_ok=1
@@ -5665,20 +5766,13 @@ EOF
   hdr "+  AmneziaWG kernel module (git + DKMS)"
   local tmp_mod=/tmp/amneziawg-linux-kernel-module
   rm -rf "$tmp_mod"
-  git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git "$tmp_mod" || {
+  run_step "Клонирование kernel module" \
+    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git "$tmp_mod" || {
     err "Не удалось клонировать kernel module"
     info "Проверь интернет: ping github.com"
     prompt_retry || return 1; continue
   }
-  (
-    cd "$tmp_mod/src" || exit 1
-    make dkms-install || exit 1
-    local mod_ver
-    mod_ver=$(grep -oP 'version\s*"\K[^"]+' dkms.conf 2>/dev/null || echo "1.0.0")
-    dkms add -m amneziawg -v "$mod_ver" 2>/dev/null || true
-    dkms build -m amneziawg -v "$mod_ver" || exit 1
-    dkms install -m amneziawg -v "$mod_ver" || exit 1
-  ) || {
+  run_step "Сборка и установка модуля (DKMS)" _build_awg_module "$tmp_mod" || {
     err "Сборка kernel module провалилась"
     echo ""
     info "Возможные причины:"
@@ -5717,20 +5811,14 @@ EOF
   if (( ${#_kernels[@]} > 0 )); then
     newest_k=$(printf '%s\n' "${_kernels[@]}" | sort -V | tail -1)
   fi
-  if dkms autoinstall >/dev/null 2>&1; then
-    ok "Модуль собран под все установленные ядра"
-  else
+  run_step "Сборка под все установленные ядра" dkms autoinstall || \
     warn "dkms autoinstall отработал с ошибкой — проверь: dkms status"
-  fi
 
   # autoinstall молча пропускает ядро без заголовков, поэтому «всё собрано»
   # проверяем по факту, а не по коду возврата
   if [[ -n "$newest_k" ]] && ! dkms status 2>/dev/null | grep -q "$newest_k"; then
-    if dkms autoinstall -k "$newest_k" >/dev/null 2>&1; then
-      ok "Модуль дособран под $newest_k"
-    else
+    run_step "Досборка под $newest_k" dkms autoinstall -k "$newest_k" || \
       warn "Модуль под $newest_k собрать не удалось (нет linux-headers-$newest_k?)"
-    fi
   fi
 
   # Если загружено не самое новое ядро — предупреждаем прямо, а не постфактум
@@ -5749,13 +5837,12 @@ EOF
   hdr "+  amneziawg-tools (git + make)"
   local tmp_tools=/tmp/amneziawg-tools
   rm -rf "$tmp_tools"
-  git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git "$tmp_tools" || {
+  run_step "Клонирование amneziawg-tools" \
+    git clone --depth 1 https://github.com/amnezia-vpn/amneziawg-tools.git "$tmp_tools" || {
     err "Не удалось клонировать tools"; prompt_retry || return 1; continue
   }
-  (
-    cd "$tmp_tools/src" || exit 1
-    make && make install
-  ) || { err "Сборка tools провалилась"; prompt_retry || return 1; continue; }
+  run_step "Сборка amneziawg-tools" _build_awg_tools "$tmp_tools" || {
+    err "Сборка tools провалилась"; prompt_retry || return 1; continue; }
   rm -rf "$tmp_tools"
 
   if command -v awg &>/dev/null; then
