@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.21"
+VERSION="v0.7.22"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -389,14 +389,22 @@ QUIC_DOMAINS_RU=(
   "ozon.ru"
 )
 
-# Заготовленные домены для автогенерации I1-I5. Тот же список зашит в
-# CPS-генератор (RU_DOMAIN_POOL): массовые российские сайты, к которым идёт
-# фоновый трафик у любого пользователя в РФ, поэтому SNI или DNS-запрос с ними
-# не выделяется на общем фоне. Здесь пул нужен, чтобы перед генерацией
-# проверить домены на доступность и показать выбранный пользователю.
+# РЕЗЕРВНЫЙ пул доменов для автогенерации I1-I5.
+#
+# Прежний список (ya.ru, mail.ru, vk.com, ozon.ru, gosuslugi.ru, ...) взят из
+# payloadGen и одинаков у всех, кто пользуется тем же генератором. Одинаковый
+# у всех набор SNI/QNAME — это уже не маскировка, а признак: DPI учится по нему
+# быстрее всего, и «плохой домен» ломает подключение ещё до вопросов о скорости.
+# Поэтому здесь инфраструктурные хосты (CDN, статика, телеметрия): фоновый
+# трафик к ним идёт постоянно, а страничного профиля у них нет.
+#
+# Пул именно резервный. Свой домен пользователя всегда лучше — меню домена
+# предлагает его первым; список ниже используется, только если человек выбрал
+# автоподбор, и перед выдачей проверяется на доступность (scan_pool).
 CPS_RU_DOMAINS=(
-  "ya.ru" "mail.ru" "vk.com" "ozon.ru" "wildberries.ru"
-  "gosuslugi.ru" "dzen.ru" "avito.ru" "rutube.ru" "sberbank.ru"
+  "yastatic.net" "mc.yandex.ru" "avatars.mds.yandex.net"
+  "ok.ru" "st.mycdn.me" "vk.ru"
+  "kinopoisk.ru" "hh.ru" "2gis.ru" "lenta.ru" "mos.ru" "citilink.ru"
 )
 
 
@@ -715,17 +723,20 @@ def random_private_ipv4():
     return ".".join(str(x) for x in rc(pools))
 
 # == Константы (app.js: CONFIG / CHROME_BROWSER_DATA, generators.js: пулы) ==
-DEFAULT_HOST = "gosuslugi.ru"          # CONFIG.defaultHost
+DEFAULT_HOST = "yastatic.net"          # запасной хост, если домен не передали
 DEFAULT_MTU = 1280                     # CONFIG.defaultMtu
 MAX_OUTPUT_LINES = 5                   # CONFIG.maxOutputLines (I1-I5)
 
-# Заготовленные домены для автогенерации, когда пользователь не ввёл свой.
-# Взяты из DOMAIN_POOL payloadGen: массовые российские сайты, к которым идёт
-# фоновый трафик у любого пользователя в РФ, поэтому SNI/QNAME с ними не
-# выделяется. Сюда же смотрит меню awg2 при выборе домена.
+# Резервный пул на случай, когда домен не передали (например, вызов из бота).
+# Список payloadGen (ya.ru, gosuslugi.ru, vk.com, ...) отсюда убран намеренно:
+# он одинаков у всех пользователей того генератора, поэтому сам является
+# признаком. Здесь — инфраструктурные хосты с постоянным фоновым трафиком.
+# Тот же список продублирован в awg2 как CPS_RU_DOMAINS, где он ещё и
+# проверяется на доступность перед генерацией.
 RU_DOMAIN_POOL = [
-    "ya.ru", "mail.ru", "vk.com", "ozon.ru", "wildberries.ru",
-    "gosuslugi.ru", "dzen.ru", "avito.ru", "rutube.ru", "sberbank.ru",
+    "yastatic.net", "mc.yandex.ru", "avatars.mds.yandex.net",
+    "ok.ru", "st.mycdn.me", "vk.ru",
+    "kinopoisk.ru", "hh.ru", "2gis.ru", "lenta.ru", "mos.ru", "citilink.ru",
 ]
 
 CHROME_DEFAULT_VERSION = "147.0.7727.50"   # CHROME_BROWSER_DATA.defaultVersion
@@ -2096,6 +2107,8 @@ def build_options(profile, domain, domain_is_explicit, args):
 def main(argv):
     args = {
         "mtu": DEFAULT_MTU,
+        # Бюджет длины всей цепочки в символах конфига (0 = без лимита).
+        "budget": 0,
         "ech_doh": os.environ.get("AWG_CPS_ECH_DOH", "") not in ("", "0"),
         "sip_action": "OPTIONS",
         "ice_provider": "random",
@@ -2120,6 +2133,12 @@ def main(argv):
                 args["mtu"] = max(1200, min(1500, int(argv[index])))
             except ValueError:
                 _warn_once("значение --mtu не число, беру %d" % DEFAULT_MTU)
+        elif arg == "--budget" and index + 1 < len(argv):
+            index += 1
+            try:
+                args["budget"] = max(0, int(argv[index]))
+            except ValueError:
+                _warn_once("значение --budget не число, лимит длины снят")
         elif arg == "--sip-action" and index + 1 < len(argv):
             index += 1
             args["sip_action"] = argv[index]
@@ -2149,7 +2168,15 @@ def main(argv):
     generator = PROTOCOL_GENERATORS[profile]
     options = build_options(profile, domain, domain_is_explicit, args)
 
+    # Бюджет применяется ЦЕЛЫМИ пакетами. Обрезать пакет на середине нельзя:
+    # получится не снимок протокола, а обрубок, по которому DPI отличает нас
+    # быстрее, чем по отсутствию мимикрии вовсе. Поэтому сколько пакетов
+    # поместится — зависит от профиля: DNS укладывает все пять в ~370 символов,
+    # один QUIC Initial занимает ~2400. Первый пакет выдаётся всегда, иначе
+    # слишком маленький бюджет молча оставил бы конфиг без мимикрии.
+    budget = args["budget"]
     lines = []
+    used = 0
     for _ in range(MAX_OUTPUT_LINES):
         if len(lines) >= MAX_OUTPUT_LINES:
             break
@@ -2158,10 +2185,14 @@ def main(argv):
         except Exception as exc:
             _warn_once("сбой генерации %s (%s: %s)" % (profile, type(exc).__name__, exc))
             break
-        for chunk in chunk_payload(payload, args["mtu"]):
-            if len(lines) >= MAX_OUTPUT_LINES:
-                break
-            lines.append("<b 0x%s>" % to_hex(chunk))
+        room = MAX_OUTPUT_LINES - len(lines)
+        piece = ["<b 0x%s>" % to_hex(chunk)
+                 for chunk in chunk_payload(payload, args["mtu"])[:room]]
+        cost = sum(len(item) for item in piece)
+        if budget and lines and used + cost > budget:
+            break
+        lines.extend(piece)
+        used += cost
         if only_i1:
             break
 
@@ -2182,13 +2213,21 @@ if __name__ == "__main__":
 # $3 = --only-i1 (необязательно). Вывод: одна строка на пакет, до пяти.
 # AWG_CPS_MTU задаёт размер, по которому пакет режется на несколько I (1200-1500).
 # AWG_CPS_ECH_DOH=1 разрешает генератору сходить за настоящим ECHConfig по DoH.
+# CPS_BUDGET (символов, 0 = без лимита) ограничивает длину всей цепочки —
+# генератор режет её целыми пакетами, см. choose_cps_budget.
 gen_cps_i1() {
   local profile="${1:-quic}"
   local domain="${2:-}"
   local only_i1="${3:-}"
   local mtu_args=()
   [[ -n "${AWG_CPS_MTU:-}" ]] && mtu_args=(--mtu "$AWG_CPS_MTU")
-  python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"} ${mtu_args[@]+"${mtu_args[@]}"}
+  local budget_args=()
+  local budget="${CPS_BUDGET:-0}"
+  if [[ "$budget" =~ ^[0-9]+$ ]] && (( budget > 0 )); then
+    budget_args=(--budget "$budget")
+  fi
+  python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"} \
+    ${mtu_args[@]+"${mtu_args[@]}"} ${budget_args[@]+"${budget_args[@]}"}
 }
 
 
@@ -2207,7 +2246,11 @@ gen_cps_i1() {
 #
 # Все профили генерируют I1-I5 через CPS-генератор (_CPS_GENERATOR).
 # Глобальные переменные на выходе: I1, I2, I3, I4, I5, MIMICRY_PROFILE
-# ── Профили AWG (Lite / Standard / Pro) ──────────────────
+# ── Профили AWG ──────────────────────────────────────────
+# Выбор из двух: «как в Amnezia» (значение lite) и «Мощный» (значение pro).
+# Имена значений не меняются — они уже записаны в awg0.conf у созданных
+# серверов и читаются ботом. Значение standard больше не предлагается, но
+# по-прежнему распознаётся у серверов, созданных раньше.
 # AWG_PROFILE определяет ВСЁ:
 #   - параметры Jc/Jmin/Jmax/S1-S4/H1-H4 (gen_awg_params)
 #   - уровень обфускации (OBF_LEVEL)
@@ -2238,6 +2281,14 @@ _target_client_label() {
     mixed)    echo "разные клиенты" ;;
     *)        echo "Amnezia VPN / AmneziaWG" ;;
   esac
+}
+
+# Профиль мимикрии, записанный в конфиг сервера ("# AWG_MIMICRY=").
+# Пусто/отсутствует — сервер старый и метки не знает: тогда решение остаётся
+# за вызывающим, «none» отсюда выдавать нельзя.
+_server_mimicry() {
+  [[ -f "$SERVER_CONF" ]] || return 0
+  grep -m1 '^# AWG_MIMICRY=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true
 }
 
 # Ложь, если выбранный клиент цепочку I1-I5 не читает.
@@ -2302,63 +2353,72 @@ choose_awg_profile() {
   choose_target_client
   echo ""
   hdr "⚙  Профиль AmneziaWG"
-  echo -e "  ${G}3${N}  ${W}Pro${N}      — максимальная защита, I1-I5 на выбор ${C}(рекомендуется)${N}"
-  echo -e "  ${D}1   Lite     — параметры как у оригинальной Amnezia, DNS мимикрия${N}"
-  echo -e "  ${D}2   Standard — усечённые диапазоны, QUIC мимикрия${N}"
+  echo -e "  ${G}1${N}  ${W}Как в Amnezia${N} ${D}— параметры один в один с официальным клиентом${N} ${C}(рекомендуется)${N}"
+  echo -e "     ${D}Jc/Jmin/Jmax и S1-S4 как в конфигах Amnezia, на 3.x H1-H4 = 1/2/3/4${N}"
+  echo -e "     ${D}(при HeaderProtectionKey заголовок и так шифруется), MTU 1280,${N}"
+  echo -e "     ${D}цепочка I1-I5 по умолчанию не добавляется — конфиг короткий.${N}"
+  echo -e "     ${D}Ровно такой набор даёт полную скорость у официальной установки.${N}"
+  echo ""
+  echo -e "  ${G}2${N}  ${W}Мощный${N} ${D}— широкие диапазоны Jc/S/H плюс цепочка I1-I5${N}"
+  echo -e "     ${D}Сильнее против анализа трафика. Конфиг длинный, и на части${N}"
+  echo -e "     ${D}маршрутов такой профиль заметно теряет в скорости —${N}"
+  echo -e "     ${D}если после него скорость просела в разы, вернись на профиль 1.${N}"
+  echo -e "  ${D}0   Назад${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   local _choice
-  read_choice _choice "$(echo -e "${C}  Выбор [1-3] (Enter = 3 Pro): ${N}")" 1 3 3
+  read_choice _choice "$(echo -e "${C}  Выбор [0-2] (Enter = 1): ${N}")" 0 2 1
 
   case "$_choice" in
+    0) return 1 ;;
     1)
+      # Значение lite сохранено как есть: оно уже записано в awg0.conf у всех
+      # созданных серверов и читается ботом. Меняется наполнение, не имя.
       AWG_PROFILE="lite"
+      # MTU 1280 — то же, что ставит официальный клиент. При 1320 внешний пакет
+      # AWG 3.x (паддинг содержимого + S4 + хвост) подходит вплотную к 1500,
+      # и на маршруте с меньшим MTU крупные пакеты начинают резаться.
+      if [[ "${MTU:-}" =~ ^[0-9]+$ ]] && (( MTU > 1280 )); then
+        info "Профиль «как в Amnezia»: MTU ${MTU} → 1280 (как у официального клиента)"
+        MTU=1280
+      fi
       if _warn_cps_unsupported; then
         OBF_LEVEL=1; MIMICRY_PROFILE="none"
         I1=""; I2=""; I3=""; I4=""; I5=""
-        info "Профиль: Lite без CPS (клиент его не читает)"
+        info "Профиль: как в Amnezia, без CPS (клиент его не читает)"
         return 0
       fi
-      OBF_LEVEL=2                # клиентам кладём I1
+      # У официальной Amnezia строк I вообще нет. Один компактный I1 (DNS,
+      # ~90 символов) добавляем только по явному согласию: любая строка I —
+      # это лишний пакет перед рукопожатием, то есть лишний повод для DPI.
+      echo ""
+      echo -e "  ${D}Добавить один компактный пакет мимикрии I1 (DNS-запрос, ~90 симв)?${N}"
+      local _add_i1
+      read_choice _add_i1 "$(echo -e "${C}  1 — нет, как в Amnezia (Enter), 2 — да: ${N}")" 1 2 1
+      if [[ "$_add_i1" == "1" ]]; then
+        OBF_LEVEL=1; MIMICRY_PROFILE="none"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        ok "Профиль: как в Amnezia (без I1-I5)"
+        return 0
+      fi
+      OBF_LEVEL=2                # клиентам кладём один I1
       MIMICRY_PROFILE="dns"
-      # Домен не передаём — Python выбирает случайный из DOMAIN_POOL
-      info "Профиль: Lite (I1 = DNS / случайный домен)"
+      CPS_BUDGET=0               # один пакет DNS и так короткий
+      choose_cps_domain "dns"
+      local sel_domain="${CPS_DOMAIN:-}"
       local cps_out
-      cps_out=$(gen_cps_i1 "dns" "" "--only-i1") || cps_out=""
+      cps_out=$(gen_cps_i1 "dns" "$sel_domain" "--only-i1") || cps_out=""
       I1=$(echo "$cps_out" | sed -n '1p')
       I2=""; I3=""; I4=""; I5=""
       if [[ -z "$I1" ]]; then
-        warn "Не удалось сгенерировать I1 для Lite — клиенты пойдут без CPS"
+        warn "Не удалось сгенерировать I1 — клиенты пойдут без CPS"
+        MIMICRY_PROFILE="none"; OBF_LEVEL=1
       else
-        ok "I1 готов (${#I1} сим)"
+        ok "Профиль: как в Amnezia + I1 (${#I1} симв${sel_domain:+, $sel_domain})"
       fi
       ;;
     2)
-      AWG_PROFILE="standard"
-      if _warn_cps_unsupported; then
-        OBF_LEVEL=1; MIMICRY_PROFILE="none"
-        I1=""; I2=""; I3=""; I4=""; I5=""
-        info "Профиль: Standard без CPS (клиент его не читает)"
-        return 0
-      fi
-      OBF_LEVEL=2                # клиентам кладём I1
-      MIMICRY_PROFILE="quic"
-      info "Профиль: Standard (I1 = QUIC Initial)"
-      local sel_domain
-      sel_domain=$(select_random_domain "quic")
-      [[ -z "$sel_domain" ]] && sel_domain=""
-      local cps_out
-      cps_out=$(gen_cps_i1 "quic" "$sel_domain") || cps_out=""
-      I1=$(echo "$cps_out" | sed -n '1p')
-      I2=""; I3=""; I4=""; I5=""
-      if [[ -z "$I1" ]]; then
-        warn "Не удалось сгенерировать I1 для Standard — клиенты пойдут без CPS"
-      else
-        ok "I1 готов (${#I1} сим${sel_domain:+, $sel_domain})"
-      fi
-      ;;
-    3)
       AWG_PROFILE="pro"
-      info "Профиль: Pro — выбор уровня I1-I5 и мимикрии"
+      info "Профиль: Мощный — выбор уровня I1-I5 и мимикрии"
       choose_obf_level
       choose_mimicry_profile || return 1
       ;;
@@ -2445,15 +2505,36 @@ choose_cps_domain() {
     esac
   fi
 
+  # Требование к домену зависит от профиля: QUIC-снимок с SNI хоста, который
+  # HTTP/3 не отдаёт вовсе, недостоверен сам по себе — DPI видит QUIC Initial
+  # к тому, кто по QUIC не отвечает. Для DNS-запроса годится любое имя.
+  local _dom_hint=""
+  case "$profile" in
+    quic|curl_quic) _dom_hint=" ${W}и который отдаёт HTTP/3${N}" ;;
+    sip)            _dom_hint=" ${W}(домен SIP-провайдера)${N}" ;;
+  esac
+
   echo ""
   hdr "◈  Домен для мимикрии (один на все I1-I5)"
-  echo -e "  ${G}1${N}  ${W}Автоматически${N} ${D}— проверю доступность и возьму из готового RU-пула${N} ${C}(рекомендуется)${N}"
-  echo -e "  ${G}2${N}  ${W}Ввести свой${N} ${D}— например, сайт, к которому у вас и так идёт трафик${N}"
+  echo -e "  ${G}1${N}  ${W}Ввести свой${N} ${D}— сайт, к которому у вас и так идёт трафик${N} ${C}(рекомендуется)${N}"
+  echo -e "  ${G}2${N}  ${W}Автоматически${N} ${D}— возьму из встроенного пула с проверкой доступности${N}"
+  echo ""
+  echo -e "  ${Y}Свой домен почти всегда лучше встроенного: пул одинаков у всех,${N}"
+  echo -e "  ${Y}кто ставит эту тулзу, поэтому по нему DPI учится быстрее всего.${N}"
+  echo -e "  ${Y}Годится любой ЖИВОЙ сайт, куда вы реально ходите с этого${N}"
+  echo -e "  ${Y}устройства${N}${_dom_hint}${Y}. Мёртвый или заблокированный домен${N}"
+  echo -e "  ${Y}делает мимикрию недостоверной — соединение может не подняться.${N}"
+  echo ""
+  echo -e "  ${D}Важно: автопроверка идёт С ЭТОГО СЕРВЕРА, а мимикрию разбирает DPI${N}"
+  echo -e "  ${D}у вашего провайдера. Живой отсюда домен может быть мёртвым или${N}"
+  echo -e "  ${D}блокируемым там. Проверить со стороны клиента можно, например,${N}"
+  echo -e "  ${D}github.com/Runnin4ik/dpi-detector — и вписать сюда домен, который${N}"
+  echo -e "  ${D}он показал рабочим.${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   local _dom_choice
   read_choice _dom_choice "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 1
 
-  if [[ "$_dom_choice" == "2" ]]; then
+  if [[ "$_dom_choice" == "1" ]]; then
     local _input
     while true; do
       _flush_stdin
@@ -2472,18 +2553,69 @@ choose_cps_domain() {
     done
   fi
 
-  echo -e "${C}  → Проверяю доступность доменов из RU-пула...${N}"
-  scan_pool "tls" "${CPS_RU_DOMAINS[@]}"
+  # Пул выбираем под профиль: quic/curl_quic — только проверенные на HTTP/3
+  # (QUIC_DOMAINS), sip — домены SIP-провайдеров, остальным подходит общий пул.
+  local _pool=() _probe="tls"
+  case "$profile" in
+    quic|curl_quic) _pool=("${QUIC_DOMAINS[@]}"); _probe="quic" ;;
+    sip)            _pool=("${SIP_DOMAINS[@]}");  _probe="sip"  ;;
+    *)              _pool=("${CPS_RU_DOMAINS[@]}") ;;
+  esac
+
+  echo -e "${C}  → Проверяю доступность доменов из встроенного пула...${N}"
+  scan_pool "$_probe" "${_pool[@]}"
   local available=("${SCAN_POOL_RESULT[@]+"${SCAN_POOL_RESULT[@]}"}")
   if [[ ${#available[@]} -gt 0 ]]; then
     CPS_DOMAIN="${available[$((RANDOM % ${#available[@]}))]}"
-    ok "Домен: $CPS_DOMAIN ${D}(доступно ${#available[@]} из ${#CPS_RU_DOMAINS[@]})${N}"
+    ok "Домен: $CPS_DOMAIN ${D}(доступно ${#available[@]} из ${#_pool[@]})${N}"
+    info "Если подключение не встанет или скорость просядет — пересоздай конфиг со СВОИМ доменом"
   else
     # Пул целиком недоступен (нет ICMP/TCP наружу) — домен не подменяем на
     # чужой профиль, а отдаём генератору пустую строку: он возьмёт домен из
     # своего встроенного RU-пула.
     CPS_DOMAIN=""
     warn "Ни один домен из пула не ответил — генератор возьмёт домен сам"
+  fi
+  return 0
+}
+
+# Длина цепочки I1-I5 в символах конфига.
+#
+# Пять полных пакетов QUIC — это ~12 000 символов: конфиг перестаёт помещаться
+# в QR, его неудобно передавать, а часть клиентов такой [Interface] читает уже
+# с трудом. Бюджет режет цепочку ЦЕЛЫМИ пакетами: обрезанный пакет — не снимок
+# протокола, а обрубок, по которому DPI отличает нас быстрее, чем по отсутствию
+# мимикрии вовсе. Поэтому сколько пакетов поместится, зависит от профиля:
+# DNS укладывает все пять в ~440 символов, один QUIC Initial занимает ~2400
+# и выдаётся целиком даже при меньшем бюджете (без первого пакета мимикрии
+# не будет вовсе).
+# Результат: глобальная CPS_BUDGET (символов, 0 = без лимита).
+CPS_BUDGET=0
+
+choose_cps_budget() {
+  CPS_BUDGET=1500
+  echo ""
+  hdr "▭  Длина цепочки I1-I5"
+  echo -e "  ${G}1${N}  ${W}Компактная${N}  ${D}— до ~1500 символов, конфиг остаётся в QR${N} ${C}(рекомендуется)${N}"
+  echo -e "  ${G}2${N}  ${W}Средняя${N}     ${D}— до ~3000 символов${N}"
+  echo -e "  ${G}3${N}  ${W}Без лимита${N}  ${D}— все пять пакетов целиком (QUIC ~12 000 символов)${N}"
+  echo -e "  ${D}0   Назад${N}"
+  echo ""
+  echo -e "  ${D}Целиком помещаются в компактный бюджет: DNS (~440), NTP (~510),${N}"
+  echo -e "  ${D}STUN (~1300), RTP (~1500). QUIC и WebRTC урежутся до 1-2 пакетов.${N}"
+  echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  local _b
+  read_choice _b "$(echo -e "${C}  Выбор [0-3] (Enter = 1): ${N}")" 0 3 1
+  case "$_b" in
+    0) return 1 ;;
+    2) CPS_BUDGET=3000 ;;
+    3) CPS_BUDGET=0 ;;
+    *) CPS_BUDGET=1500 ;;
+  esac
+  if (( CPS_BUDGET > 0 )); then
+    ok "Бюджет цепочки: ${CPS_BUDGET} символов"
+  else
+    ok "Бюджет цепочки: без лимита"
   fi
   return 0
 }
@@ -2547,6 +2679,13 @@ choose_mimicry_profile() {
     8) MIMICRY_PROFILE="rtp"  ;;
     9) MIMICRY_PROFILE="ssdp" ;;
   esac
+
+  # Длину цепочки спрашиваем только там, где пакетов больше одного
+  if [[ "${OBF_LEVEL:-1}" == "3" ]]; then
+    choose_cps_budget || return 1
+  else
+    CPS_BUDGET=0
+  fi
 
   # Домен спрашивается один раз и уходит во все пять пакетов
   choose_cps_domain "$MIMICRY_PROFILE"
@@ -4145,9 +4284,9 @@ show_header() {
   if [[ -f "$SERVER_CONF" ]]; then
     profile_raw=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
     case "$profile_raw" in
-      lite)     profile_label="Lite" ;;
-      standard) profile_label="Standard" ;;
-      pro)      profile_label="Pro" ;;
+      lite)     profile_label="как в Amnezia" ;;
+      standard) profile_label="Standard (устаревший)" ;;
+      pro)      profile_label="Мощный" ;;
       "")       profile_label="—" ;;
       *)        profile_label="$profile_raw" ;;
     esac
@@ -4307,19 +4446,21 @@ show_submenu_3() {
     echo ""
     hdr "Диагностика"
     echo ""
-    echo -e "  ${G}1)${N} Проверить домены из пулов (TCP+ping)"
+    echo -e "  ${G}1)${N} Проверить домены из пулов (TCP+ping) ${D}— с этого сервера${N}"
     if $HAS_SERVER_CONF; then
       echo -e "  ${G}2)${N} Тест DPI мимикрии (захват CPS пакета)"
     else
       echo -e "  ${D}2) Тест DPI мимикрии (нужен пункт Сервер → 2)${N}"
     fi
+    echo -e "  ${G}3)${N} DPI со стороны клиента ${D}— команда для вашего устройства${N}"
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "0"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-3]: ${N}")" 0 3 "0"
     case "${SUB_CHOICE:-}" in
       1) do_check_domains || true ;;
       2) do_sniff_test || true ;;
+      3) do_client_dpi_hint || true ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -4708,7 +4849,14 @@ choose_dns() {
 # действуют на весь интерфейс сразу. Отдельному клиенту свою версию выдать
 # нельзя: включив 3.0, сервер перестаёт принимать клиентов на 2.0. Поэтому
 # спрашиваем один раз при создании и пишем маркер в awg0.conf.
-# Результат: глобальная AWG_PROTO = "2.0" | "3.0" | "3.1"
+# Результат: глобальная AWG_PROTO = "2.0" | "3.1"
+#
+# 3.0 из выбора убрана: это тот же набор, что и 3.1, только без RandomTrailers
+# и DisableCookies, а требования к версии tools/модуля у них почти совпадают.
+# Держать промежуточный вариант значило плодить конфигурации, которые никто
+# осознанно не выбирает. Уже созданные серверы на 3.0 продолжают работать:
+# конфиги читаются как раньше, а перегенерация параметров предложит перейти
+# на 3.1 или вернуться на 2.0.
 choose_awg_proto() {
   AWG_PROTO="2.0"
   echo ""
@@ -4718,32 +4866,29 @@ choose_awg_proto() {
   echo -e "     ${D}Обфускация Jc/Jmin/Jmax, S1-S4, H1-H4 плюс мимикрия I1-I5.${N}"
   echo -e "     ${D}Работает со всеми клиентами AmneziaWG.${N}"
   echo ""
-  echo -e "  ${G}2)${N} ${W}AWG 3.0${N} ${C}(сильнее против анализа трафика)${N}"
-  echo -e "     ${D}Дополнительно: защита заголовков ключом, случайный паддинг${N}"
-  echo -e "     ${D}содержимого и рандомизация таймингов рукопожатий —${N}"
-  echo -e "     ${D}то есть скрывает не только размеры, но и временные паттерны.${N}"
-  echo ""
-  echo -e "  ${G}3)${N} ${W}AWG 3.1${N} ${C}(новейшая, самая узкая совместимость)${N}"
-  echo -e "     ${D}Всё из 3.0 плюс RandomTrailers — случайный «хвост» у пакетов${N}"
-  echo -e "     ${D}рукопожатия, из-за чего их длина перестаёт быть постоянной,${N}"
-  echo -e "     ${D}и DisableCookies — сервер не отвечает cookie-пакетами.${N}"
+  echo -e "  ${G}2)${N} ${W}AWG 3.1${N} ${C}(сильнее против анализа трафика)${N}"
+  echo -e "     ${D}Защита заголовков ключом, случайный паддинг содержимого,${N}"
+  echo -e "     ${D}рандомизация таймингов рукопожатий, RandomTrailers (длина${N}"
+  echo -e "     ${D}пакетов рукопожатия перестаёт быть постоянной) и${N}"
+  echo -e "     ${D}DisableCookies — сервер не отвечает cookie-пакетами.${N}"
   echo -e "     ${D}Нужны amneziawg-tools и модуль v3.1.20260812 или новее${N}"
   echo -e "     ${D}И НА СЕРВЕРЕ, И НА КЛИЕНТЕ: старый клиент такой конфиг${N}"
   echo -e "     ${D}даже не прочитает.${N}"
   echo ""
   echo -e "  ${Y}  Требует клиента с поддержкой выбранной версии. Версия задаётся${N}"
-  echo -e "  ${Y}  на ВЕСЬ сервер: клиенты на 2.0 к серверу 3.x не подключатся.${N}"
+  echo -e "  ${Y}  на ВЕСЬ сервер: клиенты на 2.0 к серверу 3.1 не подключатся.${N}"
+  echo -e "  ${D}  Промежуточная 3.0 из выбора убрана — 3.1 это она же плюс${N}"
+  echo -e "  ${D}  RandomTrailers/DisableCookies; уже созданные серверы на 3.0${N}"
+  echo -e "  ${D}  работают дальше без изменений.${N}"
   echo ""
   local _proto_choice
-  read_choice _proto_choice "$(echo -e "${C}  Выбор [1-3] (Enter = 1): ${N}")" 1 3 "1"
+  read_choice _proto_choice "$(echo -e "${C}  Выбор [1-2] (Enter = 1): ${N}")" 1 2 "1"
   case "$_proto_choice" in
-    2|3)
+    2)
       # Проверяем до генерации конфигов: с несовместимыми tools/модулем
-      # сервер 3.x просто не поднимется, а конфиги уже будут перезаписаны.
-      local _want="3.0"
-      [[ "$_proto_choice" == "3" ]] && _want="3.1"
-      if awg_compat_gate "$_want"; then
-        AWG_PROTO="$_want"; ok "Выбран AmneziaWG $_want"
+      # сервер 3.1 просто не поднимется, а конфиги уже будут перезаписаны.
+      if awg_compat_gate "3.1"; then
+        AWG_PROTO="3.1"; ok "Выбран AmneziaWG 3.1"
       else
         AWG_PROTO="2.0"; info "Остаёмся на AmneziaWG 2.0"
       fi
@@ -4873,10 +5018,13 @@ AWG_PARAM_KEYS_RE="(Jc|Jmin|Jmax|S[1-4]|H[1-4]|HeaderProtectionKey|ContentPaddin
 _awg_rand_s() {
   case "${AWG_PROFILE:-pro}" in
     lite)
-      # Образец оригинальной Amnezia: S1=102, S2=22, S3=21, S4=7 (±5)
+      # Образец конфига официального клиента Amnezia на 3.1:
+      # S1=86, S2=48, S3=16, S4=12. Держимся вокруг них.
+      # S4 от 12, а не от 4: при HeaderProtectionKey ядро требует S >= 12
+      # (AWG_HP_MIN_S), иначе setconf падает на «Invalid argument».
       case "$1" in
-        S1) rand_range 97 107 ;; S2) rand_range 17 27 ;;
-        S3) rand_range 16 26 ;;  S4) rand_range 4 10 ;;
+        S1) rand_range 80 92 ;; S2) rand_range 42 54 ;;
+        S3) rand_range 14 20 ;; S4) rand_range 12 18 ;;
       esac ;;
     standard)
       case "$1" in
@@ -4984,23 +5132,26 @@ gen_awg_params() {
   # Параметры AmneziaWG по ОФИЦИАЛЬНОМУ МАНУАЛУ
   # https://docs.amnezia.org/documentation/amnezia-wg/
   # ══════════════════════════════════════════════════════════
-  # Ветвление по AWG_PROFILE: lite / standard / pro
-  # Pro = текущая логика без изменений (полные диапазоны).
+  # Ветвление по AWG_PROFILE:
+  #   lite     — «как в Amnezia»: значения вокруг официального конфига
+  #   standard — устаревший, оставлен для серверов, созданных раньше
+  #   pro      — «Мощный»: полные диапазоны
 
   local Jc Jmin Jmax S1 S2 S3 S4
 
   case "${AWG_PROFILE:-pro}" in
     lite)
-      # ── Lite: параметры как у оригинальной Amnezia, ±5 рандом ──
-      # Образец оригинала: Jc=4, Jmin=10, Jmax=50, S1=102, S2=22, S3=21, S4=7
+      # ── «Как в Amnezia»: значения вокруг официального конфига ──
+      # Образец конфига официального клиента (AWG 3.1):
+      #   Jc=4, Jmin=10, Jmax=50, S1=86, S2=48, S3=16, S4=12, H1..H4 = 1/2/3/4
       Jc=$(rand_range 3 5)              # 4 ±1
-      Jmin=$(rand_range 5 15)           # 10 ±5
+      Jmin=$(rand_range 8 14)           # 10 ±4
       Jmax=$(rand_range 45 55)          # 50 ±5
       S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     standard)
-      # ── Standard: промежуточные значения ──
+      # ── Standard (устаревший): промежуточные значения ──
       Jc=$(rand_range 5 8)
       Jmin=$(rand_range 30 80)
       Jmax=$(rand_range 100 250)
@@ -5008,7 +5159,7 @@ gen_awg_params() {
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     pro|*)
-      # ── Pro: текущие полные диапазоны (без изменений) ──
+      # ── «Мощный»: полные диапазоны ──
       Jc=$(rand_range 4 16)
       Jmin=$(rand_range 50 256)
       Jmax=$(rand_range 300 1000)
@@ -5072,10 +5223,24 @@ gen_awg_params() {
   }
 
   local H1 H2 H3 H4
-  H1=$(_gen_quadrant_pair 5 "$SQ1_MAX")
-  H2=$(_gen_quadrant_pair "$SQ2_MIN" "$SQ2_MAX")
-  H3=$(_gen_quadrant_pair "$SQ3_MIN" "$SQ3_MAX")
-  H4=$(_gen_quadrant_pair "$SQ4_MIN" "$SQ4_MAX")
+  local _h_amnezia=0
+  if [[ "${AWG_PROFILE:-pro}" == "lite" ]]; then
+    case "${AWG_PROTO:-2.0}" in 3.0|3.1) _h_amnezia=1 ;; esac
+  fi
+  if (( _h_amnezia )); then
+    # Так делает сам клиент Amnezia на 3.x: H1-H4 = штатные типы WireGuard.
+    # При заданном HeaderProtectionKey заголовок шифруется целиком, поэтому
+    # подмена типа поверх шифра уже ничего не прячет, а обе стороны перестают
+    # разыгрывать значение из диапазона на каждом пакете.
+    # На 2.0 так нельзя: там заголовок открытый, и 1/2/3/4 — прямой признак
+    # WireGuard, поэтому ниже остаются диапазоны.
+    H1=1; H2=2; H3=3; H4=4
+  else
+    H1=$(_gen_quadrant_pair 5 "$SQ1_MAX")
+    H2=$(_gen_quadrant_pair "$SQ2_MIN" "$SQ2_MAX")
+    H3=$(_gen_quadrant_pair "$SQ3_MIN" "$SQ3_MAX")
+    H4=$(_gen_quadrant_pair "$SQ4_MIN" "$SQ4_MAX")
+  fi
 
   AWG_PARAMS_LINES="Jc = $Jc\nJmin = $Jmin\nJmax = $Jmax\nS1 = $S1\nS2 = $S2\nS3 = $S3\nS4 = $S4\nH1 = $H1\nH2 = $H2\nH3 = $H3\nH4 = $H4"
 
@@ -5945,6 +6110,12 @@ do_gen() {
     # знает, что выдавать, и раньше давал один I1 на сервере с полным CPS.
     echo "# AWG_OBF_LEVEL=${OBF_LEVEL:-1}"
     echo "# AWG_MIMICRY=${MIMICRY_PROFILE:-none}"
+    # Домен мимикрии. Пишется только если он был выбран: бот генерирует I1-I5
+    # сам и без этой метки брал бы случайный домен из встроенного пула — то
+    # есть клиенты одного сервера маскировались бы под разные хосты, хотя
+    # админ выбрал конкретный.
+    [[ -n "${CPS_DOMAIN:-}" && "${MIMICRY_PROFILE:-none}" != "none" ]] && \
+      echo "# AWG_MIMICRY_DOMAIN=${CPS_DOMAIN}"
     # Домен для Endpoint: строку пишем только если он задан, иначе клиентам
     # уходит IP (см. endpoint_host)
     [[ -n "${ENDPOINT_DOMAIN:-}" ]] && echo "# AWG_ENDPOINT=${ENDPOINT_DOMAIN}"
@@ -6660,14 +6831,24 @@ do_add_client() {
       i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
       ;;
     lite)
-      # Lite-сервер: клиенту всегда I1=DNS, без I2-I5. Домен не задаём —
-      # генератор берёт его из своего RU-пула.
-      info "Профиль сервера: Lite — клиент получит I1=DNS"
-      local cps_out
-      cps_out=$(gen_cps_i1 "dns" "" "--only-i1") || cps_out=""
-      I1=$(echo "$cps_out" | sed -n '1p')
-      I2=""; I3=""; I4=""; I5=""
-      [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      # Профиль «как в Amnezia». Строк I у самой Amnezia нет, и с версии, где
+      # профиль это учитывает, сервер пишет "# AWG_MIMICRY=none" — тогда клиент
+      # тоже идёт без цепочки, иначе конфиги сервера и клиента разошлись бы по
+      # смыслу. Старый lite-сервер метки не имеет: для него поведение прежнее.
+      if [[ "$(_server_mimicry)" == "none" ]]; then
+        info "Профиль сервера: как в Amnezia, без мимикрии — клиент тоже без I1"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+      else
+        info "Профиль сервера: как в Amnezia — клиент получит один I1=DNS"
+        CPS_BUDGET=0
+        choose_cps_domain "dns"
+        local cps_out
+        cps_out=$(gen_cps_i1 "dns" "${CPS_DOMAIN:-}" "--only-i1") || cps_out=""
+        I1=$(echo "$cps_out" | sed -n '1p')
+        I2=""; I3=""; I4=""; I5=""
+        [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      fi
       ;;
     standard)
       # Standard-сервер: клиенту I1=QUIC Initial, без I2-I5
@@ -6987,12 +7168,20 @@ do_bulk_add_clients() {
       i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
       ;;
     lite)
-      info "Профиль сервера Lite — клиенты получат I1=DNS"
-      local cps_out
-      cps_out=$(gen_cps_i1 "dns" "" "--only-i1") || cps_out=""
-      I1=$(echo "$cps_out" | sed -n '1p')
-      I2=""; I3=""; I4=""; I5=""
-      [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      if [[ "$(_server_mimicry)" == "none" ]]; then
+        info "Профиль сервера: как в Amnezia, без мимикрии — клиенты тоже без I1"
+        I1=""; I2=""; I3=""; I4=""; I5=""
+        i1_line=""; i2_line=""; i3_line=""; i4_line=""; i5_line=""
+      else
+        info "Профиль сервера: как в Amnezia — клиенты получат один I1=DNS"
+        CPS_BUDGET=0
+        choose_cps_domain "dns"
+        local cps_out
+        cps_out=$(gen_cps_i1 "dns" "${CPS_DOMAIN:-}" "--only-i1") || cps_out=""
+        I1=$(echo "$cps_out" | sed -n '1p')
+        I2=""; I3=""; I4=""; I5=""
+        [[ -n "$I1" ]] && i1_line="I1 = $I1" || i1_line=""
+      fi
       ;;
     standard)
       info "Профиль сервера Standard — клиенты получат I1=QUIC"
@@ -7864,20 +8053,23 @@ do_rotate_awg_params() {
   # Раз конфиги всё равно переписываются — предлагаем сменить и версию
   echo -e "  ${W}Версия протокола после перегенерации:${N}"
   echo -e "  ${G}1)${N} AWG 2.0 ${D}(шире совместимость клиентов)${N}"
-  echo -e "  ${G}2)${N} AWG 3.0 ${D}(защита заголовков, паддинг, таймеры)${N}"
-  echo -e "  ${G}3)${N} AWG 3.1 ${D}(плюс RandomTrailers/DisableCookies, нужен свежий клиент)${N}"
-  echo -e "  ${D}Enter — оставить текущую (AWG ${cur_proto})${N}"
+  echo -e "  ${G}2)${N} AWG 3.1 ${D}(защита заголовков, паддинг, таймеры,${N}"
+  echo -e "     ${D}RandomTrailers/DisableCookies — нужен свежий клиент)${N}"
   echo ""
   local _pc _def
   case "$cur_proto" in
-    3.1) _def="3" ;;
-    3.0) _def="2" ;;
+    3.0)
+      # 3.0 больше не предлагается как вариант: остаться на ней можно только
+      # ничего не перегенерируя. Предлагаем ближайшую поддерживаемую — 3.1.
+      _def="2"
+      warn "Текущая версия 3.0 из выбора убрана — перегенерация переведёт сервер на 2.0 или 3.1"
+      ;;
+    3.1) _def="2" ;;
     *)   _def="1" ;;
   esac
-  read_choice _pc "$(echo -e "${C}  Выбор [1-3] (Enter = ${_def}): ${N}")" 1 3 "$_def"
+  read_choice _pc "$(echo -e "${C}  Выбор [1-2] (Enter = ${_def}): ${N}")" 1 2 "$_def"
   case "$_pc" in
-    3) new_proto="3.1" ;;
-    2) new_proto="3.0" ;;
+    2) new_proto="3.1" ;;
     *) new_proto="2.0" ;;
   esac
 
@@ -11538,6 +11730,51 @@ do_uninstall() {
   # ошибку вместо чистого выхода.
   ( sleep 1; rm -f "$SCRIPT_PATH" ) >/dev/null 2>&1 &
   exit 0
+}
+
+# Подсказка по клиентской диагностике DPI.
+#
+# Здесь СПЕЦИАЛЬНО ничего не запускается. Всё, что умеет проверить awg2, он
+# проверяет с сервера, а мимикрию и блокировки разбирает DPI у провайдера
+# клиента: домен, живой отсюда, там может быть заблокирован или подменён.
+# Проверять это надо с той стороны, поэтому функция только печатает команду
+# для копирования — никаких зависимостей, ничего не ставится и не качается.
+#
+# dpi-detector (MIT, github.com/Runnin4ik/dpi-detector) проверяет TLS 1.2/1.3
+# и HTTP, перехват UDP/53 и подмену IP, блокировку DoH, SNI-блокировку и
+# обрыв соединения к CDN/хостингам после 14-34 КБ. UDP кроме DNS, QUIC и
+# WireGuard он не трогает — сам туннель AmneziaWG им не диагностируется.
+do_client_dpi_hint() {
+  echo ""
+  hdr "◈  DPI со стороны клиента"
+  echo ""
+  echo -e "  ${Y}Запускать НЕ ЗДЕСЬ, а на устройстве, с которого вы ходите в VPN.${N}"
+  echo -e "  ${D}Сервер обычно стоит за границей: отсюда видно совсем не то, что${N}"
+  echo -e "  ${D}видит DPI у вашего провайдера. Ниже — команда для того устройства.${N}"
+  echo ""
+  echo -e "  ${W}Docker (проще всего):${N}"
+  echo -e "  ${G}docker run --rm -it --pull=always ghcr.io/runnin4ik/dpi-detector:latest${N}"
+  echo ""
+  echo -e "  ${W}Python 3.8+ без Docker:${N}"
+  echo -e "  ${G}git clone https://github.com/Runnin4ik/dpi-detector.git${N}"
+  echo -e "  ${G}cd dpi-detector && python -m pip install -r requirements.txt${N}"
+  echo -e "  ${G}python dpi_detector.py${N}"
+  echo ""
+  echo -e "  ${D}Windows и macOS — готовые сборки в разделе Releases репозитория.${N}"
+  echo ""
+  echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo -e "  ${W}Что делать с результатом:${N}"
+  echo -e "  ${C}•${N} Домен, который он показал рабочим, впишите при создании сервера"
+  echo -e "    или клиента: меню домена мимикрии → ${W}1) Ввести свой${N}."
+  echo -e "  ${C}•${N} Подмена DNS или перехват UDP/53 — включите шифрованный DNS:"
+  echo -e "    ${W}Туннели и DNS${N} → DNSCrypt."
+  echo -e "  ${C}•${N} Обрыв или просадка ПОСЛЕ первых десятков килобайт — это"
+  echo -e "    ограничение потока, а не оверхед параметров: пробуйте профиль"
+  echo -e "    ${W}«как в Amnezia»${N} и цепочку I1-I5 покороче."
+  echo -e "${W}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
+  echo ""
+  echo -e "  ${D}Проект сторонний, лицензия MIT. awg2 его не ставит и не запускает.${N}"
+  return 0
 }
 
 # Параллельный пинг всех доменов из 4 пулов.

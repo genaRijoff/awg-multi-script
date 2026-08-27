@@ -172,7 +172,7 @@ def menu_text() -> str:
     return (
         "🛡 <b>awgToolza Bot</b>\n\n"
         "<b>СЕРВЕР</b>\n"
-        f"{state} · профиль <code>{esc(info.profile or '—')}</code>"
+        f"{state} · профиль <code>{esc(core.profile_label(info.profile))}</code>"
         f" · AWG <code>{esc(info.proto or '2.0')}</code>\n"
         f"🌍 <code>{esc(info.public_ip or '—')}:{esc(info.listen_port or '—')}</code>\n"
         f"⏱ аптайм: {uptime}\n\n"
@@ -201,7 +201,12 @@ def status_text() -> str:
         f"Адрес сети: <code>{esc(info.address)}</code>\n"
         f"Порт: <code>{esc(info.listen_port)}</code>  MTU: <code>{esc(info.mtu)}</code>\n"
         f"Внешний IP: <code>{esc(info.public_ip or '—')}</code>\n"
-        f"Регион: <code>{esc(info.region or '—')}</code>\n\n"
+        f"Регион: <code>{esc(info.region or '—')}</code>\n"
+        f"Профиль: <code>{esc(core.profile_label(info.profile))}</code>"
+        f"  ·  AWG <code>{esc(info.proto or '2.0')}</code>\n"
+        f"Мимикрия сервера: {kb.mimicry_label(info.mimicry)}"
+        + (f" (<code>{esc(info.mimicry_domain)}</code>)" if info.mimicry_domain else "")
+        + "\n\n"
         f"Клиентов всего: <b>{len(peers)}</b>\n"
         f"🟢 онлайн: <b>{online}</b>   🚫 заблок.: <b>{blocked}</b>\n"
         f"Трафик (RX/TX): {core.fmt_bytes(total_rx)} / {core.fmt_bytes(total_tx)}"
@@ -467,17 +472,29 @@ async def msg_add_name(msg: Message, state: FSMContext) -> None:
         return
     await state.update_data(add_name=name)
     await state.set_state(Flow.add_profile)
-    # профиль сервера определяет, давать ли выбор (как в awg2: Pro → выбор)
+    # Профиль сервера определяет, давать ли выбор: «мощный» (pro) → выбор,
+    # остальные фиксируют мимикрию, чтобы конфиги от бота и от awg2 совпадали.
     info = core.get_server_info()
     srv_prof = (info.profile or "").lower()
     if srv_prof == "lite":
-        await _create_with_profile(msg, state, name, "dns")
+        # «Как в Amnezia». У официального конфига строк I нет вовсе, и awg2
+        # с v0.7.22 пишет тогда "# AWG_MIMICRY=none" — клиент от бота тоже
+        # идёт без цепочки. Старый lite-сервер метки не имеет: там мимикрия
+        # была DNS, её и оставляем.
+        await _create_with_profile(
+            msg, state, name, "basic" if info.mimicry == "none" else "dns")
         return
     if srv_prof == "standard":
+        # Устаревший профиль: awg2 его больше не предлагает, но серверы,
+        # созданные раньше, работают дальше.
         await _create_with_profile(msg, state, name, "tls")
         return
     await msg.answer(
-        f"👤 Имя: <b>{esc(name)}</b>\n\nВыбери профиль мимикрии:",
+        f"👤 Имя: <b>{esc(name)}</b>\n\nВыбери профиль мимикрии:\n\n"
+        "<i>Длина цепочки ограничена компактным бюджетом (~1500 символов),"
+        " как в awg2. Самые короткие профили — DNS и NTP; QUIC и cURL QUIC"
+        " одним пакетом занимают ~2400 символов, и QR из такого конфига"
+        " уже не соберётся.</i>",
         reply_markup=kb.profile_choices(),
     )
 

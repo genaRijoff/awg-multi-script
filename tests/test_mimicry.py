@@ -72,7 +72,13 @@ with open(os.path.join(BIN, "awg-quick"), "w") as f:
     f.write("#!/usr/bin/env bash\nexit 0\n")
 os.chmod(os.path.join(BIN, "awg-quick"), 0o755)
 # Бот ищет генератор CPS в бинаре awg2 — подкладываем сам скрипт.
-shutil.copy2(AWG2, os.path.join(BIN, "awg2"))
+# copy2 сохраняет права исходника, а awg2.sh в репозитории не исполняемый:
+# без chmod shutil.which("awg2") его не находит, и cps молча остаётся без
+# генератора. Путь дублируем через AWG2_BIN.
+_AWG2_COPY = os.path.join(BIN, "awg2")
+shutil.copy2(AWG2, _AWG2_COPY)
+os.chmod(_AWG2_COPY, 0o755)
+os.environ["AWG2_BIN"] = _AWG2_COPY
 
 os.environ["PATH"] = BIN + os.pathsep + os.environ.get("PATH", "")
 os.environ["AWG_SERVER_CONF"] = SERVER_CONF
@@ -194,8 +200,15 @@ chk("ssdp: ok", True, ok)
 if ok:
     text = open(path).read()
     i_lines = re.findall(r"^(I[1-5])\s*=\s*(.+)$", text, re.M)
-    chk("ssdp: цепочка I1-I5 (уровень 3)", ["I1", "I2", "I3", "I4", "I5"],
-        [k for k, _ in i_lines])
+    # На уровне 3 бот даёт цепочку, но её длину ограничивает бюджет
+    # (cps.DEFAULT_BUDGET): он режет целыми пакетами, поэтому у ssdp
+    # (~2100 символов на все пять) в конфиг попадают не все. Требование —
+    # непрерывная нумерация с I1 и попадание в бюджет.
+    keys = [k for k, _ in i_lines]
+    chk("ssdp: цепочка не пуста и нумерация непрерывна",
+        [f"I{n}" for n in range(1, len(keys) + 1)] or ["I1"], keys)
+    chk("ssdp: цепочка в бюджет уложилась", True,
+        0 < sum(len(v) for _, v in i_lines) <= cps.DEFAULT_BUDGET)
     chk("ssdp: старые I не остались", [], [v for _, v in i_lines if v.startswith("<b 0x1111")])
     chk("ssdp: I-строки внутри [Interface]",
         True, text.index("I1 = ") < text.index("[Peer]"))

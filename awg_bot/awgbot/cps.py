@@ -19,6 +19,11 @@ cps.py — генерация I1 (CPS-мимикрия) тем же кодом, 
 Генератор v2 — порт payloadGen; строки отдаются чистым hex (<b 0x..>).
 Старое имя профиля tls генератор принимает как алиас на quic: TLS-записи
 поверх UDP не существует, а на серверах остались конфиги с AWG_MIMICRY=tls.
+
+С awg2 v0.7.22 генератор принимает --budget <символов> и режет цепочку целыми
+пакетами. Флаг передаётся только после проверки, что извлечённый код его
+понимает (см. _supports_budget): на сервере может стоять awg2 постарше, а
+угадывать поддержку по номеру версии — значит однажды угадать неверно.
 """
 
 from __future__ import annotations
@@ -31,7 +36,10 @@ import subprocess
 
 log = logging.getLogger("awgbot.cps")
 
-AWG2_BIN = shutil.which("awg2") or "/usr/local/bin/awg2"
+# Путь к awg2. Переопределяется переменной AWG2_BIN — так же, как core.py
+# переопределяет пути к конфигу и клиентам: без этого генератор невозможно
+# прогнать на машине, где сервер не установлен (тесты, отладка).
+AWG2_BIN = os.environ.get("AWG2_BIN") or shutil.which("awg2") or "/usr/local/bin/awg2"
 
 # профили, которые поддерживает CPS-генератор awg2 (v2 = порт payloadGen).
 # tls оставлен ради серверов, установленных до перехода: генератор v2 сам
@@ -55,6 +63,11 @@ _MARKER_RES = (
         re.S | re.M,
     ),
 )
+
+# Бюджет длины цепочки I1-I5 по умолчанию — то же значение, что предлагает
+# awg2 («компактная цепочка»). Пять полных QUIC Initial занимают ~12 000
+# символов: такой конфиг не собирается в QR и его неудобно передавать.
+DEFAULT_BUDGET = 1500
 
 _cached_code: str | None = None
 _cache_mtime: float = 0.0
@@ -118,6 +131,24 @@ def available() -> bool:
     return _extract_generator() is not None
 
 
+def _supports_budget(code: str) -> bool:
+    """
+    Понимает ли извлечённый генератор флаг --budget.
+
+    Проверяем по самому коду, а не по версии awg2: файл у нас уже в руках,
+    и это факт, а не предположение. Генератор до v0.7.22 неизвестный флаг
+    молча пропустит, но полагаться на это поведение нельзя — у v1 разбор
+    аргументов другой.
+    """
+    return "--budget" in code
+
+
+def _budget_args(code: str, budget: int) -> list[str]:
+    if budget and budget > 0 and _supports_budget(code):
+        return ["--budget", str(budget)]
+    return []
+
+
 def gen_i1(profile: str, domain: str = "") -> str | None:
     """
     Возвращает строку I1 (например '<b 0x...>' или '<r 2><b 0x...>')
@@ -148,11 +179,17 @@ def gen_i1(profile: str, domain: str = "") -> str | None:
     return None
 
 
-def gen_full(profile: str, domain: str = "") -> list[str]:
+def gen_full(profile: str, domain: str = "",
+             budget: int = DEFAULT_BUDGET) -> list[str]:
     """
     Полный набор I1..I5 одним вызовом генератора. Нужен для серверов уровня
     «полный CPS»: клиент от бота должен получать столько же пакетов, сколько
     выдаёт awg2, иначе конфиги одного сервера различаются.
+
+    budget — предел длины всей цепочки в символах конфига (0 = без лимита).
+    Генератор режет её целыми пакетами, поэтому число I зависит от профиля:
+    DNS укладывает все пять в ~440 символов, один QUIC Initial занимает ~2400
+    и выдаётся целиком даже при меньшем бюджете.
     """
     if profile == "basic" or profile not in PROFILES:
         return []
@@ -162,6 +199,7 @@ def gen_full(profile: str, domain: str = "") -> list[str]:
     args = ["python3", "-c", code, profile]
     if domain:
         args.append(domain)
+    args += _budget_args(code, budget)
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=30)
     except (subprocess.TimeoutExpired, FileNotFoundError):

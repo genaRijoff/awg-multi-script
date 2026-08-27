@@ -112,6 +112,7 @@ class ServerInfo:
     proto: str = ""            # версия протокола AmneziaWG: "2.0", "3.0", "3.1"
     obf_level: int = 0         # 1 = без I1-I5, 2 = только I1, 3 = полный I1-I5
     mimicry: str = ""          # профиль мимикрии сервера (# AWG_MIMICRY=)
+    mimicry_domain: str = ""   # домен мимикрии сервера (# AWG_MIMICRY_DOMAIN=)
     endpoint_domain: str = ""  # домен для Endpoint; пусто — используется IP
     region: str = ""
     peers_count: int = 0
@@ -196,6 +197,12 @@ def get_server_info() -> ServerInfo:
         info.region = m.group(1).strip()
     if m := re.search(r"^#\s*AWG_MIMICRY=(\S+)", text, re.M):
         info.mimicry = m.group(1).strip()
+    # Домен мимикрии, выбранный админом в awg2. Без него бот брал бы случайный
+    # из встроенного пула генератора, и клиенты одного сервера маскировались бы
+    # под разные хосты. Маркер появился в awg2 v0.7.22; у серверов постарше его
+    # нет — тогда домен по-прежнему выбирает генератор.
+    if m := re.search(r"^#\s*AWG_MIMICRY_DOMAIN=(\S+)", text, re.M):
+        info.mimicry_domain = m.group(1).strip()
     # Домен для Endpoint: если задан в awg2, клиенты от бота должны получать
     # его же, иначе конфиги одного сервера указывают в разные места
     if m := re.search(r"^#\s*AWG_ENDPOINT=(\S+)", text, re.M):
@@ -215,6 +222,21 @@ def get_server_info() -> ServerInfo:
     info.iface_up = rc == 0 and bool(out.strip())
     info.public_ip = _public_ip_from_peers()
     return info
+
+
+# Ярлыки профилей сервера. Значения в "# AWG_PROFILE=" не менялись при
+# переименовании в awg2 v0.7.22 — они уже записаны у созданных серверов,
+# поэтому переводим их здесь, а не переписываем конфиги.
+PROFILE_LABELS = {
+    "lite": "как в Amnezia",
+    "pro": "мощный",
+    "standard": "standard (устаревший)",
+}
+
+
+def profile_label(profile: str) -> str:
+    key = (profile or "").strip().lower()
+    return PROFILE_LABELS.get(key, profile or "—")
 
 
 def _obf_level_from_clients() -> int:
@@ -581,7 +603,12 @@ def add_client(name: str, expires: int | None = None,
     used_profile: str | None = "none"
     if profile and profile != "basic":
         from . import cps
-        srv_level = get_server_info().obf_level
+        _srv = get_server_info()
+        srv_level = _srv.obf_level
+        # Домен берём тот, что админ выбрал в awg2: иначе генератор возьмёт
+        # случайный из своего пула, и клиенты одного сервера замаскируются
+        # под разные хосты. Явно переданный аргумент имеет приоритет.
+        domain = domain or _srv.mimicry_domain
         # уровень неизвестен (старый сервер без клиентов) — ведём себя как раньше
         want_full = srv_level >= 3
         already = any(l.startswith("I1 ") or l.startswith("I1=") for l in cli_lines)
@@ -667,7 +694,10 @@ def change_client_mimicry(name: str, profile: str,
     new_lines: list[str] = []
     used_profile = "none"
     if profile != "basic":
-        if get_server_info().obf_level >= 3:
+        _srv = get_server_info()
+        # Тот же домен, что и при создании клиента, — см. add_client
+        domain = domain or _srv.mimicry_domain
+        if _srv.obf_level >= 3:
             packets = cps.gen_full(profile, domain)
             if not packets:
                 return False, "Генератор I1-I5 недоступен (проверьте awg2)", None

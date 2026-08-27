@@ -60,7 +60,14 @@ os.chmod(os.path.join(BIN, "awg"), 0o755)
 with open(os.path.join(BIN, "awg-quick"), "w") as f:
     f.write("#!/usr/bin/env bash\nexit 0\n")
 os.chmod(os.path.join(BIN, "awg-quick"), 0o755)
-shutil.copy2(AWG2, os.path.join(BIN, "awg2"))
+# copy2 сохраняет права исходника, а awg2.sh в репозитории не исполняемый —
+# без chmod shutil.which("awg2") его не находил, cps брал несуществующий
+# /usr/local/bin/awg2 и молча отдавал пустую цепочку. Тест при этом «падал»
+# по I1-I5, хотя проверял не то. Дублируем путь и через AWG2_BIN.
+_AWG2_COPY = os.path.join(BIN, "awg2")
+shutil.copy2(AWG2, _AWG2_COPY)
+os.chmod(_AWG2_COPY, 0o755)
+os.environ["AWG2_BIN"] = _AWG2_COPY
 
 os.environ["PATH"] = BIN + os.pathsep + os.environ.get("PATH", "")
 os.environ["AWG_SERVER_CONF"] = SERVER_CONF
@@ -70,6 +77,7 @@ os.environ["AWG_NOTES_FILE"] = os.path.join(ETC, "notes.json")
 
 sys.path.insert(0, BOT_PKG)
 from awgbot import core  # noqa: E402
+from awgbot import cps as cps_mod  # noqa: E402
 
 
 def bash_fn(name):
@@ -170,7 +178,10 @@ for v, lines in PARAMS.items():
     open(os.path.join(CLI, "seed_awg2.conf"), "w").write(
         "[Interface]\nI1 = <b 0x11>\nI2 = <b 0x22>\n[Peer]\n")
     name = "cli" + v.replace(".", "")
-    ok, msg, path = core.add_client(name, None, "quic")
+    # Профиль dns: его цепочка (~440 символов) целиком помещается в бюджет
+    # длины, поэтому здесь проверяются все пять пакетов. Урезание бюджетом
+    # проверяется отдельно ниже, на quic.
+    ok, msg, path = core.add_client(name, None, "dns")
     chk(f"{v}: клиент создан ботом", True, ok)
     if not ok:
         print("       ", msg)
@@ -180,6 +191,10 @@ for v, lines in PARAMS.items():
     chk(f"{v}: все awg-параметры в конфиге клиента", [], missing)
     chk(f"{v}: цепочка I1-I5 выдана", ["I1", "I2", "I3", "I4", "I5"],
         re.findall(r"^(I[1-5]) = ", text, re.M))
+    chain = [l.split(" = ", 1)[1] for l in text.splitlines()
+             if re.match(r"^I[1-5] = ", l)]
+    chk(f"{v}: цепочка в бюджет уложилась", True,
+        0 < sum(len(x) for x in chain) <= cps_mod.DEFAULT_BUDGET)
     chk(f"{v}: Endpoint есть", True, bool(re.search(r"^Endpoint = \S+:51820$", text, re.M)))
     # На 3.x keepalive обязан быть диапазоном: фиксированные 25 с дают ровную
     # временную сигнатуру — то самое, что 3.x и призван скрывать.
@@ -187,12 +202,25 @@ for v, lines in PARAMS.items():
     chk(f"{v}: PersistentKeepalive по версии",
         True, bool(re.fullmatch(r"\d+" if v == "2.0" else r"\d+-\d+", ka.group(1).strip()))
         if ka else False)
-    chk(f"{v}: метка профиля", "quic",
+    chk(f"{v}: метка профиля", "dns",
         (re.search(r"^#\s*mimicry=(\S+)", "".join(
             b for b in re.split(r"(?=\[Peer\])", open(SERVER_CONF).read())[1:]
             if core._block_name(b) == name), re.M) or [None, ""])[1])
+    # Бюджет режет цепочку целыми пакетами: один QUIC Initial (~2400 символов)
+    # в компактный бюджет не влезает, но выдаётся всегда — без первого пакета
+    # мимикрии не было бы вовсе. Нумерация обязана оставаться непрерывной.
+    okq, _msgq, pathq = core.add_client(name + "q", None, "quic")
+    if okq:
+        tq = open(pathq).read()
+        nums = re.findall(r"^I([1-5]) = ", tq, re.M)
+        chk(f"{v}: quic урезан бюджетом", True, 0 < len(nums) < 5)
+        chk(f"{v}: нумерация I непрерывна",
+            [str(n) for n in range(1, len(nums) + 1)], nums)
+    else:
+        chk(f"{v}: клиент quic создан", True, okq)
+
     # смена мимикрии не должна ронять параметры версии
-    ok2, msg2, path2 = core.change_client_mimicry(name, "dns")
+    ok2, msg2, path2 = core.change_client_mimicry(name, "quic")
     chk(f"{v}: смена мимикрии прошла", True, ok2)
     if ok2:
         t2 = open(path2).read()
