@@ -21,7 +21,7 @@
 # сам откатываться, а не падать посреди пересборки с удалённой старой версией.
 set -uo pipefail
 
-VERSION="v1.0.0"
+VERSION="v1.0.1"
 
 REPO="amnezia-vpn/amneziawg-linux-kernel-module"
 REPO_GIT="https://github.com/${REPO}.git"
@@ -95,10 +95,10 @@ awg_ifaces() {
 module_ver()  { cat /sys/module/${DKMS_NAME}/version 2>/dev/null || echo "не загружен"; }
 saved_tag()   { [[ -f "$TAG_FILE" ]] && tr -d '[:space:]' < "$TAG_FILE" || echo ""; }
 
-dkms_line() {
-  local line
-  line="$(dkms status -m "$DKMS_NAME" 2>/dev/null | grep -v '^Deprecated' | head -1)"
-  echo "${line:-модуль не зарегистрирован}"
+# Строк бывает несколько: DKMS держит сборку под каждое ядро, и показать только
+# первую — значит спрятать ту, под которой система реально работает.
+dkms_lines() {
+  dkms status -m "$DKMS_NAME" 2>/dev/null | grep -v '^Deprecated'
 }
 
 # Собран ли модуль под текущее ядро.
@@ -112,7 +112,15 @@ show_state() {
   ifaces="$(awg_ifaces | tr '\n' ' ')"
   hdr "Состояние"
   dim "ядро      : ${KVER}"
-  dim "DKMS      : $(dkms_line)"
+  local dkms_out first rest
+  dkms_out="$(dkms_lines)"
+  if [[ -z "$dkms_out" ]]; then
+    dim "DKMS      : модуль не зарегистрирован"
+  else
+    first="$(head -1 <<<"$dkms_out")"; rest="$(tail -n +2 <<<"$dkms_out")"
+    dim "DKMS      : ${first}"
+    [[ -n "$rest" ]] && while read -r l; do dim "            ${l}"; done <<<"$rest"
+  fi
   dim "в памяти  : $(module_ver)"
   dim "тег       : ${tag:-неизвестен (ставили не этим скриптом)}"
   dim "tools     : $(awg --version 2>/dev/null | head -1 || echo 'нет awg')"
@@ -315,7 +323,8 @@ reload_module() {
   cmd="UNITS='${units}'; IFACES='${ifaces}'; RC=0
 set -x
 for u in \$UNITS;  do systemctl stop \"\$u\"; done
-for i in \$IFACES; do awg-quick down \"\$i\" 2>/dev/null || ip link del \"\$i\" 2>/dev/null; done
+for i in \$IFACES; do ip link show \"\$i\" >/dev/null 2>&1 || continue
+  awg-quick down \"\$i\" 2>/dev/null || ip link del \"\$i\" 2>/dev/null; done
 rmmod ${DKMS_NAME} || RC=3
 modprobe ${DKMS_NAME} || RC=4
 for u in \$UNITS;  do systemctl start \"\$u\"; done
@@ -366,9 +375,24 @@ verify() {
   dkms_installed_here \
     && ok "DKMS: собран и установлен под ${KVER}" \
     || err "DKMS: под ${KVER} установленной сборки нет"
-  lsmod | grep -q "^${DKMS_NAME}" \
-    && ok "Модуль загружен в ядро" \
-    || warn "Модуль не загружен (перезагрузи модуль или сервер)"
+  if lsmod | grep -q "^${DKMS_NAME}"; then
+    ok "Модуль загружен в ядро"
+    # version.h апстрим не бумпает, поэтому сверяем srcversion загруженного
+    # модуля с тем, что лежит на диске: разошлись — в памяти прежний код.
+    local mem disk
+    mem="$(cat /sys/module/${DKMS_NAME}/srcversion 2>/dev/null)"
+    disk="$(modinfo -F srcversion "$DKMS_NAME" 2>/dev/null | head -1)"
+    if [[ -z "$mem" || -z "$disk" ]]; then
+      warn "srcversion не прочитался — сверить память и диск не вышло"
+    elif [[ "$mem" == "$disk" ]]; then
+      ok "В памяти тот же модуль, что на диске (srcversion ${mem})"
+    else
+      warn "В памяти прежний модуль: ${mem}, на диске ${disk}"
+      dim "Нужна перезагрузка модуля (пункт 3) или сервера"
+    fi
+  else
+    warn "Модуль не загружен (перезагрузи модуль или сервер)"
+  fi
   local ifaces; ifaces="$(awg_ifaces | tr '\n' ' ')"
   [[ -n "$ifaces" ]] && ok "Интерфейсы: ${ifaces}" || warn "Поднятых интерфейсов нет"
   dmesg 2>/dev/null | grep -i 'amneziawg' | tail -3 | sed 's/^/      /'
