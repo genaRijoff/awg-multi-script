@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.28"
+VERSION="v0.7.29"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -3414,6 +3414,26 @@ awg_module_stale() {
   (( mod_time > load_time ))
 }
 
+# Делает net.ipv4.ip_forward=1 постоянным и печатает файл, куда записано.
+# В Ubuntu 26.04 /etc/sysctl.conf больше нет — всё переехало в /etc/sysctl.d/,
+# и прежний `grep ... /etc/sysctl.conf` ругался на отсутствующий файл, а потом
+# создавал его редиректом. Пишем drop-in, а старый файл уважаем, если строка
+# уже там (иначе получили бы два источника одной настройки).
+_ip_forward_persist() {
+  local dropin="/etc/sysctl.d/99-awg2.conf"
+  local re='^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1'
+  if grep -qsE "$re" /etc/sysctl.conf; then
+    echo "/etc/sysctl.conf"
+    return 0
+  fi
+  mkdir -p /etc/sysctl.d 2>/dev/null || true
+  if ! grep -qsE "$re" "$dropin"; then
+    echo "net.ipv4.ip_forward=1" > "$dropin" 2>/dev/null || return 1
+    chmod 644 "$dropin" 2>/dev/null || true
+  fi
+  echo "$dropin"
+}
+
 # Кто держит UDP-порт $1. Пустой вывод — держатель неизвестен (нет ss или
 # порт свободен). Отдельной функцией, чтобы диагностику можно было проверять
 # без живого сокета.
@@ -3878,9 +3898,13 @@ do_repair() {
     warn "IP forwarding выключён"
     issues=$((issues+1))
     sysctl -w net.ipv4.ip_forward=1 -q
-    grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || \
-      echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-    ok "IP forwarding включён"
+    local _fwd_file
+    _fwd_file=$(_ip_forward_persist) || _fwd_file=""
+    if [[ -n "$_fwd_file" ]]; then
+      ok "IP forwarding включён (постоянно в $_fwd_file)"
+    else
+      ok "IP forwarding включён (постоянную настройку записать не удалось)"
+    fi
     fixed=$((fixed+1))
   fi
 
@@ -5940,9 +5964,13 @@ EOF
 
   hdr "»  IP Forwarding"
   sysctl -w net.ipv4.ip_forward=1 -q
-  grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || \
-    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
-  ok "net.ipv4.ip_forward=1 (включён и прописан в /etc/sysctl.conf)"
+  local _fwd_file
+  if _fwd_file=$(_ip_forward_persist) && [[ -n "$_fwd_file" ]]; then
+    ok "net.ipv4.ip_forward=1 (включён, постоянно в $_fwd_file)"
+  else
+    warn "IP forwarding включён, но постоянную настройку записать не удалось"
+    info "После перезагрузки проверь: sysctl net.ipv4.ip_forward"
+  fi
 
   hdr "»  NAT + FORWARD"
   local ext_if
@@ -6011,15 +6039,14 @@ EOF
     echo -e "  ${Y}Без неё awg0 может не подняться: в памяти ядра сидит модуль,${N}"
     echo -e "  ${Y}не совпадающий с тем, что сейчас на диске.${N}"
     echo ""
-    info "После перезагрузки — ровно в таком порядке:"
-    info "  1) awg2 → Сервер (1) → п.1 — повторить установку"
-    info "     (соберёт и загрузит модуль под ядро, которое поднялось)"
-    info "  2) сразу, БЕЗ второй перезагрузки: Сервер (1) → п.2 — Создать сервер"
+    info "После перезагрузки: awg2 → Сервер (1) → п.2 — Создать сервер"
+    info "Модуль под поднявшееся ядро п.2 подхватит сам. Если он скажет, что"
+    info "модуль не собран — сначала п.1, затем сразу п.2 без второй перезагрузки"
     echo ""
     local _do_rb
     read_yesno _do_rb "$(echo -e "${G}  Перезагрузить сейчас? [Y/n]: ${N}")" "y"
     if [[ "$_do_rb" == "y" ]]; then
-      ok "Перезагружаюсь. Заходи через минуту: awg2 → п.1, затем п.2 (без ребута)"
+      ok "Перезагружаюсь. Заходи через минуту: awg2 → Сервер (1) → п.2"
       log_info "do_install: reboot по согласию пользователя ($_rb_reason)"
       sleep 2
       reboot
@@ -6096,7 +6123,7 @@ do_gen() {
     local _rb_now
     read_yesno _rb_now "$(echo -e "${G}  Перезагрузить сейчас (создать сервер после)? [Y/n]: ${N}")" "y"
     if [[ "$_rb_now" == "y" ]]; then
-      ok "Перезагружаюсь. Заходи через минуту: awg2 → Сервер (1) → п.1, затем п.2"
+      ok "Перезагружаюсь. Заходи через минуту: awg2 → Сервер (1) → п.2"
       log_info "do_gen: reboot по согласию пользователя ($_rb_reason)"
       sleep 2
       reboot
