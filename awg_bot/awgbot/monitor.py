@@ -164,7 +164,7 @@ async def _notify_offline(bot, admin_ids: set[int], p: core.Peer) -> None:
         f"👤 {html.escape(p.name)}\n"
         f"IP: <code>{html.escape(p.allowed_ips)}</code>\n"
         f"Последняя активность: {last}\n"
-        f"Заметка: {html.escape(p.note or '—')}"
+        f"Заметка: {html.escape(core.strip_monitor_tag(p.note) or '—')}"
     ))
 
 
@@ -179,7 +179,7 @@ async def _notify_back(bot, admin_ids: set[int], p: core.Peer, since: int) -> No
         f"👤 {html.escape(p.name)}\n"
         f"IP: <code>{html.escape(p.allowed_ips)}</code>\n"
         f"{gone}"
-        f"Заметка: {html.escape(p.note or '—')}"
+        f"Заметка: {html.escape(core.strip_monitor_tag(p.note) or '—')}"
     ))
 
 

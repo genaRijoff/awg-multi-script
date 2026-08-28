@@ -1220,6 +1220,48 @@ def is_monitored(name: str) -> bool:
     return MONITOR_TAG.lower() in get_note(name).lower()
 
 
+def strip_monitor_tag(note: str) -> str:
+    """Текст заметки без служебного маркера #ping."""
+    if not note:
+        return ""
+    cleaned = re.sub(re.escape(MONITOR_TAG), " ", note, flags=re.I)
+    return re.sub(r"\s{2,}", " ", cleaned).strip()
+
+
+def set_monitor(name: str, on: bool) -> tuple[bool, str]:
+    """
+    Включает/выключает мониторинг активности клиента (кнопка «Активность»).
+
+    Источник истины остаётся прежним — маркер #ping в заметке. Так кнопка и
+    заметка, введённая руками, не расходятся, а старые клиенты с #ping в
+    тексте продолжают мониториться без миграции.
+    """
+    if not get_peer(name):
+        return False, f"Клиент '{name}' не найден"
+    note = get_note(name)
+    has = MONITOR_TAG.lower() in note.lower()
+
+    if on:
+        if has:
+            return True, "Мониторинг активности уже включён"
+        base = strip_monitor_tag(note)
+        # заметка ограничена 200 символами — освобождаем место под маркер
+        limit = 200 - len(MONITOR_TAG) - 1
+        if len(base) > limit:
+            base = base[:limit].rstrip()
+        ok, _ = set_note(name, f"{base} {MONITOR_TAG}".strip())
+        if not ok:
+            return False, "Не удалось включить мониторинг"
+        return True, "🔔 Мониторинг активности включён"
+
+    if not has:
+        return True, "Мониторинг активности уже выключен"
+    ok, _ = set_note(name, strip_monitor_tag(note))
+    if not ok:
+        return False, "Не удалось выключить мониторинг"
+    return True, "🔕 Мониторинг активности выключен"
+
+
 
 # ───────────────────────── DNSCrypt upstream (серверный шифрованный DNS) ─────────────────────────
 # В awg2 «выбор DNS» = смена upstream-резолверов dnscrypt-proxy на сервере

@@ -167,7 +167,7 @@ def menu_text() -> str:
     dns_on = "active" in (out + out2)
     dns = "вкл" if dns_on else "нет"
 
-    mon_line = f"\n🔔 #ping: <b>{monitored}</b>" if monitored else ""
+    mon_line = f"\n🔔 Мониторинг активности: <b>{monitored}</b>" if monitored else ""
 
     return (
         "🛡 <b>awgToolza Bot</b>\n\n"
@@ -227,10 +227,14 @@ def client_card_text(p: core.Peer) -> str:
         left = p.expires - int(time.time())
         when = datetime.fromtimestamp(p.expires).strftime("%Y-%m-%d %H:%M")
         exp = f"⏳ до {when}" + ("" if left > 0 else " (истёк)")
+    # Маркер #ping — служебный: состояние показываем отдельной строкой
+    # «Активность», а в тексте заметки его не дублируем.
     note_line = ""
-    if p.note:
-        mon = " 🔔" if p.monitored else ""
-        note_line = f"Заметка: {esc(p.note)}{mon}\n"
+    note_text = core.strip_monitor_tag(p.note)
+    if note_text:
+        note_line = f"Заметка: {esc(note_text)}\n"
+    mon_line = ("Активность: 🔔 мониторинг вкл\n" if p.monitored
+                else "Активность: 🔕 мониторинг выкл\n")
     # WARP-маршрут
     ws = core.warp_client_state(p.name)
     if ws is True:
@@ -248,6 +252,7 @@ def client_card_text(p: core.Peer) -> str:
         f"Мимикрия: {kb.mimicry_label(p.mimicry)}"
         + ("" if p.mimicry else " <i>(метки нет — конфиг выдан раньше)</i>") + "\n"
         f"{note_line}"
+        f"{mon_line}"
         f"Трафик ↓{core.fmt_bytes(p.rx)} ↑{core.fmt_bytes(p.tx)}\n"
         + (f"Endpoint: <code>{esc(p.endpoint)}</code>\n" if p.endpoint else "")
     )
@@ -639,8 +644,9 @@ async def cb_client_note(cq: CallbackQuery, state: FSMContext) -> None:
     await safe_edit(
         cq,
         f"Пришли текст заметки для <b>{esc(p.name)}</b> сообщением.\n"
-        f"До 200 символов. Чтобы включить мониторинг активности, добавь "
-        f"<code>{core.MONITOR_TAG}</code> в текст.\n"
+        f"До 200 символов. Мониторинг активности удобнее включать кнопкой "
+        f"<b>🔔 Активность</b> в карточке; маркер <code>{core.MONITOR_TAG}</code> "
+        f"в тексте работает как раньше.\n"
         f"Пустое сообщение или <code>-</code> — очистить заметку." + cur,
         kb.back_button(f"client:{idx}"),
     )
@@ -656,13 +662,39 @@ async def msg_note(msg: Message, state: FSMContext) -> None:
     txt = (msg.text or "").strip()
     if txt == "-":
         txt = ""
+    was_mon = await asyncio.to_thread(core.is_monitored, data["name"])
     ok, res = await asyncio.to_thread(core.set_note, data["name"], txt)
     mon = core.MONITOR_TAG.lower() in txt.lower()
-    extra = f"\n🔔 Мониторинг активности включён ({core.MONITOR_TAG})" if mon else ""
+    if mon:
+        extra = f"\n🔔 Мониторинг активности включён ({core.MONITOR_TAG})"
+    elif was_mon:
+        # заметка перезаписывается целиком: без маркера мониторинг снимается —
+        # говорим об этом прямо, иначе алерты тихо перестанут приходить
+        extra = (f"\n🔕 Мониторинг активности выключен — в новой заметке нет "
+                 f"{core.MONITOR_TAG} (вернуть можно кнопкой «Активность»)")
+    else:
+        extra = ""
     await msg.answer(("✅ " if ok else "❌ ") + esc(res) + extra)
     p = _peer_by_idx(data["idx"])
     if p:
         await msg.answer(client_card_text(p), reply_markup=_card_kb(data["idx"], p))
+
+
+# ── мониторинг активности (кнопка «Активность» = маркер #ping) ──
+@dp.callback_query(F.data.startswith("cl_mon:"))
+async def cb_client_monitor(cq: CallbackQuery) -> None:
+    if not authorized(cq.from_user.id):
+        return await deny(cq)
+    _, raw_idx, raw_on = cq.data.split(":")
+    idx = int(raw_idx)
+    p = _peer_by_idx(idx)
+    if not p:
+        return await cq.answer("Клиент не найден", show_alert=True)
+    ok, res = await asyncio.to_thread(core.set_monitor, p.name, raw_on == "1")
+    await cq.answer(res, show_alert=not ok)
+    p = _peer_by_idx(idx)
+    if p:
+        await safe_edit(cq, client_card_text(p), _card_kb(idx, p))
 
 
 # ── WARP на клиента ──
