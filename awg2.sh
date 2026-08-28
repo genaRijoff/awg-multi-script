@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.27"
+VERSION="v0.7.28"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -5657,36 +5657,39 @@ do_install() {
     err "Не удалось определить ОС (/etc/os-release отсутствует)"; return 1
   fi
 
-  hdr "▬  Обнаружена ОС"
-  echo -e "  ${W}ID${N}       : $OS_ID"
-  echo -e "  ${W}Version${N}  : $OS_VER"
-  echo -e "  ${W}Codename${N} : ${OS_CODENAME:-n/a}"
-  echo ""
+  # ── Предпроверки: ОС, остатки PPA, DNS ──
+  # Три быстрые проверки. Раньше у каждой была своя рамка hdr — пол-экрана
+  # ради одной строки результата. Теперь один блок построчно, а подробности
+  # печатаются только когда что-то не так.
+  echo -e "  ${W}▬  Проверки перед установкой${N}"
+
+  local _os_label="${OS_ID^} $OS_VER"
+  [[ -n "$OS_CODENAME" ]] && _os_label+=" ($OS_CODENAME)"
 
   case "$OS_ID" in
     ubuntu)
       case "$OS_VER" in
         24.04|24.10|25.04|25.10|26.04)
-          ok "Ubuntu $OS_VER — будем собирать amneziawg через git+DKMS"
+          ok "ОС   $_os_label — сборка amneziawg через git+DKMS"
           ;;
         *)
-          warn "Ubuntu $OS_VER не в списке проверенных, но пробуем git+DKMS"
+          warn "ОС   $_os_label не в списке проверенных, но пробуем git+DKMS"
           ;;
       esac
       ;;
     debian)
       case "$OS_VER" in
         12|13)
-          ok "Debian $OS_VER — будем собирать amneziawg через git+DKMS"
+          ok "ОС   $_os_label — сборка amneziawg через git+DKMS"
           ;;
         *)
-          err "Debian $OS_VER не поддерживается. Нужен 12 или 13"
+          err "ОС   $_os_label не поддерживается. Нужен Debian 12 или 13"
           return 1
           ;;
       esac
       ;;
     *)
-      err "ОС $OS_ID не поддерживается. Только Ubuntu 24+ или Debian 12/13"
+      err "ОС   $_os_label не поддерживается. Только Ubuntu 24+ или Debian 12/13"
       return 1
       ;;
   esac
@@ -5694,17 +5697,15 @@ do_install() {
   # ───────────── Очистка остатков PPA от прошлых попыток установки
   # Чтобы apt-get update не плевался ошибками типа "Temporary failure resolving"
   # при наличии висящих PPA от прошлой версии скрипта
-  hdr "✂  Очистка старых PPA"
   if _purge_legacy_ppa; then
-    ok "Старые PPA удалены"
+    ok "PPA  остатки прошлых установок удалены"
   else
-    ok "Чисто — PPA остатков нет"
+    ok "PPA  остатков нет"
   fi
 
   # ───────────── Проверка DNS
-  hdr "⌘  Проверка DNS"
   if ! getent hosts github.com &>/dev/null; then
-    warn "DNS не работает — github.com не резолвится"
+    warn "DNS  github.com не резолвится"
     info "Применяю Cloudflare + Google DNS как fallback..."
     if [[ -L /etc/resolv.conf ]]; then
       # systemd-resolved — добавляем DNS через resolvectl
@@ -5723,9 +5724,9 @@ EOF
     rm -f /tmp/resolv.conf.fix
 
     if getent hosts github.com &>/dev/null; then
-      ok "DNS работает (Cloudflare + Google)"
+      ok "DNS  работает через Cloudflare + Google"
     else
-      err "DNS всё ещё не работает. Проверь сетевую настройку сервера"
+      err "DNS  всё ещё не работает. Проверь сетевую настройку сервера"
       info "Команды для диагностики:"
       info "  ping 1.1.1.1            (проверка интернета)"
       info "  cat /etc/resolv.conf    (текущие DNS)"
@@ -5734,8 +5735,9 @@ EOF
       continue
     fi
   else
-    ok "DNS работает"
+    ok "DNS  github.com резолвится"
   fi
+  echo ""
 
   hdr "+  Система и зависимости"
   export DEBIAN_FRONTEND=noninteractive
@@ -5940,6 +5942,7 @@ EOF
   sysctl -w net.ipv4.ip_forward=1 -q
   grep -q "^net.ipv4.ip_forward=1" /etc/sysctl.conf || \
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+  ok "net.ipv4.ip_forward=1 (включён и прописан в /etc/sysctl.conf)"
 
   hdr "»  NAT + FORWARD"
   local ext_if
@@ -5960,6 +5963,7 @@ EOF
   hdr "›  Папка конфигов"
   mkdir -p /etc/amnezia/amneziawg
   chmod 700 /etc/amnezia/amneziawg
+  ok "/etc/amnezia/amneziawg готова (права 700)"
 
   hdr "◼  Firewall (UFW)"
   if command -v ufw &>/dev/null; then
@@ -6007,12 +6011,15 @@ EOF
     echo -e "  ${Y}Без неё awg0 может не подняться: в памяти ядра сидит модуль,${N}"
     echo -e "  ${Y}не совпадающий с тем, что сейчас на диске.${N}"
     echo ""
-    info "После перезагрузки: awg2 → Сервер (1) → п.2 — Создать сервер"
+    info "После перезагрузки — ровно в таком порядке:"
+    info "  1) awg2 → Сервер (1) → п.1 — повторить установку"
+    info "     (соберёт и загрузит модуль под ядро, которое поднялось)"
+    info "  2) сразу, БЕЗ второй перезагрузки: Сервер (1) → п.2 — Создать сервер"
     echo ""
     local _do_rb
     read_yesno _do_rb "$(echo -e "${G}  Перезагрузить сейчас? [Y/n]: ${N}")" "y"
     if [[ "$_do_rb" == "y" ]]; then
-      ok "Перезагружаюсь. Заходи через минуту и запускай: awg2"
+      ok "Перезагружаюсь. Заходи через минуту: awg2 → п.1, затем п.2 (без ребута)"
       log_info "do_install: reboot по согласию пользователя ($_rb_reason)"
       sleep 2
       reboot
@@ -6057,6 +6064,30 @@ do_gen() {
   # собранном под другое ядро. Спрашиваем до генерации ключей и конфигов.
   local _rb_reason
   _rb_reason=$(awg_reboot_reason || true)
+
+  # Модуль не загружен — перезагрузка это НЕ лечит. Типовой путь: п.1 принёс
+  # новое ядро, человек перезагрузился, и теперь работает ядро, под которое
+  # модуль в память никто не вставил. Сначала пробуем modprobe (если сборка
+  # под это ядро есть — вопрос закрыт), и только потом отправляем в п.1.
+  if [[ "$_rb_reason" == *"не загружен"* ]]; then
+    echo ""
+    info "Модуль amneziawg не загружен — пробую: modprobe amneziawg"
+    if modprobe amneziawg 2>/dev/null && [[ -d /sys/module/amneziawg ]]; then
+      ok "Модуль загружен под $(uname -r) — перезагрузка не нужна"
+      _rb_reason=$(awg_reboot_reason || true)
+    fi
+  fi
+
+  if [[ "$_rb_reason" == *"не загружен"* ]]; then
+    echo ""
+    err "Модуль amneziawg не собран под работающее ядро $(uname -r)"
+    info "Перезагрузка здесь не поможет — модуль нужно собрать под это ядро:"
+    info "  1) Сервер (1) → п.1 — установка компонентов (пересоберёт модуль)"
+    info "  2) сразу, БЕЗ перезагрузки: Сервер (1) → п.2 — Создать сервер"
+    log_info "do_gen: отказ — модуль не загружен под $(uname -r)"
+    return 1
+  fi
+
   if [[ -n "$_rb_reason" ]]; then
     echo ""
     warn "Сервер не перезагружен после установки: $_rb_reason"
@@ -6065,7 +6096,7 @@ do_gen() {
     local _rb_now
     read_yesno _rb_now "$(echo -e "${G}  Перезагрузить сейчас (создать сервер после)? [Y/n]: ${N}")" "y"
     if [[ "$_rb_now" == "y" ]]; then
-      ok "Перезагружаюсь. Заходи через минуту: awg2 → Сервер (1) → п.2"
+      ok "Перезагружаюсь. Заходи через минуту: awg2 → Сервер (1) → п.1, затем п.2"
       log_info "do_gen: reboot по согласию пользователя ($_rb_reason)"
       sleep 2
       reboot
