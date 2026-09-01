@@ -2,30 +2,56 @@
 bot.py — Telegram-бот управления AmneziaWG (awg2).
 
 Управление полностью кнопочное (inline). Единственная команда — /start.
-Доступ: только ADMIN_ID из конфига.
+Доступ: владелец (ADMIN_ID из конфига) и приглашённые им админы.
+
+Устройство (aiogram 3.31, Bot API 10.3):
+
+    Dispatcher
+    ├── start_router — ПУБЛИЧНЫЙ, только /start. Через него приходят
+    │                  приглашения (deep-link) и подсказка «твой ID», поэтому
+    │                  проверку доступа он делает сам, внутри обработчика.
+    └── router       — всё остальное. Доступ проверяет AccessMiddleware ОДИН
+                       раз на входе, а не каждый обработчик по отдельности.
+
+Почему middleware, а не проверка в каждом обработчике: обработчиков 70+, и
+любая новая кнопка, где забыли строчку `if not authorized(...)`, — это дыра,
+которую ничто не подсветит. Внешний слой закрывает весь роутер разом, включая
+обработчики, которые ещё не написаны.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import io
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime
+from typing import Any
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+)
 from aiogram.filters import CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     BufferedInputFile,
     CallbackQuery,
+    ErrorEvent,
     Message,
+    TelegramObject,
 )
 
 from . import admins, core, keyboards as kb, wrapper
@@ -38,33 +64,110 @@ logging.basicConfig(
 log = logging.getLogger("awgbot")
 
 CFG = load_config()
-bot = Bot(token=CFG.token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+bot = Bot(
+    token=CFG.token,
+    default=DefaultBotProperties(
+        parse_mode=ParseMode.HTML,
+        # Карточки клиентов и статусы содержат ссылки (t.me, документация).
+        # Превью раздувает сообщение и ломает вёрстку карточки — гасим глобально.
+        link_preview_is_disabled=True,
+    ),
+)
+# events_isolation здесь сознательно НЕ включён. Он выстроил бы нажатия одного
+# пользователя в очередь, но от гонки не спасает: два нажатия всё равно
+# выполнятся, просто по очереди. Настоящую защиту даёт замок в core
+# (core._serialized), а очередь стоила бы UI: пока идёт установка WARP (до трёх
+# минут в pexpect), любая другая кнопка этого же админа висела бы до её конца.
 dp = Dispatcher(storage=MemoryStorage())
+
+start_router = Router(name="start")
+router = Router(name="main")
+
+
+# ───────────────────────── доступ ─────────────────────────
+class AccessMiddleware(BaseMiddleware):
+    """Внешний слой доступа для всего основного роутера.
+
+    Outer, а не inner: отсекать надо ДО фильтров и до создания FSM-контекста,
+    иначе посторонний может гонять бота по состояниям, не имея доступа.
+    Разрешённому пользователю кладём в data флаг владельца — обработчики
+    управления админами берут его оттуда, а не считают заново.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        user = data.get("event_from_user") or getattr(event, "from_user", None)
+        uid = getattr(user, "id", None)
+        if uid is None or not authorized(uid):
+            log.info("Отклонён доступ: uid=%s, событие %s", uid, type(event).__name__)
+            # На нажатие кнопки отвечаем обязательно: у нажавшего крутится
+            # «часики», и он заслуживает объяснения — кнопку он видит, только
+            # если бот когда-то ему писал (например, доступ отозвали).
+            # На постороннее СООБЩЕНИЕ молчим: раньше такие сообщения просто не
+            # находили обработчика, и превращать бота в автоответчик для
+            # случайных людей не за чем. Кому нужен доступ — тому /start
+            # объяснит, как его получить.
+            if isinstance(event, CallbackQuery):
+                await deny(event)
+            return None
+        # Ключ называется owner, а не is_owner: одноимённая функция нужна
+        # обработчикам для проверки ДРУГИХ пользователей (например, «этот ID и
+        # так владелец»), и параметр с тем же именем её бы перекрыл.
+        data["owner"] = is_owner(uid)
+        return await handler(event, data)
+
+
+router.message.outer_middleware(AccessMiddleware())
+router.callback_query.outer_middleware(AccessMiddleware())
 
 
 # ───────────────────────── глобальный обработчик ошибок ─────────────────────────
+# Безобидные ошибки Telegram различаем по ТИПУ исключения и по коду ответа, а
+# не по подстроке в тексте: текст задаётся сервером Telegram и меняется без
+# предупреждения, после чего «глушилка» начинает пропускать шум в ERROR или,
+# наоборот, прятать настоящие ошибки.
+BENIGN_BAD_REQUEST = (
+    "query is too old",          # кнопку нажали, а ответ ушёл позже таймаута
+    "query id is invalid",       # то же после перезапуска бота
+    "message is not modified",   # перерисовали экран тем же текстом
+    "message to edit not found",  # сообщение удалили руками
+)
+
+
 @dp.error()
-async def on_error(event) -> bool:
-    """
-    Глушит шумные, но безобидные ошибки:
-      - "query is too old / query ID is invalid" — пользователь нажал кнопку,
-        а бот ответил позже таймаута Telegram (перезапуск/лаг сети). Нажатие
-        просто теряется, ничего страшного.
-      - сетевые таймауты до Telegram — aiogram сам переподключится.
-    Остальное логируем как ERROR, чтобы видеть реальные баги.
-    """
-    exc = getattr(event, "exception", None)
-    msg = str(exc) if exc else ""
-    exc_name = type(exc).__name__ if exc else ""
-    benign_markers = (
-        "query is too old", "query ID is invalid",
-        "message is not modified", "Request timeout",
-    )
-    benign = any(m in msg for m in benign_markers) or "Timeout" in exc_name
-    if benign:
-        log.info("Пропущена безобидная ошибка: %s", msg[:120])
-        return True  # обработано, дальше не пробрасываем
-    log.exception("Необработанная ошибка: %s", msg)
+async def on_error(event: ErrorEvent) -> bool:
+    exc = event.exception
+
+    if isinstance(exc, TelegramRetryAfter):
+        # Флуд-контроль Telegram. Ждать здесь нечего — обновление уже потеряно,
+        # но интервал важно видеть в логе: он подсказывает, что бот шлёт слишком
+        # часто (обычно рассылка уведомлений мониторинга).
+        log.warning("Telegram просит подождать %s с (flood control)", exc.retry_after)
+        return True
+
+    if isinstance(exc, TelegramBadRequest):
+        text = str(exc).lower()
+        if any(marker in text for marker in BENIGN_BAD_REQUEST):
+            log.info("Безобидный BadRequest: %s", str(exc)[:120])
+            return True
+        log.error("BadRequest: %s", exc)
+        return True
+
+    if isinstance(exc, TelegramForbiddenError):
+        # Пользователь заблокировал бота или удалил чат.
+        log.warning("Нет доступа к чату: %s", str(exc)[:120])
+        return True
+
+    if isinstance(exc, TelegramNetworkError):
+        # Сеть до Telegram моргнула — aiogram переподключится сам.
+        log.info("Сетевая ошибка Telegram: %s", str(exc)[:120])
+        return True
+
+    log.exception("Необработанная ошибка: %s", exc)
     return True
 
 
@@ -271,7 +374,7 @@ async def safe_edit(cq: CallbackQuery, text: str, markup=None) -> None:
 
 
 # ───────────────────────── /start ─────────────────────────
-@dp.message(CommandStart())
+@start_router.message(CommandStart())
 async def cmd_start(msg: Message, state: FSMContext, command: CommandObject) -> None:
     uid = msg.from_user.id
     payload = (command.args or "").strip()
@@ -304,36 +407,28 @@ async def cmd_start(msg: Message, state: FSMContext, command: CommandObject) -> 
 
 
 # ───────────────────────── навигация ─────────────────────────
-@dp.callback_query(F.data == "menu")
+@router.callback_query(F.data == "menu")
 async def cb_menu(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await state.clear()
     info = core.get_server_info()
     await safe_edit(cq, menu_text(), kb.main_menu(info.installed))
     await cq.answer()
 
 
-@dp.callback_query(F.data == "not_installed")
+@router.callback_query(F.data == "not_installed")
 async def cb_not_installed(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Установи сервер в консоли: awg2 → Сервер (1) → п.2", show_alert=True)
 
 
-@dp.callback_query(F.data == "status")
+@router.callback_query(F.data == "status")
 async def cb_status(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await safe_edit(cq, status_text(), kb.back_button("menu"))
     await cq.answer()
 
 
 # ───────────────────────── клиенты ─────────────────────────
-@dp.callback_query(F.data == "clients")
+@router.callback_query(F.data == "clients")
 async def cb_clients(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await state.clear()
     peers = core.list_peers()
     txt = f"<b>👥 Клиенты ({len(peers)})</b>\n\n🟢 онлайн · ⚪️ офлайн · 🚫 заблокирован"
@@ -341,10 +436,8 @@ async def cb_clients(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("clpage:"))
+@router.callback_query(F.data.startswith("clpage:"))
 async def cb_clients_page(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await state.clear()
     _, page_s, sort_s = cq.data.split(":")
     page, sort_active = int(page_s), bool(int(sort_s))
@@ -354,7 +447,7 @@ async def cb_clients_page(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "noop")
+@router.callback_query(F.data == "noop")
 async def cb_noop(cq: CallbackQuery) -> None:
     await cq.answer()  # кнопка-счётчик страниц, ничего не делает
 
@@ -364,10 +457,8 @@ def _peer_by_idx(idx: int) -> core.Peer | None:
     return peers[idx] if 0 <= idx < len(peers) else None
 
 
-@dp.callback_query(F.data.startswith("client:"))
+@router.callback_query(F.data.startswith("client:"))
 async def cb_client_card(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -376,10 +467,8 @@ async def cb_client_card(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("cl_conf:"))
+@router.callback_query(F.data.startswith("cl_conf:"))
 async def cb_client_conf(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p or not os.path.isfile(p.conf_path):
@@ -392,10 +481,8 @@ async def cb_client_conf(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("cl_qr:"))
+@router.callback_query(F.data.startswith("cl_qr:"))
 async def cb_client_qr(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p or not os.path.isfile(p.conf_path):
@@ -418,10 +505,8 @@ async def cb_client_qr(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("cl_del:"))
+@router.callback_query(F.data.startswith("cl_del:"))
 async def cb_client_del(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -434,10 +519,8 @@ async def cb_client_del(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("cl_delok:"))
+@router.callback_query(F.data.startswith("cl_delok:"))
 async def cb_client_delok(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -449,10 +532,8 @@ async def cb_client_delok(cq: CallbackQuery) -> None:
 
 
 # ── добавление клиента (FSM) ──
-@dp.callback_query(F.data == "client_add")
+@router.callback_query(F.data == "client_add")
 async def cb_client_add(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await state.set_state(Flow.add_name)
     await safe_edit(
         cq,
@@ -463,10 +544,8 @@ async def cb_client_add(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.message(Flow.add_name)
+@router.message(Flow.add_name)
 async def msg_add_name(msg: Message, state: FSMContext) -> None:
-    if not authorized(msg.from_user.id):
-        return await deny(msg)
     name = (msg.text or "").strip()
     # базовая валидация имени до выбора профиля
     if not core.NAME_RE.match(name):
@@ -504,10 +583,8 @@ async def msg_add_name(msg: Message, state: FSMContext) -> None:
     )
 
 
-@dp.callback_query(Flow.add_profile, F.data.startswith("prof:"))
+@router.callback_query(Flow.add_profile, F.data.startswith("prof:"))
 async def cb_add_profile(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     profile = cq.data.split(":")[1]
     data = await state.get_data()
     name = data.get("add_name", "")
@@ -542,10 +619,8 @@ async def _create_with_profile(target, state: FSMContext, name: str, profile: st
 
 
 # ── смена мимикрии у выданного клиента ──
-@dp.callback_query(F.data.startswith("cl_mim:"))
+@router.callback_query(F.data.startswith("cl_mim:"))
 async def cb_client_mimicry(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -565,10 +640,8 @@ async def cb_client_mimicry(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("cl_mim_set:"))
+@router.callback_query(F.data.startswith("cl_mim_set:"))
 async def cb_client_mimicry_set(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     parts = cq.data.split(":")
     if len(parts) != 3:
         return await cq.answer("Некорректный запрос", show_alert=True)
@@ -603,10 +676,8 @@ async def cb_client_mimicry_set(cq: CallbackQuery) -> None:
 
 
 # ── переименование (FSM) ──
-@dp.callback_query(F.data.startswith("cl_ren:"))
+@router.callback_query(F.data.startswith("cl_ren:"))
 async def cb_client_ren(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -617,10 +688,8 @@ async def cb_client_ren(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.message(Flow.rename)
+@router.message(Flow.rename)
 async def msg_rename(msg: Message, state: FSMContext) -> None:
-    if not authorized(msg.from_user.id):
-        return await deny(msg)
     data = await state.get_data()
     await state.clear()
     ok, text = await asyncio.to_thread(core.rename_client, data["old"], (msg.text or "").strip())
@@ -630,10 +699,8 @@ async def msg_rename(msg: Message, state: FSMContext) -> None:
 
 
 # ── заметки (FSM) ──
-@dp.callback_query(F.data.startswith("cl_note:"))
+@router.callback_query(F.data.startswith("cl_note:"))
 async def cb_client_note(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -653,10 +720,8 @@ async def cb_client_note(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.message(Flow.note_text)
+@router.message(Flow.note_text)
 async def msg_note(msg: Message, state: FSMContext) -> None:
-    if not authorized(msg.from_user.id):
-        return await deny(msg)
     data = await state.get_data()
     await state.clear()
     txt = (msg.text or "").strip()
@@ -681,10 +746,8 @@ async def msg_note(msg: Message, state: FSMContext) -> None:
 
 
 # ── мониторинг активности (кнопка «Активность» = маркер #ping) ──
-@dp.callback_query(F.data.startswith("cl_mon:"))
+@router.callback_query(F.data.startswith("cl_mon:"))
 async def cb_client_monitor(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     _, raw_idx, raw_on = cq.data.split(":")
     idx = int(raw_idx)
     p = _peer_by_idx(idx)
@@ -698,18 +761,14 @@ async def cb_client_monitor(cq: CallbackQuery) -> None:
 
 
 # ── WARP на клиента ──
-@dp.callback_query(F.data == "warp_not_installed")
+@router.callback_query(F.data == "warp_not_installed")
 async def cb_warp_not_installed(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("WARP не установлен. Установи через Туннели → WARP или sudo awg2.",
                     show_alert=True)
 
 
-@dp.callback_query(F.data.startswith("cl_warp_on:"))
+@router.callback_query(F.data.startswith("cl_warp_on:"))
 async def cb_warp_on(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -720,10 +779,8 @@ async def cb_warp_on(cq: CallbackQuery) -> None:
     await safe_edit(cq, client_card_text(p), _card_kb(idx, p))
 
 
-@dp.callback_query(F.data.startswith("cl_warp_off:"))
+@router.callback_query(F.data.startswith("cl_warp_off:"))
 async def cb_warp_off(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -735,10 +792,8 @@ async def cb_warp_off(cq: CallbackQuery) -> None:
 
 
 # ── DNS upstream (серверный DNSCrypt) ──
-@dp.callback_query(F.data == "dns_upstream")
+@router.callback_query(F.data == "dns_upstream")
 async def cb_dns_upstream(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     if not core.dnscrypt_installed():
         return await cq.answer("Шифрованный DNS не установлен. Сначала DNS: установить.",
                                show_alert=True)
@@ -750,10 +805,8 @@ async def cb_dns_upstream(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("dns_up:"))
+@router.callback_query(F.data.startswith("dns_up:"))
 async def cb_dns_up_set(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     key = cq.data.split(":")[1]
     await cq.answer("Применяю и перезапускаю DNSCrypt…")
     ok, msg = await asyncio.to_thread(core.set_dns_upstream, key)
@@ -763,18 +816,14 @@ async def cb_dns_up_set(cq: CallbackQuery) -> None:
                     kb.dns_upstream_choices())
 
 
-@dp.callback_query(F.data == "expire")
+@router.callback_query(F.data == "expire")
 async def cb_expire(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await safe_edit(cq, "<b>⏳ Сроки действия клиентов</b>", kb.expire_menu())
     await cq.answer()
 
 
-@dp.callback_query(F.data == "exp_list")
+@router.callback_query(F.data == "exp_list")
 async def cb_exp_list(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     peers = [p for p in core.list_peers() if p.expires]
     if not peers:
         await safe_edit(cq, "Нет клиентов со сроком — все бессрочные.", kb.expire_menu())
@@ -789,10 +838,8 @@ async def cb_exp_list(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("cl_exp:"))
+@router.callback_query(F.data.startswith("cl_exp:"))
 async def cb_cl_exp(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -805,10 +852,8 @@ async def cb_cl_exp(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("exp_set:"))
+@router.callback_query(F.data.startswith("exp_set:"))
 async def cb_exp_set(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     _, idx_s, spec = cq.data.split(":")
     idx = int(idx_s)
     p = _peer_by_idx(idx)
@@ -821,10 +866,8 @@ async def cb_exp_set(cq: CallbackQuery) -> None:
     await safe_edit(cq, client_card_text(p), _card_kb(idx, p))
 
 
-@dp.callback_query(F.data.startswith("exp_clear:"))
+@router.callback_query(F.data.startswith("exp_clear:"))
 async def cb_exp_clear(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -835,10 +878,8 @@ async def cb_exp_clear(cq: CallbackQuery) -> None:
     await safe_edit(cq, client_card_text(p), _card_kb(idx, p))
 
 
-@dp.callback_query(F.data.startswith("exp_custom:"))
+@router.callback_query(F.data.startswith("exp_custom:"))
 async def cb_exp_custom(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     idx = int(cq.data.split(":")[1])
     p = _peer_by_idx(idx)
     if not p:
@@ -851,10 +892,8 @@ async def cb_exp_custom(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.message(Flow.expire_date)
+@router.message(Flow.expire_date)
 async def msg_exp_custom(msg: Message, state: FSMContext) -> None:
-    if not authorized(msg.from_user.id):
-        return await deny(msg)
     data = await state.get_data()
     await state.clear()
     ts = core.parse_duration((msg.text or "").strip())
@@ -868,10 +907,8 @@ async def msg_exp_custom(msg: Message, state: FSMContext) -> None:
         await msg.answer(client_card_text(p), reply_markup=_card_kb(data["idx"], p))
 
 
-@dp.callback_query(F.data == "exp_purge_confirm")
+@router.callback_query(F.data == "exp_purge_confirm")
 async def cb_exp_purge_confirm(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     now = int(time.time())
     victims = [p for p in core.list_peers() if p.expires and p.expires <= now and p.blocked]
     if not victims:
@@ -883,10 +920,8 @@ async def cb_exp_purge_confirm(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "exp_purge_ok")
+@router.callback_query(F.data == "exp_purge_ok")
 async def cb_exp_purge_ok(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     now = int(time.time())
     victims = [p for p in core.list_peers() if p.expires and p.expires <= now and p.blocked]
     cnt = 0
@@ -898,29 +933,23 @@ async def cb_exp_purge_ok(cq: CallbackQuery) -> None:
 
 
 # ───────────────────────── рестарт ─────────────────────────
-@dp.callback_query(F.data == "restart_confirm")
+@router.callback_query(F.data == "restart_confirm")
 async def cb_restart_confirm(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await safe_edit(cq, "Перезапустить интерфейс awg0?\nКлиенты переподключатся автоматически.",
                     kb.confirm(yes_cb="restart_ok", no_cb="menu", danger=False))
     await cq.answer()
 
 
-@dp.callback_query(F.data == "restart_ok")
+@router.callback_query(F.data == "restart_ok")
 async def cb_restart_ok(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Перезапускаю…")
     ok, msg = await asyncio.to_thread(core.restart_iface)
     await safe_edit(cq, ("✅ " if ok else "❌ ") + esc(msg), kb.back_button("menu"))
 
 
 # ───────────────────────── туннели / обслуживание (через awg2) ─────────────────────────
-@dp.callback_query(F.data == "tunnels")
+@router.callback_query(F.data == "tunnels")
 async def cb_tunnels(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     note = "" if wrapper.available() else "\n\n⚠️ Модуль pexpect не установлен — операции недоступны."
     await safe_edit(cq, "<b>🛡 Туннели</b>\nWARP и шифрованный DNS." + note,
                     kb.tunnels_menu())
@@ -934,37 +963,29 @@ TUNNEL_ACTIONS = {
 }
 
 
-@dp.callback_query(F.data == "t_warp_status")
+@router.callback_query(F.data == "t_warp_status")
 async def cb_warp_status(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Читаю статус WARP…")
     txt = await asyncio.to_thread(core.warp_status)
     await safe_edit(cq, f"<b>🌐 WARP</b>\n\n{esc(txt)}", kb.tunnels_menu())
 
-@dp.callback_query(F.data == "t_warp_restart")
+@router.callback_query(F.data == "t_warp_restart")
 async def cb_warp_restart(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Жёсткий рестарт WARP…")
     ok, msg = await asyncio.to_thread(core.warp_hard_restart)
     icon = "✅" if ok else "❌"
     await safe_edit(cq, f"<b>{icon} WARP рестарт</b>\n\n<pre>{esc(msg)}</pre>", kb.tunnels_menu())
 
 
-@dp.callback_query(F.data == "t_dns_status")
+@router.callback_query(F.data == "t_dns_status")
 async def cb_dns_status(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Читаю статус DNS…")
     txt = await asyncio.to_thread(core.dns_status)
     await safe_edit(cq, f"<b>🌐 Шифрованный DNS</b>\n\n{esc(txt)}", kb.tunnels_menu())
 
 
-@dp.callback_query(F.data.in_(TUNNEL_ACTIONS.keys()))
+@router.callback_query(F.data.in_(TUNNEL_ACTIONS.keys()))
 async def cb_tunnel_action(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     if not wrapper.available():
         return await cq.answer("Нужен pexpect и установленный awg2", show_alert=True)
     scenario = TUNNEL_ACTIONS[cq.data]
@@ -976,18 +997,14 @@ async def cb_tunnel_action(cq: CallbackQuery) -> None:
     await safe_edit(cq, f"<b>Результат:</b>\n<pre>{esc(tail)}</pre>{note}", kb.tunnels_menu())
 
 
-@dp.callback_query(F.data == "maint")
+@router.callback_query(F.data == "maint")
 async def cb_maint(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await safe_edit(cq, "<b>🔧 Обслуживание</b>", kb.maint_menu())
     await cq.answer()
 
 
-@dp.callback_query(F.data == "show_server_conf")
+@router.callback_query(F.data == "show_server_conf")
 async def cb_show_conf(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     if not core.server_installed():
         return await cq.answer("Конфиг не найден", show_alert=True)
     data = open(core.SERVER_CONF, "rb").read()
@@ -998,10 +1015,8 @@ async def cb_show_conf(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "show_logs")
+@router.callback_query(F.data == "show_logs")
 async def cb_show_logs(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     rc, out, _ = await asyncio.to_thread(core.run, ["tail", "-n", "40", "/var/log/awg-manager.log"])
     txt = out.strip() or "(лог пуст)"
     await safe_edit(cq, f"<pre>{esc(txt[-3500:])}</pre>", kb.maint_menu())
@@ -1009,23 +1024,19 @@ async def cb_show_logs(cq: CallbackQuery) -> None:
 
 
 # ───────────────────────── управление самим ботом ─────────────────────────
-@dp.callback_query(F.data == "botctl")
-async def cb_botctl(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
+@router.callback_query(F.data == "botctl")
+async def cb_botctl(cq: CallbackQuery, owner: bool) -> None:
     await safe_edit(
         cq,
         "<b>🤖 Управление ботом</b>\n\n"
         "Те же действия доступны в консоли: <code>sudo awg-bot</code>.",
-        kb.botctl_menu(is_owner(cq.from_user.id)),
+        kb.botctl_menu(owner),
     )
     await cq.answer()
 
 
-@dp.callback_query(F.data == "bot_status")
-async def cb_bot_status(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
+@router.callback_query(F.data == "bot_status")
+async def cb_bot_status(cq: CallbackQuery, owner: bool) -> None:
     await cq.answer("Читаю статус…")
     rc, out, _ = await asyncio.to_thread(core.run, ["awg-bot", "status"])
     bl = core.bot_version_local()
@@ -1035,25 +1046,21 @@ async def cb_bot_status(cq: CallbackQuery) -> None:
             f"📡 Канал: <b>{'🧪 бета' if ch == 'beta' else '🛡 стабильный'}</b>\n\n")
     body = out.strip() or "awg-bot status недоступен"
     await safe_edit(cq, head + f"<pre>{esc(body[-3000:])}</pre>",
-                    kb.botctl_menu(is_owner(cq.from_user.id)))
+                    kb.botctl_menu(owner))
 
 
-@dp.callback_query(F.data == "bot_logs")
-async def cb_bot_logs(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
+@router.callback_query(F.data == "bot_logs")
+async def cb_bot_logs(cq: CallbackQuery, owner: bool) -> None:
     rc, out, _ = await asyncio.to_thread(
         core.run, ["journalctl", "-u", "awg-bot.service", "--no-pager", "-n", "50"])
     txt = out.strip() or "(лог пуст)"
     await safe_edit(cq, f"<pre>{esc(txt[-3500:])}</pre>",
-                    kb.botctl_menu(is_owner(cq.from_user.id)))
+                    kb.botctl_menu(owner))
     await cq.answer()
 
 
-@dp.callback_query(F.data == "bot_update")
+@router.callback_query(F.data == "bot_update")
 async def cb_bot_update(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Проверяю версии…")
     # читаем версии (сетевые — в потоке, чтобы не блокировать)
     bl = core.bot_version_local()
@@ -1092,10 +1099,8 @@ async def cb_bot_update(cq: CallbackQuery) -> None:
     await safe_edit(cq, txt, kb.update_menu(bot_upd, channel))
 
 
-@dp.callback_query(F.data == "bot_update_ok")
+@router.callback_query(F.data == "bot_update_ok")
 async def cb_bot_update_ok(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Обновляю бота из GitHub…")
     await safe_edit(cq, "⏳ Тяну свежую версию и перезапускаю бота…\n"
                         "Через ~20-30 сек нажми /start — увидишь новую версию.\n\n"
@@ -1124,30 +1129,24 @@ async def cb_bot_update_ok(cq: CallbackQuery) -> None:
                             "Бот остался на текущей версии, ничего не сломано.", None)
 
 
-@dp.callback_query(F.data == "bot_restart_confirm")
+@router.callback_query(F.data == "bot_restart_confirm")
 async def cb_bot_restart_confirm(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await safe_edit(cq, "Перезапустить бота? Текущая сессия меню прервётся, "
                         "после рестарта нажми /start.",
                     kb.confirm(yes_cb="bot_restart_ok", no_cb="botctl", danger=False))
     await cq.answer()
 
 
-@dp.callback_query(F.data == "bot_restart_ok")
+@router.callback_query(F.data == "bot_restart_ok")
 async def cb_bot_restart_ok(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Перезапускаю бота…")
     await safe_edit(cq, "↻ Перезапуск бота… нажми /start через несколько секунд.",
                     None)
     await asyncio.to_thread(core.run, ["systemctl", "restart", "awg-bot.service"])
 
 
-@dp.callback_query(F.data == "bot_uninstall_confirm")
+@router.callback_query(F.data == "bot_uninstall_confirm")
 async def cb_bot_uninstall_confirm(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await safe_edit(cq,
         "🗑 <b>Удалить бота полностью?</b>\n\n"
         "Будут остановлены и удалены сервис, код в /opt/awg-bot и команда awg-bot. "
@@ -1158,10 +1157,8 @@ async def cb_bot_uninstall_confirm(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "bot_uninstall_ok")
+@router.callback_query(F.data == "bot_uninstall_ok")
 async def cb_bot_uninstall_ok(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Удаляю бота…")
     await safe_edit(cq,
         "🗑 Удаляю бота…\n\nСервис остановится через пару секунд. "
@@ -1175,10 +1172,8 @@ async def cb_bot_uninstall_ok(cq: CallbackQuery) -> None:
     )
 
 
-@dp.callback_query(F.data == "bot_purge_confirm")
+@router.callback_query(F.data == "bot_purge_confirm")
 async def cb_bot_purge_confirm(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await safe_edit(cq,
         "💀 <b>Удалить бота под корень?</b>\n\n"
         "Дополнительно к обычному удалению будут снесены:\n"
@@ -1192,10 +1187,8 @@ async def cb_bot_purge_confirm(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "bot_purge_ok")
+@router.callback_query(F.data == "bot_purge_ok")
 async def cb_bot_purge_ok(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await cq.answer("Удаляю бота полностью…")
     await safe_edit(cq,
         "💀 Удаляю бота под корень…\n\nОтвечать он больше не будет. "
@@ -1209,10 +1202,8 @@ async def cb_bot_purge_ok(cq: CallbackQuery) -> None:
     )
 
 
-@dp.callback_query(F.data == "backup")
+@router.callback_query(F.data == "backup")
 async def cb_backup_menu(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await safe_edit(cq,
         "<b>💾 Бэкап / Восстановление</b>\n\n"
         "📥 <b>Создать</b> — бот пришлёт архив с конфигом сервера и всеми клиентами.\n"
@@ -1222,10 +1213,8 @@ async def cb_backup_menu(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "backup_create")
+@router.callback_query(F.data == "backup_create")
 async def cb_backup_create(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     import tarfile
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
@@ -1243,10 +1232,8 @@ async def cb_backup_create(cq: CallbackQuery) -> None:
     await cq.answer("Бэкап готов")
 
 
-@dp.callback_query(F.data == "backup_restore")
+@router.callback_query(F.data == "backup_restore")
 async def cb_backup_restore(cq: CallbackQuery, state: FSMContext) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     await state.set_state(Flow.await_backup)
     await safe_edit(cq,
         "📤 <b>Восстановление</b>\n\n"
@@ -1259,10 +1246,8 @@ async def cb_backup_restore(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.message(Flow.await_backup, F.document)
+@router.message(Flow.await_backup, F.document)
 async def msg_backup_file(msg: Message, state: FSMContext) -> None:
-    if not authorized(msg.from_user.id):
-        return await deny(msg)
     await state.clear()
     doc = msg.document
     if not doc.file_name.endswith(".tar.gz"):
@@ -1288,18 +1273,14 @@ async def msg_backup_file(msg: Message, state: FSMContext) -> None:
         await msg.answer(f"<b>👥 Клиенты ({len(peers)})</b>", reply_markup=kb.clients_menu(peers))
 
 
-@dp.message(Flow.await_backup)
+@router.message(Flow.await_backup)
 async def msg_backup_notfile(msg: Message, state: FSMContext) -> None:
-    if not authorized(msg.from_user.id):
-        return await deny(msg)
     await msg.answer("Жду файл бэкапа (.tar.gz). Пришли его как документ "
                      "или нажми «Назад» в меню бэкапа для отмены.")
 
 
-@dp.callback_query(F.data == "bot_channel")
+@router.callback_query(F.data == "bot_channel")
 async def cb_bot_channel(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     channel = core.update_channel()
     target = "stable" if channel == "beta" else "beta"
     src_kind, src_val = core.update_source()
@@ -1326,10 +1307,8 @@ async def cb_bot_channel(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("bot_channel_set:"))
+@router.callback_query(F.data.startswith("bot_channel_set:"))
 async def cb_bot_channel_set(cq: CallbackQuery) -> None:
-    if not authorized(cq.from_user.id):
-        return await deny(cq)
     target = cq.data.split(":", 1)[1]
     if target not in ("beta", "stable"):
         return await cq.answer("Неизвестный канал", show_alert=True)
@@ -1401,9 +1380,9 @@ def admins_text() -> str:
     return "\n".join(lines)
 
 
-@dp.callback_query(F.data == "admins")
-async def cb_admins(cq: CallbackQuery, state: FSMContext) -> None:
-    if not is_owner(cq.from_user.id):
+@router.callback_query(F.data == "admins")
+async def cb_admins(cq: CallbackQuery, state: FSMContext, owner: bool) -> None:
+    if not owner:
         return await deny_owner(cq)
     await state.clear()
     await safe_edit(cq, admins_text(),
@@ -1411,9 +1390,9 @@ async def cb_admins(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "adm_add")
-async def cb_admin_add(cq: CallbackQuery, state: FSMContext) -> None:
-    if not is_owner(cq.from_user.id):
+@router.callback_query(F.data == "adm_add")
+async def cb_admin_add(cq: CallbackQuery, state: FSMContext, owner: bool) -> None:
+    if not owner:
         return await deny_owner(cq)
     await state.clear()
     await safe_edit(cq,
@@ -1427,9 +1406,9 @@ async def cb_admin_add(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "adm_invite")
-async def cb_admin_invite(cq: CallbackQuery) -> None:
-    if not is_owner(cq.from_user.id):
+@router.callback_query(F.data == "adm_invite")
+async def cb_admin_invite(cq: CallbackQuery, owner: bool) -> None:
+    if not owner:
         return await deny_owner(cq)
     token, res = admins.create_invite(cq.from_user.id)
     if token is None:
@@ -1455,9 +1434,9 @@ async def cb_admin_invite(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data == "adm_revoke")
-async def cb_admin_revoke(cq: CallbackQuery) -> None:
-    if not is_owner(cq.from_user.id):
+@router.callback_query(F.data == "adm_revoke")
+async def cb_admin_revoke(cq: CallbackQuery, owner: bool) -> None:
+    if not owner:
         return await deny_owner(cq)
     n = admins.revoke_invites()
     await cq.answer(f"Отозвано приглашений: {n}" if n else "Живых приглашений нет")
@@ -1465,9 +1444,9 @@ async def cb_admin_revoke(cq: CallbackQuery) -> None:
                     kb.admins_menu(admins.list_invited(), admins.pending_invites()))
 
 
-@dp.callback_query(F.data == "adm_by_id")
-async def cb_admin_by_id(cq: CallbackQuery, state: FSMContext) -> None:
-    if not is_owner(cq.from_user.id):
+@router.callback_query(F.data == "adm_by_id")
+async def cb_admin_by_id(cq: CallbackQuery, state: FSMContext, owner: bool) -> None:
+    if not owner:
         return await deny_owner(cq)
     await state.set_state(Flow.add_admin_id)
     await safe_edit(cq,
@@ -1479,9 +1458,9 @@ async def cb_admin_by_id(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.answer()
 
 
-@dp.message(Flow.add_admin_id)
-async def msg_admin_by_id(msg: Message, state: FSMContext) -> None:
-    if not is_owner(msg.from_user.id):
+@router.message(Flow.add_admin_id)
+async def msg_admin_by_id(msg: Message, state: FSMContext, owner: bool) -> None:
+    if not owner:
         return await deny_owner(msg)
     raw = (msg.text or "").strip()
     if not raw.isdigit():
@@ -1510,9 +1489,9 @@ async def msg_admin_by_id(msg: Message, state: FSMContext) -> None:
                      reply_markup=kb.back_button("admins"))
 
 
-@dp.callback_query(F.data.startswith("adm_del:"))
-async def cb_admin_del(cq: CallbackQuery) -> None:
-    if not is_owner(cq.from_user.id):
+@router.callback_query(F.data.startswith("adm_del:"))
+async def cb_admin_del(cq: CallbackQuery, owner: bool) -> None:
+    if not owner:
         return await deny_owner(cq)
     uid = cq.data.split(":", 1)[1]
     if not uid.isdigit():
@@ -1525,9 +1504,9 @@ async def cb_admin_del(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-@dp.callback_query(F.data.startswith("adm_delok:"))
-async def cb_admin_delok(cq: CallbackQuery) -> None:
-    if not is_owner(cq.from_user.id):
+@router.callback_query(F.data.startswith("adm_delok:"))
+async def cb_admin_delok(cq: CallbackQuery, owner: bool) -> None:
+    if not owner:
         return await deny_owner(cq)
     raw = cq.data.split(":", 1)[1]
     if not raw.isdigit():
@@ -1542,21 +1521,76 @@ async def cb_admin_delok(cq: CallbackQuery) -> None:
 
 
 # ───────────────────────── запуск ─────────────────────────
-async def main() -> None:
+# Порядок роутеров важен: /start обязан разбираться до всего остального, иначе
+# приглашение по deep-link упрётся в проверку доступа основного роутера.
+dp.include_routers(start_router, router)
+
+# Ссылку на фоновую задачу держим здесь. asyncio хранит только слабую ссылку на
+# task: без сильной сборщик мусора вправе убить мониторинг посреди работы.
+_monitor_task: asyncio.Task | None = None
+
+
+@dp.startup()
+async def on_startup() -> None:
     from . import monitor
+
+    global _monitor_task
     log.info("Бот запущен. Владельцы: %s, приглашённых админов: %s",
              CFG.admins, len(admins.invited_ids()))
+
+    # Накопленные за простой нажатия обрабатывать нельзя: экраны, которым они
+    # адресованы, давно устарели, а Telegram всё равно отвергнет ответ на такой
+    # callback как «query is too old». Заодно снимаем возможный вебхук —
+    # с ним getUpdates не работает вовсе.
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        log.warning("delete_webhook: %s", e)
+
+    # Кнопка «Меню» в клиенте Telegram. Команда одна, но без неё пользователь
+    # видит пустой список и вводит /start руками.
+    try:
+        await bot.set_my_commands([BotCommand(command="start", description="Главное меню")])
+    except Exception as e:
+        log.warning("set_my_commands: %s", e)
+
     # одноразовая чистка legacy "# note=" из конфига (баг ранних версий)
     try:
-        n = core.cleanup_legacy_notes()
+        n = await asyncio.to_thread(core.cleanup_legacy_notes)
         if n:
             log.info("Вычищено legacy note= строк из конфига: %s", n)
     except Exception as e:
         log.warning("cleanup_legacy_notes: %s", e)
+
     # фоновый мониторинг активности клиентов с #ping
     # список получателей — функцией: приглашённый админ начинает получать
     # уведомления сразу, без перезапуска бота
-    asyncio.create_task(monitor.monitor_loop(bot, all_admin_ids))
+    _monitor_task = asyncio.create_task(
+        monitor.monitor_loop(bot, all_admin_ids), name="monitor")
+
+
+@dp.shutdown()
+async def on_shutdown() -> None:
+    """Гасим мониторинг до закрытия сессии бота.
+
+    systemd шлёт SIGTERM (awg-bot restart, обновление бота из меню), aiogram
+    ловит сигнал и вызывает этот хук. Без явной отмены задача успевает уйти в
+    send_message на уже закрытой сессии и оставляет в логе трейс на ровном месте.
+    """
+    global _monitor_task
+    if _monitor_task is not None:
+        _monitor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _monitor_task
+        _monitor_task = None
+    log.info("Бот остановлен")
+
+
+async def main() -> None:
+    # Сигналы (SIGINT/SIGTERM) и закрытие HTTP-сессии aiogram берёт на себя:
+    # handle_signals=True и close_bot_session=True — значения по умолчанию.
+    # allowed_updates не задаём: aiogram сам выведет список типов обновлений
+    # из зарегистрированных обработчиков и не будет тянуть лишнее.
     await dp.start_polling(bot)
 
 

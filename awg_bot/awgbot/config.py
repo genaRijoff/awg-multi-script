@@ -28,7 +28,18 @@ def _read_file(path: str) -> dict[str, str]:
     p = Path(path)
     if not p.is_file():
         return data
-    for line in p.read_text().splitlines():
+    try:
+        text = p.read_text()
+    except OSError as e:
+        # Файл есть, а прочитать нельзя: чаще всего конфиг с токеном лежит с
+        # правами root:root 600, а бота запустили не от root. Трейс на пол-экрана
+        # тут ничего не объясняет, поэтому падаем с внятной строкой.
+        raise SystemExit(
+            f"{path} не читается ({e.strerror}). "
+            "Запусти бота от пользователя, которому доступен конфиг, "
+            "или передай BOT_TOKEN и ADMIN_ID переменными окружения."
+        ) from e
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
