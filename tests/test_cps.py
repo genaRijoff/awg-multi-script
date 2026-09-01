@@ -275,8 +275,18 @@ def check_stun(pkt, expect_host=None, offset=0, allow_tail=False):
         o += 4 + al + ((4 - (al % 4)) % 4)
     assert o == end, "атрибуты вышли за границу сообщения"
     assert 0x0006 in attrs, "нет USERNAME"
-    assert 0x8022 in attrs, "нет SOFTWARE"
     assert 0x8028 in attrs, "нет FINGERPRINT"
+    # SOFTWARE в STUN необязателен (RFC 5389 §15.10). Он есть, когда пакет
+    # изображает клиента известного провайдера, и его НЕ должно быть, когда
+    # хост подменён своим доменом: вендорское имя рядом с чужим хостом — та
+    # самая несостыковка, ради устранения которой атрибут и убирается.
+    if expect_host:
+        assert 0x8022 not in attrs, (
+            "при своём домене остался вендорский SOFTWARE: %r" % attrs[0x8022])
+        assert attrs.get(0x0014, expect_host.encode()) == expect_host.encode(), (
+            "REALM %r не совпал со своим доменом" % attrs.get(0x0014))
+    else:
+        assert 0x8022 in attrs, "нет SOFTWARE"
     import zlib
     crc = (zlib.crc32(pkt[offset:end-8]) ^ 0x5354554E) & 0xFFFFFFFF
     assert int.from_bytes(attrs[0x8028], "big") == crc, "FINGERPRINT не сходится с CRC32"
@@ -339,6 +349,23 @@ def check_ssdp(pkt):
     assert hdr["man"] == '"ssdp:discover"', "MAN не ssdp:discover"
     assert hdr["mx"].isdigit() and 1 <= int(hdr["mx"]) <= 5, "MX вне 1-5"
     return "SSDP M-SEARCH ok: ST=%s" % hdr["st"]
+
+
+def stun_attrs(pkt, offset=0):
+    """Атрибуты STUN-сообщения — для проверок, общих на всю цепочку I1-I5."""
+    end = offset + 20 + int.from_bytes(pkt[offset+2:offset+4], "big")
+    o, attrs = offset + 20, {}
+    while o + 4 <= end:
+        at = int.from_bytes(pkt[o:o+2], "big")
+        al = int.from_bytes(pkt[o+2:o+4], "big")
+        attrs[at] = pkt[o+4:o+4+al]
+        o += 4 + al + ((4 - (al % 4)) % 4)
+    return attrs
+
+
+def dns_query_type(pkt):
+    """QTYPE вопроса: он стоит перед QCLASS, а дальше только запись OPT (11 байт)."""
+    return int.from_bytes(pkt[-15:-13], "big")
 
 
 def check_webrtc(pkt):
@@ -415,6 +442,38 @@ for profile, domain in CASES:
             fail += 1
             print("  FAIL %-21s I%d %5dB  %s: %s"
                   % (label, i, len(line) // 2, type(e).__name__, e))
+
+    # ── связность ЦЕПОЧКИ, а не отдельного пакета ──
+    # Пакеты I1-I5 уходят подряд от одного клиента, поэтому смотреть их надо
+    # вместе: по отдельности каждый может быть безупречен, а вместе они выдают
+    # то, чего в жизни не бывает.
+    try:
+        packets = [parse_line(line) for line in out]
+        if profile in ("stun", "webrtc"):
+            softwares = {bytes(stun_attrs(p).get(0x8022, b"")) for p in packets}
+            assert len(softwares) == 1, (
+                "клиент представился по-разному в одной цепочке: %s"
+                % sorted(x.decode(errors="replace") for x in softwares))
+            # Строки-заглушки в креденшелах — прямая сигнатура: их можно искать
+            # байтовым сравнением, без всякой статистики.
+            usernames = b" ".join(stun_attrs(p).get(0x0006, b"") for p in packets)
+            for literal in (b"a1b2c3d4e5f6g7h8i9j0", b"abcdef1234567890abcd",
+                            b"1a2b3c4d5e6f7g8h9i0j", b"1234567890abcdef1234"):
+                assert literal not in usernames, (
+                    "в USERNAME литеральная заглушка %r" % literal)
+            who = list(softwares)[0].decode(errors="replace") or "без SOFTWARE"
+            print("  OK  %-22s цепочка: один клиент (%s), креденшелы случайны"
+                  % (label, who))
+        if profile == "dns":
+            qtypes = [dns_query_type(p) for p in packets]
+            assert len(set(qtypes)) > 1, (
+                "вся цепочка спрашивает один тип записи: %s" % qtypes)
+            adjacent = [a for a, b in zip(qtypes, qtypes[1:]) if a == b]
+            assert not adjacent, "два одинаковых запроса подряд: %s" % qtypes
+            print("  OK  %-22s цепочка: типы запросов %s" % (label, qtypes))
+    except Exception as e:
+        fail += 1
+        print("  FAIL %-21s цепочка  %s: %s" % (label, type(e).__name__, e))
 
 os.unlink(GEN)
 print("\nпровалов:", fail)

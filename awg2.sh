@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.30"
+VERSION="v0.7.31"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -900,10 +900,6 @@ TWILIO_TURN_SERVERS = [
     "ie01-1.turn.twilio.com", "ie01-2.turn.twilio.com", "jp01-1.turn.twilio.com",
     "jp01-2.turn.twilio.com", "au01-1.turn.twilio.com", "br01-1.turn.twilio.com",
     "in01-1.turn.twilio.com",
-]
-TWILIO_TURN_USERNAME_PREFIXES = [
-    "a1b2c3d4e5f6g7h8i9j0", "1a2b3c4d5e6f7g8h9i0j",
-    "abcdef1234567890abcd", "1234567890abcdef1234",
 ]
 TWILIO_REALM = "twilio.com"
 GOOGLE_STUN_SERVERS = [
@@ -1850,13 +1846,44 @@ def build_dns_question(query_id, flags, name_bytes, type_value, class_value,
             u16(additional_count) + name_bytes + u16(type_value) +
             u16(class_value) + additional_record)
 
+def next_dns_query_type(options):
+    """Тип запроса для очередного пакета цепочки — без повторов подряд.
+
+    Раньше тип разыгрывался независимо на каждый из пяти пакетов, и они
+    схлопывались: четыре одинаковых запроса из пяти — обычный расклад. Живой
+    stub-резолвер по одному имени спрашивает РАЗНОЕ (A, AAAA, у браузеров ещё
+    HTTPS), а повторяет только при потере ответа. Раздаём типы по кругу,
+    перемешивая порядок на каждом проходе: типов три, пакетов пять, поэтому
+    два повтора остаются — но они выглядят как обычный ретрай, тем более что
+    идентификатор запроса у каждого пакета теперь свой.
+    """
+    queue = options.get("_dnsQueue")
+    if not queue:
+        queue = list(DNS_QUERY_TYPES)
+        # Перемешивание Фишера-Йетса на нашем источнике случайности
+        for i in range(len(queue) - 1, 0, -1):
+            j = ri(i + 1)
+            queue[i], queue[j] = queue[j], queue[i]
+        # Стык проходов: типов три, пакетов пять, поэтому круг начинается
+        # заново — и может начаться тем же типом, которым кончился прошлый.
+        # Два одинаковых запроса ПОДРЯД — это уже не ретрай (тот приходит
+        # через таймаут, а не встык), поэтому такой стык разводим.
+        last = options.get("_dnsLast")
+        if last is not None and len(queue) > 1 and queue[0] == last:
+            queue[0], queue[-1] = queue[-1], queue[0]
+        options["_dnsQueue"] = queue
+    qtype = queue.pop(0)
+    options["_dnsLast"] = qtype
+    return qtype
+
 def generate_dns_payload(options):
     # Идентификатор запроса резолвер выбирает случайно на каждый запрос — это
     # штатная защита от подделки ответа (RFC 5452), поэтому тег здесь не только
     # безопасен, но и правдоподобнее фиксированного значения.
     query_id = ri(65535)
     payload = build_dns_question(query_id, 0x0100, encode_dns_name(options["host"]),
-                                 rc(DNS_QUERY_TYPES), 0x0001, build_dns_opt_record(1232))
+                                 next_dns_query_type(options), 0x0001,
+                                 build_dns_opt_record(1232))
     dyn(u16(query_id))
     return payload
 
@@ -2127,10 +2154,14 @@ def build_stun_message_with_fingerprint(message_type, attrs):
     crc_value = (crc32_stun(prefix + attr_bytes) ^ 0x5354554E) & 0xFFFFFFFF
     return prefix + attr_bytes + build_stun_attribute(0x8028, u32(crc_value))
 
+# Провайдеры ICE, из которых выбирает режим random. Список нужен и здесь, и в
+# build_options: разыгрывать провайдера обязаны ОДИН раз на всю цепочку I1-I5.
+STUN_PROVIDERS = ["google", "cloudflare", "meta", "twilio", "twilio_stun"]
+
 def resolve_stun_turn_profile(provider):
     provider = str(provider or "").strip().lower()
     if provider == "random":
-        provider = rc(["google", "cloudflare", "meta", "twilio", "twilio_stun"])
+        provider = rc(STUN_PROVIDERS)
     if provider == "twilio_stun":
         return {"id": "twilio", "serverPool": TWILIO_STUN_SERVERS, "realm": TWILIO_REALM,
                 "softwareName": "Twilio WebRTC ICE agent", "preferredMode": "binding",
@@ -2170,16 +2201,37 @@ def resolve_stun_turn_mode(options, profile):
         return "binding"
     return "allocate" if (ri(1000) / 1000.0) < profile["autoAllocateProbability"] else "binding"
 
-def stun_software_name(profile):
-    if profile["id"] == "meta":
-        return rc(["WhatsApp/2", "Instagram/2", "Messenger WebRTC"])
-    return profile["softwareName"]
+# Приложения Meta, которыми может представиться профиль meta. Выбор — один на
+# цепочку: WhatsApp не превращается в Instagram от пакета к пакету.
+META_SOFTWARE_NAMES = ["WhatsApp/2", "Instagram/2", "Messenger WebRTC"]
+
+def stun_software_name(profile, options=None):
+    if profile["id"] != "meta":
+        return profile["softwareName"]
+    if options is None:
+        return rc(META_SOFTWARE_NAMES)
+    name = options.get("_metaSoftware")
+    if not name:
+        name = rc(META_SOFTWARE_NAMES)
+        options["_metaSoftware"] = name
+    return name
+
+def twilio_username_token():
+    """Временный креденшел Twilio: 20 hex-символов.
+
+    Здесь стоял пул из четырёх строк-заглушек — "a1b2c3d4e5f6g7h8i9j0",
+    "abcdef1234567890abcd" и ещё две того же вида. Это не статистика и не
+    эвристика: четыре литерала, по которым любой DPI однозначно опознаёт всех,
+    кто пользуется этим профилем, — сигнатура жёстче, чем у самого WireGuard.
+    Форму (длину и алфавит) сохраняем, содержимое делаем случайным.
+    """
+    return to_hex(rb(10))
 
 def build_stun_binding_username(profile, server_host):
     if profile["id"] == "meta":
         return enc_text("WA-%d:%s" % (1000000000 + ri(9000000000), server_host))
     if profile["id"] == "twilio":
-        return enc_text("%s:%s" % (rc(TWILIO_TURN_USERNAME_PREFIXES), server_host))
+        return enc_text("%s:%s" % (twilio_username_token(), server_host))
     return enc_text("%s:%s" % (to_hex(rb(4)), server_host))
 
 def build_stun_allocate_username(profile, server_host):
@@ -2187,7 +2239,7 @@ def build_stun_allocate_username(profile, server_host):
         return enc_text("WA-%d@%s" % (1000000000 + ri(9000000000), server_host))
     suffix = str(ri(9000) + 1000)
     if profile["id"] == "twilio":
-        return enc_text("%s%s@%s" % (rc(TWILIO_TURN_USERNAME_PREFIXES), suffix, server_host))
+        return enc_text("%s%s@%s" % (twilio_username_token(), suffix, server_host))
     return enc_text("%s%s@%s" % (to_hex(rb(8)), suffix, server_host))
 
 def generate_stun_payload(options):
@@ -2198,6 +2250,18 @@ def generate_stun_payload(options):
     profile = resolve_stun_turn_profile(options.get("iceProvider") or "google")
     mode = resolve_stun_turn_mode(options, profile)
     server_host = options.get("iceServerHost") or rc(profile["serverPool"])
+
+    # Свой домен пользователя и провайдерская маркировка вместе не живут.
+    # Было: REALM = cloudflare.com, SOFTWARE = «Cloudflare WebRTC client», а
+    # USERNAME = <случайное>@<домен пользователя> — разбирающий STUN видит
+    # клиента, который представляется Cloudflare, а ходит к чужому хосту.
+    # Домен в пакете пользователю и нужен (в STUN больше негде показать имя),
+    # поэтому не выкидываем его, а снимаем противоречие: realm становится тем
+    # же доменом, а вендорские имена уходят — SOFTWARE в STUN необязателен
+    # (RFC 5389 §15.10), и клиенты его регулярно не шлют.
+    if options.get("iceServerHost"):
+        profile = dict(profile, id="generic", realm=server_host, softwareName=None)
+
     attrs = []
 
     if mode == "allocate":
@@ -2212,7 +2276,9 @@ def generate_stun_payload(options):
     else:
         username = build_stun_binding_username(profile, server_host)
 
-    attrs.append(build_stun_attribute(0x8022, enc_text(stun_software_name(profile))))
+    software = stun_software_name(profile, options)
+    if software:
+        attrs.append(build_stun_attribute(0x8022, enc_text(software)))
     attrs.append(build_stun_attribute(0x0024, u32(ru32() | 0x40000000)))
     attrs.append(build_stun_attribute(0x8029 if ri(2) == 0 else 0x802A,
                                       u32(ru32()) + u32(ru32())))
@@ -2283,8 +2349,23 @@ def build_options(profile, domain, domain_is_explicit, args):
         options["hasCustomHost"] = True
         options["sipAction"] = args["sip_action"]
     elif profile in ("stun", "webrtc"):
-        options["iceProvider"] = args["ice_provider"]
+        # random разыгрываем ЗДЕСЬ, один раз на цепочку, а не внутри
+        # resolve_stun_turn_profile на каждый пакет. Атрибут SOFTWARE описывает
+        # клиентскую реализацию, а не сервер: пять пакетов подряд, где клиент
+        # называется то «Google STUN client», то «Twilio WebRTC ICE agent»,
+        # то «Cloudflare WebRTC client», — это один браузер, объявивший себя
+        # тремя разными. Такого не бывает, и заметно это без всякой статистики.
+        provider = str(args["ice_provider"] or "").strip().lower()
+        if provider == "random":
+            provider = rc(STUN_PROVIDERS)
+        options["iceProvider"] = provider
         options["iceMode"] = args["ice_mode"]
+        # Имя приложения Meta фиксируем здесь же, а не лениво при первом
+        # пакете: профиль webrtc собирает STUN на КОПИИ options
+        # (dict(options)), и запомненное внутри копии значение до следующего
+        # пакета не доживает — цепочка снова представлялась бы тремя разными
+        # приложениями сразу.
+        options["_metaSoftware"] = rc(META_SOFTWARE_NAMES)
         # Домен подставляем в ICE только если его ввёл пользователь: при
         # автогенерации правдоподобнее пул серверов самого провайдера.
         options["iceServerHost"] = domain if domain_is_explicit else ""
