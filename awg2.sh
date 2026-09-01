@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.31"
+VERSION="v0.8.0"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -276,8 +276,143 @@ prompt_retry() {
   return 1
 }
 
-SERVER_CONF="/etc/amnezia/amneziawg/awg0.conf"
+SERVER_DIR="/etc/amnezia/amneziawg"
+SERVER_IFACE="${AWG_IFACE:-awg0}"
+SERVER_CONF="${SERVER_DIR}/${SERVER_IFACE}.conf"
 LOG_FILE="/var/log/awg-manager.log"
+
+# ── Multi-Server функции ──────────────────────────────────
+# Возвращает список имён всех установленных серверов (awg0, awg1, ...)
+get_installed_servers() {
+  local srvs=()
+  if [[ -d "$SERVER_DIR" ]]; then
+    local f base
+    for f in "$SERVER_DIR"/awg*.conf; do
+      if [[ -f "$f" ]]; then
+        base=$(basename "$f" .conf)
+        if [[ "$base" =~ ^awg[0-9]+$ ]]; then
+          srvs+=("$base")
+        fi
+      fi
+    done
+  fi
+  if [[ ${#srvs[@]} -gt 0 ]]; then
+    mapfile -t srvs < <(printf '%s\n' "${srvs[@]}" | sort -V -u)
+  fi
+  printf '%s\n' "${srvs[@]}"
+}
+
+# Переключает активный интерфейс/сервер
+set_active_server() {
+  local iface="${1:-awg0}"
+  SERVER_IFACE="$iface"
+  SERVER_CONF="${SERVER_DIR}/${SERVER_IFACE}.conf"
+  
+  if [[ -f "$SERVER_CONF" ]]; then
+    local saved_region
+    saved_region=$(grep -oP '^#\s*Region:\s*\K\w+' "$SERVER_CONF" 2>/dev/null | head -1 || true)
+    if [[ -n "$saved_region" ]]; then
+      SERVER_REGION="$saved_region"
+      if [[ "$saved_region" == "ru" ]]; then
+        TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
+        DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
+        SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
+        QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
+      else
+        TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
+        DTLS_DOMAINS=("${DTLS_DOMAINS_WORLD[@]}")
+        SIP_DOMAINS=("${SIP_DOMAINS_WORLD[@]}")
+        QUIC_DOMAINS=("${QUIC_DOMAINS_WORLD[@]}")
+      fi
+    fi
+  fi
+}
+
+# Ищет следующий свободный индекс интерфейса (awg0, awg1, awg2...)
+get_next_free_iface() {
+  local idx=0
+  while [[ -f "${SERVER_DIR}/awg${idx}.conf" ]]; do
+    idx=$((idx + 1))
+  done
+  echo "awg${idx}"
+}
+
+# Собирает все используемые порты во всех awg*.conf
+get_all_used_ports() {
+  local ports=()
+  if [[ -d "$SERVER_DIR" ]]; then
+    local f p
+    for f in "$SERVER_DIR"/awg*.conf; do
+      [[ -f "$f" ]] || continue
+      p=$(awk -F= '/^ListenPort/{gsub(/ /,"",$2); print $2}' "$f" 2>/dev/null | tr -dc '0-9' || true)
+      [[ -n "$p" ]] && ports+=("$p")
+    done
+  fi
+  printf '%s\n' "${ports[@]}"
+}
+
+# Собирает все используемые подсети во всех awg*.conf (первые 3 октета)
+get_all_used_subnets() {
+  local subnets=()
+  if [[ -d "$SERVER_DIR" ]]; then
+    local f addr base
+    for f in "$SERVER_DIR"/awg*.conf; do
+      [[ -f "$f" ]] || continue
+      addr=$(grep "^Address" "$f" 2>/dev/null | awk -F'=' '{print $2}' | tr -d ' ' | head -1 || true)
+      if [[ -n "$addr" ]]; then
+        base=$(echo "$addr" | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s", $1, $2, $3}')
+        [[ -n "$base" ]] && subnets+=("$base")
+      fi
+    done
+  fi
+  printf '%s\n' "${subnets[@]}"
+}
+
+# Меню переключения активного сервера
+do_switch_server_menu() {
+  local srvs=()
+  mapfile -t srvs < <(get_installed_servers)
+  if [[ ${#srvs[@]} -le 1 ]]; then
+    info "Установлен только один сервер (${SERVER_IFACE})"
+    return 0
+  fi
+
+  echo ""
+  hdr "⇄  Выбор активного сервера AWG"
+  echo ""
+  local i=1 sel=1
+  for s in "${srvs[@]}"; do
+    local st port peers
+    if ip link show "$s" &>/dev/null; then
+      st="${G}UP${N}"
+      port=$(awg show "$s" listen-port 2>/dev/null || echo "—")
+      peers=$(awg show "$s" peers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+    else
+      st="${R}DOWN${N}"
+      port=$(grep -m1 '^ListenPort' "${SERVER_DIR}/${s}.conf" 2>/dev/null | tr -dc '0-9' || echo "—")
+      peers=$(grep -c "^\[Peer\]" "${SERVER_DIR}/${s}.conf" 2>/dev/null || echo "0")
+    fi
+    local cur_mark=""
+    if [[ "$s" == "$SERVER_IFACE" ]]; then
+      cur_mark=" ${Y}★ [текущий]${N}"
+      sel=$i
+    fi
+    printf "  ${C}%d)${N} %-8s [%b]  порт: %-6s  клиентов: %-3s%b\n" "$i" "$s" "$st" "$port" "$peers" "$cur_mark"
+    i=$((i + 1))
+  done
+  echo ""
+  echo -e "  ${W}0)${N} ← Назад"
+  echo ""
+  local choice
+  read_choice choice "$(echo -e "${C}  Выбери сервер [1-${#srvs[@]}] (Enter = $sel, 0 = отмена): ${N}")" 0 "${#srvs[@]}" "$sel"
+  if [[ "$choice" == "0" ]]; then
+    return 0
+  fi
+  local target_iface="${srvs[$((choice - 1))]}"
+  set_active_server "$target_iface"
+  ok "Активный сервер изменён на: ${W}${SERVER_IFACE}${N}"
+  return 0
+}
 
 # Warp туннель (Cloudflare wgcf) — Туннели (5)
 WARP_DIR="/etc/wgcf"
@@ -3184,7 +3319,7 @@ do_sniff_test() {
 
   # Выбор клиента
   local endpoints_raw
-  endpoints_raw=$(awg show awg0 endpoints 2>/dev/null | awk 'NF==2 && $2!="(none)"')
+  endpoints_raw=$(awg show "$SERVER_IFACE" endpoints 2>/dev/null | awk 'NF==2 && $2!="(none)"')
   if [[ -z "$endpoints_raw" ]]; then
     warn "Нет подключённых клиентов"
     echo -e "${C}  Сначала подключись клиентом и вернись сюда${N}"
@@ -3298,6 +3433,7 @@ check_deps() {
   HAS_AWG=false
   HAS_SERVER_CONF=false
   HAS_BACKUPS=false
+  HAS_MULTIPLE_SERVERS=false
 
   # Кэш проверки бинарей (они не появляются/исчезают в течение сессии).
   # _DEPS_CACHED — пустая до первой проверки, потом "1".
@@ -3307,27 +3443,23 @@ check_deps() {
   fi
   HAS_AWG="$_CACHED_HAS_AWG"
 
-  [[ -f "$SERVER_CONF" ]] && HAS_SERVER_CONF=true
-
-  # Восстанавливаем SERVER_REGION из шапки конфига если сервер создан
-  if [[ -f "$SERVER_CONF" ]]; then
-    local saved_region
-    saved_region=$(grep -oP '^#\s*Region:\s*\K\w+' "$SERVER_CONF" 2>/dev/null | head -1 || true)
-    if [[ -n "$saved_region" ]]; then
-      SERVER_REGION="$saved_region"
-      # Пересобираем активные пулы под регион
-      if [[ "$saved_region" == "ru" ]]; then
-        TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_RU[@]}")
-        DTLS_DOMAINS=("${DTLS_DOMAINS_RU[@]}")
-        SIP_DOMAINS=("${SIP_DOMAINS_RU[@]}")
-        QUIC_DOMAINS=("${QUIC_DOMAINS_RU[@]}")
-      else
-        TLS_CLIENT_HELLO_DOMAINS=("${TLS_DOMAINS_WORLD[@]}")
-        DTLS_DOMAINS=("${DTLS_DOMAINS_WORLD[@]}")
-        SIP_DOMAINS=("${SIP_DOMAINS_WORLD[@]}")
-        QUIC_DOMAINS=("${QUIC_DOMAINS_WORLD[@]}")
-      fi
+  local installed_srvs=()
+  mapfile -t installed_srvs < <(get_installed_servers)
+  
+  if [[ ${#installed_srvs[@]} -gt 0 ]]; then
+    HAS_SERVER_CONF=true
+    (( ${#installed_srvs[@]} > 1 )) && HAS_MULTIPLE_SERVERS=true
+    # Если текущий SERVER_CONF не существует, переключаем на первый найденный
+    if [[ ! -f "$SERVER_CONF" ]]; then
+      set_active_server "${installed_srvs[0]}"
+    else
+      # Перечитываем регион активного сервера
+      set_active_server "$SERVER_IFACE"
     fi
+  else
+    HAS_SERVER_CONF=false
+    SERVER_IFACE="awg0"
+    SERVER_CONF="${SERVER_DIR}/${SERVER_IFACE}.conf"
   fi
 
   # Проверка бекапов
@@ -3478,7 +3610,13 @@ rand_range() {
   local lo="$1" hi="$2"
   # Защита: если lo > hi, возвращаем lo (избегаем ошибки python randint)
   if [[ "$lo" -gt "$hi" ]]; then echo "$lo"; return 0; fi
-  python3 -c "import random; print(random.randint($lo, $hi))"
+  if command -v python3 &>/dev/null; then
+    python3 -c "import random; print(random.randint($lo, $hi))" 2>/dev/null && return 0
+  fi
+  if command -v python &>/dev/null; then
+    python -c "import random; print(random.randint($lo, $hi))" 2>/dev/null && return 0
+  fi
+  echo "$(( lo + (RANDOM * 32768 + RANDOM) % (hi - lo + 1) ))"
 }
 
 # Форматирует секунды в человеческий вид: 5с / 3м12с / 2ч15м / 3д4ч
@@ -3516,16 +3654,22 @@ find_free_ip() {
 }
 
 get_status() {
+  local iface="${1:-$SERVER_IFACE}"
   local ip port status clients
   ip=$(get_public_ip)
   if [[ -z "$ip" ]]; then ip="—"; fi
-  if ip link show awg0 &>/dev/null; then
+  if ip link show "$iface" &>/dev/null; then
     status="${G}активен${N}"
-    port=$(awg show awg0 listen-port 2>/dev/null || echo "—")
-    clients=$(awg show awg0 peers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+    port=$(awg show "$iface" listen-port 2>/dev/null || echo "—")
+    clients=$(awg show "$iface" peers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
   else
     status="${R}не активен${N}"
-    port="—"; clients="—"
+    if [[ -f "${SERVER_DIR}/${iface}.conf" ]]; then
+      port=$(grep -m1 '^ListenPort' "${SERVER_DIR}/${iface}.conf" 2>/dev/null | tr -dc '0-9' || echo "—")
+      clients=$(grep -c "^\[Peer\]" "${SERVER_DIR}/${iface}.conf" 2>/dev/null || echo "0")
+    else
+      port="—"; clients="—"
+    fi
   fi
   echo -e "$ip|$port|$status|$clients"
 }
@@ -4117,44 +4261,44 @@ do_repair() {
   fi
 
   # 4. Интерфейс
-  if ip link show awg0 &>/dev/null; then
-    ok "Интерфейс awg0 присутствует"
+  if ip link show "$SERVER_IFACE" &>/dev/null; then
+    ok "Интерфейс ${SERVER_IFACE} присутствует"
 
     # Проверка состояния (UP/DOWN)
-    if ip link show awg0 | grep -q "state UP\|UP,"; then
-      ok "awg0 в состоянии UP"
+    if ip link show "$SERVER_IFACE" | grep -q "state UP\|UP,"; then
+      ok "${SERVER_IFACE} в состоянии UP"
     else
-      warn "awg0 существует, но не UP"
+      warn "${SERVER_IFACE} существует, но не UP"
       issues=$((issues+1))
-      ip link set awg0 up 2>/dev/null && ok "awg0 поднят" && fixed=$((fixed+1)) || \
+      ip link set "$SERVER_IFACE" up 2>/dev/null && ok "${SERVER_IFACE} поднят" && fixed=$((fixed+1)) || \
         warn "Не удалось поднять, попробуем перезапуск"
     fi
 
     # Сверяем количество peer'ов в конфиге и в ядре
     local conf_peers live_peers
     conf_peers=$(grep -c "^\[Peer\]" "$SERVER_CONF" 2>/dev/null || echo "0")
-    live_peers=$(awg show awg0 peers 2>/dev/null | wc -l | tr -d ' ')
+    live_peers=$(awg show "$SERVER_IFACE" peers 2>/dev/null | wc -l | tr -d ' ')
     if [[ "$conf_peers" != "$live_peers" ]]; then
       warn "Расхождение: в конфиге $conf_peers пиров, в ядре $live_peers"
       issues=$((issues+1))
-      info "Перезапуск awg0 для синхронизации..."
+      info "Перезапуск ${SERVER_IFACE} для синхронизации..."
       awg-quick down "$SERVER_CONF" 2>/dev/null || true
       sleep 1
       if awg_up_diag "$SERVER_CONF"; then
-        ok "awg0 перезапущен — пиры синхронизированы"
+        ok "${SERVER_IFACE} перезапущен — пиры синхронизированы"
         fixed=$((fixed+1))
       else
-        err "Не удалось перезапустить awg0"
+        err "Не удалось перезапустить ${SERVER_IFACE}"
       fi
     else
       ok "Пиры синхронизированы ($conf_peers)"
     fi
   else
-    warn "Интерфейс awg0 НЕ существует"
+    warn "Интерфейс ${SERVER_IFACE} НЕ существует"
     issues=$((issues+1))
     info "Запускаю: awg-quick up $SERVER_CONF"
     if awg_up_diag "$SERVER_CONF"; then
-      ok "awg0 запущен"
+      ok "${SERVER_IFACE} запущен"
       fixed=$((fixed+1))
     else
       err "awg-quick up провалился — причина выше"
@@ -4174,13 +4318,13 @@ do_repair() {
         ok "MASQUERADE добавлен" && fixed=$((fixed+1))
     fi
 
-    if iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1; then
-      ok "iptables FORWARD -i awg0 ACCEPT"
+    if iptables -C FORWARD -i "$SERVER_IFACE" -j ACCEPT >/dev/null 2>&1; then
+      ok "iptables FORWARD -i ${SERVER_IFACE} ACCEPT"
     else
-      warn "iptables FORWARD -i awg0 отсутствует"
+      warn "iptables FORWARD -i ${SERVER_IFACE} отсутствует"
       issues=$((issues+1))
-      iptables -A FORWARD -i awg0 -j ACCEPT && \
-        ok "FORWARD -i awg0 добавлен" && fixed=$((fixed+1))
+      iptables -A FORWARD -i "$SERVER_IFACE" -j ACCEPT && \
+        ok "FORWARD -i ${SERVER_IFACE} добавлен" && fixed=$((fixed+1))
     fi
   fi
 
@@ -4569,10 +4713,10 @@ do_self_update() {
 show_header() {
   clear
   local s ip port st clients
-  s=$(get_status)
+  s=$(get_status "$SERVER_IFACE")
   IFS='|' read -r ip port st clients <<< "$s"
 
-  # Читаем профиль из awg0.conf (Lite / Standard / Pro / —)
+  # Читаем профиль из активного конфига (Lite / Standard / Pro / —)
   local profile_raw="—"
   local profile_label="—"
   if [[ -f "$SERVER_CONF" ]]; then
@@ -4584,16 +4728,27 @@ show_header() {
       "")       profile_label="—" ;;
       *)        profile_label="$profile_raw" ;;
     esac
-    # Версия протокола: маркера нет у серверов, созданных до 0.7.3 — там 2.0
     local proto_raw
     proto_raw=$(grep -m1 '^# AWG_PROTO=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
     profile_label="${profile_label} ${D}/ AWG ${proto_raw:-2.0}${N}"
   fi
 
+  local all_srvs=() srv_summary=""
+  mapfile -t all_srvs < <(get_installed_servers)
+  if [[ ${#all_srvs[@]} -gt 1 ]]; then
+    local s_parts=()
+    for sv in "${all_srvs[@]}"; do
+      if [[ "$sv" == "$SERVER_IFACE" ]]; then
+        s_parts+=("${W}★${sv}${N}")
+      else
+        s_parts+=("${D}${sv}${N}")
+      fi
+    done
+    srv_summary=" ${D}(серверы: ${s_parts[*]})${N}"
+  fi
+
   # Бейдж новой версии — из кэша, без обращения к сети (см. update_check_async)
   local _upd _ver_line _ch_badge=""
-  # На бета-канале это должно быть видно с первого экрана — иначе непонятно,
-  # откуда приехала версия, которой нет у остальных.
   [[ "$UPDATE_CHANNEL" == "beta" ]] && _ch_badge=" ${Y}[beta]${N}"
   _upd=$(update_available || true)
   if [[ -n "$_upd" ]]; then
@@ -4608,7 +4763,7 @@ show_header() {
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
   echo -e "  IP сервера : ${W}$ip${N}"
   echo -e "  Порт       : ${W}$port${N}"
-  echo -e "  Интерфейс  : $st${N}"
+  echo -e "  Интерфейс  : ${W}${SERVER_IFACE}${N} [$st]${srv_summary}"
   echo -e "  Профиль    : ${W}$profile_label${N}"
   echo -e "  Клиентов   : ${W}$clients${N}"
   echo -e "${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
@@ -4650,50 +4805,85 @@ show_submenu_1() {
     check_deps
     show_header
     echo ""
-    hdr "Сервер"
+    hdr "Сервер (${SERVER_IFACE})"
     echo ""
     echo -e "  ${C}1)${N} Установка зависимостей и AmneziaWG"
     if $HAS_AWG; then
-      echo -e "  ${C}2)${N} Создать сервер + первый клиент (с мимикрией)"
+      if $HAS_SERVER_CONF; then
+        local next_if
+        next_if=$(get_next_free_iface)
+        echo -e "  ${C}2)${N} Создать дополнительный сервер (${next_if}) + клиент"
+      else
+        echo -e "  ${C}2)${N} Создать сервер (awg0) + первый клиент"
+      fi
     else
       echo -e "  ${D}2) Создать сервер (нужен пункт 1)${N}"
     fi
-    if $HAS_SERVER_CONF; then
-      echo -e "  ${C}3)${N} Перезапустить awg0"
-    else
-      echo -e "  ${D}3) Перезапустить awg0 (нужен пункт 2)${N}"
+
+    if $HAS_MULTIPLE_SERVERS; then
+      echo -e "  ${M}3)${N} Выбрать активный сервер ${D}(сейчас: ${SERVER_IFACE})${N}"
     fi
+
     if $HAS_SERVER_CONF; then
-      echo -e "  ${C}4)${N} Проверить и починить awg0 (авторемонт)"
+      if $HAS_MULTIPLE_SERVERS; then
+        echo -e "  ${C}4)${N} Перезапустить сервер ${SERVER_IFACE} ${D}(или все)${N}"
+        echo -e "  ${C}5)${N} Проверить и починить ${SERVER_IFACE} (авторемонт)"
+        echo -e "  ${C}6)${N} Перегенерировать параметры обфускации (${SERVER_IFACE})"
+        local _ep_now
+        _ep_now=$(endpoint_domain)
+        echo -e "  ${C}7)${N} Endpoint для клиентов ${D}${_ep_now:-IP сервера}${N}"
+        echo -e "  ${Y}8)${N} Сбросить/удалить сервер ${SERVER_IFACE}"
+      else
+        echo -e "  ${C}3)${N} Перезапустить awg0"
+        echo -e "  ${C}4)${N} Проверить и починить awg0 (авторемонт)"
+        echo -e "  ${C}5)${N} Перегенерировать параметры обфускации"
+        local _ep_now
+        _ep_now=$(endpoint_domain)
+        echo -e "  ${C}6)${N} Endpoint для клиентов  ${D}${_ep_now:-IP сервера}${N}"
+        echo -e "  ${Y}7)${N} Сбросить настройки сервера (чистая переустановка)"
+      fi
     else
-      echo -e "  ${D}4) Авторемонт (нужен пункт 2)${N}"
-    fi
-    if $HAS_SERVER_CONF; then
-      echo -e "  ${C}5)${N} Перегенерировать параметры обфускации"
-      local _ep_now
-      _ep_now=$(endpoint_domain)
-      echo -e "  ${C}6)${N} Endpoint для клиентов  ${D}${_ep_now:-IP сервера}${N}"
-      echo -e "  ${Y}7)${N} Сбросить настройки сервера (чистая переустановка)"
-    else
-      echo -e "  ${D}5) Перегенерировать параметры (нужен пункт 2)${N}"
-      echo -e "  ${D}6) Endpoint для клиентов (нужен пункт 2)${N}"
-      echo -e "  ${D}7) Сбросить сервер (нет сервера)${N}"
+      if ! $HAS_MULTIPLE_SERVERS; then
+        echo -e "  ${D}3) Перезапустить awg0 (нужен пункт 2)${N}"
+        echo -e "  ${D}4) Авторемонт (нужен пункт 2)${N}"
+        echo -e "  ${D}5) Перегенерировать параметры (нужен пункт 2)${N}"
+        echo -e "  ${D}6) Endpoint для клиентов (нужен пункт 2)${N}"
+        echo -e "  ${D}7) Сбросить сервер (нет сервера)${N}"
+      fi
     fi
     echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-7]: ${N}")" 0 7 "0"
-    case "${SUB_CHOICE:-}" in
-      1) do_install || true ;;
-      2) do_gen || true ;;
-      3) do_restart || true ;;
-      4) do_repair || true ;;
-      5) do_rotate_awg_params || true ;;
-      6) do_endpoint_menu || true ;;
-      7) do_reset_server || true ;;
-      0|"") return 0 ;;
-      *) warn "Неверный выбор" ;;
-    esac
+    local max_choice=7
+    $HAS_MULTIPLE_SERVERS && max_choice=8
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-${max_choice}]: ${N}")" 0 "$max_choice" "0"
+
+    if $HAS_MULTIPLE_SERVERS; then
+      case "${SUB_CHOICE:-}" in
+        1) do_install || true ;;
+        2) do_gen || true ;;
+        3) do_switch_server_menu || true ;;
+        4) do_restart || true ;;
+        5) do_repair || true ;;
+        6) do_rotate_awg_params || true ;;
+        7) do_endpoint_menu || true ;;
+        8) do_reset_server || true ;;
+        0|"") return 0 ;;
+        *) warn "Неверный выбор" ;;
+      esac
+    else
+      case "${SUB_CHOICE:-}" in
+        1) do_install || true ;;
+        2) do_gen || true ;;
+        3) do_restart || true ;;
+        4) do_repair || true ;;
+        5) do_rotate_awg_params || true ;;
+        6) do_endpoint_menu || true ;;
+        7) do_reset_server || true ;;
+        0|"") return 0 ;;
+        *) warn "Неверный выбор" ;;
+      esac
+    fi
     echo ""
     read -rp "$(echo -e "${C}  Enter для продолжения...${N}")" || return 0
   done
@@ -5719,17 +5909,19 @@ gen_awg3_params() {
 }
 
 _apply_config() {
+  local iface="${1:-$SERVER_IFACE}"
+  local conf="${2:-${SERVER_DIR}/${iface}.conf}"
   # Попытка syncconf (без разрыва соединений)
   local strip_out
-  strip_out=$(timeout 10 awg-quick strip awg0 2>/dev/null) || strip_out=""
+  strip_out=$(timeout 10 awg-quick strip "$iface" 2>/dev/null) || strip_out=""
   if [[ -n "$strip_out" ]]; then
-    if echo "$strip_out" | timeout 10 awg syncconf awg0 /dev/stdin 2>/dev/null; then
+    if echo "$strip_out" | timeout 10 awg syncconf "$iface" /dev/stdin 2>/dev/null; then
       return 0
     fi
   fi
   # Fallback: полный restart
-  awg-quick down "$SERVER_CONF" 2>/dev/null || true
-  awg-quick up "$SERVER_CONF" 2>/dev/null
+  awg-quick down "$conf" 2>/dev/null || true
+  awg-quick up "$conf" 2>/dev/null
 }
 
 # Выдаёт готовый конфиг. $1 = файл, $2 = "qr" — показать QR вместо текста.
@@ -5810,8 +6002,8 @@ _nat_install_persist() {
 #!/bin/sh
 iptables -t nat -C POSTROUTING -o ${ext_if} -j MASQUERADE >/dev/null 2>&1 || \
 iptables -t nat -A POSTROUTING -o ${ext_if} -j MASQUERADE
-iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i awg0 -j ACCEPT
-iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o awg0 -j ACCEPT
+iptables -C FORWARD -i awg+ -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i awg+ -j ACCEPT
+iptables -C FORWARD -o awg+ -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o awg+ -j ACCEPT
 EOF
     if [[ -s "$hook" ]]; then
       chmod +x "$hook"
@@ -5833,17 +6025,17 @@ set -u
 IFACE=\$(ip -4 route show default 2>/dev/null | awk '/default/ {print \$5; exit}')
 [ -z "\$IFACE" ] && IFACE="${ext_if}"
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
-iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE >/dev/null 2>&1 || \\
+iptables -t nat -C POSTROUTING -o "\$IFACE" -j MASQUERADE >/dev/null 2>&1 || \
   iptables -t nat -A POSTROUTING -o "\$IFACE" -j MASQUERADE
-iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i awg0 -j ACCEPT
-iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o awg0 -j ACCEPT
+iptables -C FORWARD -i awg+ -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i awg+ -j ACCEPT
+iptables -C FORWARD -o awg+ -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o awg+ -j ACCEPT
 exit 0
 EOF
   chmod +x "$NAT_PERSIST_SCRIPT"
 
   cat > "$NAT_PERSIST_SERVICE" <<EOF
 [Unit]
-Description=AWG Toolza — NAT/FORWARD rules for awg0
+Description=AWG Toolza — NAT/FORWARD rules for AmneziaWG
 After=network-online.target
 Wants=network-online.target
 
@@ -5861,9 +6053,7 @@ EOF
     ok "NAT-правила переживут ребут (systemd: awg-nat.service)"
   else
     warn "systemctl enable awg-nat.service не сработал"
-    warn "После перезагрузки NAT придётся вернуть вручную: sudo awg2 → Сервер (1) → п.1"
   fi
-  return 0
 }
 
 # Шаги сборки вынесены в функции: run_step запускает команду, и подоболочка
@@ -6291,21 +6481,48 @@ do_gen() {
   command -v awg &>/dev/null || { err "awg не найден. Сначала Сервер (1) → п.1"; return 1; }
   command -v python3 &>/dev/null || { err "python3 не найден — нужен для генерации параметров"; info "Запусти Сервер (1) → п.1 или: apt-get install python3"; return 1; }
 
-  # ── Защита: сервер уже установлен? ──
-  if [[ -f "$SERVER_CONF" ]]; then
-    local _current_profile
-    _current_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
-    [[ -z "$_current_profile" ]] && _current_profile="custom (старый сервер без маркера)"
+  local TARGET_IFACE="awg0"
+  local installed_srvs=()
+  mapfile -t installed_srvs < <(get_installed_servers)
+
+  if [[ ${#installed_srvs[@]} -gt 0 ]]; then
+    local next_free
+    next_free=$(get_next_free_iface)
     echo ""
-    warn "Сервер AmneziaWG уже установлен."
-    warn "Текущий профиль: ${W}${_current_profile}${N}"
+    hdr "»  Создание / переустановка сервера AWG"
     echo ""
-    info "Для смены профиля сначала удали текущий сервер:"
-    info "  • Сервер (1) → п.7 — Сбросить настройки сервера (чистая переустановка)"
-    info "  • Удаление (7) → п.2 — Удалить всё (пакеты + конфиги)"
-    info "После этого выбери Сервер (1) → п.2 заново и укажи нужный профиль."
-    return 0
+    echo -e "  Уже установлены серверы: ${W}${installed_srvs[*]}${N}"
+    echo -e "  Текущий активный: ${C}${SERVER_IFACE}${N}"
+    echo ""
+    echo -e "  ${G}1)${N} Создать новый дополнительный сервер (${W}${next_free}${N})"
+    echo -e "  ${Y}2)${N} Переустановить текущий сервер (${W}${SERVER_IFACE}${N})"
+    echo -e "  ${W}0)${N} Отмена"
+    echo ""
+    local GEN_MODE
+    read_choice GEN_MODE "$(echo -e "${C}  Выбор [0-2] (Enter = 1): ${N}")" 0 2 1
+    case "$GEN_MODE" in
+      1)
+        TARGET_IFACE="$next_free"
+        ;;
+      2)
+        TARGET_IFACE="$SERVER_IFACE"
+        local _current_profile
+        _current_profile=$(grep -m1 '^# AWG_PROFILE=' "$SERVER_CONF" 2>/dev/null | cut -d= -f2 || true)
+        [[ -z "$_current_profile" ]] && _current_profile="custom"
+        echo ""
+        warn "Переустановка сервера ${TARGET_IFACE} перезапишет его конфиг и ключи!"
+        local _reinst_ok
+        read_yesno _reinst_ok "$(echo -e "${R}  Продолжить переустановку ${TARGET_IFACE}? [y/N]: ${N}")" "n"
+        [[ "$_reinst_ok" == "y" ]] || { info "Отменено"; return 0; }
+        ;;
+      0|*)
+        info "Отменено"
+        return 0
+        ;;
+    esac
   fi
+
+  local TARGET_CONF="${SERVER_DIR}/${TARGET_IFACE}.conf"
 
   # Ставили компоненты и не перезагрузились — awg-quick up ляжет на модуле,
   # собранном под другое ядро. Спрашиваем до генерации ключей и конфигов.
@@ -6338,7 +6555,7 @@ do_gen() {
   if [[ -n "$_rb_reason" ]]; then
     echo ""
     warn "Сервер не перезагружен после установки: $_rb_reason"
-    info "Обычно именно из-за этого awg0 не поднимается сразу после п.1"
+    info "Обычно именно из-за этого ${TARGET_IFACE} не поднимается сразу после п.1"
     echo ""
     local _rb_now
     read_yesno _rb_now "$(echo -e "${G}  Перезагрузить сейчас (создать сервер после)? [Y/n]: ${N}")" "y"
@@ -6353,9 +6570,9 @@ do_gen() {
   fi
 
   local bak_ts
-  bak_ts="${SERVER_CONF}.bak.$(date +%s)"
-  if [[ -f "$SERVER_CONF" ]]; then
-    cp "$SERVER_CONF" "$bak_ts"
+  bak_ts="${TARGET_CONF}.bak.$(date +%s)"
+  if [[ -f "$TARGET_CONF" ]]; then
+    cp "$TARGET_CONF" "$bak_ts"
     info "Резервная копия: $bak_ts"
   fi
 
@@ -6363,7 +6580,7 @@ do_gen() {
   choose_dns
 
   # MTU выбираем ДО мимикрии — CPS-генератору нужен актуальный MTU
-  hdr "▬  MTU"
+  hdr "▬  MTU (${TARGET_IFACE})"
   echo "  1) 1420 — стандартный WireGuard"
   echo "  2) 1380 — баланс"
   echo "  3) 1360 — провайдеры с PPPoE overhead"
@@ -6397,8 +6614,12 @@ do_gen() {
   choose_awg_profile || return 1
   choose_awg_proto   || return 1
 
-  hdr "»  IP подсеть сервера"
-  echo "  1) Случайная подсеть из пула 10.[10-55].[1-254].0/24 (рекомендуется)"
+  # Сбор всех уже занятых подсетей для исключения конфликтов
+  local used_subnets=()
+  mapfile -t used_subnets < <(get_all_used_subnets)
+
+  hdr "»  IP подсеть сервера (${TARGET_IFACE})"
+  echo "  1) Случайная свободная подсеть 10.[10-55].[1-254].0/24 (рекомендуется)"
   echo "  2) 10.100.0.0/24"
   echo "  3) 10.101.0.0/24"
   echo "  4) 10.102.0.0/24"
@@ -6409,13 +6630,24 @@ do_gen() {
   read_choice ADDR_CHOICE "$(echo -e "${C}  Выбор [1-6] (Enter = 1 случайная): ${N}")" 1 6 1
   case $ADDR_CHOICE in
     1)
-      local rnd_octet2 rnd_octet3
-      rnd_octet2=$(rand_range 10 55)
-      rnd_octet3=$(rand_range 1 254)
-      CLIENT_ADDR="10.${rnd_octet2}.${rnd_octet3}.2/32"
-      SERVER_ADDR="10.${rnd_octet2}.${rnd_octet3}.1/24"
-      CLIENT_NET="10.${rnd_octet2}.${rnd_octet3}.0/24"
-      ok "Случайная подсеть: $CLIENT_NET"
+      local rnd_octet2 rnd_octet3 candidate_base candidate_net is_taken
+      while true; do
+        rnd_octet2=$(rand_range 10 55)
+        rnd_octet3=$(rand_range 1 254)
+        candidate_base="10.${rnd_octet2}.${rnd_octet3}"
+        candidate_net="${candidate_base}.0/24"
+        is_taken=0
+        for us in "${used_subnets[@]}"; do
+          if [[ "$us" == "$candidate_base" && "$TARGET_IFACE" != "$SERVER_IFACE" ]]; then
+            is_taken=1; break
+          fi
+        done
+        [[ $is_taken -eq 0 ]] && break
+      done
+      CLIENT_ADDR="${candidate_base}.2/32"
+      SERVER_ADDR="${candidate_base}.1/24"
+      CLIENT_NET="$candidate_net"
+      ok "Свободная подсеть: $CLIENT_NET"
       ;;
     2) CLIENT_ADDR="10.100.0.2/32"; SERVER_ADDR="10.100.0.1/24"; CLIENT_NET="10.100.0.0/24" ;;
     3) CLIENT_ADDR="10.101.0.2/32"; SERVER_ADDR="10.101.0.1/24"; CLIENT_NET="10.101.0.0/24" ;;
@@ -6441,22 +6673,49 @@ do_gen() {
       ;;
   esac
 
-  hdr "»  Порт сервера"
+  # Сбор всех уже занятых портов для исключения конфликтов
+  local used_ports=()
+  mapfile -t used_ports < <(get_all_used_ports)
+
+  hdr "»  Порт сервера (${TARGET_IFACE})"
   while true; do
     read -rp "$(echo -e "${C}  Порт [Enter = случайный / 51820 = стандартный / свой]: ${N}")" PORT
     if [[ -z "${PORT:-}" || "${PORT:-}" == "r" || "${PORT:-}" == "R" ]]; then
-      PORT=$(rand_range 30001 65535)
-      ok "случайный порт: $PORT"
+      local cand_port is_p_taken
+      while true; do
+        cand_port=$(rand_range 30001 65535)
+        is_p_taken=0
+        for up in "${used_ports[@]}"; do
+          if [[ "$up" == "$cand_port" && "$TARGET_IFACE" != "$SERVER_IFACE" ]]; then
+            is_p_taken=1; break
+          fi
+        done
+        if ss -ulpn 2>/dev/null | grep -q ":${cand_port} "; then
+          is_p_taken=1
+        fi
+        [[ $is_p_taken -eq 0 ]] && break
+      done
+      PORT="$cand_port"
+      ok "свободный случайный порт: $PORT"
       break
     fi
     if [[ "$PORT" =~ ^[0-9]+$ ]] && (( PORT >= 1024 && PORT <= 65535 )); then
+      local conflict=0
+      for up in "${used_ports[@]}"; do
+        if [[ "$up" == "$PORT" && "$TARGET_IFACE" != "$SERVER_IFACE" ]]; then
+          conflict=1; break
+        fi
+      done
+      if [[ $conflict -eq 1 ]]; then
+        warn "Порт $PORT уже используется другим сервером AWG. Выбери другой порт."
+        continue
+      fi
       break
     fi
     warn "Порт должен быть числом 1024-65535. Попробуй ещё раз."
   done
 
-  # Домен вместо IP в Endpoint — спрашиваем здесь, рядом с портом: вместе они
-  # и составляют Endpoint клиентского конфига.
+  # Домен вместо IP в Endpoint
   ask_endpoint_domain
 
   local obf_label
@@ -6467,7 +6726,8 @@ do_gen() {
     *) obf_label="Базовый" ;;
   esac
 
-  hdr "≡  Параметры настройки"
+  hdr "≡  Параметры настройки (${TARGET_IFACE})"
+  echo -e "  ${W}Интерфейс  : ${N}$TARGET_IFACE"
   echo -e "  ${W}Версия     : ${N}AWG ${AWG_PROTO:-2.0}"
   echo -e "  ${W}Обфускация : ${N}$obf_label"
   echo -e "  ${W}DNS        : ${N}$CLIENT_DNS"
@@ -6479,6 +6739,7 @@ do_gen() {
   echo -e "  ${W}Порт       : ${N}$PORT"
   echo -e "  ${W}Endpoint   : ${N}${ENDPOINT_DOMAIN:-IP сервера}:$PORT"
   echo ""
+  local CONFIRM
   read_yesno CONFIRM "$(echo -e "${C}  Продолжить? [Y/n]: ${N}")" "y"
   [[ "$CONFIRM" == "y" ]] || { warn "Отменено."; return 0; }
 
@@ -6490,7 +6751,6 @@ do_gen() {
   srv_pub=$(echo "$srv_priv" | awg pubkey 2>/dev/null) || { err "awg pubkey failed"; return 1; }
   cli_priv=$(awg genkey 2>/dev/null) || { err "awg genkey failed (client)"; return 1; }
   cli_pub=$(echo "$cli_priv" | awg pubkey 2>/dev/null) || { err "awg pubkey failed (client)"; return 1; }
-  # Имя первого клиента: рандом 5 строчных букв + "_" + 2 цифры (напр. xkqve_73)
   FIRST_CLIENT_NAME="$(tr -dc 'a-z' </dev/urandom | head -c5)_$(tr -dc '0-9' </dev/urandom | head -c2)"
   [[ "$FIRST_CLIENT_NAME" =~ ^[a-z]{5}_[0-9]{2}$ ]] || FIRST_CLIENT_NAME="client1"
   psk=$(awg genpsk 2>/dev/null) || { err "awg genpsk failed"; return 1; }
@@ -6502,7 +6762,6 @@ do_gen() {
     while true; do
       read -rp "$(echo -e "${C}  Введи IP сервера вручную: ${N}")" srv_ip
       if [[ -n "$srv_ip" ]]; then
-        # Базовая валидация — IPv4 или домен
         if [[ "$srv_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$srv_ip" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
           break
         fi
@@ -6528,27 +6787,22 @@ do_gen() {
   gen_awg_params || { err "gen_awg_params failed"; return 1; }
   [[ -z "$AWG_PARAMS_LINES" ]] && { err "AWG_PARAMS_LINES пустой"; return 1; }
 
-  # sysctl может падать в LXC/OpenVZ — не критично, но предупреждаем
   if ! sysctl -w net.ipv4.ip_forward=1 -q 2>/dev/null; then
     warn "sysctl -w не сработал (LXC/OpenVZ?) — пробуем /proc"
     echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || \
       warn "IP forwarding не включился — возможно, нужны права хоста"
   fi
 
-  mkdir -p /etc/amnezia/amneziawg
+  mkdir -p "$SERVER_DIR"
 
-  awg-quick down "$SERVER_CONF" 2>/dev/null || \
-    ip link delete dev awg0 2>/dev/null || true
+  awg-quick down "$TARGET_CONF" 2>/dev/null || \
+    ip link delete dev "$TARGET_IFACE" 2>/dev/null || true
 
   {
     echo "# AWG_PROFILE=${AWG_PROFILE:-pro}"
     echo "# AmneziaWG Toolza — AWG ${AWG_PROTO:-2.0} server config"
     echo "# Region: ${SERVER_REGION:-world}"
     echo "# AWG_PROTO=${AWG_PROTO:-2.0}"
-    # Сколько CPS-пакетов получает клиент (1 = без I1-I5, 2 = только I1,
-    # 3 = полный I1-I5) и какой профиль мимикрии. Сами I1-I5 в серверный
-    # конфиг не пишутся — они клиентские, поэтому без этих маркеров бот не
-    # знает, что выдавать, и раньше давал один I1 на сервере с полным CPS.
     echo "# AWG_OBF_LEVEL=${OBF_LEVEL:-1}"
     echo "# AWG_MIMICRY=${MIMICRY_PROFILE:-none}"
     # Домен мимикрии. Пишется только если он был выбран: бот генерирует I1-I5
@@ -6566,11 +6820,9 @@ do_gen() {
     echo "ListenPort = $PORT"
     echo "MTU = $MTU"
     echo -e "$AWG_PARAMS_LINES"
-    # I1-I5 НЕ записываем в серверный конфиг — это клиентские параметры.
-    # Сервер не нуждается в CPS signature packets.
     echo ""
-    echo "PostUp   = ip link set dev awg0 mtu $MTU; echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE >/dev/null 2>&1 || iptables -t nat -A POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE; iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i awg0 -j ACCEPT; iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o awg0 -j ACCEPT"
-    echo "PostDown = iptables -t nat -D POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
+    echo "PostUp   = ip link set dev ${TARGET_IFACE} mtu $MTU; echo 1 > /proc/sys/net/ipv4/ip_forward; iptables -t nat -C POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE >/dev/null 2>&1 || iptables -t nat -A POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE; iptables -C FORWARD -i ${TARGET_IFACE} -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -i ${TARGET_IFACE} -j ACCEPT; iptables -C FORWARD -o ${TARGET_IFACE} -j ACCEPT >/dev/null 2>&1 || iptables -A FORWARD -o ${TARGET_IFACE} -j ACCEPT"
+    echo "PostDown = iptables -t nat -D POSTROUTING -s $CLIENT_NET -o $iface -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i ${TARGET_IFACE} -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o ${TARGET_IFACE} -j ACCEPT 2>/dev/null || true"
     echo ""
     echo "[Peer]"
     echo "# $FIRST_CLIENT_NAME"
@@ -6578,9 +6830,10 @@ do_gen() {
     echo "PublicKey = $cli_pub"
     echo "PresharedKey = $psk"
     echo "AllowedIPs = $CLIENT_ADDR"
-  } > "$SERVER_CONF"
-  chmod 600 "$SERVER_CONF"
+  } > "$TARGET_CONF"
+  chmod 600 "$TARGET_CONF"
 
+  local first_cli_file="/root/${FIRST_CLIENT_NAME}_${TARGET_IFACE}.conf"
   {
     echo "[Interface]"
     echo "PrivateKey = $cli_priv"
@@ -6602,20 +6855,29 @@ do_gen() {
     echo "Endpoint = $(endpoint_host "$srv_ip"):$PORT"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = $(awg_keepalive_value)"
-  } > "/root/${FIRST_CLIENT_NAME}_awg2.conf"
-  chmod 600 "/root/${FIRST_CLIENT_NAME}_awg2.conf"
+  } > "$first_cli_file"
+  chmod 600 "$first_cli_file"
 
-  if awg_up_diag "$SERVER_CONF"; then
-    log_info "do_gen: awg-quick up успешно"
+  # Для обратной совместимости с awg0
+  if [[ "$TARGET_IFACE" == "awg0" ]]; then
+    cp -f "$first_cli_file" "/root/${FIRST_CLIENT_NAME}_awg2.conf" 2>/dev/null || true
+    chmod 600 "/root/${FIRST_CLIENT_NAME}_awg2.conf" 2>/dev/null || true
+  fi
+
+  _setup_autostart "$TARGET_IFACE"
+
+  if awg_up_diag "$TARGET_CONF"; then
+    log_info "do_gen: awg-quick up для $TARGET_IFACE успешно"
   else
-    log_err "do_gen: awg-quick up провалился"
-    warn "awg-quick up не удался"
+    log_err "do_gen: awg-quick up для $TARGET_IFACE провалился"
+    warn "awg-quick up не удался для $TARGET_IFACE"
     if [[ -n "$bak_ts" && -f "$bak_ts" ]]; then
       echo -e "  ${Y}  • Предыдущий конфиг сохранён: $bak_ts${N}"
+      local RESTORE_BAK
       read_yesno RESTORE_BAK "$(echo -e "${C}  Восстановить предыдущий конфиг? [y/N]: ${N}")" "n"
       if [[ "$RESTORE_BAK" == "y" ]]; then
-        cp "$bak_ts" "$SERVER_CONF"
-        awg-quick up "$SERVER_CONF" 2>/dev/null || true
+        cp "$bak_ts" "$TARGET_CONF"
+        awg-quick up "$TARGET_CONF" 2>/dev/null || true
         ok "Конфиг восстановлен"
       fi
     fi
@@ -6623,41 +6885,52 @@ do_gen() {
   fi
 
   if command -v ufw &>/dev/null; then
+    local OPEN_UFW
     read_yesno OPEN_UFW "$(echo -e "${C}  Открыть порт $PORT/udp в UFW? [Y/n]: ${N}")" "y"
     if [[ "$OPEN_UFW" == "y" ]]; then
-      ufw allow "${PORT}/udp" comment "AmneziaWG" || true
+      ufw allow "${PORT}/udp" comment "AmneziaWG_${TARGET_IFACE}" || true
       ok "Порт ${PORT}/udp открыт в файрволе"
     fi
   fi
 
+  # Устанавливаем созданный сервер как активный
+  set_active_server "$TARGET_IFACE"
+
   # Раздача конфига
-  _share_config "/root/${FIRST_CLIENT_NAME}_awg2.conf"
+  _share_config "$first_cli_file"
 
   echo ""
-  success_box "■  Сервер создан успешно"
-  echo -e "${W}  Версия : ${N}AWG ${AWG_PROTO:-2.0}"
-  echo -e "${W}  Профиль: ${N}${MIMICRY_PROFILE:-none}"
-  echo -e "${W}  Сервер : ${N}$SERVER_CONF"
-  echo -e "${W}  Клиент : ${N}/root/${FIRST_CLIENT_NAME}_awg2.conf"
-  echo -e "${W}  IP     : ${N}$srv_ip:$PORT"
-  echo -e "${W}  Iface  : ${N}$iface"
+  success_box "■  Сервер ${TARGET_IFACE} создан успешно"
+  echo -e "${W}  Интерфейс : ${N}$TARGET_IFACE"
+  echo -e "${W}  Версия    : ${N}AWG ${AWG_PROTO:-2.0}"
+  echo -e "${W}  Профиль   : ${N}${MIMICRY_PROFILE:-none}"
+  echo -e "${W}  Сервер    : ${N}$TARGET_CONF"
+  echo -e "${W}  Клиент    : ${N}$first_cli_file"
+  echo -e "${W}  IP        : ${N}$srv_ip:$PORT"
+  echo -e "${W}  Iface     : ${N}$iface"
 
-  _setup_autostart
   _warn_bot_needs_update
 }
 
 
 _setup_autostart() {
-  local unit_dir="/etc/systemd/system/awg-quick@awg0.service.d"
-  mkdir -p "$unit_dir"
+  local iface="${1:-$SERVER_IFACE}"
+  local unit_dir="/etc/systemd/system/awg-quick@${iface}.service.d"
+  mkdir -p "$unit_dir" 2>/dev/null || true
   cat > "${unit_dir}/override.conf" <<EOF
+[Unit]
+Description=AmneziaWG via awg-quick for ${iface}
+After=network-online.target
+Wants=network-online.target
+
 [Service]
+ExecStartPre=-/sbin/modprobe amneziawg
 ExecStart=
-ExecStart=/usr/bin/awg-quick up awg0
+ExecStart=/usr/bin/awg-quick up ${iface}
 EOF
-  systemctl daemon-reload
-  systemctl enable awg-quick@awg0 2>/dev/null && ok "Автозапуск awg0 включён" || \
-    warn "Не удалось включить автозапуск awg0"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable "awg-quick@${iface}" 2>/dev/null && ok "Автозапуск ${iface} включён" || \
+    warn "Не удалось включить автозапуск ${iface}"
 
   # Автозагрузка модуля ядра при старте системы
   if echo "amneziawg" > /etc/modules-load.d/amneziawg.conf 2>/dev/null; then
@@ -6756,7 +7029,7 @@ do_manage_clients() {
 
   while true; do
     echo ""
-    hdr "⚙  Управление клиентами"
+    hdr "⚙  Управление клиентами (${SERVER_IFACE})"
     echo -e "  ${G}1)${N} Добавить клиента"
     echo -e "  ${G}2)${N} Переименовать клиента"
     echo -e "  ${R}3)${N} Удалить клиента"
@@ -6797,7 +7070,7 @@ do_show_config() {
   local found_files=()
   while IFS= read -r -d '' f; do
     found_files+=("$f")
-  done < <(find /root -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
+  done < <(find /root -maxdepth 1 \( -name "*_${SERVER_IFACE}.conf" -o -name "*_awg2.conf" -o -name "*_awg*.conf" \) -print0 2>/dev/null)
 
   [[ ${#found_files[@]} -eq 0 ]] && { err "Конфиги не найдены в /root/"; return 1; }
 
@@ -6942,11 +7215,14 @@ do_rename_client() {
   chmod 600 "$SERVER_CONF"
 
   # Переименование файла клиента если он существует
-  local old_file="/root/${old_name}_awg2.conf"
-  local new_file="/root/${new_name}_awg2.conf"
+  local old_file="/root/${old_name}_${SERVER_IFACE}.conf"
+  local new_file="/root/${new_name}_${SERVER_IFACE}.conf"
   if [[ -f "$old_file" && "$old_name" != "безымянный" ]]; then
     mv "$old_file" "$new_file"
     ok "Файл переименован: $(basename "$old_file") → $(basename "$new_file")"
+  fi
+  if [[ -f "/root/${old_name}_awg2.conf" && "$old_name" != "безымянный" ]]; then
+    mv "/root/${old_name}_awg2.conf" "/root/${new_name}_awg2.conf" 2>/dev/null || true
   fi
 
   ok "Клиент переименован: $old_name → $new_name"
@@ -6967,7 +7243,7 @@ _delete_one_peer() {
   local del_name="$1" del_pk="$2" del_ip="${3:-?}"
 
   # Удаляем peer из runtime
-  awg set awg0 peer "$del_pk" remove 2>/dev/null || warn "[$del_name] не удалось удалить peer из runtime"
+  awg set "$SERVER_IFACE" peer "$del_pk" remove 2>/dev/null || warn "[$del_name] не удалось удалить peer из runtime"
 
   # Вырезаем блок [Peer] из SERVER_CONF через awk (буферизуем блок, печатаем если PublicKey != del_pk)
   local tmp_conf
@@ -7009,9 +7285,12 @@ _delete_one_peer() {
   chmod 600 "$SERVER_CONF"
 
   # Удаляем файл клиента
-  local del_file="/root/${del_name}_awg2.conf"
+  local del_file="/root/${del_name}_${SERVER_IFACE}.conf"
   if [[ -f "$del_file" && "$del_name" != "безымянный" ]]; then
     rm -f "$del_file"
+  fi
+  if [[ -f "/root/${del_name}_awg2.conf" && "$del_name" != "безымянный" ]]; then
+    rm -f "/root/${del_name}_awg2.conf" 2>/dev/null || true
   fi
 
   # Чистим expire-warn флаг если был
@@ -7158,8 +7437,8 @@ do_add_client() {
     return 0
   fi
 
-  local client_file="/root/${client_name}_awg2.conf"
-  if [[ -f "$client_file" ]]; then warn "Файл $client_file уже существует — будет перезаписан"; fi
+  local client_file="/root/${client_name}_${SERVER_IFACE}.conf"
+  if [[ -f "$client_file" || -f "/root/${client_name}_awg2.conf" ]]; then warn "Файл клиента уже существует — будет перезаписан"; fi
 
   read_yesno CONFIRM_IP "$(echo -e "${C}  Использовать IP $client_addr? [Y/n]: ${N}")" "y"
   if [[ "$CONFIRM_IP" != "y" ]]; then
@@ -7320,11 +7599,16 @@ do_add_client() {
   esac
 
   local srv_pub srv_ip port
-  srv_pub=$(awg show awg0 public-key 2>/dev/null) \
-    || { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
+  srv_pub=$(awg show "$SERVER_IFACE" public-key 2>/dev/null || true)
+  if [[ -z "$srv_pub" && -f "$SERVER_CONF" ]]; then
+    local _spriv
+    _spriv=$(grep -m1 '^PrivateKey' "$SERVER_CONF" | awk -F'= ' '{print $2}' | tr -d ' ' || true)
+    [[ -n "$_spriv" ]] && srv_pub=$(echo "$_spriv" | awg pubkey 2>/dev/null || true)
+  fi
+  [[ -z "$srv_pub" ]] && { err "${SERVER_IFACE} не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
   srv_ip=$(get_public_ip)
   [[ -z "$srv_ip" ]] && { err "не удалось получить внешний IP"; return 1; }
-  port=$(grep "^ListenPort = " "$SERVER_CONF" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ' || true)
+  port=$(grep "^ListenPort" "$SERVER_CONF" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ' || true)
   [[ -z "$port" ]] && { err "ListenPort не найден в конфиге сервера"; return 1; }
 
   local cli_priv cli_pub psk
@@ -7348,7 +7632,7 @@ do_add_client() {
   echo "$psk" > "$psk_tmp"
 
   local awg_set_ok=0
-  awg set awg0 peer "$cli_pub" \
+  awg set "$SERVER_IFACE" peer "$cli_pub" \
     preshared-key "$psk_tmp" \
     allowed-ips "$client_addr" && awg_set_ok=1
   rm -f "$psk_tmp"
@@ -7384,6 +7668,11 @@ do_add_client() {
     echo "PersistentKeepalive = $(awg_keepalive_value)"
   } > "$client_file"
   chmod 600 "$client_file"
+
+  if [[ "$SERVER_IFACE" == "awg0" ]]; then
+    cp -f "$client_file" "/root/${client_name}_awg2.conf" 2>/dev/null || true
+    chmod 600 "/root/${client_name}_awg2.conf" 2>/dev/null || true
+  fi
 
   # Применяем через syncconf (без разрыва других клиентов)
   info "Применяем конфиг..."
@@ -7424,7 +7713,7 @@ do_add_client() {
 do_bulk_add_clients() {
   [[ ! -f "$SERVER_CONF" ]] && { warn "Конфиг сервера не найден. Сначала Сервер (1) → п.2"; return 0; }
   command -v awg &>/dev/null || { warn "awg не найден — возврат"; return 0; }
-  awg show awg0 public-key &>/dev/null || { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
+  awg show "$SERVER_IFACE" public-key &>/dev/null || { err "awg0 не поднят. Запусти: awg-quick up $SERVER_CONF"; return 1; }
 
   # ── Базовые данные сервера ──
   local server_net base_ip srv_pub srv_ip port srv_mtu _srv_profile
@@ -7432,7 +7721,7 @@ do_bulk_add_clients() {
   base_ip=$(echo "$server_net" | cut -d. -f1-3)
   [[ -z "$base_ip" ]] && { err "Не удалось определить подсеть сервера"; return 1; }
 
-  srv_pub=$(awg show awg0 public-key 2>/dev/null) || { err "awg0 не поднят"; return 1; }
+  srv_pub=$(awg show "$SERVER_IFACE" public-key 2>/dev/null) || { err "awg0 не поднят"; return 1; }
   srv_ip=$(get_public_ip)
   [[ -z "$srv_ip" ]] && { err "не удалось получить внешний IP"; return 1; }
   port=$(grep "^ListenPort = " "$SERVER_CONF" 2>/dev/null | awk -F'= ' '{print $2}' | tr -d ' ' || true)
@@ -7699,7 +7988,7 @@ do_bulk_add_clients() {
       while (( name_idx <= 9999 )); do
         printf -v suffix "%03d" "$name_idx"
         candidate="${prefix}-${suffix}"
-        candidate_file="/root/${candidate}_awg2.conf"
+        candidate_file="/root/${candidate}_${SERVER_IFACE}.conf"
         if [[ ! -f "$candidate_file" ]] && ! grep -qE "^# ${candidate}$" "$SERVER_CONF" 2>/dev/null; then
           name="$candidate"
           name_idx=$((name_idx+1))
@@ -7741,7 +8030,7 @@ do_bulk_add_clients() {
     psk_tmp=$(mktemp)
     chmod 600 "$psk_tmp"
     echo "$psk" > "$psk_tmp"
-    if ! awg set awg0 peer "$cli_pub" preshared-key "$psk_tmp" allowed-ips "$client_addr" 2>/dev/null; then
+    if ! awg set "$SERVER_IFACE" peer "$cli_pub" preshared-key "$psk_tmp" allowed-ips "$client_addr" 2>/dev/null; then
       rm -f "$psk_tmp"
       warn "[${idx}/${count}] ${name}: awg set не удался, откат записи"
       # Откат: возвращаем файл к размеру, снятому перед дописыванием блока
@@ -7757,7 +8046,7 @@ do_bulk_add_clients() {
     rm -f "$psk_tmp"
 
     # Файл клиента
-    client_file="/root/${name}_awg2.conf"
+    client_file="/root/${name}_${SERVER_IFACE}.conf"
     {
       echo "[Interface]"
       echo "PrivateKey = $cli_priv"
@@ -7836,7 +8125,11 @@ do_export_configs() {
   local srv_base
   srv_base=$(basename "${SERVER_CONF:-/etc/amnezia/amneziawg/awg0.conf}")
   local files=() f
-  for f in /root/*_awg2.conf; do
+  local _all_cli=()
+  shopt -s nullglob
+  _all_cli=( "/root/"*"_${SERVER_IFACE}.conf" "/root/"*"_awg2.conf" "/root/"*"_awg"*.conf )
+  shopt -u nullglob
+  for f in "${_all_cli[@]}"; do
     [[ -e "$f" ]] || continue
     [[ "$(basename "$f")" == "$srv_base" ]] && continue
     files+=("$f")
@@ -7901,13 +8194,13 @@ do_list_clients() {
   echo ""
 
   local transfer_cache
-  transfer_cache=$(awg show awg0 transfer 2>/dev/null || true)
+  transfer_cache=$(awg show "$SERVER_IFACE" transfer 2>/dev/null || true)
   
   local handshake_cache
-  handshake_cache=$(awg show awg0 latest-handshakes 2>/dev/null || true)
+  handshake_cache=$(awg show "$SERVER_IFACE" latest-handshakes 2>/dev/null || true)
   
   local endpoint_cache
-  endpoint_cache=$(awg show awg0 endpoints 2>/dev/null || true)
+  endpoint_cache=$(awg show "$SERVER_IFACE" endpoints 2>/dev/null || true)
 
   local i=0
   local name="" pubkey="" ip="" tx_raw=0 rx_raw=0 handshake_time="" endpoint="" expire_ts=""
@@ -8300,9 +8593,29 @@ do_show_qr() {
   echo -e "${D}  Конфиг: $chosen${N}"
 }
 
+_restart_single_server() {
+  local iface="${1:-$SERVER_IFACE}"
+  local conf="${SERVER_DIR}/${iface}.conf"
+  if [[ ! -f "$conf" ]]; then
+    err "Конфиг ${iface} не найден ($conf)"
+    return 1
+  fi
+  restart "Перезапуск ${iface}..."
+  awg-quick down "$conf" 2>/dev/null || true
+  if awg_up_diag "$conf"; then
+    ok "${iface} перезапущен"
+    return 0
+  else
+    err "Не удалось поднять ${iface}"
+    return 1
+  fi
+}
+
 do_restart() {
-  hdr "↻  Перезапуск awg0"
-  if [[ ! -f "$SERVER_CONF" ]]; then
+  local srvs=()
+  mapfile -t srvs < <(get_installed_servers)
+
+  if [[ ! -f "$SERVER_CONF" && ${#srvs[@]} -eq 0 ]]; then
     err "Конфиг сервера не найден"
     echo -e "  ${Y}→ Возможно, AmneziaWG ещё не установлен${N}"
     echo -e "  ${Y}→ Сервер (1) → п.1 — установка зависимостей${N}"
@@ -8322,13 +8635,30 @@ do_restart() {
         ;;
     esac
   fi
-  restart "Перезапуск awg0..."
-  awg-quick down "$SERVER_CONF" 2>/dev/null || true
-  if awg_up_diag "$SERVER_CONF"; then
-    ok "awg0 перезапущен"
+
+  if [[ ${#srvs[@]} -gt 1 ]]; then
+    hdr "↻  Перезапуск серверов AmneziaWG"
+    echo ""
+    echo -e "  ${C}1)${N} Перезапустить активный сервер (${SERVER_IFACE})"
+    echo -e "  ${C}2)${N} Перезапустить ВСЕ серверы (${srvs[*]})"
+    echo -e "  ${W}0)${N} ← Отмена"
+    echo ""
+    local r_choice
+    read_choice r_choice "$(echo -e "${C}  Выбор [0-2]: ${N}")" 0 2 "1"
+    case "$r_choice" in
+      1) _restart_single_server "$SERVER_IFACE" ;;
+      2)
+        local all_ok=0
+        for s in "${srvs[@]}"; do
+          _restart_single_server "$s" || all_ok=$((all_ok + 1))
+        done
+        [[ $all_ok -eq 0 ]] && ok "Все серверы перезапущены" || warn "Часть серверов не поднялась"
+        ;;
+      0|"") return 0 ;;
+    esac
   else
-    err "Не удалось поднять awg0"
-    return 1
+    hdr "↻  Перезапуск ${SERVER_IFACE}"
+    _restart_single_server "$SERVER_IFACE"
   fi
 }
 
@@ -8584,15 +8914,84 @@ do_rotate_awg_params() {
 }
 
 do_reset_server() {
+  local srvs=()
+  mapfile -t srvs < <(get_installed_servers)
+
   echo ""
+  if [[ ${#srvs[@]} -gt 1 ]]; then
+    hdr "↺  Удаление / сброс сервера ${SERVER_IFACE}"
+    echo ""
+    warn "Будет удалён только сервер ${SERVER_IFACE}:"
+    echo -e "  ${R}—${N} Интерфейс ${SERVER_IFACE} (awg-quick down)"
+    echo -e "  ${R}—${N} Серверный конфиг: ${W}$SERVER_CONF${N}"
+    echo -e "  ${R}—${N} Клиентские конфиги: ${W}/root/*_${SERVER_IFACE}.conf${N}"
+    echo -e "  ${R}—${N} iptables правила NAT/FORWARD для ${SERVER_IFACE}"
+    echo -e "  ${R}—${N} Автозапуск awg-quick@${SERVER_IFACE}"
+    echo ""
+    echo -e "${G}  Остальные серверы (${srvs[*]}) не будут затронуты.${N}"
+    echo ""
+    read_confirm "$(echo -e "${R}  Подтверди удаление ${SERVER_IFACE} (введи yes): ${N}")" || \
+      { warn "Отменено."; return 0; }
+
+    # Авто-бэкап
+    if [[ -f "$SERVER_CONF" ]]; then
+      auto_backup "reset_${SERVER_IFACE}" || warn "Авто-бэкап не удался"
+    fi
+
+    trash "Останавливаем ${SERVER_IFACE}..."
+    systemctl disable --now awg-quick@${SERVER_IFACE} 2>/dev/null || true
+    awg-quick down "$SERVER_CONF" 2>/dev/null || \
+      ip link delete dev "$SERVER_IFACE" 2>/dev/null || true
+
+    trash "Очищаем iptables NAT/FORWARD..."
+    local client_net=""
+    if [[ -f "$SERVER_CONF" ]]; then
+      local srv_addr
+      srv_addr=$(grep "^Address = " "$SERVER_CONF" | head -1 | awk -F'= ' '{print $2}' | tr -d ' ' || true)
+      if [[ -n "$srv_addr" ]]; then
+        local base
+        base=$(echo "$srv_addr" | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s.0", $1, $2, $3}')
+        client_net="${base}/24"
+      fi
+    fi
+    local iface
+    iface=$(ip route | awk '/default/{print $5; exit}')
+    if [[ -n "$client_net" && -n "$iface" ]]; then
+      iptables -t nat -D POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || true
+    fi
+    iptables -D FORWARD -i "$SERVER_IFACE" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -o "$SERVER_IFACE" -j ACCEPT 2>/dev/null || true
+
+    trash "Удаляем конфиг ${SERVER_CONF}..."
+    rm -f "$SERVER_CONF" "${SERVER_CONF}".bak.* "${SERVER_CONF}".pre_* 2>/dev/null || true
+
+    trash "Удаляем клиентские конфиги..."
+    rm -f /root/*_"${SERVER_IFACE}".conf 2>/dev/null || true
+    [[ "$SERVER_IFACE" == "awg0" ]] && rm -f /root/*_awg2.conf 2>/dev/null || true
+
+    # Переключаем активный сервер
+    local rem_srvs=()
+    mapfile -t rem_srvs < <(get_installed_servers)
+    if [[ ${#rem_srvs[@]} -gt 0 ]]; then
+      set_active_server "${rem_srvs[0]}"
+      ok "Сервер удалён. Активным стал: ${SERVER_IFACE}"
+    else
+      set_active_server "awg0"
+      SERVER_REGION="world"
+      ok "Все серверы удалены."
+    fi
+    log_info "do_reset_server: сброс ${SERVER_IFACE} выполнен"
+    return 0
+  fi
+
   hdr "↺  Сброс настроек сервера (чистая переустановка)"
   echo ""
   warn "Будет удалено:"
-  echo -e "  ${R}—${N} Интерфейс awg0 (awg-quick down)"
+  echo -e "  ${R}—${N} Интерфейс ${SERVER_IFACE} (awg-quick down)"
   echo -e "  ${R}—${N} Серверный конфиг: ${W}$SERVER_CONF${N}"
-  echo -e "  ${R}—${N} Все клиентские конфиги: ${W}/root/*_awg2.conf${N}"
+  echo -e "  ${R}—${N} Все клиентские конфиги: ${W}/root/*_${SERVER_IFACE}.conf${N}"
   echo -e "  ${R}—${N} UFW правила AmneziaWG"
-  echo -e "  ${R}—${N} iptables правила NAT/FORWARD для awg0"
+  echo -e "  ${R}—${N} iptables правила NAT/FORWARD для ${SERVER_IFACE}"
   echo ""
   echo -e "${G}  Сохраняется:${N}"
   echo -e "  ${G}✓${N} Пакеты amneziawg, amneziawg-tools"
@@ -8612,9 +9011,10 @@ do_reset_server() {
   fi
 
   # === Сброс ===
-  trash "Останавливаем awg0..."
+  trash "Останавливаем ${SERVER_IFACE}..."
+  systemctl disable --now awg-quick@${SERVER_IFACE} 2>/dev/null || true
   awg-quick down "$SERVER_CONF" 2>/dev/null || \
-    ip link delete dev awg0 2>/dev/null || true
+    ip link delete dev "$SERVER_IFACE" 2>/dev/null || true
 
   # Убираем iptables правила явно — PostDown мог не отработать
   trash "Очищаем iptables NAT/FORWARD..."
@@ -8635,8 +9035,8 @@ do_reset_server() {
   if [[ -n "$client_net" && -n "$iface" ]]; then
     iptables -t nat -D POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE 2>/dev/null || true
   fi
-  iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true
-  iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$SERVER_IFACE" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -o "$SERVER_IFACE" -j ACCEPT 2>/dev/null || true
 
   trash "Удаляем серверный конфиг..."
   rm -f "$SERVER_CONF" 2>/dev/null || true
@@ -8646,6 +9046,7 @@ do_reset_server() {
   rm -f "${SERVER_CONF}".pre_delete.* 2>/dev/null || true
 
   trash "Удаляем клиентские конфиги..."
+  rm -f /root/*_"${SERVER_IFACE}".conf 2>/dev/null || true
   rm -f /root/*_awg2.conf 2>/dev/null || true
 
   trash "Удаляем UFW правила..."
@@ -10238,7 +10639,6 @@ _warp_up() {
   # Берём ТОЛЬКО IPv4 — IPv6 от Cloudflare нам не нужен (избегаем утечек)
   addr_line=$(awk -F' = ' '/^Address/{print $2; exit}' "$WARP_CONF")
   warp_addr4=""
-  local IFS=','
   for a in $addr_line; do
     a="${a#"${a%%[![:space:]]*}"}"
     a="${a%"${a##*[![:space:]]}"}"
@@ -10266,14 +10666,6 @@ _warp_up() {
   ip link add dev warp0 type wireguard 2>&1 || { err "Не удалось создать warp0"; return 1; }
 
   # Конфигурируем приватный ключ + peer
-  # ВАЖНО: AllowedIPs = 0.0.0.0/0 нужен только на стороне peer config wireguard
-  # это значит "куда МЫ шлём трафик через peer", НЕ маршрутизация ОС
-  # Временный конфиг кладём в /etc/wireguard, а НЕ в /tmp. На Ubuntu 26.04
-  # пакетный wg не смог прочитать файл из /tmp — "fopen: Permission denied",
-  # при том что собранный из исходников awg тот же /tmp читает спокойно
-  # (похоже на AppArmor-профиль пакета wireguard-tools). Каталог /etc/wireguard
-  # создаётся с правами 700 и принадлежит root — не менее строго, чем /tmp,
-  # и это канонический путь, откуда wg читает конфиги.
   local tmp_wg_conf="/etc/wireguard/.warp0.setconf.$$"
   rm -f "$tmp_wg_conf"
   cat > "$tmp_wg_conf" << EOF
@@ -10305,45 +10697,27 @@ EOF
   ok "warp0 активен"
 
   # ── SPLIT-TUNNEL: маршруты только для AWG подсети ──
-  # БЕЗ policy routing (fwmark) — тогда SSH не сломается
-  # MASQUERADE на warp0 для трафика из AWG подсети
-
   info "Настраиваем split-tunnel для $client_net..."
 
-  # ВАЖНО: НЕ удаляем eth0-MASQUERADE — оно нужно как fallback
-  # для клиентов которые НЕ в warp_peers (идут через main table → eth0).
-  # Иначе их пакеты уйдут наружу с приватным src (10.x.x.x) → дропнутся провайдером.
-  # Гарантируем что eth0-MASQUERADE существует:
   iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
     iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE
 
-  # Добавляем MASQUERADE через warp0 (для клиентов с ip rule lookup 200)
   iptables -t nat -C POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE >/dev/null 2>&1 || \
     iptables -t nat -A POSTROUTING -s "$client_net" -o warp0 -j MASQUERADE
 
-  # FORWARD правила
-  iptables -C FORWARD -i awg0 -o warp0 -j ACCEPT >/dev/null 2>&1 || \
-    iptables -A FORWARD -i awg0 -o warp0 -j ACCEPT
-  iptables -C FORWARD -i warp0 -o awg0 -j ACCEPT >/dev/null 2>&1 || \
-    iptables -A FORWARD -i warp0 -o awg0 -j ACCEPT
+  iptables -C FORWARD -i "$SERVER_IFACE" -o warp0 -j ACCEPT >/dev/null 2>&1 || \
+    iptables -A FORWARD -i "$SERVER_IFACE" -o warp0 -j ACCEPT
+  iptables -C FORWARD -i warp0 -o "$SERVER_IFACE" -j ACCEPT >/dev/null 2>&1 || \
+    iptables -A FORWARD -i warp0 -o "$SERVER_IFACE" -j ACCEPT
 
-  # rp_filter loose mode только для VPN интерфейсов
-  # ВАЖНО: НЕ трогаем .all.rp_filter — иначе eth0 тоже станет loose, ослабнет защита от spoofing
-  # Linux применяет max(all.rp_filter, iface.rp_filter), значит для warp0/awg0 будет loose, для eth0 — strict
   sysctl -w net.ipv4.conf.warp0.rp_filter=2 >/dev/null 2>&1 || true
-  sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -w "net.ipv4.conf.${SERVER_IFACE}.rp_filter=2" >/dev/null 2>&1 || true
 
-  # Policy routing: создаём отдельную таблицу 200 для трафика выбранных клиентов
-  # ВАЖНО: src обязательно указать иначе kernel не сможет маршрутизировать (warp0 имеет /32)
   ip route flush table 200 2>/dev/null || true
   ip route add default dev warp0 src "${warp_addr4%/*}" table 200
 
-  # Сначала синхронизируем — убираем мёртвые IP (удалённых клиентов)
   _warp_sync_peers 2>/dev/null || true
 
-  # Первый запуск (файла ещё нет) — заполняем всеми клиентами по умолчанию.
-  # Именно отсутствие файла, а не пустота: пустой список значит, что WARP
-  # сознательно выключен всем, и подъём не должен это отменять.
   if [[ ! -f "$WARP_PEERS" ]]; then
     info "Список клиентов в Warp не создан — добавляем всех по умолчанию"
     mkdir -p "$WARP_DIR"
@@ -10354,16 +10728,13 @@ EOF
     done < <(_warp_list_awg_clients)
   fi
 
-  # Убираем старое правило для всей подсети (если осталось от прошлых версий)
   ip rule del from "$client_net" lookup 200 2>/dev/null || true
 
-  # Применяем правила для каждого включённого клиента
   _warp_apply_peer_rules
 
   local peer_count
   peer_count=$(wc -l < "$WARP_PEERS" 2>/dev/null || echo 0)
 
-  # Сохраняем состояние
   echo "active" > "$WARP_STATE"
   echo "client_net=$client_net" >> "$WARP_STATE"
   echo "iface=$iface" >> "$WARP_STATE"
@@ -10372,11 +10743,6 @@ EOF
   info "SSH и серверный трафик идут напрямую"
   info "Управление клиентами в Warp: Туннели (5) → Warp → п.6"
 
-  # ── Автозапуск после ребута ──────────────────────────────
-  # Создаём systemd-юнит который при загрузке вызовет awg2 и тот
-  # увидит state=active → выполнит _warp_up автоматически.
-  # Юнит зависит от awg-quick@awg0 — WARP может подняться только
-  # после AWG-сервера (нужен client_net).
   _warp_install_autostart 2>/dev/null || warn "Автозапуск WARP не настроен (не критично)"
 
   return 0
@@ -12437,49 +12803,55 @@ do_backup() {
   backup_path="${BACKUP_DIR}/awg2_backup_${timestamp}"
 
   echo ""
-  hdr "◈  Бекап AmneziaWG 2.0"
+  hdr "◈  Бекап AmneziaWG"
   bkup "Директория бекапа: $backup_path"
 
   mkdir -p "$backup_path" || { err "Не удалось создать директорию $backup_path"; return 1; }
 
   local backed_up=0
 
-  # Серверный конфиг
-  if [[ -f "$SERVER_CONF" ]]; then
-    cp "$SERVER_CONF" "$backup_path/awg0.conf"
-    ok "Серверный конфиг: awg0.conf"
-    backed_up=$((backed_up + 1))
-  else
-    warn "Серверный конфиг не найден: $SERVER_CONF"
+  # Все серверные конфиги
+  local found_srv=0
+  if [[ -d "$SERVER_DIR" ]]; then
+    local sc
+    for sc in "$SERVER_DIR"/awg*.conf; do
+      if [[ -f "$sc" ]]; then
+        cp "$sc" "$backup_path/" && ok "Серверный конфиг: $(basename "$sc")"
+        backed_up=$((backed_up + 1))
+        found_srv=1
+      fi
+    done
   fi
+  [[ $found_srv -eq 0 ]] && warn "Серверные конфиги не найдены в $SERVER_DIR"
 
   # Все клиентские конфиги из /root/ (find -print0 — безопасно для имён с пробелами)
   while IFS= read -r -d '' cfile; do
-    cp "$cfile" "$backup_path/" && ok "Клиент: $(basename "$cfile")"
+    local bname
+    bname=$(basename "$cfile")
+    [[ "$bname" =~ ^awg[0-9]+\.conf$ ]] && continue
+    cp "$cfile" "$backup_path/" && ok "Клиент: $bname"
     backed_up=$((backed_up + 1))
-  done < <(find /root -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
+  done < <(find /root -maxdepth 1 \( -name "*_awg*.conf" -o -name "*_awg2.conf" \) -print0 2>/dev/null)
 
   # AWG параметры (текущие, live dump)
-  if ip link show awg0 &>/dev/null 2>&1; then
-    awg show awg0 > "$backup_path/awg_show_dump.txt" 2>/dev/null || true
-    ok "Live dump awg show awg0"
+  if ip link show "$SERVER_IFACE" &>/dev/null 2>&1; then
+    awg show "$SERVER_IFACE" > "$backup_path/awg_show_dump.txt" 2>/dev/null || true
+    ok "Live dump awg show ${SERVER_IFACE}"
   fi
 
   # ── Состояние WARP ──
-  # Раньше в бэкап не попадало вовсе: при потере сервера аккаунт Cloudflare
-  # приходилось регистрировать заново, а он упирается в лимиты.
   local warp_backend
   warp_backend=$(warp_backend_current)
   mkdir -p "$backup_path/warp"
-  # Бэкенд wg: аккаунт и профиль wgcf
   if [[ -d "$WARP_DIR" ]]; then
-    cp -a "$WARP_DIR" "$backup_path/warp/wgcf" 2>/dev/null &&       { ok "WARP (wg): аккаунт и список клиентов"; backed_up=$((backed_up + 1)); }
+    cp -a "$WARP_DIR" "$backup_path/warp/wgcf" 2>/dev/null && \
+      { ok "WARP (wg): аккаунт и список клиентов"; backed_up=$((backed_up + 1)); }
   fi
   [[ -f "$WARP_CONF" ]] && cp "$WARP_CONF" "$backup_path/warp/warp0.conf" 2>/dev/null || true
-  # Бэкенд usque: config.json — это и есть зарегистрированное устройство
   if [[ -f "$USQUE_CONF" ]]; then
     mkdir -p "$backup_path/warp/usque"
-    cp "$USQUE_CONF" "$backup_path/warp/usque/config.json" 2>/dev/null &&       { ok "WARP (usque): регистрация устройства"; backed_up=$((backed_up + 1)); }
+    cp "$USQUE_CONF" "$backup_path/warp/usque/config.json" 2>/dev/null && \
+      { ok "WARP (usque): регистрация устройства"; backed_up=$((backed_up + 1)); }
   fi
   rmdir "$backup_path/warp" 2>/dev/null || true
 
@@ -12489,9 +12861,10 @@ do_backup() {
   # Метаданные бекапа
   {
     echo "timestamp=$timestamp"
+    echo "server_iface=$SERVER_IFACE"
     echo "server_conf=$SERVER_CONF"
     echo "backed_files=$backed_up"
-    echo "awg_version=2.0"
+    echo "awg_version=$VERSION"
     echo "warp_backend=$warp_backend"
     echo "hostname=$(hostname)"
   } > "$backup_path/backup_meta.txt"
@@ -12508,7 +12881,7 @@ do_backup() {
 
 do_restore() {
   echo ""
-  hdr "◈  Восстановление AmneziaWG 2.0"
+  hdr "◈  Восстановление AmneziaWG"
 
   if [[ ! -d "$BACKUP_DIR" ]]; then
     err "Директория бекапов не найдена: $BACKUP_DIR"
@@ -12550,59 +12923,62 @@ do_restore() {
   local chosen_backup="${backups[$((RESTORE_CHOICE - 1))]}"
   echo -e "${C}  → Восстановление из: ${W}$(basename "$chosen_backup")${N}"
 
-  read_confirm "$(echo -e "${R}  Текущий серверный конфиг будет заменён. Продолжить? (введи yes): ${N}")" || \
+  read_confirm "$(echo -e "${R}  Текущие серверные конфиги будут заменены. Продолжить? (введи yes): ${N}")" || \
     { warn "Отменено."; return 0; }
 
-  # Останавливаем интерфейс
-  info "Останавливаем awg0..."
-  awg-quick down "$SERVER_CONF" 2>/dev/null || \
-    ip link delete dev awg0 2>/dev/null || true
+  # Останавливаем все запущенные интерфейсы
+  local cur_srvs=()
+  mapfile -t cur_srvs < <(get_installed_servers)
+  for s in "${cur_srvs[@]}"; do
+    info "Останавливаем ${s}..."
+    awg-quick down "${SERVER_DIR}/${s}.conf" 2>/dev/null || ip link delete dev "$s" 2>/dev/null || true
+  done
 
-  # Бекап текущего конфига перед заменой
-  if [[ -f "$SERVER_CONF" ]]; then
-    cp "$SERVER_CONF" "${SERVER_CONF}.pre_restore.$(date +%s)" 2>/dev/null || true
-    info "Текущий конфиг сохранён как pre_restore"
-  fi
-
-  mkdir -p /etc/amnezia/amneziawg
+  mkdir -p "$SERVER_DIR"
   local restored=0
 
-  # Восстанавливаем серверный конфиг
-  if [[ -f "$chosen_backup/awg0.conf" ]]; then
-    cp "$chosen_backup/awg0.conf" "$SERVER_CONF"
-    chmod 600 "$SERVER_CONF"
-    ok "Серверный конфиг восстановлен"
-    restored=$((restored + 1))
-  else
-    warn "awg0.conf не найден в бекапе"
-  fi
+  # Восстанавливаем все серверные конфиги
+  local sc
+  for sc in "$chosen_backup"/awg*.conf; do
+    if [[ -f "$sc" ]]; then
+      local base
+      base=$(basename "$sc")
+      cp "$sc" "${SERVER_DIR}/${base}"
+      chmod 600 "${SERVER_DIR}/${base}"
+      ok "Серверный конфиг восстановлен: ${base}"
+      restored=$((restored + 1))
+    fi
+  done
 
   # Восстанавливаем клиентские конфиги (find -print0 — безопасно для имён с пробелами)
   while IFS= read -r -d '' cfile; do
-    cp "$cfile" "/root/$(basename "$cfile")"
-    chmod 600 "/root/$(basename "$cfile")"
-    ok "Клиент восстановлен: $(basename "$cfile")"
+    local bname
+    bname=$(basename "$cfile")
+    [[ "$bname" =~ ^awg[0-9]+\.conf$ ]] && continue
+    cp "$cfile" "/root/${bname}"
+    chmod 600 "/root/${bname}"
+    ok "Клиент восстановлен: ${bname}"
     restored=$((restored + 1))
-  done < <(find "$chosen_backup" -maxdepth 1 -name "*_awg2.conf" -print0 2>/dev/null)
+  done < <(find "$chosen_backup" -maxdepth 1 \( -name "*_awg*.conf" -o -name "*_awg2.conf" \) -print0 2>/dev/null)
 
   # ── Состояние WARP ──
-  # Восстанавливаем аккаунты обоих бэкендов: перерегистрация упирается в лимиты
-  # Cloudflare, а список клиентов в WARP иначе пришлось бы собирать заново.
   if [[ -d "$chosen_backup/warp" ]]; then
     if [[ -d "$chosen_backup/warp/wgcf" ]]; then
       mkdir -p "$(dirname "$WARP_DIR")"
-      cp -a "$chosen_backup/warp/wgcf/." "$WARP_DIR/" 2>/dev/null &&         { ok "WARP (wg): аккаунт и список клиентов"; restored=$((restored + 1)); }
+      cp -a "$chosen_backup/warp/wgcf/." "$WARP_DIR/" 2>/dev/null && \
+        { ok "WARP (wg): аккаунт и список клиентов"; restored=$((restored + 1)); }
       chmod 700 "$WARP_DIR" 2>/dev/null || true
     fi
     if [[ -f "$chosen_backup/warp/warp0.conf" ]]; then
       mkdir -p /etc/wireguard && chmod 700 /etc/wireguard
-      cp "$chosen_backup/warp/warp0.conf" "$WARP_CONF" 2>/dev/null &&         chmod 600 "$WARP_CONF" 2>/dev/null || true
+      cp "$chosen_backup/warp/warp0.conf" "$WARP_CONF" 2>/dev/null && \
+        chmod 600 "$WARP_CONF" 2>/dev/null || true
     fi
     if [[ -f "$chosen_backup/warp/usque/config.json" ]]; then
       mkdir -p "$USQUE_DIR" && chmod 700 "$USQUE_DIR"
-      cp "$chosen_backup/warp/usque/config.json" "$USQUE_CONF" 2>/dev/null &&         { chmod 600 "$USQUE_CONF"; ok "WARP (usque): регистрация устройства"; restored=$((restored + 1)); }
+      cp "$chosen_backup/warp/usque/config.json" "$USQUE_CONF" 2>/dev/null && \
+        { chmod 600 "$USQUE_CONF"; ok "WARP (usque): регистрация устройства"; restored=$((restored + 1)); }
     fi
-    # Возвращаем тот бэкенд, который был активен на момент бэкапа
     local saved_be
     saved_be=$(grep -oP '^warp_backend=\K\S+' "$chosen_backup/backup_meta.txt" 2>/dev/null || true)
     if [[ -n "$saved_be" ]] && warp_backend_known "$saved_be"; then
@@ -12611,13 +12987,18 @@ do_restore() {
     info "Туннель WARP не поднимается автоматически — включи его в меню Туннели"
   fi
 
-  # Поднимаем интерфейс
-  info "Запускаем awg0..."
-  if awg_up_diag "$SERVER_CONF"; then
-    ok "Интерфейс awg0 запущен"
-  else
-    err "Не удалось поднять awg0. Проверь конфиг: $SERVER_CONF"
-    return 1
+  # Поднимаем активный интерфейс
+  local restored_srvs=()
+  mapfile -t restored_srvs < <(get_installed_servers)
+  if [[ ${#restored_srvs[@]} -gt 0 ]]; then
+    set_active_server "${restored_srvs[0]}"
+    info "Запускаем ${SERVER_IFACE}..."
+    if awg_up_diag "$SERVER_CONF"; then
+      ok "Интерфейс ${SERVER_IFACE} запущен"
+    else
+      err "Не удалось поднять ${SERVER_IFACE}. Проверь конфиг: $SERVER_CONF"
+      return 1
+    fi
   fi
 
   echo ""
@@ -14087,8 +14468,8 @@ PYEOF
 # Применить изменения серверного конфига через syncconf (без рестарта awg0)
 _expire_apply() {
   local strip_out
-  strip_out=$(awg-quick strip awg0 2>/dev/null) || return 1
-  echo "$strip_out" | timeout 10 awg syncconf awg0 /dev/stdin 2>/dev/null
+  strip_out=$(awg-quick strip "$SERVER_IFACE" 2>/dev/null) || return 1
+  echo "$strip_out" | timeout 10 awg syncconf "$SERVER_IFACE" /dev/stdin 2>/dev/null
 }
 
 # Форматирование unix-ts в человеческий вид (TZ сервера) + сколько осталось
