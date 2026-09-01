@@ -411,7 +411,7 @@ STATIC_PROFILES = {"quic", "curl_quic", "tls", "stun", "ssdp"}
 
 fail = 0
 for profile, domain in CASES:
-    args = ["python3", GEN, profile] + ([domain] if domain else [])
+    args = [sys.executable, GEN, profile] + ([domain] if domain else [])
     proc = subprocess.run(args, capture_output=True, text=True)
     out = [l for l in proc.stdout.splitlines() if l.strip()]
     label = "%s/%s" % (profile, domain or "auto")

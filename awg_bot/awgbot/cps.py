@@ -31,15 +31,19 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import subprocess
+import sys
 
 log = logging.getLogger("awgbot.cps")
 
-# Путь к awg2. Переопределяется переменной AWG2_BIN — так же, как core.py
-# переопределяет пути к конфигу и клиентам: без этого генератор невозможно
-# прогнать на машине, где сервер не установлен (тесты, отладка).
-AWG2_BIN = os.environ.get("AWG2_BIN") or shutil.which("awg2") or "/usr/local/bin/awg2"
+def _get_awg2_bin() -> str:
+    if os.environ.get("AWG2_BIN") and os.path.isfile(os.environ["AWG2_BIN"]):
+        return os.environ["AWG2_BIN"]
+    which = shutil.which("awg2")
+    if which and os.path.isfile(which):
+        return which
+    installed = "/usr/local/bin/awg2"
+    return installed if os.path.isfile(installed) else ""
 
 # профили, которые поддерживает CPS-генератор awg2 (v2 = порт payloadGen).
 # tls оставлен ради серверов, установленных до перехода: генератор v2 сам
@@ -79,17 +83,18 @@ def _extract_generator() -> str | None:
     чтобы переподхватывать новый генератор после обновления скрипта.
     """
     global _cached_code, _cache_mtime
-    if not os.path.isfile(AWG2_BIN):
+    bin_path = _get_awg2_bin()
+    if not os.path.isfile(bin_path):
         return None
     try:
-        mtime = os.path.getmtime(AWG2_BIN)
+        mtime = os.path.getmtime(bin_path)
     except OSError:
         return None
     if _cached_code is not None and mtime == _cache_mtime:
         return _cached_code
 
     try:
-        text = open(AWG2_BIN, encoding="utf-8", errors="replace").read()
+        text = open(bin_path, encoding="utf-8", errors="replace").read()
     except OSError:
         return None
 
@@ -110,7 +115,7 @@ def _extract_generator() -> str | None:
         # запасной вариант: до строки, состоящей только из закрывающей кавычки
         m = re.search(r"_CPS_GENERATOR='(.*?)'\s*$", text, re.S | re.M)
     if not m:
-        log.warning("CPS: в %s не найден блок _CPS_GENERATOR — I1 генерироваться не будет", AWG2_BIN)
+        log.warning("CPS: в %s не найден блок _CPS_GENERATOR — I1 генерироваться не будет", bin_path)
         return None
 
     code = m.group(1)
@@ -119,7 +124,7 @@ def _extract_generator() -> str | None:
     try:
         compile(code, "<awg2:_CPS_GENERATOR>", "exec")
     except SyntaxError as exc:
-        log.warning("CPS: блок из %s не компилируется (%s) — I1 отключён", AWG2_BIN, exc)
+        log.warning("CPS: блок из %s не компилируется (%s) — I1 отключён", bin_path, exc)
         return None
 
     _cached_code = code
@@ -162,12 +167,13 @@ def gen_i1(profile: str, domain: str = "") -> str | None:
     code = _extract_generator()
     if code is None:
         return None
-    args = ["python3", "-c", code, profile]
+    py_exec = sys.executable
+    args = [py_exec, "-", profile]
     if domain:
         args.append(domain)
     args.append("--only-i1")
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        p = subprocess.run(args, input=code, capture_output=True, text=True, timeout=30)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return None
     if p.returncode != 0:
@@ -196,12 +202,13 @@ def gen_full(profile: str, domain: str = "",
     code = _extract_generator()
     if code is None:
         return []
-    args = ["python3", "-c", code, profile]
+    py_exec = sys.executable
+    args = [py_exec, "-", profile]
     if domain:
         args.append(domain)
     args += _budget_args(code, budget)
     try:
-        p = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        p = subprocess.run(args, input=code, capture_output=True, text=True, timeout=30)
     except (subprocess.TimeoutExpired, FileNotFoundError):
         return []
     if p.returncode != 0:
