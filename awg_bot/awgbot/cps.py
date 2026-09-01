@@ -31,7 +31,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
 
@@ -43,16 +42,8 @@ def _get_awg2_bin() -> str:
     which = shutil.which("awg2")
     if which and os.path.isfile(which):
         return which
-    for p in os.environ.get("PATH", "").split(os.pathsep):
-        cand = os.path.join(p, "awg2")
-        if os.path.isfile(cand):
-            return cand
-    repo_awg = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "awg2.sh"))
-    if os.path.isfile(repo_awg):
-        return repo_awg
-    return "/usr/local/bin/awg2"
-
-AWG2_BIN = _get_awg2_bin()
+    installed = "/usr/local/bin/awg2"
+    return installed if os.path.isfile(installed) else ""
 
 # профили, которые поддерживает CPS-генератор awg2 (v2 = порт payloadGen).
 # tls оставлен ради серверов, установленных до перехода: генератор v2 сам
