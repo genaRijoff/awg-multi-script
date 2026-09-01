@@ -14,7 +14,7 @@ CPS_GENERATOR_BEGIN/END v2) — тестируется то, что реальн
 Запуск:  python3 tests/test_cps.py [путь/к/awg2.sh]
 Выход:   0 — все пакеты валидны, 1 — есть провалы.
 """
-import os, re, subprocess, sys, tempfile
+import os, random, re, subprocess, sys, tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 AWG2 = sys.argv[1] if len(sys.argv) > 1 else os.path.join(_HERE, "..", "awg2.sh")
@@ -67,15 +67,43 @@ def _extract_generator(path):
 GEN = _extract_generator(AWG2)
 
 
+_LETTERS = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_DIGITS = b"0123456789"
+# Ограничение движка на длину динамического тега (docs.amnezia.org: length <= 1000)
+TAG_LEN_MAX = 1000
+
+
 def parse_line(line):
-    """Строка вида <b 0x...> -> байты пакета. Других тегов в v2 не бывает."""
+    """Строка I -> байты пакета, как их соберёт модуль перед отправкой.
+
+    Повторяет модификаторы ядра (junk.c): <b 0x..> — статические байты,
+    <r N> — N случайных байт, <rc N> — N букв [A-Za-z], <rd N> — N цифр.
+    Каждый вызов даёт НОВЫЙ пакет: jp_spec_applymods пересчитывает эти поля
+    перед каждой отправкой, поэтому проверять надо любое их значение.
+    """
     tags = re.findall(r"<([^>]*)>", line)
     assert tags, "строка не похожа на CPS-пакет: %r" % line[:40]
     pkt = b""
     for tag in tags:
-        assert tag.startswith("b 0x"), "неожиданный тег <%s>" % tag[:10]
-        pkt += bytes.fromhex(tag[4:])
+        if tag.startswith("b 0x"):
+            pkt += bytes.fromhex(tag[4:])
+            continue
+        key, _, val = tag.partition(" ")
+        assert key in ("r", "rc", "rd"), "неожиданный тег <%s>" % tag[:10]
+        assert val.isdigit(), "длина тега <%s> не число" % tag[:10]
+        n = int(val)
+        assert 1 <= n <= TAG_LEN_MAX, "<%s %d> вне 1-%d" % (key, n, TAG_LEN_MAX)
+        if key == "r":
+            pkt += os.urandom(n)
+        elif key == "rc":
+            pkt += bytes(random.choice(_LETTERS) for _ in range(n))
+        else:
+            pkt += bytes(random.choice(_DIGITS) for _ in range(n))
     return pkt
+
+
+def count_tags(line):
+    return len(re.findall(r"<(?:r|rc|rd) \d+>", line))
 
 
 # ── TLS ClientHello: общий разбор для QUIC, DTLS и ECH ──
@@ -323,6 +351,37 @@ def check_webrtc(pkt):
     return "WebRTC ok: %s + %s + RTP/RTCP, %d Б" % (msg, dtls_msg, len(pkt))
 
 
+def check_packet(profile, pkt, domain):
+    if profile in ("quic", "tls"):
+        return check_quic(pkt, expect_host=domain or None)
+    if profile == "curl_quic":
+        return check_quic(pkt, expect_host=domain or None, expect_ech=True)
+    if profile == "dns":
+        return check_dns(pkt, expect_host=domain or None)
+    if profile == "sip":
+        return check_sip(pkt, expect_host=domain or None)
+    if profile == "stun":
+        return check_stun(pkt, expect_host=domain or None)[0]
+    if profile == "webrtc":
+        return check_webrtc(pkt)
+    if profile == "dtls":
+        return check_dtls(pkt, expect_host=domain or None)[0]
+    if profile == "ntp":
+        return check_ntp(pkt)
+    if profile == "rtp":
+        return check_rtp(pkt)
+    return check_ssdp(pkt)
+
+
+# Профили, у которых пакет ОБЯЗАН содержать динамические поля: без них строка I
+# уходит байт в байт одинаковой при каждом рукопожатии (раз в ~120 с), а это
+# ровно тот повторяющийся паттерн, ради устранения которого делалась 3.1.
+DYNAMIC_PROFILES = {"dns", "sip", "ntp", "rtp", "dtls", "webrtc"}
+# Профили, где динамическое поле сломало бы пакет: STUN накрыт FINGERPRINT
+# (CRC32 по всему сообщению), QUIC Initial — AEAD с ключами из DCID, SSDP в
+# жизни и так повторяется дословно.
+STATIC_PROFILES = {"quic", "curl_quic", "tls", "stun", "ssdp"}
+
 fail = 0
 for profile, domain in CASES:
     args = ["python3", GEN, profile] + ([domain] if domain else [])
@@ -337,26 +396,20 @@ for profile, domain in CASES:
     for i, line in enumerate(out, 1):
         try:
             pkt = parse_line(line)
-            if profile in ("quic", "tls"):
-                msg = check_quic(pkt, expect_host=domain or None)
-            elif profile == "curl_quic":
-                msg = check_quic(pkt, expect_host=domain or None, expect_ech=True)
-            elif profile == "dns":
-                msg = check_dns(pkt, expect_host=domain or None)
-            elif profile == "sip":
-                msg = check_sip(pkt, expect_host=domain or None)
-            elif profile == "stun":
-                msg = check_stun(pkt, expect_host=domain or None)[0]
-            elif profile == "webrtc":
-                msg = check_webrtc(pkt)
-            elif profile == "dtls":
-                msg = check_dtls(pkt, expect_host=domain or None)[0]
-            elif profile == "ntp":
-                msg = check_ntp(pkt)
-            elif profile == "rtp":
-                msg = check_rtp(pkt)
-            else:
-                msg = check_ssdp(pkt)
+            msg = check_packet(profile, pkt, domain)
+            tags = count_tags(line)
+            if tags:
+                # Второе разворачивание тегов — другой набор случайных полей.
+                # Пакет обязан остаться валидным при ЛЮБОМ их значении, иначе
+                # мимикрия ломается на второй же отправке.
+                other = parse_line(line)
+                check_packet(profile, other, domain)
+                assert other != pkt, "теги есть, а пакет не изменился"
+                msg += "; динамических полей %d" % tags
+            if profile in DYNAMIC_PROFILES:
+                assert tags, "профиль без динамических полей: строка замрёт навсегда"
+            if profile in STATIC_PROFILES:
+                assert not tags, "у этого профиля тег ломает контрольную сумму/AEAD"
             print("  OK  %-22s I%d %5dB  %s" % (label, i, len(pkt), msg))
         except Exception as e:
             fail += 1

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.7.29"
+VERSION="v0.7.30"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -756,6 +756,70 @@ def to_hex(b):
 
 def read_u16(b, off):
     return (b[off] << 8) | b[off + 1]
+
+# == Динамические поля пакета мимикрии (теги <r>/<rc>/<rd>) ==
+#
+# Строка I, собранная только из <b 0x...>, — это замороженный снимок: модуль
+# кладёт его в буфер один раз при setconf и шлёт БАЙТ В БАЙТ при каждой попытке
+# рукопожатия (send.c: jp_spec_applymods + wg_socket_send_buffer_to_peer, раз в
+# ~120 с). Повторяющийся один и тот же UDP-пакет — ровно тот статистический
+# признак, против которого делалась 3.1.
+#
+# Теги <r N> / <rc N> / <rd N> модуль пересчитывает на КАЖДОЙ отправке
+# (junk.c: random_byte_modifier / random_char_modifier / random_digit_modifier,
+# вызываются из jp_spec_applymods перед каждым send), то есть поле становится
+# заново случайным. Порядок тегов в строке сохраняется: jp_parse_tags кладёт их
+# через list_add (в обратном порядке), а сборка идёт list_for_each_entry_reverse
+# — на выходе порядок написания.
+#
+# Помечать можно ДАЛЕКО не всё. Поле годится, только если оно случайно в самом
+# протоколе и от него ничего не считается:
+#   • нельзя всё, что покрыто контрольной суммой или AEAD (STUN FINGERPRINT
+#     CRC32, QUIC Initial — ключи выводятся из DCID, заголовок входит в AAD);
+#   • нельзя поле, встречающееся в пакете дважды (SIP Call-ID в двух заголовках,
+#     RTCP SSRC): теги независимы, и две копии разъедутся. Это ловится
+#     автоматически — помечается только уникальное вхождение;
+#   • в текстовых протоколах нельзя <r> (двоичный мусор внутри текста) — только
+#     <rc>/<rd>.
+# Длина поля тегом сохраняется, поэтому длины и Content-Length остаются верными.
+#
+# Ограничение движка: длина <r/rc/rd> не больше 1000 байт.
+DYN_TAG_MAX = 1000
+
+_DYN = []
+
+def dyn_reset():
+    del _DYN[:]
+
+def dyn(value, tag="r"):
+    """Помечает поле как заново случайное при каждой отправке. Возвращает его же."""
+    token = value if isinstance(value, bytes) else enc_text(value)
+    if 2 <= len(token) <= DYN_TAG_MAX:
+        _DYN.append((token, tag))
+    return value
+
+def build_tagged_line(payload):
+    """Строка I: статические куски <b 0x..> вперемешку с тегами помеченных полей."""
+    holes = []
+    for token, tag in _DYN:
+        # Неуникальное вхождение пропускаем: разные вхождения одного поля
+        # обязаны совпадать, а два тега дали бы разные значения.
+        if payload.count(token) != 1:
+            continue
+        holes.append((payload.find(token), len(token), tag))
+    holes.sort()
+    out = []
+    pos = 0
+    for start, length, tag in holes:
+        if start < pos:                 # перекрытие с уже вставленным тегом
+            continue
+        if start > pos:
+            out.append("<b 0x%s>" % to_hex(payload[pos:start]))
+        out.append("<%s %d>" % (tag, length))
+        pos = start + length
+    if pos < len(payload):
+        out.append("<b 0x%s>" % to_hex(payload[pos:]))
+    return "".join(out)
 
 def quic_varint(value):
     # encodeQuicVarInt (RFC 9000 §16)
@@ -1787,8 +1851,14 @@ def build_dns_question(query_id, flags, name_bytes, type_value, class_value,
             u16(class_value) + additional_record)
 
 def generate_dns_payload(options):
-    return build_dns_question(ri(65535), 0x0100, encode_dns_name(options["host"]),
-                              rc(DNS_QUERY_TYPES), 0x0001, build_dns_opt_record(1232))
+    # Идентификатор запроса резолвер выбирает случайно на каждый запрос — это
+    # штатная защита от подделки ответа (RFC 5452), поэтому тег здесь не только
+    # безопасен, но и правдоподобнее фиксированного значения.
+    query_id = ri(65535)
+    payload = build_dns_question(query_id, 0x0100, encode_dns_name(options["host"]),
+                                 rc(DNS_QUERY_TYPES), 0x0001, build_dns_opt_record(1232))
+    dyn(u16(query_id))
+    return payload
 
 def generate_ssdp_payload(options):
     message = "\r\n".join([
@@ -1814,15 +1884,34 @@ def generate_ntp_payload(options):
     payload[4:8] = u32(0x00000100)
     payload[8:12] = u32(0x00000100)
     payload[12:16] = enc_text("INIT")
-    payload[16:24] = ntp_timestamp(now - 1)
-    payload[40:48] = ntp_timestamp(now)
+    # Reference Timestamp — момент последней синхронизации клиента, у живого
+    # клиента это минуты назад, а не ровно секунда. Секундный сдвиг был ещё и
+    # вреден технически: дробные части обеих меток совпадали байт в байт, и
+    # уникальности для тега не оставалось.
+    # Сдвиг обязан быть дробным: ntp_timestamp считает дробь от миллисекунд, и
+    # при целом числе секунд обе метки получили бы одинаковые младшие 4 байта.
+    reference = ntp_timestamp(now - rr(30, 900) - ri(1000) / 1000.0)
+    transmit = ntp_timestamp(now)
+    payload[16:24] = reference
+    payload[40:48] = transmit
+    # Секунды не трогаем: случайные 4 байта дали бы дату вне текущей эпохи NTP,
+    # то есть подделку виднее, чем повтор. Дробная часть (младшие 4 байта
+    # метки) в реальных клиентах равномерно случайна — её и помечаем.
+    dyn(reference[4:])
+    dyn(transmit[4:])
     return bytes(payload)
 
 def generate_rtp_payload(options=None):
     payload_type = rc([0x00, 0x08, 0x60])
     body = rb(96) if payload_type == 0x60 else rb(160)
-    return (bytes([0x80, payload_type]) + u16(ri(65535)) +
-            u32(ru32()) + u32(ru32()) + body)
+    sequence = u16(ri(65535))
+    timestamp = u32(ru32())
+    ssrc = u32(ru32())
+    # Внутри RTP ничего не считается от этих полей: заголовок без контрольной
+    # суммы, тело — сжатый звук, для наблюдателя неотличимый от случайного.
+    # Поэтому весь пакет, кроме двух байт версии/типа, может быть динамическим.
+    dyn(sequence); dyn(timestamp); dyn(ssrc); dyn(body)
+    return bytes([0x80, payload_type]) + sequence + timestamp + ssrc + body
 
 def generate_rtcp_payload(options=None):
     ssrc = ru32()
@@ -1879,8 +1968,10 @@ def build_sip_invite_body(origin_user, host):
         "a=ptime:%d" % rc([20, 30, 40]),
         "a=maxptime:%d" % rc([60, 80, 120]),
         "a=rtcp-mux",
-        "a=ice-ufrag:" + to_hex(rb(4)),
-        "a=ice-pwd:" + to_hex(rb(12)),
+        # ICE-креденшелы генерируются заново на каждую сессию (RFC 5245 §15.4)
+        # и состоят из ice-char = ALPHA / DIGIT / + / — буквы от <rc> подходят.
+        "a=ice-ufrag:" + dyn(to_hex(rb(4)), "rc"),
+        "a=ice-pwd:" + dyn(to_hex(rb(12)), "rc"),
         "a=fingerprint:sha-256 " + fingerprint,
         "a=setup:actpass",
         "a=msid-semantic: WMS " + origin_user,
@@ -1904,9 +1995,14 @@ def generate_sip_payload(options):
     to_user = from_user if action == "REGISTER" else random_sip_user_part()
     from_display = rc(SIP_DISPLAY_NAMES)
     to_display = from_display if action == "REGISTER" else rc(SIP_DISPLAY_NAMES)
-    branch = "z9hG4bK" + to_hex(rb(9))
-    tag = to_hex(rb(6))
-    call_id = to_hex(rb(12)) + "@" + host
+    # Идентификаторы транзакции SIP: branch, tag и Call-ID уникальны для каждого
+    # запроса по самой спецификации (RFC 3261 §8.1.1.7, §19.3) — повтор одного и
+    # того же Call-ID выглядел бы куда подозрительнее случайных букв. Тег <rc>,
+    # а не <r>: протокол текстовый, двоичный мусор внутри заголовка недопустим.
+    # Префикс z9hG4bK остаётся статикой — это обязательный магический маркер.
+    branch = "z9hG4bK" + dyn(to_hex(rb(9)), "rc")
+    tag = dyn(to_hex(rb(6)), "rc")
+    call_id = dyn(to_hex(rb(12)), "rc") + "@" + host
     cseq = 1 + ri(50)
     user_agent = rc(SIP_USER_AGENTS)
     allow_header = rc(SIP_ALLOW_HEADERS)
@@ -1991,7 +2087,13 @@ def build_dtls_client_hello_body(host):
                   ext_extended_master_secret())
     cipher_suites = b"".join(u16(c) for c in
                              [0xC02B, 0xC02F, 0xCCA9, 0xC02C, 0x009C, 0x009D])
-    return (b"\xFE\xFD" + rb(32) + bytes([len(session_id)]) + session_id +
+    # ClientHello в DTLS ничем не подписан и не зашифрован (MAC появляется
+    # только после смены шифра), а client_random и session_id по спецификации
+    # случайны — оба поля можно отдать тегам. ECH здесь нет, так что связывания
+    # с внешним ClientHello, которое сломалось бы, тоже нет.
+    client_random = rb(32)
+    dyn(client_random); dyn(session_id)
+    return (b"\xFE\xFD" + client_random + bytes([len(session_id)]) + session_id +
             b"\x00" + u16(len(cipher_suites)) + cipher_suites + b"\x01\x00" +
             u16(len(extensions)) + extensions)
 
@@ -2133,6 +2235,18 @@ def generate_webrtc_payload(options):
 # ================================================================
 # Диспетчер профилей и вывод (app.js: appendChunkLines/chunkPayload)
 # ================================================================
+# Динамические поля (теги <r>/<rc>/<rd>) есть не у всех профилей — и это не
+# недоделка, а свойство самих протоколов:
+#   dns, ntp, rtp, sip, dtls — помечены (см. dyn() в соответствующих функциях);
+#   webrtc — помечены только его DTLS/RTP-части, STUN внутри неприкосновенен;
+#   stun   — весь пакет накрыт FINGERPRINT (CRC32 по всему сообщению), любое
+#            динамическое поле сделало бы контрольную сумму несходящейся;
+#   quic, curl_quic — ключи Initial выводятся из DCID, а заголовок целиком
+#            входит в AAD (RFC 9001 §5.2): подменив байт, мы получаем пакет,
+#            который не расшифрует никто, включая DPI, который как раз и лезет
+#            в Initial за SNI. Повторный идентичный Initial выглядит обычной
+#            ретрансмиссией, битый — аномалией. Поэтому статика;
+#   ssdp   — M-SEARCH реального устройства и в жизни повторяется дословно.
 PROTOCOL_GENERATORS = {
     "dns": generate_dns_payload,
     "quic": generate_quic_payload,
@@ -2185,6 +2299,10 @@ def main(argv):
         "sip_action": "OPTIONS",
         "ice_provider": "random",
         "ice_mode": "auto",
+        # --static возвращает поведение до динамических тегов: строка целиком из
+        # <b 0x..>. Нужен для сравнения в тестах и как аварийный откат, если
+        # клиент окажется без поддержки <r>/<rc>.
+        "static": False,
     }
     only_i1 = False
     positional = []
@@ -2193,6 +2311,8 @@ def main(argv):
         arg = argv[index]
         if arg == "--only-i1":
             only_i1 = True
+        elif arg == "--static":
+            args["static"] = True
         elif arg == "--ech-doh":
             args["ech_doh"] = True
         elif arg == "--full":
@@ -2253,13 +2373,20 @@ def main(argv):
         if len(lines) >= MAX_OUTPUT_LINES:
             break
         try:
+            dyn_reset()
             payload = generator(options)
         except Exception as exc:
             _warn_once("сбой генерации %s (%s: %s)" % (profile, type(exc).__name__, exc))
             break
         room = MAX_OUTPUT_LINES - len(lines)
-        piece = ["<b 0x%s>" % to_hex(chunk)
-                 for chunk in chunk_payload(payload, args["mtu"])[:room]]
+        chunks = chunk_payload(payload, args["mtu"])
+        if args["static"] or len(chunks) > 1:
+            # Разрезанный на несколько строк пакет помечать нечем: смещения
+            # полей уезжают в соседний кусок. Такое бывает только у QUIC при
+            # маленьком --mtu, а там динамических полей всё равно нет.
+            piece = ["<b 0x%s>" % to_hex(chunk) for chunk in chunks[:room]]
+        else:
+            piece = [build_tagged_line(payload)]
         cost = sum(len(item) for item in piece)
         if budget and lines and used + cost > budget:
             break
@@ -5439,7 +5566,7 @@ gen_awg_params() {
 # Инвариант, который нельзя нарушать: RejectAfterTime > RekeyAfterTime, иначе
 # сессия будет отвергнута раньше, чем сторона успеет её переустановить.
 gen_awg3_params() {
-  local hp_key cpa rat_lo rat_hi rjt_lo rjt_hi ka_lo ka_hi rkt mha
+  local hp_key cpa rat_lo rat_hi rjt_lo rjt_hi ka_lo ka_hi rkt rkt_lo rkt_hi mha
 
   # Ключ защиты заголовков — обязан совпадать на обоих концах
   hp_key=$(awg genkey 2>/dev/null || true)
@@ -5472,9 +5599,21 @@ gen_awg3_params() {
   ka_lo=$(rand_range 9 14)
   ka_hi=$(rand_range 20 30)
 
-  # Таймаут повтора рукопожатия оставляем фиксированным: разброс тут даёт
-  # мало маскировки, зато заметно влияет на скорость восстановления связи.
-  rkt=5
+  # Таймаут повтора рукопожатия. Раньше держали фиксированные 5 с — те самые,
+  # что зашиты в WireGuard (REKEY_TIMEOUT в messages.h). При потере пакета это
+  # даёт серию повторов ровно через 5 с, то есть стабильную временную подпись
+  # ровно там, где 3.1 как раз и рандомизирует поведение: остальные таймеры мы
+  # раздаём диапазонами, а этот оставался константой.
+  #
+  # Нижнюю границу не опускаем ниже 5: от неё же считается момент, с которого
+  # рукопожатие разрешено повторить (peer.h, wg_peer_reset_last_sent_handshake
+  # берёт u16_range_lo), и меньшее значение означает более агрессивный повтор.
+  # Верх держим не выше 9: MaxHandshakeAttempts у нас 16-20, и при худшем
+  # розыгрыше (20 x 9) отказ от рукопожатия наступает через ~3 минуты —
+  # приемлемо, дальше уже заметно на глаз при восстановлении связи.
+  rkt_lo=$(rand_range 5 6)
+  rkt_hi=$(( rkt_lo + $(rand_range 2 3) ))
+  rkt="${rkt_lo}-${rkt_hi}"
   mha=$(rand_range 16 20)
 
   # ── Добавка AWG 3.1 ──

@@ -130,6 +130,18 @@ for v in ("3.0", "3.1"):
     rat_hi = int(d["RekeyAfterTime"].split("-")[-1])
     rjt_lo = int(d["RejectAfterTime"].split("-")[0])
     chk(f"{v}: RejectAfterTime > RekeyAfterTime", True, rjt_lo > rat_hi)
+    # Повтор рукопожатия тоже обязан быть диапазоном: фиксированные 5 с — это
+    # штатный REKEY_TIMEOUT WireGuard, то есть ровная временная подпись при
+    # каждой потере пакета.
+    rkt = d["RekeyTimeout"]
+    rkt_lo, _, rkt_hi = rkt.partition("-")
+    chk(f"{v}: RekeyTimeout — диапазон", True, bool(rkt_hi))
+    chk(f"{v}: RekeyTimeout не агрессивнее WireGuard", True, int(rkt_lo) >= 5)
+    # Верх ограничен, иначе восстановление связи после потери заметно затянется:
+    # MaxHandshakeAttempts x RekeyTimeout — это время до отказа от рукопожатия.
+    mha_hi = int(d["MaxHandshakeAttempts"].split("-")[-1])
+    chk(f"{v}: отказ от рукопожатия < 4 мин", True,
+        mha_hi * int(rkt_hi or rkt_lo) < 240)
 
 # ── отбор строк регуляркой awg2.sh ──
 m = re.search(r'^AWG_PARAM_KEYS_RE="\((.+)\)"\s*$', SRC, re.M)
