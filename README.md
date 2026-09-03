@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v0.7.31-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v0.8.0-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -72,6 +72,39 @@ sudo awg-mod-update --latest     # обновить до последнего т
 на месте. Перезагрузка модуля — отдельный подтверждаемый шаг (туннель ложится на
 несколько секунд); если SSH идёт через сам туннель, перезапуск уходит в `systemd-run`,
 чтобы не потерять сервер. Есть откат из резервной копии.
+
+---
+
+## Туннели: Xray, tun2socks, AWG-exit
+
+Пункт **5) Туннели и DNS** — Warp, DNS, каскад портов, плюс:
+
+- **Xray** — outbounds из ссылок `vless://` / `vmess://` / `hysteria2://`,
+  балансировка (random / roundRobin / leastPing / leastLoad), выбор того, кто
+  из клиентов идёт в туннель. Трафик уходит через интерфейс `xray0`.
+- **tun2socks** — весь трафик AWG-клиентов в готовый SOCKS5
+  (`awg-tun2socks.service`)
+- **AWG exit-ноды** — каскад через другие AWG-серверы, ECMP-балансировка
+  между ними, per-client переключатели
+
+Одновременно может быть активен только один из Warp / Xray / tun2socks / exit —
+скрипт проверяет это при включении каждого.
+
+Про `xray0`: апстримный XTLS/Xray-core не умеет inbound `tun`, поэтому скрипт
+спрашивает у самого бинаря (`xray run -test`), есть ли TUN-вход. Если нет —
+Xray отдаёт SOCKS5 на `127.0.0.1:10808`, а `xray0` поднимает поверх него
+tun2socks. Снаружи разницы нет; режим виден в статусе туннеля.
+
+CLI:
+
+```bash
+sudo awg2 --auto                  # неинтерактивная установка сервера и client1
+sudo awg2 --add-client имя        # добавить клиента
+sudo awg2 --interactive           # меню даже на чистом сервере
+sudo awg2 --help                  # список аргументов
+```
+
+`AUTOINSTALL=1` — то же, что `--auto`.
 
 ---
 
@@ -143,6 +176,6 @@ sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-scri
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v0.7.31** · MIT License
+**AWG Toolza v0.8.0** · MIT License
 
 </div>
