@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v0.8.1-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v0.8.2-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -89,6 +89,12 @@ sudo awg-mod-update --latest     # обновить до последнего т
 
 Одновременно может быть активен только один из Warp / Xray / tun2socks / exit —
 скрипт проверяет это при включении каждого.
+
+Перед тем как увести клиентов в туннель, скрипт проверяет, что трафик по нему
+реально ходит: не ходит — туннель не включается и маршруты клиентов не
+меняются. Если что-то всё же пошло не так, **5 → 7) Аварийный сброс** гасит
+все туннели и возвращает клиентов на прямой маршрут, ничего не удаляя из
+настроек.
 
 Про `xray0`: апстримный XTLS/Xray-core не умеет inbound `tun`, поэтому скрипт
 спрашивает у самого бинаря (`xray run -test`), есть ли TUN-вход. Если нет —
@@ -183,6 +189,6 @@ sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-scri
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v0.8.1** · MIT License
+**AWG Toolza v0.8.2** · MIT License
 
 </div>

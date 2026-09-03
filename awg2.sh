@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.1"
+VERSION="v0.8.2"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -4872,6 +4872,76 @@ show_submenu_4() {
 }
 
 # ── Подменю 5: Туннели и DNS ───────────────────────────
+# Аварийный сброс: вернуть всех клиентов на прямой маршрут.
+# Нужен, когда туннель включился, интернет у клиентов пропал, а штатное
+# «выключить» по какой-то причине не помогло. Ничего не удаляет из настроек —
+# только снимает маршрутизацию и гасит службы туннелей.
+_tunnels_panic_reset() {
+  hdr "⛑  Аварийный сброс маршрутизации"
+  echo ""
+  warn "Все туннели (Warp / Xray / tun2socks / каскад) будут выключены,"
+  warn "клиенты вернутся на прямой маршрут через сервер."
+  echo ""
+  local go="n"
+  read_yesno go "$(echo -e "${G}  Продолжить? [Y/n]: ${N}")" "y"
+  [[ "$go" == "y" ]] || { info "Отменено"; return 0; }
+
+  info "Останавливаю службы туннелей..."
+  local unit
+  for unit in awg-xray-tun.service awg-xray.service awg-tun2socks.service \
+              awg-exits-routing.service; do
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+  done
+
+  # Таблицы: 100 tun2socks, 200 Warp, 201 Xray, 202 каскад.
+  info "Снимаю правила маршрутизации..."
+  local table guard
+  for table in 100 200 201 202; do
+    guard=0
+    while (( guard < 128 )) && ip rule del lookup "$table" 2>/dev/null; do
+      guard=$((guard + 1))
+    done
+    ip route flush table "$table" 2>/dev/null || true
+  done
+
+  local client_net iface dev
+  client_net=$(_warp_get_client_net 2>/dev/null || echo "")
+  iface=$(_uplink_iface || true)
+  [[ -n "$iface" ]] || iface="eth0"
+
+  if [[ -n "$client_net" ]]; then
+    info "Убираю NAT через туннельные интерфейсы..."
+    for dev in xray0 tun0 warp0; do
+      iptables -t nat -D POSTROUTING -s "$client_net" -o "$dev" -j MASQUERADE 2>/dev/null || true
+      iptables -D FORWARD -i awg0 -o "$dev" -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -i "$dev" -o awg0 -j ACCEPT 2>/dev/null || true
+    done
+    # Возвращаем прямой NAT — то же правило, что ставит PostUp конфига сервера
+    iptables -t nat -C POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE >/dev/null 2>&1 || \
+      iptables -t nat -A POSTROUTING -s "$client_net" -o "$iface" -j MASQUERADE || \
+      warn "Не удалось вернуть MASQUERADE на $iface — проверь iptables -t nat -S"
+    iptables -C FORWARD -i awg0 -j ACCEPT >/dev/null 2>&1 || \
+      iptables -A FORWARD -i awg0 -j ACCEPT || true
+    iptables -C FORWARD -o awg0 -j ACCEPT >/dev/null 2>&1 || \
+      iptables -A FORWARD -o awg0 -j ACCEPT || true
+  else
+    warn "Подсеть клиентов не определяется — NAT не трогаю"
+  fi
+
+  for dev in xray0 tun0; do
+    ip link show "$dev" &>/dev/null && { info "Удаляю $dev..."; ip link delete "$dev" 2>/dev/null || true; }
+  done
+
+  rm -f "$XRAY_STATE" "$AWG_EXITS_STATE" 2>/dev/null || true
+  sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+
+  echo ""
+  ok "Маршрутизация сброшена — клиенты идут напрямую через сервер"
+  info "Если интернет не вернулся, перезапусти интерфейс:"
+  info "  awg-quick down $SERVER_CONF && awg-quick up $SERVER_CONF"
+}
+
 show_submenu_5() {
   while true; do
     check_deps
@@ -4938,9 +5008,11 @@ show_submenu_5() {
       echo -e "  ${C}6)${N} AWG Exit-ноды  ${D}○ не настроен${N}"
     fi
     echo ""
+    echo -e "  ${R}7)${N} Аварийный сброс ${D}— вернуть клиентов напрямую${N}"
+    echo ""
     echo -e "  ${W}0)${N} ← Назад"
     echo ""
-    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-6]: ${N}")" 0 6 "0"
+    read_choice SUB_CHOICE "$(echo -e "${C}  Выбор [0-7]: ${N}")" 0 7 "0"
     case "${SUB_CHOICE:-}" in
       1) do_warp_menu || true ;;
       2) do_dns_menu || true ;;
@@ -4948,6 +5020,7 @@ show_submenu_5() {
       4) do_xray_menu || true ;;
       5) do_tun2socks_menu || true ;;
       6) do_awg_exits_menu || true ;;
+      7) _tunnels_panic_reset || true; read -rp "Enter..." ;;
       0|"") return 0 ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -15589,6 +15662,23 @@ os.replace(tmp, '$XRAY_CONF')
 # валидирует конфиг и падает на неизвестном протоколе. Результат кэшируем —
 # проверка дёргается из меню статуса.
 _XRAY_TUN_SUPPORTED=""
+# Реально ли ходит трафик через Xray. Проверяем его же SOCKS-вход (он есть в
+# конфиге в обоих режимах), то есть всю цепочку до выходного сервера целиком.
+# Без этой пробы «туннель включён» означало лишь «интерфейс появился»: клиентов
+# уводило в таблицу 201, а там мёртвый outbound — и интернет пропадал у всех.
+_xray_probe_socks() {
+  local port="${1:-10808}" url="http://cp.cloudflare.com/generate_204" code=""
+  command -v curl &>/dev/null || return 0   # нечем проверить — не мешаем
+  local opt
+  for opt in --socks5-hostname --socks5; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+             "$opt" "127.0.0.1:${port}" "$url" 2>/dev/null || true)
+    [[ "$code" =~ ^(204|200)$ ]] && return 0
+  done
+  echo "${code:-нет ответа}"
+  return 1
+}
+
 # Есть ли в конфиге хоть один настоящий proxy-outbound.
 # Тот же критерий, что у guard'а в _xray_up: без него туннель поднимать некуда.
 _xray_has_proxy_outbound() {
@@ -15981,6 +16071,23 @@ _xray_up() {
   ip link set dev "$tun_dev" up 2>/dev/null || true
   info "TUN-интерфейс: $tun_dev (режим: $tun_mode)"
 
+  # Пробуем цепочку ДО того, как трогаем маршрутизацию клиентов. Если выходной
+  # сервер не отвечает, откатываемся молча и никого никуда не уводим: лучше
+  # «туннель не включился», чем «интернета нет ни у кого».
+  local probe_out=""
+  info "Проверяю, ходит ли трафик через Xray..."
+  if ! probe_out=$(_xray_probe_socks 10808); then
+    err "Через Xray трафик не идёт (ответ: $probe_out) — туннель не включаю"
+    info "Клиенты остались на прямом маршруте, маршрутизация не менялась."
+    info "Проверь outbound: пункт 9 — «Проверить конфиг (диагностика)»"
+    info "Логи: journalctl -u awg-xray.service -n 30 --no-pager"
+    systemctl stop awg-xray-tun.service 2>/dev/null || true
+    systemctl stop awg-xray.service 2>/dev/null || true
+    ip link delete "$tun_dev" 2>/dev/null || true
+    return 1
+  fi
+  ok "Трафик через Xray проходит"
+
   # Назначаем IP вручную (Xray не всегда делает это сам)
   ip addr add 172.16.250.1/30 dev "$tun_dev" 2>/dev/null || true
 
@@ -16036,20 +16143,34 @@ _xray_up() {
 
 _xray_down() {
   local tun_dev client_net iface
+  # ВАЖНО: очистка маршрутизации идёт БЕЗУСЛОВНО, не под "if -f $XRAY_STATE".
+  # State пишется в _xray_up последним, уже после правил для клиентов: сбой
+  # между этими шагами оставлял клиентов в таблице 201, а «Выключить туннель»
+  # для маршрутов оказывалось пустышкой — интернета нет и вернуть его нечем.
   if [[ -f "$XRAY_STATE" ]]; then
     client_net=$(grep "^client_net=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
     iface=$(grep "^iface=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
     tun_dev=$(grep "^tun_dev=" "$XRAY_STATE" 2>/dev/null | cut -d= -f2 || true)
-    tun_dev="${tun_dev:-xray0}"
-    _xray_remove_peer_rules
-    if [[ -n "$client_net" ]]; then
-      iptables -t nat -D POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null || true
-      iptables -D FORWARD -i awg0 -o "$tun_dev" -j ACCEPT 2>/dev/null || true
-      iptables -D FORWARD -i "$tun_dev" -o awg0 -j ACCEPT 2>/dev/null || true
-      iptables -D FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-    fi
-    ip route del default dev "$tun_dev" table 201 2>/dev/null || true
-    ip rule del from "$client_net" table 201 priority 201 2>/dev/null || true
+  fi
+  tun_dev="${tun_dev:-xray0}"
+  [[ -n "${client_net:-}" ]] || client_net=$(_warp_get_client_net 2>/dev/null || echo "")
+
+  # Снимаем ВСЕ правила на таблицу 201, а не только те IP, что сейчас лежат в
+  # peers.list: список мог измениться после того, как правила были добавлены,
+  # и остатки висели бы вечно.
+  local guard=0
+  while (( guard < 128 )) && ip rule del lookup 201 2>/dev/null; do
+    guard=$((guard + 1))
+  done
+  _xray_remove_peer_rules
+  ip rule del from "$client_net" table 201 priority 201 2>/dev/null || true
+  ip route flush table 201 2>/dev/null || true
+
+  if [[ -n "$client_net" ]]; then
+    iptables -t nat -D POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null || true
+    iptables -D FORWARD -i awg0 -o "$tun_dev" -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "$tun_dev" -o awg0 -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -p tcp --tcp-flags SYN,RST SYN -o awg0 -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   fi
 
   # awg-xray-tun.service существует только в режиме tun2socks; гасим его
@@ -17447,6 +17568,13 @@ EOF
 _exits_down() {
   info "Останавливаем службу маршрутизации каскада..."
   systemctl disable --now awg-exits-routing.service >/dev/null 2>&1 || true
+  # ExecStop мог не отработать (юнит уже удалён, служба упала) — снимаем
+  # правила сами, иначе клиенты остаются в мёртвой таблице 202.
+  local guard=0
+  while (( guard < 128 )) && ip rule del lookup 202 2>/dev/null; do
+    guard=$((guard + 1))
+  done
+  ip route flush table 202 2>/dev/null || true
   rm -f /etc/systemd/system/awg-exits-routing.service
   rm -f /usr/local/bin/awg2-exits-routing.sh
   rm -f "$AWG_EXITS_STATE"
