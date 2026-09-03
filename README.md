@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v0.8.0-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v0.8.1-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -95,6 +95,13 @@ sudo awg-mod-update --latest     # обновить до последнего т
 Xray отдаёт SOCKS5 на `127.0.0.1:10808`, а `xray0` поднимает поверх него
 tun2socks. Снаружи разницы нет; режим виден в статусе туннеля.
 
+Ссылка `hysteria2://` принимается только сборкой Xray с поддержкой этого
+протокола — в апстримном XTLS/Xray-core её нет. Скрипт проверяет каждый
+outbound на самом бинаре до записи в конфиг и не даёт положить туда то, что
+Xray не примет. Разобраться с уже сломанным конфигом помогает
+**5 → 4 → 9) Проверить конфиг** — покажет причину и предложит убрать
+неподдерживаемые outbounds.
+
 CLI:
 
 ```bash
@@ -176,6 +183,6 @@ sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-scri
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v0.8.0** · MIT License
+**AWG Toolza v0.8.1** · MIT License
 
 </div>

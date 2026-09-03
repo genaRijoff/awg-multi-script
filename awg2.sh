@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.0"
+VERSION="v0.8.1"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -14972,9 +14972,10 @@ do_xray_menu() {
     echo -e "  6) Выключить туннель"
     echo -e "  7) Перезапустить туннель"
     echo -e "  ${C}8) Управление клиентами в Xray${N}"
+    echo -e "  9) Проверить конфиг (диагностика)"
     echo -e "  0) Назад в главное меню"
     echo ""
-    XRAY_CHOICE=0; safe_read XRAY_CHOICE "$(echo -e "${C}  Выбор [0-8]: ${N}")"
+    XRAY_CHOICE=0; safe_read XRAY_CHOICE "$(echo -e "${C}  Выбор [0-9]: ${N}")"
 
     case "${XRAY_CHOICE:-}" in
       1) _xray_install; read -rp "Enter..." ;;
@@ -14985,6 +14986,7 @@ do_xray_menu() {
       6) _xray_down; read -rp "Enter..." ;;
       7) _xray_down 2>/dev/null; _xray_up; read -rp "Enter..." ;;
       8) do_xray_peers_menu; set +e ;;
+      9) _xray_diagnose; read -rp "Enter..." ;;
       0) break ;;
       *) warn "Неверный выбор" ;;
     esac
@@ -15194,6 +15196,8 @@ JSONEOF
 }
 
 _xray_add_outbound() {
+  # hysteria2 упомянут, но принимается только сборкой Xray с его поддержкой —
+  # в апстримном XTLS/Xray-core его нет. Проверка ниже скажет об этом прямо.
   safe_read link "Введите ссылку на Xray outbound (vless:// / vmess:// / hysteria2://): "
   if [[ -z "$link" ]]; then
     warn "Ссылка пустая"
@@ -15360,6 +15364,36 @@ PYEOF
 
   local tag
   tag=$(echo "$new_outbound" | grep -oP '"tag": "\K[^"]+')
+
+  # Проверяем outbound на самом бинаре ДО записи в config.json. Иначе
+  # неподдерживаемый протокол (в апстримном Xray-core нет hysteria2) попадал
+  # в конфиг, и туннель переставал подниматься вообще — с ошибкой, которая
+  # никак не указывала на только что добавленную ссылку.
+  local probe_conf probe_err=""
+  probe_conf=$(mktemp /tmp/awg_tmp_xprobe_XXXXXX.json) || { err "mktemp провалился"; return 1; }
+  chmod 600 "$probe_conf"
+  OUTBOUND="$new_outbound" python3 - "$probe_conf" << 'PYEOF3'
+import json, os, sys
+json.dump({
+    "log": {"loglevel": "none"},
+    "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                  "tag": "probe-in", "settings": {"auth": "noauth"}}],
+    "outbounds": [json.loads(os.environ["OUTBOUND"]),
+                  {"protocol": "freedom", "tag": "direct"}],
+}, open(sys.argv[1], "w"))
+PYEOF3
+  if ! probe_err=$(_xray_test_conf "$probe_conf"); then
+    rm -f "$probe_conf"
+    err "Этот Xray не принимает такой outbound:"
+    printf '%s\n' "$probe_err" | sed 's/^/      /'
+    echo ""
+    info "Если это hysteria2 — апстримный XTLS/Xray-core его не поддерживает,"
+    info "нужна сборка с hysteria2 или другой протокол (vless/vmess)."
+    info "Конфиг $XRAY_CONF не тронут."
+    return 1
+  fi
+  rm -f "$probe_conf"
+  ok "Xray принимает outbound '$tag'"
 
   info "Добавляем outbound '$tag' в $XRAY_CONF..."
   # Simple python script to append outbound to config.json
@@ -15555,6 +15589,33 @@ os.replace(tmp, '$XRAY_CONF')
 # валидирует конфиг и падает на неизвестном протоколе. Результат кэшируем —
 # проверка дёргается из меню статуса.
 _XRAY_TUN_SUPPORTED=""
+# Есть ли в конфиге хоть один настоящий proxy-outbound.
+# Тот же критерий, что у guard'а в _xray_up: без него туннель поднимать некуда.
+_xray_has_proxy_outbound() {
+  [[ -f "$XRAY_CONF" ]] || return 1
+  python3 -c "
+import json, sys
+conf = json.load(open('$XRAY_CONF'))
+skip = ('freedom', 'blackhole', 'dns')
+sys.exit(0 if [o for o in conf.get('outbounds', [])
+               if o.get('tag') and o.get('protocol') not in skip] else 1)" 2>/dev/null
+}
+
+# Прогоняет конфиг через сам Xray и отдаёт текст ошибки в stdout.
+# 0 — конфиг принят, 1 — отвергнут (в stdout причина от самого Xray).
+# Раньше вывод уходил в /dev/null, и «Xray отверг конфиг» ничего не объясняло.
+_xray_test_conf() {
+  local conf="${1:-$XRAY_CONF}" out
+  command -v xray &>/dev/null || { echo "бинарь xray не найден"; return 1; }
+  if out=$(xray run -test -c "$conf" 2>&1); then
+    return 0
+  fi
+  # Xray печатает многострочный баннер; интересна строка с failed/infra
+  printf '%s\n' "$out" | grep -iE 'failed|error|invalid|unknown|not found' | head -5
+  [[ -n "$out" ]] || echo "xray вернул ошибку без текста"
+  return 1
+}
+
 _xray_tun_supported() {
   if [[ -n "$_XRAY_TUN_SUPPORTED" ]]; then
     [[ "$_XRAY_TUN_SUPPORTED" == "1" ]]
@@ -15583,6 +15644,107 @@ JSONEOF
   fi
   rm -f "$probe"
   [[ "$_XRAY_TUN_SUPPORTED" == "1" ]]
+}
+
+# Какие outbounds этот бинарь Xray не принимает. По тегу в строку на каждый.
+# Проверяем каждый по отдельности: «failed to build router» на весь конфиг не
+# говорит, из-за какого именно outbound он отвалился.
+_xray_bad_outbounds() {
+  [[ -f "$XRAY_CONF" ]] || return 0
+  local tags tag probe
+  tags=$(python3 -c "
+import json
+conf = json.load(open('$XRAY_CONF'))
+skip = ('freedom', 'blackhole', 'dns')
+print('\n'.join(o['tag'] for o in conf.get('outbounds', [])
+                 if o.get('tag') and o.get('protocol') not in skip))" 2>/dev/null || true)
+  [[ -n "$tags" ]] || return 0
+
+  probe=$(mktemp /tmp/awg_tmp_xdiag_XXXXXX.json) || return 0
+  chmod 600 "$probe"
+  while IFS= read -r tag; do
+    [[ -n "$tag" ]] || continue
+    TAG="$tag" python3 - "$XRAY_CONF" "$probe" << 'PYEOF4' || continue
+import json, os, sys
+conf = json.load(open(sys.argv[1]))
+ob = next(o for o in conf["outbounds"] if o.get("tag") == os.environ["TAG"])
+json.dump({
+    "log": {"loglevel": "none"},
+    "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                  "tag": "probe-in", "settings": {"auth": "noauth"}}],
+    "outbounds": [ob, {"protocol": "freedom", "tag": "direct"}],
+}, open(sys.argv[2], "w"))
+PYEOF4
+    _xray_test_conf "$probe" >/dev/null 2>&1 || echo "$tag"
+  done <<< "$tags"
+  rm -f "$probe"
+}
+
+# Диагностика: что именно не так с текущим конфигом и чем это лечится.
+_xray_diagnose() {
+  if [[ ! -f "$XRAY_CONF" ]]; then
+    err "Конфиг $XRAY_CONF не найден — Xray ещё не установлен (пункт 1)"
+    return 1
+  fi
+  command -v xray &>/dev/null || { err "Бинарь xray не найден (пункт 1)"; return 1; }
+
+  info "Бинарь: $(xray version 2>/dev/null | head -n1)"
+  if _xray_tun_supported; then
+    info "TUN-вход: поддерживается — xray0 поднимет сам Xray"
+  else
+    info "TUN-вход: нет — xray0 поднимет tun2socks поверх SOCKS5 127.0.0.1:10808"
+  fi
+
+  local test_err=""
+  if test_err=$(_xray_test_conf "$XRAY_CONF"); then
+    ok "Конфиг принят Xray — можно включать туннель (пункт 5)"
+    return 0
+  fi
+
+  err "Конфиг отвергнут:"
+  printf '%s\n' "$test_err" | sed 's/^/      /'
+  echo ""
+
+  local bad
+  bad=$(_xray_bad_outbounds)
+  if [[ -n "$bad" ]]; then
+    warn "Эти outbounds не принимает данная сборка Xray:"
+    printf '%s\n' "$bad" | sed 's/^/      • /'
+    echo ""
+    info "Чаще всего это hysteria2: в апстримном XTLS/Xray-core его нет."
+    local _rm="n"
+    read_yesno _rm "$(echo -e "${G}  Удалить их из конфига? [Y/n]: ${N}")" "y"
+    if [[ "$_rm" == "y" ]]; then
+      BAD_TAGS="$bad" python3 - "$XRAY_CONF" << 'PYEOF5'
+import json, os, sys
+path = sys.argv[1]
+bad = {t for t in os.environ["BAD_TAGS"].split("\n") if t}
+conf = json.load(open(path))
+conf["outbounds"] = [o for o in conf.get("outbounds", []) if o.get("tag") not in bad]
+tmp = path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(conf, f, indent=2, ensure_ascii=False)
+os.replace(tmp, path)
+PYEOF5
+      # Висячие ссылки на удалённые теги чинит подготовка конфига
+      _xray_prepare_conf "$(_xray_tun_supported && echo native || echo tun2socks)" || true
+      if _xray_test_conf "$XRAY_CONF" >/dev/null; then
+        if _xray_has_proxy_outbound; then
+          ok "Конфиг починен — можно включать туннель (пункт 5)"
+        else
+          ok "Конфиг починен, но proxy-outbounds не осталось"
+          info "Добавь рабочую ссылку (пункт 2) — vless:// или vmess://"
+        fi
+        return 0
+      fi
+      warn "Конфиг всё ещё отвергается — смотри вывод выше"
+    fi
+  else
+    info "Отдельные outbounds Xray принимает — дело в маршрутизации."
+    info "Попробуй включить туннель (пункт 5): подготовка конфига чинит"
+    info "висячие ссылки на удалённые outbounds автоматически."
+  fi
+  return 1
 }
 
 # Приводит $XRAY_CONF к выбранному режиму входа.
@@ -15652,6 +15814,44 @@ for r in rules:
 if not touched:
     rules.append({"type": "field", "inboundTag": [want], "outboundTag": "proxy"})
 
+# Починка висячих outboundTag. Удалили outbound (пункт 3) — правило осталось
+# указывать на несуществующий тег, и Xray отвергает такой конфиг целиком:
+# "failed to build router". Перенаправляем на первый настоящий proxy-outbound,
+# а если его нет — снимаем тег, чтобы конфиг остался валидным (туннель всё
+# равно не поднимется: выше стоит guard "нет proxy outbounds").
+skip_proto = ("freedom", "blackhole", "dns")
+existing_tags = {o.get("tag") for o in conf.get("outbounds", []) if o.get("tag")}
+proxy_tags = [o["tag"] for o in conf.get("outbounds", [])
+              if o.get("tag") and o.get("protocol") not in skip_proto]
+balancer_tags = {b.get("tag") for b in routing.get("balancers", []) or [] if b.get("tag")}
+
+for r in rules:
+    bt = r.get("balancerTag")
+    if bt:
+        if bt in balancer_tags:
+            continue
+        r.pop("balancerTag", None)   # балансировщик удалён — правило осиротело
+    ot = r.get("outboundTag")
+    if ot and ot not in existing_tags:
+        if proxy_tags:
+            r["outboundTag"] = proxy_tags[0]
+        else:
+            r.pop("outboundTag", None)
+
+# Правило вообще без назначения Xray не примет — выкидываем такие
+rules = [r for r in rules if r.get("outboundTag") or r.get("balancerTag")]
+routing["rules"] = rules
+
+# Селектор балансировщика тоже мог протухнуть
+for b in routing.get("balancers", []) or []:
+    sel = [t for t in (b.get("selector") or []) if t in existing_tags]
+    if sel:
+        b["selector"] = sel
+if routing.get("balancers"):
+    routing["balancers"] = [b for b in routing["balancers"] if b.get("selector")]
+    if not routing["balancers"]:
+        del routing["balancers"]
+
 tmp = path + ".tmp"
 with open(tmp, "w") as f:
     json.dump(conf, f, indent=2, ensure_ascii=False)
@@ -15673,7 +15873,7 @@ _xray_up() {
   # Guard: начальный конфиг (после _xray_install) ссылается на outboundTag
   # "proxy", которого нет до добавления первого outbound. Без proxy outbounds
   # Xray стартует с правилом в никуда (дроп/ошибка). Не пускаем.
-  if ! python3 -c "import json; conf=json.load(open('$XRAY_CONF')); exit(0 if [o for o in conf.get('outbounds',[]) if o.get('tag') and o.get('tag')!='direct' and o.get('protocol')!='freedom'] else 1)" 2>/dev/null; then
+  if ! _xray_has_proxy_outbound; then
     err "Нет настроенных proxy outbounds. Сначала добавьте outbound (пункт 2), затем включайте туннель."
     return 1
   fi
@@ -15715,8 +15915,24 @@ _xray_up() {
 
   _xray_prepare_conf "$tun_mode" || { err "Не удалось подготовить конфиг Xray"; return 1; }
 
-  if ! xray run -test -c "$XRAY_CONF" >/dev/null 2>&1; then
-    err "Xray отверг конфиг $XRAY_CONF. Проверь: xray run -test -c $XRAY_CONF"
+  local test_err=""
+  if ! test_err=$(_xray_test_conf "$XRAY_CONF"); then
+    err "Xray отверг конфиг $XRAY_CONF:"
+    printf '%s\n' "$test_err" | sed 's/^/      /'
+    echo ""
+    info "Частые причины:"
+    info "  • outbound на протоколе, которого нет в этой сборке Xray"
+    info "    (hysteria2 в апстримном XTLS/Xray-core не поддерживается)"
+    info "  • правило маршрутизации ссылается на удалённый outbound"
+    local bad_tags
+    bad_tags=$(_xray_bad_outbounds)
+    if [[ -n "$bad_tags" ]]; then
+      warn "Не принимаются этой сборкой Xray:"
+      printf '%s\n' "$bad_tags" | sed 's/^/      • /'
+      info "Убрать их: пункт 9 — «Проверить конфиг (диагностика)»"
+    else
+      info "Список outbounds: пункт 3; диагностика: пункт 9"
+    fi
     return 1
   fi
 
@@ -15743,8 +15959,10 @@ _xray_up() {
     # Отдельный юнит, не awg-tun2socks.service: тот принадлежит своему пункту
     # меню и имеет собственный proxy_url. Смешивать их — значит гасить чужой
     # туннель при выключении этого.
+    # Флаги только в длинной форме: pflag не понимает "-device", молча
+    # печатает usage и выходит с кодом 0 — юнит «стартовал» бы и тут же умер.
     systemd-run --unit=awg-xray-tun.service /usr/local/bin/tun2socks \
-      -device "tun://$tun_dev" -proxy socks5://127.0.0.1:10808 -loglevel warn \
+      --device "tun://$tun_dev" --proxy socks5://127.0.0.1:10808 --loglevel warn \
       >/dev/null 2>&1
   fi
 
@@ -16003,7 +16221,10 @@ TUN2SOCKS_DIR="/etc/tun2socks"
 TUN2SOCKS_CONF="$TUN2SOCKS_DIR/proxy.txt"
 
 _tun2socks_install() {
-  if command -v tun2socks &>/dev/null && tun2socks -version &>/dev/null; then
+  # Флаг именно --version: у tun2socks 2.x разбор на pflag, и одинарный
+  # "-version" печатает usage и выходит с кодом 2 — из-за этого рабочий
+  # бинарь считался сломанным и качался заново на каждый заход.
+  if command -v tun2socks &>/dev/null && tun2socks --version &>/dev/null; then
     return 0
   fi
   info "Устанавливаем tun2socks..."
@@ -16061,12 +16282,27 @@ _tun2socks_install() {
   }
   rm -rf "$tmpd"
 
-  if ! /usr/local/bin/tun2socks -version &>/dev/null; then
-    err "Бинарь tun2socks не запускается"; rm -f /usr/local/bin/tun2socks; return 1
+  local ver_out="" ver_rc=0
+  ver_out=$(/usr/local/bin/tun2socks --version 2>&1) || ver_rc=$?
+  # 126/127 — бинарь физически не исполняется (чужая архитектура, нет loader'а).
+  # Ненулевой код с осмысленным выводом — не повод паниковать: у разных версий
+  # разные флаги, а нам важно лишь то, что файл вообще запускается.
+  if (( ver_rc == 126 || ver_rc == 127 )) || [[ -z "$ver_out" && $ver_rc -ne 0 ]] \
+     || printf '%s' "$ver_out" | grep -qiE 'GLIBC|error while loading shared|exec format'; then
+    err "Бинарь tun2socks не запускается (код $ver_rc):"
+    printf '%s\n' "$ver_out" | head -3 | sed 's/^/      /'
+    rm -f /usr/local/bin/tun2socks
+    return 1
   fi
 
   mkdir -p "$TUN2SOCKS_DIR"
-  ok "tun2socks установлен: $(/usr/local/bin/tun2socks -version 2>/dev/null | head -n1)"
+  if (( ver_rc == 0 )); then
+    ok "tun2socks установлен: $(printf '%s' "$ver_out" | head -n1)"
+  else
+    # Бинарь живой, но --version у него не тот: версию не показываем, чтобы
+    # не выдавать текст ошибки за номер версии.
+    ok "tun2socks установлен"
+  fi
 }
 
 _tun2socks_up() {
@@ -16207,7 +16443,7 @@ Wants=awg-quick@awg0.service
 
 [Service]
 Type=simple
-ExecStart=$ts_bin -device tun://tun0 -proxy socks5://$proxy_url -loglevel info
+ExecStart=$ts_bin --device tun://tun0 --proxy socks5://$proxy_url --loglevel info
 ExecStartPost=/usr/local/bin/awg2-tun2socks-routing.sh start
 ExecStopPost=/usr/local/bin/awg2-tun2socks-routing.sh stop
 Restart=on-failure
