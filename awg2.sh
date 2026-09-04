@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.3"
+VERSION="v0.8.4"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -15327,14 +15327,63 @@ def parse_link(link):
             _grpc = {}
             if "serviceName" in qs:
                 _grpc["serviceName"] = qs["serviceName"][0]
+            if "mode" in qs and qs["mode"][0] == "multi":
+                _grpc["multiMode"] = True
             outbound["streamSettings"]["grpcSettings"] = _grpc
+        elif _net in ("xhttp", "splithttp"):
+            # XHTTP (бывший SplitHTTP). Без path сервер отдаёт 404 на корень:
+            # TLS проходит, туннель «поднят», трафика нет. Раньше path/host/mode
+            # из ссылки просто терялись — обрабатывались только ws и grpc.
+            _xh = {}
+            if "path" in qs:
+                _xh["path"] = qs["path"][0]
+            if "host" in qs:
+                _xh["host"] = qs["host"][0]
+            if "mode" in qs:
+                _xh["mode"] = qs["mode"][0]
+            if "extra" in qs:
+                try:
+                    _xh["extra"] = json.loads(qs["extra"][0])
+                except Exception:
+                    pass
+            key = "xhttpSettings" if _net == "xhttp" else "splithttpSettings"
+            outbound["streamSettings"][key] = _xh
+        elif _net == "httpupgrade":
+            _hu = {}
+            if "path" in qs:
+                _hu["path"] = qs["path"][0]
+            if "host" in qs:
+                _hu["host"] = qs["host"][0]
+            outbound["streamSettings"]["httpupgradeSettings"] = _hu
+        elif _net in ("h2", "http"):
+            _h2 = {}
+            if "path" in qs:
+                _h2["path"] = qs["path"][0]
+            if "host" in qs:
+                _h2["host"] = qs["host"][0].split(",")
+            outbound["streamSettings"]["httpSettings"] = _h2
+        elif _net not in ("tcp", "raw", ""):
+            # Транспорт, для которого мы не умеем собирать *Settings: молчать
+            # нельзя — параметры из ссылки потеряются, и туннель встанет
+            # «рабочим», но пустым.
+            print("UNSUPPORTED_TRANSPORT:" + _net, file=sys.stderr)
 
-        if outbound["streamSettings"]["security"] == "tls" or outbound["streamSettings"]["security"] == "reality":
+        if outbound["streamSettings"]["security"] in ("tls", "reality"):
             tls_settings = {"serverName": qs.get("sni", [""])[0], "fingerprint": qs.get("fp", ["chrome"])[0]}
+            # SNI в ссылке может отсутствовать — тогда берём адрес сервера,
+            # иначе TLS уйдёт с пустым serverName и сервер оборвёт рукопожатие.
+            if not tls_settings["serverName"]:
+                tls_settings["serverName"] = qs.get("host", [parsed.hostname or ""])[0]
             if "pbk" in qs:
                 tls_settings["publicKey"] = qs.get("pbk", [""])[0]
             if "sid" in qs:
                 tls_settings["shortId"] = qs.get("sid", [""])[0]
+            if "spx" in qs:
+                tls_settings["spiderX"] = qs.get("spx", [""])[0]
+            if "alpn" in qs:
+                tls_settings["alpn"] = qs["alpn"][0].split(",")
+            if qs.get("allowInsecure", ["0"])[0] in ("1", "true"):
+                tls_settings["allowInsecure"] = True
             if outbound["streamSettings"]["security"] == "reality":
                 outbound["streamSettings"]["realitySettings"] = tls_settings
             else:
@@ -15427,13 +15476,29 @@ except Exception as e:
     sys.exit(1)
 PYEOF
 
-  local new_outbound=""
-  if ! new_outbound=$(python3 "$parser_script" "$link") || [[ -z "$new_outbound" ]]; then
-    rm -f "$parser_script"
+  local new_outbound="" parse_err="" parse_log
+  parse_log=$(mktemp /tmp/awg_tmp_xparse_XXXXXX.log) || { err "mktemp провалился"; return 1; }
+  if ! new_outbound=$(python3 "$parser_script" "$link" 2>"$parse_log") || [[ -z "$new_outbound" ]]; then
+    parse_err=$(cat "$parse_log" 2>/dev/null || true)
+    rm -f "$parser_script" "$parse_log"
     err "Не удалось распарсить ссылку"
+    [[ -n "$parse_err" ]] && printf '%s\n' "$parse_err" | head -3 | sed 's/^/      /'
     return 1
   fi
-  rm -f "$parser_script"
+  # Транспорт, для которого парсер не умеет собирать *Settings: путь/хост из
+  # ссылки потеряются, и туннель поднимется рабочим, но пустым.
+  if grep -q '^UNSUPPORTED_TRANSPORT:' "$parse_log" 2>/dev/null; then
+    warn "Транспорт $(sed -n 's/^UNSUPPORTED_TRANSPORT://p' "$parse_log" | head -1) скрипт собирать не умеет"
+    warn "Параметры из ссылки (path/host и прочие) будут потеряны."
+    local _go="n"
+    read_yesno _go "$(echo -e "${G}  Всё равно добавить? [y/N]: ${N}")" "n"
+    if [[ "$_go" != "y" ]]; then
+      rm -f "$parser_script" "$parse_log"
+      info "Отменено — конфиг не тронут"
+      return 1
+    fi
+  fi
+  rm -f "$parser_script" "$parse_log"
 
   local tag
   tag=$(echo "$new_outbound" | grep -oP '"tag": "\K[^"]+')
