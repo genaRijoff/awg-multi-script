@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.2"
+VERSION="v0.8.3"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -16091,7 +16091,15 @@ _xray_up() {
   # Назначаем IP вручную (Xray не всегда делает это сам)
   ip addr add 172.16.250.1/30 dev "$tun_dev" 2>/dev/null || true
 
+  # rp_filter loose и на туннеле, и на awg0 — как в Warp/usque/каскаде.
+  # Только на $tun_dev недостаточно: пакет клиента приходит на awg0, и обратная
+  # проверка пути для его адреса уходит в таблицу 201 (default dev xray0), то
+  # есть не на awg0 — при строгом rp_filter ядро молча дропает такие пакеты, и
+  # клиент оказывается без интернета при живом туннеле.
+  # .all.rp_filter не трогаем: ядро берёт max(all, iface), и eth0 остаётся
+  # строгим (защита от spoofing).
   sysctl -w net.ipv4.conf."$tun_dev".rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
 
   # Настройка маршрутизации для клиентов
   if ! iptables -t nat -C POSTROUTING -s "$client_net" -o "$tun_dev" -j MASQUERADE 2>/dev/null; then
@@ -16520,6 +16528,11 @@ start() {
   ip addr add "$TUN_ADDR" dev "$TUN_DEV" 2>/dev/null || true
   ip link set "$TUN_DEV" up 2>/dev/null || true
   sysctl -qw net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  # loose rp_filter на обоих концах: обратный путь для адреса клиента ведёт в
+  # таблицу 100 (default dev tun0), а пакет пришёл на awg0 — строгая проверка
+  # такие пакеты дропает.
+  sysctl -qw net.ipv4.conf."$TUN_DEV".rp_filter=2 >/dev/null 2>&1 || true
+  sysctl -qw net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
 
   ip route replace default dev "$TUN_DEV" table "$TABLE" || return 1
   # priority задаём явно: без него ядро выбирает её само, и удалить правило
