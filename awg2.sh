@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.8"
+VERSION="v0.8.9"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -3329,6 +3329,30 @@ do_sniff_test() {
 
   rm -f "$pcap" "$analyzer"
   log_info "DPI тест: клиент=$client_ip verdict=$verdict"
+}
+
+# apt-get install с одной повторной попыткой после обновления индексов.
+# Типичный отказ на давно не обновлявшемся сервере — 404 на .deb: в архиве
+# уже лежит более новая версия пакета, а локальный индекс помнит старую.
+# Гонять "apt-get update" перед каждой установкой дорого, поэтому обновляемся
+# только после первой неудачи. Вывод apt остаётся в APT_LAST_OUTPUT — чтобы
+# вызывающий показал настоящую причину, а не «не удалось установить».
+APT_LAST_OUTPUT=""
+_apt_install() {
+  local rc=0
+  APT_LAST_OUTPUT=$(apt-get install -y -q "$@" 2>&1) || rc=$?
+  (( rc == 0 )) && return 0
+
+  info "Индексы пакетов устарели — обновляю и пробую ещё раз..."
+  apt-get update -q >/dev/null 2>&1 || true
+  rc=0
+  APT_LAST_OUTPUT=$(apt-get install -y -q "$@" 2>&1) || rc=$?
+  return $rc
+}
+
+# Печатает строки ошибок из последнего вызова _apt_install.
+_apt_last_errors() {
+  printf '%s\n' "$APT_LAST_OUTPUT" | grep -E '^E:' | head -3 | sed 's/^/      /' || true
 }
 
 check_deps() {
@@ -10066,7 +10090,7 @@ _warp_ensure_deps() {
     info "Ставим зависимости WARP: ${missing[*]}"
     apt-get update -y >/dev/null 2>&1 || \
       warn "apt-get update завершился с ошибкой — пробуем ставить как есть"
-    if ! apt-get install -y -q "${missing[@]}" >/dev/null 2>&1; then
+    if ! _apt_install "${missing[@]}" >/dev/null 2>&1; then
       err "Не удалось установить: ${missing[*]}"
       info "Поставь вручную и повтори:"
       info "  apt-get update && apt-get install -y ${missing[*]}"
@@ -11830,16 +11854,17 @@ _dns_proxy_install() {
   # ───── 1. Установка пакета ─────
   if ! command -v dnscrypt-proxy &>/dev/null; then
     info "Устанавливаем dnscrypt-proxy + dnsutils..."
-    if ! apt-get install -y -q dnscrypt-proxy dnsutils 2>&1 | grep -E "^(Setting up|E:)" | head -5; then
-      err "Не удалось установить dnscrypt-proxy"
-      info "Попробуй: apt-get update && apt-get install dnscrypt-proxy"
+    if ! _apt_install dnscrypt-proxy dnsutils; then
+      err "Не удалось установить dnscrypt-proxy:"
+      _apt_last_errors
+      info "Попробуй вручную: apt-get update && apt-get install dnscrypt-proxy"
       return 1
     fi
     ok "dnscrypt-proxy установлен"
   else
     info "dnscrypt-proxy уже установлен"
     if ! command -v dig &>/dev/null; then
-      apt-get install -y -q dnsutils 2>&1 | grep -E "^(Setting up|E:)" | head -3 || true
+      _apt_install dnsutils >/dev/null 2>&1 || warn "dnsutils не установился — dig будет недоступен"
     fi
   fi
 
