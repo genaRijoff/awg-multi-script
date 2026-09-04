@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.7"
+VERSION="v0.8.8"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -15765,17 +15765,25 @@ _xray_port_owner() {
 # конфиге в обоих режимах), то есть всю цепочку до выходного сервера целиком.
 # Без этой пробы «туннель включён» означало лишь «интерфейс появился»: клиентов
 # уводило в таблицу 201, а там мёртвый outbound — и интернет пропадал у всех.
-_xray_probe_socks() {
-  local port="${1:-10808}" url="http://cp.cloudflare.com/generate_204" code=""
+# Ходит ли трафик через SOCKS5 по адресу host:port. Настоящий запрос наружу,
+# а не просто TCP-коннект: прокси может принимать соединения и никуда их не
+# отправлять — снаружи это неотличимо, а для клиентов означает чёрную дыру.
+# 0 — прошло, 1 — нет (в stdout код ответа или «нет ответа»).
+_socks_probe() {
+  local addr="${1:-127.0.0.1:10808}" url="http://cp.cloudflare.com/generate_204" code=""
   command -v curl &>/dev/null || return 0   # нечем проверить — не мешаем
   local opt
   for opt in --socks5-hostname --socks5; do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
-             "$opt" "127.0.0.1:${port}" "$url" 2>/dev/null || true)
+             "$opt" "$addr" "$url" 2>/dev/null || true)
     [[ "$code" =~ ^(204|200)$ ]] && return 0
   done
   echo "${code:-нет ответа}"
   return 1
+}
+
+_xray_probe_socks() {
+  _socks_probe "127.0.0.1:${1:-10808}"
 }
 
 # Есть ли в конфиге хоть один настоящий proxy-outbound.
@@ -16606,10 +16614,22 @@ _tun2socks_up() {
   [[ -e /dev/net/tun ]] || modprobe tun 2>/dev/null || true
   systemctl stop awg-tun2socks.service 2>/dev/null || true
 
-  local host="${proxy_url%:*}" port="${proxy_url##*:}"
-  if ! timeout 2 bash -c "echo >/dev/tcp/${host}/${port}" 2>/dev/null; then
-    warn "SOCKS5 $proxy_url не отвечает — сервис поднимем, но трафик не пойдёт, пока прокси не заработает"
+  # Проверяем прокси НАСТОЯЩИМ запросом и до того, как трогаем маршруты.
+  # Раньше здесь был просто TCP-коннект и предупреждение: сервис поднимался
+  # поверх мёртвого прокси, клиенты уходили в таблицу 100 и теряли интернет —
+  # ровно то, от чего защищён путь Xray.
+  local probe_out=""
+  info "Проверяю SOCKS5 $proxy_url..."
+  if ! probe_out=$(_socks_probe "$proxy_url"); then
+    err "Через $proxy_url трафик не идёт (ответ: $probe_out) — туннель не включаю"
+    info "Клиенты остались на прямом маршруте, маршрутизация не менялась."
+    if [[ "$proxy_url" == "127.0.0.1:10808" || "$proxy_url" == "localhost:10808" ]]; then
+      warn "10808 — это SOCKS-вход самого Xray. Он поднимается своим пунктом:"
+      warn "  5 → 4 → 5) Включить туннель, а не через tun2socks."
+    fi
+    return 1
   fi
+  ok "SOCKS5 $proxy_url отвечает"
 
   ip rule del from "$awg_subnet" lookup 100 2>/dev/null || true
   ip route flush table 100 2>/dev/null || true
@@ -16822,10 +16842,24 @@ do_tun2socks_menu() {
       safe_read S_CHOICE "  Выбор [0-1]: "
       case "${S_CHOICE:-}" in
         1)
-          local default_proxy="127.0.0.1:10808"
-          [[ -n "$saved_proxy" ]] && default_proxy="$saved_proxy"
-          safe_read p "  Введи IP:PORT для SOCKS5 прокси [Enter = $default_proxy]: "
-          [[ -z "$p" ]] && p="$default_proxy"
+          # По умолчанию раньше подставлялся 127.0.0.1:10808 — порт SOCKS
+          # самого Xray. Но включить tun2socks на него нельзя: выше стоит
+          # запрет при поднятом xray0, то есть значение годилось лишь когда
+          # Xray выключен и на порту никого нет. Подсказка вела в тупик.
+          local default_proxy="$saved_proxy"
+          if [[ -n "$default_proxy" ]]; then
+            safe_read p "  Введи IP:PORT для SOCKS5 прокси [Enter = $default_proxy]: "
+            [[ -z "$p" ]] && p="$default_proxy"
+          else
+            echo -e "  ${D}Адрес готового SOCKS5-прокси, например 127.0.0.1:1080.${N}"
+            echo -e "  ${D}Для туннеля Xray это не нужно — он поднимается пунктом 5 → 4.${N}"
+            safe_read p "  Введи IP:PORT для SOCKS5 прокси: "
+          fi
+          if [[ -z "$p" ]]; then
+            warn "Адрес не указан"
+            sleep 1
+            continue
+          fi
           _tun2socks_up "$p"
           sleep 2
           ;;
