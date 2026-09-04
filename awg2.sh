@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.5"
+VERSION="v0.8.6"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -15735,8 +15735,12 @@ _XRAY_TUN_SUPPORTED=""
 _xray_port_owner() {
   local port="${1:-10808}"
   command -v ss &>/dev/null || return 0
+  # По строке на сокет, с pid: из-за SO_REUSEPORT на одном порту может сидеть
+  # несколько процессов сразу — и это обычно два экземпляра с ОДНИМ именем
+  # ("xray" и "xray"). По именам их не различить, поэтому берём pid.
   ss -lntpH "sport = :$port" 2>/dev/null \
-    | grep -oP 'users:\(\("\K[^"]+' | head -1 || true
+    | sed -n 's/.*users:(("\([^"]*\)",pid=\([0-9]*\).*/\1 (pid \2)/p' \
+    | sort -u || true
 }
 
 # Реально ли ходит трафик через Xray. Проверяем его же SOCKS-вход (он есть в
@@ -15860,6 +15864,23 @@ _xray_diagnose() {
     info "TUN-вход: поддерживается — xray0 поднимет сам Xray"
   else
     info "TUN-вход: нет — xray0 поднимет tun2socks поверх SOCKS5 127.0.0.1:10808"
+  fi
+
+  # Xray ставит SO_REUSEPORT: на 10808 могут молча сидеть сразу несколько
+  # процессов, и ядро раскидает соединения между ними. Снаружи это выглядит
+  # как «половина трафика работает» и ничем больше себя не проявляет.
+  local owners owner_count
+  owners=$(_xray_port_owner 10808)
+  owner_count=$(printf '%s' "$owners" | grep -c . || true)
+  if (( owner_count > 1 )); then
+    err "На 127.0.0.1:10808 слушают несколько процессов:"
+    printf '%s\n' "$owners" | sed 's/^/      • /'
+    warn "Соединения делятся между ними — часть трафика уходит не туда."
+    info "Лишний обычно это ручной запуск: pkill -f 'xray run -c'"
+  elif [[ -n "$owners" ]]; then
+    info "SOCKS 127.0.0.1:10808 слушает: $owners"
+  else
+    info "SOCKS 127.0.0.1:10808: никто не слушает (туннель выключен?)"
   fi
 
   local test_err=""
@@ -16087,7 +16108,8 @@ _xray_up() {
   local port_owner
   port_owner=$(_xray_port_owner 10808)
   if [[ -n "$port_owner" ]]; then
-    err "127.0.0.1:10808 уже занят процессом «$port_owner» — Xray не запустить"
+    err "127.0.0.1:10808 уже занят — Xray не запустить:"
+    printf '%s\n' "$port_owner" | sed 's/^/      • /'
     info "Кто это: ss -lntp | grep 10808"
     info "Если это забытый ручной запуск: pkill -f 'xray run -c'"
     return 1
