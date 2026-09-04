@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.6"
+VERSION="v0.8.7"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -15294,141 +15294,159 @@ import json
 import urllib.parse
 import base64
 
+# Разбор транспорта и TLS — один на все протоколы. Раньше он был скопирован
+# в ветки vless и vmess по отдельности и разъехался: в vless добавили xhttp,
+# в vmess забыли, и ссылка молча теряла path — туннель поднимался пустым.
+TRANSPORT_KNOWN = ("tcp", "raw", "ws", "grpc", "xhttp", "splithttp",
+                   "httpupgrade", "h2", "http")
+
+
+def apply_transport(ss, net, get):
+    """get(имя) -> строка или None. Заполняет <транспорт>Settings."""
+    if net == "ws":
+        cfg = {}
+        if get("path"):
+            cfg["path"] = get("path")
+        if get("host"):
+            cfg["headers"] = {"Host": get("host")}
+        ss["wsSettings"] = cfg
+    elif net == "grpc":
+        cfg = {}
+        svc = get("serviceName") or get("svc") or get("path")
+        if svc:
+            cfg["serviceName"] = svc
+        if get("mode") == "multi":
+            cfg["multiMode"] = True
+        ss["grpcSettings"] = cfg
+    elif net in ("xhttp", "splithttp"):
+        # Без path сервер отдаёт 404 на корень: TLS проходит, туннель
+        # «поднят», трафика нет.
+        cfg = {}
+        for key in ("path", "host", "mode"):
+            if get(key):
+                cfg[key] = get(key)
+        if get("extra"):
+            try:
+                cfg["extra"] = json.loads(get("extra"))
+            except Exception:
+                pass
+        ss["xhttpSettings" if net == "xhttp" else "splithttpSettings"] = cfg
+    elif net == "httpupgrade":
+        cfg = {}
+        for key in ("path", "host"):
+            if get(key):
+                cfg[key] = get(key)
+        ss["httpupgradeSettings"] = cfg
+    elif net in ("h2", "http"):
+        # Транспорт HTTP/2 из Xray выпилен: "has been removed and migrated to
+        # XHTTP stream-one H2 & H3". httpSettings современный бинарь не примет
+        # вообще, поэтому переводим ссылку на официальную замену.
+        cfg = {"mode": "stream-one"}
+        if get("path"):
+            cfg["path"] = get("path")
+        if get("host"):
+            cfg["host"] = get("host").split(",")[0]
+        ss["network"] = "xhttp"
+        ss["xhttpSettings"] = cfg
+        print("MIGRATED_TRANSPORT:h2->xhttp/stream-one", file=sys.stderr)
+    elif net not in ("tcp", "raw", "", None):
+        # Транспорт, который мы собирать не умеем: параметры из ссылки
+        # потеряются, и туннель встанет «рабочим», но пустым.
+        print("UNSUPPORTED_TRANSPORT:" + str(net), file=sys.stderr)
+
+
+def apply_tls(ss, get, fallback_sni=""):
+    sec = ss.get("security") or "none"
+    if sec in ("", "none", "0"):
+        ss["security"] = "none"
+        return
+    ss["security"] = sec
+    # Пустой serverName сервер обрывает на рукопожатии — подставляем host,
+    # а затем адрес самого сервера.
+    tls = {
+        "serverName": get("sni") or get("host") or fallback_sni or "",
+        "fingerprint": get("fp") or "chrome",
+    }
+    if get("pbk"):
+        tls["publicKey"] = get("pbk")
+    if get("sid"):
+        tls["shortId"] = get("sid")
+    if get("spx"):
+        tls["spiderX"] = get("spx")
+    if get("alpn"):
+        tls["alpn"] = get("alpn").split(",")
+    if str(get("allowInsecure") or "").lower() in ("1", "true"):
+        tls["allowInsecure"] = True
+    ss["realitySettings" if sec == "reality" else "tlsSettings"] = tls
+
+
 def parse_link(link):
     if link.startswith('vless://'):
         parsed = urllib.parse.urlparse(link)
         qs = urllib.parse.parse_qs(parsed.query)
+
+        def get(key):
+            vals = qs.get(key)
+            return vals[0] if vals else None
+
+        host = parsed.hostname or ""
         outbound = {
             "protocol": "vless",
-            "tag": "proxy_" + parsed.hostname.replace('.','_'),
+            "tag": "proxy_" + host.replace('.', '_'),
             "settings": {
                 "vnext": [{
-                    "address": parsed.hostname,
+                    "address": host,
                     "port": parsed.port or 443,
-                    "users": [{"id": parsed.username, "encryption": qs.get("encryption", ["none"])[0], "flow": qs.get("flow", [""])[0]}]
+                    "users": [{
+                        "id": parsed.username,
+                        "encryption": get("encryption") or "none",
+                        "flow": get("flow") or "",
+                    }],
                 }]
             },
             "streamSettings": {
-                "network": qs.get("type", ["tcp"])[0],
-                "security": qs.get("security", ["none"])[0]
-            }
+                "network": get("type") or "tcp",
+                "security": get("security") or "none",
+            },
         }
-        # Transport-настройки для ws/grpc (без path/serviceName vless+ws/grpc
-        # стучатся на "/" и не подключаются к реальному backend).
-        _net = outbound["streamSettings"]["network"]
-        if _net == "ws":
-            _ws = {}
-            if "path" in qs:
-                _ws["path"] = qs["path"][0]
-            if "host" in qs:
-                _ws["headers"] = {"Host": qs["host"][0]}
-            outbound["streamSettings"]["wsSettings"] = _ws
-        elif _net == "grpc":
-            _grpc = {}
-            if "serviceName" in qs:
-                _grpc["serviceName"] = qs["serviceName"][0]
-            if "mode" in qs and qs["mode"][0] == "multi":
-                _grpc["multiMode"] = True
-            outbound["streamSettings"]["grpcSettings"] = _grpc
-        elif _net in ("xhttp", "splithttp"):
-            # XHTTP (бывший SplitHTTP). Без path сервер отдаёт 404 на корень:
-            # TLS проходит, туннель «поднят», трафика нет. Раньше path/host/mode
-            # из ссылки просто терялись — обрабатывались только ws и grpc.
-            _xh = {}
-            if "path" in qs:
-                _xh["path"] = qs["path"][0]
-            if "host" in qs:
-                _xh["host"] = qs["host"][0]
-            if "mode" in qs:
-                _xh["mode"] = qs["mode"][0]
-            if "extra" in qs:
-                try:
-                    _xh["extra"] = json.loads(qs["extra"][0])
-                except Exception:
-                    pass
-            key = "xhttpSettings" if _net == "xhttp" else "splithttpSettings"
-            outbound["streamSettings"][key] = _xh
-        elif _net == "httpupgrade":
-            _hu = {}
-            if "path" in qs:
-                _hu["path"] = qs["path"][0]
-            if "host" in qs:
-                _hu["host"] = qs["host"][0]
-            outbound["streamSettings"]["httpupgradeSettings"] = _hu
-        elif _net in ("h2", "http"):
-            _h2 = {}
-            if "path" in qs:
-                _h2["path"] = qs["path"][0]
-            if "host" in qs:
-                _h2["host"] = qs["host"][0].split(",")
-            outbound["streamSettings"]["httpSettings"] = _h2
-        elif _net not in ("tcp", "raw", ""):
-            # Транспорт, для которого мы не умеем собирать *Settings: молчать
-            # нельзя — параметры из ссылки потеряются, и туннель встанет
-            # «рабочим», но пустым.
-            print("UNSUPPORTED_TRANSPORT:" + _net, file=sys.stderr)
-
-        if outbound["streamSettings"]["security"] in ("tls", "reality"):
-            tls_settings = {"serverName": qs.get("sni", [""])[0], "fingerprint": qs.get("fp", ["chrome"])[0]}
-            # SNI в ссылке может отсутствовать — тогда берём адрес сервера,
-            # иначе TLS уйдёт с пустым serverName и сервер оборвёт рукопожатие.
-            if not tls_settings["serverName"]:
-                tls_settings["serverName"] = qs.get("host", [parsed.hostname or ""])[0]
-            if "pbk" in qs:
-                tls_settings["publicKey"] = qs.get("pbk", [""])[0]
-            if "sid" in qs:
-                tls_settings["shortId"] = qs.get("sid", [""])[0]
-            if "spx" in qs:
-                tls_settings["spiderX"] = qs.get("spx", [""])[0]
-            if "alpn" in qs:
-                tls_settings["alpn"] = qs["alpn"][0].split(",")
-            if qs.get("allowInsecure", ["0"])[0] in ("1", "true"):
-                tls_settings["allowInsecure"] = True
-            if outbound["streamSettings"]["security"] == "reality":
-                outbound["streamSettings"]["realitySettings"] = tls_settings
-            else:
-                outbound["streamSettings"]["tlsSettings"] = tls_settings
-
+        apply_transport(outbound["streamSettings"],
+                        outbound["streamSettings"]["network"], get)
+        apply_tls(outbound["streamSettings"], get, host)
         print(json.dumps(outbound))
 
     elif link.startswith('vmess://'):
         b64 = link[8:]
         b64 += "=" * ((4 - len(b64) % 4) % 4)
         data = json.loads(base64.b64decode(b64).decode('utf-8'))
+
+        def get(key):
+            # В vmess-JSON serviceName живёт в path, а SNI — в sni либо host
+            val = data.get(key)
+            return str(val) if val not in (None, "") else None
+
+        host = str(data.get("add") or "")
         outbound = {
             "protocol": "vmess",
-            "tag": "proxy_" + data.get("add", "unknown").replace('.','_'),
+            "tag": "proxy_" + host.replace('.', '_'),
             "settings": {
                 "vnext": [{
-                    "address": data.get("add"),
-                    "port": int(data.get("port")),
-                    "users": [{"id": data.get("id"), "alterId": int(data.get("aid", 0))}]
+                    "address": host,
+                    "port": int(data.get("port") or 443),
+                    "users": [{
+                        "id": data.get("id"),
+                        "alterId": int(data.get("aid") or 0),
+                        "security": data.get("scy") or "auto",
+                    }],
                 }]
             },
             "streamSettings": {
-                "network": data.get("net", "tcp"),
-                "security": data.get("tls", "none")
-            }
+                "network": data.get("net") or "tcp",
+                "security": data.get("tls") or "none",
+            },
         }
-        # Transport-настройки для ws/grpc (vmess: path/host для ws; для grpc
-        # serviceName historically лежит в "path" или "svc").
-        _net = outbound["streamSettings"]["network"]
-        if _net == "ws":
-            _ws = {}
-            if data.get("path"):
-                _ws["path"] = data.get("path")
-            if data.get("host"):
-                _ws["headers"] = {"Host": data.get("host")}
-            outbound["streamSettings"]["wsSettings"] = _ws
-        elif _net == "grpc":
-            _grpc = {}
-            _svc = data.get("serviceName") or data.get("svc") or data.get("path")
-            if _svc:
-                _grpc["serviceName"] = _svc
-            outbound["streamSettings"]["grpcSettings"] = _grpc
-
-        if outbound["streamSettings"]["security"] == "tls":
-             outbound["streamSettings"]["tlsSettings"] = {"serverName": data.get("sni", "")}
+        apply_transport(outbound["streamSettings"],
+                        outbound["streamSettings"]["network"], get)
+        apply_tls(outbound["streamSettings"], get, host)
         print(json.dumps(outbound))
 
     elif link.startswith('hysteria2://') or link.startswith('hy2://'):
@@ -15437,23 +15455,19 @@ def parse_link(link):
         host = parsed.hostname
         port = parsed.port or 443
         password = parsed.username or ""
-        tag_name = host.replace('.','_') if host else 'hysteria'
+        tag_name = host.replace('.', '_') if host else 'hysteria'
 
         settings = {
             "server": host,
             "port": port,
-            "password": password
+            "password": password,
         }
-        # serverName (SNI)
         if "sni" in qs:
             settings["serverName"] = qs["sni"][0]
-        # insecure
         if "insecure" in qs:
             settings["insecure"] = qs["insecure"][0] == "1"
-        # obfs (salamander)
         if "obfs" in qs:
-            obfs_type = qs["obfs"][0]
-            obfs_cfg = {"type": obfs_type}
+            obfs_cfg = {"type": qs["obfs"][0]}
             if "obfs-password" in qs:
                 obfs_cfg["password"] = qs["obfs-password"][0]
             settings["obfs"] = obfs_cfg
@@ -15461,13 +15475,14 @@ def parse_link(link):
         outbound = {
             "protocol": "hysteria2",
             "tag": "proxy_" + tag_name,
-            "settings": settings
+            "settings": settings,
         }
         print(json.dumps(outbound))
 
     else:
         print("Unsupported", file=sys.stderr)
         sys.exit(1)
+
 
 try:
     parse_link(sys.argv[1])
@@ -15484,6 +15499,9 @@ PYEOF
     err "Не удалось распарсить ссылку"
     [[ -n "$parse_err" ]] && printf '%s\n' "$parse_err" | head -3 | sed 's/^/      /'
     return 1
+  fi
+  if grep -q '^MIGRATED_TRANSPORT:' "$parse_log" 2>/dev/null; then
+    info "Транспорт h2 в Xray убран — ссылка переведена на XHTTP stream-one"
   fi
   # Транспорт, для которого парсер не умеет собирать *Settings: путь/хост из
   # ссылки потеряются, и туннель поднимется рабочим, но пустым.
@@ -16966,24 +16984,46 @@ start_routing() {
   local client_net
   client_net=$(get_client_net) || { echo "cannot get client net" >&2; exit 1; }
 
+  # Маршрут по умолчанию в таблице 202 — единственное, ради чего всё это.
+  # Его результат ОБЯЗАТЕЛЬНО проверяется: без default в 202 клиенты, чьи
+  # ip rule уже указывают на эту таблицу, остаются без выхода вообще.
+  local single_target=""
+  if [[ -n "$single_exit" ]] && ip link show "awg-exit-$single_exit" &>/dev/null; then
+    single_target="awg-exit-$single_exit"
+  else
+    single_target="${up_interfaces[0]}"
+  fi
+
+  local applied=""
   if [[ "$balancer" == "ecmp" && ${#up_interfaces[@]} -gt 1 ]]; then
     local route_args=("ip" "route" "replace" "default" "table" "202")
     for iface in "${up_interfaces[@]}"; do
       route_args+=("nexthop" "dev" "$iface" "weight" "1")
     done
-    "${route_args[@]}"
-    sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
-    echo "ECMP balancing enabled on: ${up_interfaces[*]}"
-  else
-    local target_iface=""
-    if [[ -n "$single_exit" ]] && ip link show "awg-exit-$single_exit" &>/dev/null; then
-      target_iface="awg-exit-$single_exit"
+    if "${route_args[@]}" 2>/dev/null; then
+      # L4-хеш: поток липнет к одной ноде по 5-кортежу, иначе пакеты одного
+      # соединения разъезжались бы по разным выходам и его рвало бы.
+      sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null 2>&1 || true
+      applied="ECMP: ${up_interfaces[*]}"
     else
-      target_iface="${up_interfaces[0]}"
+      # Многопутёвая маршрутизация может быть не собрана в ядре
+      # (CONFIG_IP_ROUTE_MULTIPATH). Молчать нельзя: без отката в таблице
+      # не осталось бы ни одного маршрута.
+      echo "ECMP не принят ядром — откатываюсь на одну ноду" >&2
+      ip route replace default dev "$single_target" table 202 2>/dev/null \
+        && applied="single (откат с ECMP): $single_target"
     fi
-    ip route replace default dev "$target_iface" table 202
-    echo "Routing through single exit: $target_iface"
+  else
+    ip route replace default dev "$single_target" table 202 2>/dev/null \
+      && applied="single: $single_target"
   fi
+
+  if [[ -z "$applied" ]] || ! ip route show table 202 2>/dev/null | grep -q '^default'; then
+    echo "не удалось поставить маршрут по умолчанию в таблицу 202" >&2
+    ip rule del from all lookup 202 2>/dev/null || true
+    exit 1
+  fi
+  echo "Routing through $applied"
 
   sysctl -w net.ipv4.conf.awg0.rp_filter=2 >/dev/null 2>&1 || true
   for iface in "${up_interfaces[@]}"; do
@@ -17108,7 +17148,13 @@ _exits_status() {
       local balancer
       balancer=$(grep "^balancer=" "$AWG_EXITS_STATE" 2>/dev/null | cut -d= -f2 || true)
       balancer="${balancer:-single}"
-      if [[ "$mode" == "all" ]]; then
+      # Файл состояния говорит лишь о том, что настраивали. Работает ли оно
+      # сейчас — знает только systemd; раньше статус показывал «Включена»
+      # при мёртвой службе.
+      if ! systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+        echo -e "  Маршрутизация       : ${Y}○ настроена, но служба не запущена${N}"
+        echo -e "  ${D}  включить: пункт 4${N}"
+      elif [[ "$mode" == "all" ]]; then
         echo -e "  Маршрутизация       : ${G}● Включена (все клиенты)${N}"
       else
         local p_count=0
@@ -17488,22 +17534,38 @@ _exits_setup_balancing() {
     return 0
   fi
 
-  local active_exits=()
+  # Ноды делим на поднятые и лежащие: ECMP имеет смысл только между живыми
+  # интерфейсами, а раньше в списке были все конфиги подряд, и «балансировка»
+  # предлагалась даже когда работала одна нода.
+  local active_exits=() down_exits=()
   for conf in $files; do
     [[ ! -f "$conf" ]] && continue
     local fullname
     fullname=$(basename "$conf" .conf)
     local name="${fullname#awg-exit-}"
-    active_exits+=("$name")
+    if ip link show "$fullname" &>/dev/null; then
+      active_exits+=("$name")
+    else
+      down_exits+=("$name")
+    fi
   done
+
+  if [[ ${#active_exits[@]} -eq 0 ]]; then
+    warn "Ни один интерфейс awg-exit-* не поднят — балансировать нечем"
+    [[ ${#down_exits[@]} -gt 0 ]] && info "Лежат: ${down_exits[*]}"
+    return 0
+  fi
 
   echo ""
   echo -e "${W}Настройка балансировки AWG exit-нод:${N}"
-  echo -e "  Доступно нод: ${C}${active_exits[*]}${N}"
+  echo -e "  Подняты: ${G}${active_exits[*]}${N}"
+  [[ ${#down_exits[@]} -gt 0 ]] && echo -e "  Лежат:   ${D}${down_exits[*]}${N}"
   echo ""
   echo -e "  ${C}1)${N} Использовать одну конкретную ноду (Single Exit)"
   if [[ ${#active_exits[@]} -gt 1 ]]; then
     echo -e "  ${C}2)${N} Использовать все ноды (ECMP балансировка)"
+  else
+    echo -e "  ${D}2) ECMP — нужны минимум две поднятые ноды${N}"
   fi
   echo -e "  0) Отмена"
   echo ""
