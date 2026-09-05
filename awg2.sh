@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.10"
+VERSION="v0.8.11"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -2312,8 +2312,14 @@ def generate_stun_payload(options):
         attrs.append(build_stun_attribute(0x0014, enc_text(profile["realm"])))
         attrs.append(build_stun_attribute(0x000D, u32(lifetime)))
         attrs.append(build_stun_attribute(0x0019, u32(0x00000011) + zeros(4)))
+        # REQUESTED-ADDRESS-FAMILY (0x0017, RFC 6156 §4.1.1): байт семейства,
+        # затем три зарезервированных нуля. Было 0x8027 со значением
+        # 00 01 00 00 — и тип, и порядок байт мимо: 0x8027 это CACHE-TIMEOUT
+        # (RFC 5780), атрибут ОТВЕТА при обнаружении поведения NAT, клиент его
+        # в Allocate не шлёт, а семейство 0x00 не существует. Разбирающий STUN
+        # видел ровно ту аномалию, ради сокрытия которой мимикрия и делается.
         attrs.append(build_stun_attribute(
-            0x8027, bytes([0x00, 0x0001 if ri(2) == 0 else 0x0002, 0x00, 0x00])))
+            0x0017, bytes([0x01 if ri(2) == 0 else 0x02, 0x00, 0x00, 0x00])))
         username = build_stun_allocate_username(profile, server_host)
     else:
         username = build_stun_binding_username(profile, server_host)
