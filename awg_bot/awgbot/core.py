@@ -140,6 +140,7 @@ class ServerInfo:
     profile: str = ""
     proto: str = ""            # версия протокола AmneziaWG: "2.0", "3.0", "3.1"
     obf_level: int = 0         # 1 = без I1-I5, 2 = только I1, 3 = полный I1-I5
+    cps_budget: int = -1       # бюджет цепочки (# AWG_CPS_BUDGET), -1 = метки нет
     mimicry: str = ""          # профиль мимикрии сервера (# AWG_MIMICRY=)
     mimicry_domain: str = ""   # домен мимикрии сервера (# AWG_MIMICRY_DOMAIN=)
     endpoint_domain: str = ""  # домен для Endpoint; пусто — используется IP
@@ -243,6 +244,10 @@ def get_server_info() -> ServerInfo:
         # выданные клиенты. Иначе бот выдаёт свой набор, не совпадающий с
         # остальными конфигами того же сервера.
         info.obf_level = _obf_level_from_clients()
+    # Бюджет цепочки, выбранный админом в awg2 (0 = без лимита). Метки нет —
+    # сервер создан старой версией, остаёмся на компактном значении бота.
+    if m := re.search(r"^#\s*AWG_CPS_BUDGET=(\d+)", text, re.M):
+        info.cps_budget = int(m.group(1))
 
     _, peers = _split_blocks(text)
     info.peers_count = len(peers)
@@ -651,7 +656,10 @@ def add_client(name: str, expires: int | None = None,
             # оставляем непроставленной, а не выдаём "none" за факт.
             used_profile = None
         elif want_full:
-            packets = cps.gen_full(profile, domain)
+            # Бюджет берём с сервера: свой компактный резал цепочку до одного
+            # пакета там, где awg2 выдавал пять.
+            budget = _srv.cps_budget if _srv.cps_budget >= 0 else cps.DEFAULT_BUDGET
+            packets = cps.gen_full(profile, domain, budget)
             if packets:
                 for n, pkt in enumerate(packets[:5], start=1):
                     cli_lines.append(f"I{n} = {pkt}")
