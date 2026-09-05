@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.9"
+VERSION="v0.8.10"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -1023,7 +1023,12 @@ try:
     from cryptography.hazmat.primitives.asymmetric.x25519 import (
         X25519PrivateKey, X25519PublicKey)
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
-except Exception:
+# BaseException, а не Exception: при поломанной сборке python3-cryptography
+# (нет _cffi_backend, рассинхрон с pyo3 после частичного обновления) импорт
+# падает с PanicException, а она наследуется напрямую от BaseException и мимо
+# "except Exception" проходит насквозь. Тогда умирал ВЕСЬ генератор, и клиенты
+# оставались без I1-I5 вообще — вместо честной деградации «QUIC без шифрования».
+except BaseException:
     _CRYPTO_OK = False
 
 def crypto_available():
