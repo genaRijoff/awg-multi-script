@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.13"
+VERSION="v0.8.14"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -17399,6 +17399,13 @@ for line in lines:
     if in_interface and re.match(r'^\s*\[', line):
         in_interface = False
     if in_interface and re.match(r'^\s*table\s*=', line, re.I):
+        continue
+    # DNS из конфига exit-ноды выбрасываем по той же причине, что и Table:
+    # это транзитный туннель, а не VPN самого сервера. awg-quick на строку DNS
+    # зовёт resolvconf — если его нет, интерфейс просто не поднимается (в логе
+    # "resolvconf -a ..." и сразу "ip link delete"); а если он есть, awg-quick
+    # перепишет /etc/resolv.conf, и DNS всего сервера уедет в exit-ноду.
+    if in_interface and re.match(r'^\s*dns\s*=', line, re.I):
         continue
     new_lines.append(line)
 
