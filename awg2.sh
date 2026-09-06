@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.16"
+VERSION="v0.8.17"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -17213,17 +17213,34 @@ do_tun2socks_menu() {
 # =         AWG EXIT NODES ROUTING         =
 # ==========================================
 
+# Строка списка: "IP" — общий выход каскада, "IP|нода" — персональная нода.
+# Старые файлы состоят из одних IP, поэтому вторая часть необязательна и все
+# функции ниже одинаково понимают оба вида.
 _exits_peer_enabled() {
   local ip="$1"
   [[ ! -f "$AWG_EXITS_PEERS" ]] && return 1
-  grep -qxF "$ip" "$AWG_EXITS_PEERS"
+  grep -qE "^${ip//./\\.}(\||\$)" "$AWG_EXITS_PEERS"
+}
+
+# Имя ноды, назначенной клиенту. Пусто — общий выход каскада.
+_exits_peer_node() {
+  local ip="$1" line
+  [[ ! -f "$AWG_EXITS_PEERS" ]] && return 0
+  line=$(grep -E "^${ip//./\\.}(\||\$)" "$AWG_EXITS_PEERS" 2>/dev/null | head -1 || true)
+  [[ "$line" == *"|"* ]] && echo "${line#*|}"
+  return 0
 }
 
 _exits_peer_add() {
-  local ip="$1"
+  local ip="$1" node="${2:-}"
   mkdir -p "$AWG_EXITS_DIR"
   touch "$AWG_EXITS_PEERS"
-  if ! _exits_peer_enabled "$ip"; then
+  # Переназначение ноды — это удалить и записать заново, иначе в списке
+  # окажутся две строки на один IP и правил тоже станет два.
+  _exits_peer_remove "$ip"
+  if [[ -n "$node" ]]; then
+    echo "${ip}|${node}" >> "$AWG_EXITS_PEERS"
+  else
     echo "$ip" >> "$AWG_EXITS_PEERS"
   fi
 }
@@ -17231,7 +17248,7 @@ _exits_peer_add() {
 _exits_peer_remove() {
   local ip="$1"
   [[ ! -f "$AWG_EXITS_PEERS" ]] && return 0
-  grep -vxF "$ip" "$AWG_EXITS_PEERS" > "$AWG_EXITS_PEERS.tmp" 2>/dev/null || true
+  grep -vE "^${ip//./\\.}(\||\$)" "$AWG_EXITS_PEERS" > "$AWG_EXITS_PEERS.tmp" 2>/dev/null || true
   mv "$AWG_EXITS_PEERS.tmp" "$AWG_EXITS_PEERS" 2>/dev/null || true
 }
 
@@ -17252,14 +17269,18 @@ _exits_sync_peers() {
 
   local tmp="${AWG_EXITS_PEERS}.tmp"
   : > "$tmp"
-  local ip
-  while IFS= read -r ip; do
-    [[ -z "$ip" ]] && continue
-    if echo "$live_ips" | grep -qxF "$ip"; then
-      echo "$ip" >> "$tmp"
+  local line peer_ip
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    peer_ip="${line%%|*}"
+    if echo "$live_ips" | grep -qxF "$peer_ip"; then
+      # Строку сохраняем как есть — вместе с назначенной нодой.
+      echo "$line" >> "$tmp"
     else
       if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
-        ip rule del from "$ip" lookup 202 priority 202 2>/dev/null || true
+        # Правило могло уйти в персональную таблицу, поэтому снимаем по
+        # приоритету, а не по номеру таблицы: приоритет у всех наш, 202.
+        ip rule del from "$peer_ip" priority 202 2>/dev/null || true
       fi
     fi
   done < "$AWG_EXITS_PEERS"
@@ -17280,6 +17301,47 @@ AWG_EXITS_DIR="/etc/amnezia/amneziawg"
 AWG_EXITS_PEERS="$AWG_EXITS_DIR/exits_peers.list"
 AWG_EXITS_STATE="$AWG_EXITS_DIR/exits_state"
 SERVER_CONF="$AWG_EXITS_DIR/awg0.conf"
+
+# Персональные таблицы: по одной на exit-ноду, чтобы разные клиенты могли
+# выходить через разные ноды. Общая таблица 202 остаётся для тех, кому
+# конкретная нода не назначена.
+#
+# Номер считаем от алфавитного порядка конфигов, а не храним: между stop и
+# start правила и таблицы всё равно пересоздаются целиком, поэтому съехавший
+# после добавления ноды номер ничего не ломает. Диапазон 210-249 выбран так,
+# чтобы не задеть занятые awg2 таблицы 100 (tun2socks), 200 (Warp), 201 (Xray)
+# и 202 (общий выход каскада).
+EXITS_TABLE_BASE=210
+EXITS_TABLE_MAX=249
+
+exit_table_for() {
+  local want="$1" idx=0 conf name
+  for conf in $(ls -1 "$AWG_EXITS_DIR"/awg-exit-*.conf 2>/dev/null | sort); do
+    [[ -f "$conf" ]] || continue
+    name=$(basename "$conf" .conf)
+    name="${name#awg-exit-}"
+    if [[ "$name" == "$want" ]]; then
+      local t=$((EXITS_TABLE_BASE + idx))
+      (( t > EXITS_TABLE_MAX )) && return 1
+      echo "$t"
+      return 0
+    fi
+    idx=$((idx + 1))
+  done
+  return 1
+}
+
+# Все наши таблицы разом — для очистки. Чистить надо и те, что остались от
+# прошлой конфигурации: нода могла быть удалена, а правило от неё — нет.
+exits_clear_rules() {
+  local t
+  while ip rule del lookup 202 2>/dev/null; do :; done
+  ip route flush table 202 2>/dev/null || true
+  for t in $(seq $EXITS_TABLE_BASE $EXITS_TABLE_MAX); do
+    while ip rule del lookup "$t" 2>/dev/null; do :; done
+    ip route flush table "$t" 2>/dev/null || true
+  done
+}
 
 get_client_net() {
   [[ ! -f "$SERVER_CONF" ]] && return 1
@@ -17348,10 +17410,9 @@ start_routing() {
     exit 1
   fi
 
-  ip route flush table 202 2>/dev/null || true
-
-  # Clean all rule lookup 202 entries safely
-  while ip rule del lookup 202 2>/dev/null; do :; done
+  # Чистим и общую таблицу, и все персональные: конфигурация могла
+  # измениться, а правила от прошлого запуска остаться.
+  exits_clear_rules
 
   local client_net
   client_net=$(get_client_net) || { echo "cannot get client net" >&2; exit 1; }
@@ -17415,17 +17476,43 @@ start_routing() {
     ip rule add from "$client_net" lookup 202 priority 202
   else
     if [[ -f "$AWG_EXITS_PEERS" ]]; then
+      # Формат строки: "IP" — общий выход каскада (таблица 202), либо
+      # "IP|нода" — персональная нода. Старые файлы состоят из одних IP,
+      # поэтому вторая часть необязательна.
+      #
       # Список пишется скриптом, но пережил и ручные правки, и старые версии.
       # Мусорная строка здесь стоила бы всей маршрутизации: ip rule add падает,
       # остальные адреса не доезжают.
-      while IFS= read -r peer_ip; do
-        peer_ip="${peer_ip//[[:space:]]/}"
-        [[ -z "$peer_ip" ]] && continue
+      local line peer_ip peer_node peer_table
+      while IFS= read -r line; do
+        line="${line//[[:space:]]/}"
+        [[ -z "$line" ]] && continue
+        peer_ip="${line%%|*}"
+        peer_node=""
+        [[ "$line" == *"|"* ]] && peer_node="${line#*|}"
         [[ "$peer_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/[0-9]{1,2})?$ ]] || {
-          echo "пропускаю некорректную строку в $AWG_EXITS_PEERS: $peer_ip" >&2
+          echo "пропускаю некорректную строку в $AWG_EXITS_PEERS: $line" >&2
           continue
         }
-        ip rule add from "$peer_ip" lookup 202 priority 202 || true
+
+        peer_table=202
+        if [[ -n "$peer_node" ]]; then
+          # Нода могла быть удалена или лежать: молча увести клиента в
+          # несуществующую таблицу — значит оставить его без интернета.
+          # Откатываемся на общий выход и говорим об этом в лог.
+          if ! ip link show "awg-exit-$peer_node" &>/dev/null; then
+            echo "нода $peer_node для $peer_ip не поднята — общий выход" >&2
+          elif ! peer_table=$(exit_table_for "$peer_node"); then
+            echo "нет номера таблицы для ноды $peer_node — общий выход" >&2
+            peer_table=202
+          else
+            if ! ip route replace default dev "awg-exit-$peer_node" table "$peer_table" 2>/dev/null; then
+              echo "не удалось поставить маршрут для ноды $peer_node — общий выход" >&2
+              peer_table=202
+            fi
+          fi
+        fi
+        ip rule add from "$peer_ip" lookup "$peer_table" priority 202 || true
       done < "$AWG_EXITS_PEERS"
     fi
   fi
@@ -17436,10 +17523,7 @@ stop_routing() {
   local client_net
   client_net=$(get_client_net) || client_net=""
 
-  # Clean all rule lookup 202 entries safely
-  while ip rule del lookup 202 2>/dev/null; do :; done
-
-  ip route flush table 202 2>/dev/null || true
+  exits_clear_rules
 
   for conf in "$AWG_EXITS_DIR"/awg-exit-*.conf; do
     [[ ! -f "$conf" ]] && continue
@@ -18192,6 +18276,99 @@ EOF
   info "Каскад переведён в режим «Выборочно по списку» — per-client переключатели активированы."
 }
 
+# Назначить клиенту конкретную ноду каскада: клиент A выходит через одну
+# страну, клиент B — через другую. Без назначения все, кто в каскаде, идут
+# общим выходом (одна нода или ECMP между всеми) — как было раньше.
+_exits_assign_node() {
+  local -a clients=("${!1}")
+  local nodes=() conf nm
+
+  for conf in $(ls -1 "$AWG_EXITS_DIR"/awg-exit-*.conf 2>/dev/null | sort); do
+    [[ -f "$conf" ]] || continue
+    nm=$(basename "$conf" .conf)
+    nodes+=("${nm#awg-exit-}")
+  done
+
+  if [[ ${#nodes[@]} -eq 0 ]]; then
+    warn "Нет ни одной exit-ноды — сначала добавьте (пункт 1)"
+    sleep 2
+    return 0
+  fi
+  if [[ ${#nodes[@]} -eq 1 ]]; then
+    info "Нода всего одна (${nodes[0]}) — назначать нечего:"
+    info "все, кто в каскаде, и так идут через неё"
+    sleep 3
+    return 0
+  fi
+
+  echo ""
+  local cnum=""
+  read -rp "$(echo -e "${C}  Номер клиента (пусто — отмена): ${N}")" cnum
+  cnum="${cnum//[[:space:]]/}"
+  [[ -z "$cnum" ]] && return 0
+  if ! [[ "$cnum" =~ ^[0-9]+$ ]] || (( cnum < 1 || cnum > ${#clients[@]} )); then
+    warn "Неверный номер клиента"
+    sleep 1
+    return 0
+  fi
+
+  local entry="${clients[$((cnum - 1))]}"
+  local cname="${entry%|*}" cip="${entry##*|}"
+  local cur; cur=$(_exits_peer_node "$cip")
+
+  echo ""
+  echo -e "  Клиент ${W}${cname}${N} ${D}(${cip})${N}"
+  if [[ -n "$cur" ]]; then
+    echo -e "  Сейчас: нода ${W}${cur}${N}"
+  elif _exits_peer_enabled "$cip"; then
+    echo -e "  Сейчас: ${D}общий выход каскада${N}"
+  else
+    echo -e "  Сейчас: ${D}напрямую, мимо каскада${N}"
+  fi
+  echo ""
+
+  local i
+  for i in "${!nodes[@]}"; do
+    if ip link show "awg-exit-${nodes[$i]}" &>/dev/null; then
+      echo -e "    ${C}$((i+1)))${N} ${W}${nodes[$i]}${N}"
+    else
+      echo -e "    ${C}$((i+1)))${N} ${nodes[$i]} ${Y}(не поднята)${N}"
+    fi
+  done
+  echo -e "    ${C}$(( ${#nodes[@]} + 1 )))${N} Общий выход каскада ${D}(как раньше)${N}"
+  echo -e "    ${C}0)${N} Отмена"
+  echo ""
+
+  local sel=""
+  read -rp "$(echo -e "${C}  Выбор [0-$(( ${#nodes[@]} + 1 ))]: ${N}")" sel
+  sel="${sel//[[:space:]]/}"
+  [[ -z "$sel" || "$sel" == "0" ]] && return 0
+  if ! [[ "$sel" =~ ^[0-9]+$ ]] || (( sel < 1 || sel > ${#nodes[@]} + 1 )); then
+    warn "Неверный выбор"
+    sleep 1
+    return 0
+  fi
+
+  if (( sel == ${#nodes[@]} + 1 )); then
+    _exits_peer_add "$cip"
+    ok "$cname → общий выход каскада"
+  else
+    local pick="${nodes[$((sel - 1))]}"
+    _exits_peer_add "$cip" "$pick"
+    ok "$cname → нода ${W}${pick}${N}"
+    ip link show "awg-exit-$pick" &>/dev/null || \
+      warn "Нода $pick сейчас не поднята — пока она лежит, клиент пойдёт общим выходом"
+  fi
+
+  # Правила пересобираем целиком, а не правим одно: назначение меняет таблицу,
+  # а не только наличие правила, и ручная правка здесь легко разъедется с тем,
+  # что делает routing-скрипт.
+  if systemctl is-active --quiet awg-exits-routing.service 2>/dev/null; then
+    _exits_apply_routing
+  fi
+  sleep 2
+}
+
 do_exits_peers_menu() {
   set +e
   while true; do
@@ -18220,7 +18397,18 @@ do_exits_peers_menu() {
       local name="${entry%|*}"
       local ip="${entry##*|}"
       if _exits_peer_enabled "$ip"; then
-        echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${C}🌉 через каскад${N}"
+        local node; node=$(_exits_peer_node "$ip")
+        if [[ -n "$node" ]]; then
+          # Нода назначена, но могла лечь — тогда клиент уедет на общий
+          # выход, и в списке это должно быть видно, а не выясняться по логам.
+          if ip link show "awg-exit-$node" &>/dev/null; then
+            echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${C}🌉 нода ${W}$node${N}"
+          else
+            echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${Y}🌉 нода $node (лежит → общий выход)${N}"
+          fi
+        else
+          echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  ${C}🌉 через каскад${N} ${D}(общий выход)${N}"
+        fi
       else
         echo -e "  ${G}[$i]${N} $name  ${D}$ip${N}  → напрямую"
       fi
@@ -18229,7 +18417,8 @@ do_exits_peers_menu() {
 
     echo ""
     echo -e "${C}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}"
-    echo -e "  Введи номер клиента для переключения"
+    echo -e "  Введи номер клиента для переключения (каскад ↔ напрямую)"
+    echo -e "  ${W}e${N} — назначить клиенту конкретную ноду каскада"
     echo -e "  a — всех через каскад, n — всех напрямую"
     echo -e "  0 — назад"
     echo ""
@@ -18254,6 +18443,9 @@ do_exits_peers_menu() {
         fi
         ok "Все clients включены в каскад"
         sleep 1
+        ;;
+      e|E)
+        _exits_assign_node clients[@]
         ;;
       n|N)
         for entry in "${clients[@]}"; do

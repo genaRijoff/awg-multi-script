@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v0.8.16-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v0.8.17-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -84,7 +84,9 @@ sudo awg-mod-update --latest     # обновить до последнего т
   из клиентов идёт в туннель. Трафик уходит через интерфейс `xray0`.
 - **tun2socks** — весь трафик AWG-клиентов в готовый SOCKS5
   (`awg-tun2socks.service`)
-- **AWG exit-ноды** — каскад через другие AWG-серверы, ECMP-балансировка
+- **AWG exit-ноды** — каскад через другие AWG-серверы, ECMP-балансировка,
+  можно назначить клиенту конкретную ноду (пункт 6 → `e`): один выходит
+  через одну страну, другой — через другую
   между ними, per-client переключатели
 
 Одновременно может быть активен только один из Warp / Xray / tun2socks / exit —
@@ -223,6 +225,6 @@ sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-scri
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v0.8.16** · MIT License
+**AWG Toolza v0.8.17** · MIT License
 
 </div>
