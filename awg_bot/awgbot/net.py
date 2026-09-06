@@ -56,15 +56,27 @@ class TelegramFallbackResolver:
     установлен (тесты, проверка конфига). Утиной типизации aiohttp хватает.
     """
 
-    def __init__(self, base: Any = None) -> None:
-        self._base = base
+    def __init__(self, base_factory: Any = None) -> None:
+        # Фабрика, а не готовый резолвер: aiohttp.DefaultResolver в
+        # конструкторе берёт текущий цикл событий (asyncio.get_running_loop),
+        # а сессия строится ДО запуска цикла — на старте это падало с
+        # "no running event loop", и запасные адреса не подключались.
+        # Создаём при первом resolve(), он уже вызывается внутри цикла.
+        self._base_factory = base_factory
+        self._base: Any = None
+
+    def _base_resolver(self) -> Any:
+        if self._base is None and self._base_factory is not None:
+            self._base = self._base_factory()
+        return self._base
 
     async def resolve(self, host: str, port: int = 0,
                       family: int = socket.AF_INET) -> list[dict[str, Any]]:
         hosts: list[dict[str, Any]] = []
+        base = self._base_resolver()
         try:
-            if self._base is not None:
-                hosts = list(await self._base.resolve(host, port, family))
+            if base is not None:
+                hosts = list(await base.resolve(host, port, family))
         except Exception as e:                       # noqa: BLE001
             # DNS не ответил. Для Telegram это не приговор: ниже подмешаем
             # запасные адреса и попробуем их. Для любого другого хоста —
@@ -127,7 +139,7 @@ def build_session(proxy: str = "") -> Any:
 
         init = getattr(session, "_connector_init", None)
         if isinstance(init, dict):
-            init["resolver"] = TelegramFallbackResolver(DefaultResolver())
+            init["resolver"] = TelegramFallbackResolver(DefaultResolver)
             log.info("Запасные адреса Telegram подключены (%d шт.)",
                      len(TELEGRAM_FALLBACK_IPS))
         else:
