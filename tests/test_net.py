@@ -160,6 +160,36 @@ def main():
         net.valid_proxy("socks5://user:pass@1.2.3.4:1080"))
     chk("схема в верхнем регистре отвергается", not net.valid_proxy("SOCKS5://h:1"))
 
+    # --- живость прокси -----------------------------------------------------
+    # На настоящих сокетах: mock тут проверял бы мой же код разбора адреса.
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    live_port = srv.getsockname()[1]
+    chk("поднятый порт признан живым",
+        net.proxy_alive("socks5://127.0.0.1:%d" % live_port, timeout=2))
+    srv.close()
+    chk("закрытый порт признан мёртвым",
+        not net.proxy_alive("socks5://127.0.0.1:%d" % live_port, timeout=2))
+    chk("несуществующий хост — мёртв",
+        not net.proxy_alive("socks5://256.256.256.256:1080", timeout=2))
+    chk("адрес без хоста — мёртв", not net.proxy_alive("socks5://", timeout=2))
+
+    # порт по умолчанию берётся из схемы, а не выдумывается
+    chk("socks5 без порта -> 1080", net._proxy_hostport("socks5://h") == ("h", 1080))
+    chk("http без порта -> 80", net._proxy_hostport("http://h") == ("h", 80))
+    chk("https без порта -> 443", net._proxy_hostport("https://h") == ("h", 443))
+    chk("явный порт важнее схемы", net._proxy_hostport("http://h:3128") == ("h", 3128))
+    chk("логин и пароль не путаются с хостом",
+        net._proxy_hostport("socks5://u:p@1.2.3.4:1080") == ("1.2.3.4", 1080))
+
+    # --- маскировка пароля ---------------------------------------------------
+    chk("пароль скрыт", net.mask_proxy("socks5://u:secret@h:1080")
+        == "socks5://***@h:1080")
+    chk("без пароля адрес не трогаем",
+        net.mask_proxy("socks5://h:1080") == "socks5://h:1080")
+    chk("в маске нет пароля", "secret" not in net.mask_proxy("http://u:secret@h:8080"))
+
     # --- сами адреса --------------------------------------------------------
     chk("запасных адресов больше одного", len(net.TELEGRAM_FALLBACK_IPS) > 1)
     chk("все запасные адреса — валидные IPv4",

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.15"
+VERSION="v0.8.16"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -5174,6 +5174,43 @@ _bot_proxy_write() {
   return 0
 }
 
+# Локальные SOCKS-прокси, которые уже подняты на этом сервере, — их можно
+# отдать боту, не поднимая ничего отдельно. Практически это SOCKS-вход Xray
+# из пункта 5. Строки вида "socks5://127.0.0.1:10808|Xray (пункт 5)".
+#
+# Порт проверяем пробой наружу, а не просто «слушает ли кто-то»: Xray умеет
+# принимать соединения и никуда их не отправлять, если выходной сервер мёртв.
+# Отдать боту такой прокси — променять одну немоту на другую.
+_bot_proxy_candidates() {
+  local port addr
+  for port in 10808; do
+    _xray_port_owner "$port" | grep -q . || continue
+    addr="127.0.0.1:${port}"
+    if _socks_probe "$addr" >/dev/null 2>&1; then
+      printf 'socks5://%s|SOCKS-вход Xray, туннель проверен\n' "$addr"
+    else
+      printf 'socks5://%s|SOCKS-вход Xray, но наружу через него не проходит\n' "$addr"
+    fi
+  done
+}
+
+# Xray в пункте 5 запускается transient-юнитом (systemd-run) и перезагрузку не
+# переживает. Значит, прокси на 127.0.0.1 после ребута исчезнет. Бот это
+# переживёт — с версии 2.2.4 он видит мёртвый прокси и идёт напрямую, — но
+# сказать об этом надо здесь, а не оставлять на выяснение по логам.
+_bot_proxy_local_warn() {
+  local url="$1"
+  case "$url" in
+    *127.0.0.1*|*localhost*|*::1*) ;;
+    *) return 0 ;;
+  esac
+  echo ""
+  warn "Это прокси с самого сервера — он живёт, пока поднят туннель"
+  info "Туннель из пункта 5 после перезагрузки не поднимается сам:"
+  info "  включите его заново, затем ${W}systemctl restart awg-bot${N}"
+  info "Пока туннеля нет, бот пойдёт напрямую (запасные адреса Telegram)"
+}
+
 do_bot_proxy() {
   if [[ $EUID -ne 0 ]]; then
     err "Правка ${W}${BOT_CONF_PATH}${N} требует root. Запусти: ${W}sudo awg2${N}"
@@ -5208,14 +5245,43 @@ do_bot_proxy() {
 
   case "${_pc:-}" in
     1)
-      local url=""
+      local url="" cand_lines=() line i=0
+      # Готовые прокси с этого же сервера — чтобы не вбивать адрес руками и
+      # не гадать, какой порт слушает Xray.
+      while IFS= read -r line; do
+        [[ -n "$line" ]] && cand_lines+=("$line")
+      done < <(_bot_proxy_candidates)
+
       echo ""
-      echo -e "  ${D}Формат: схема://[логин:пароль@]хост:порт${N}"
-      echo -e "  ${D}Например: socks5://127.0.0.1:10808 или http://1.2.3.4:8080${N}"
-      echo ""
-      read -rp "$(echo -e "${C}  Адрес прокси (пусто — отмена): ${N}")" url || return 0
-      url="${url//[[:space:]]/}"
-      [[ -z "$url" ]] && { info "Отменено"; return 0; }
+      if ((${#cand_lines[@]} > 0)); then
+        echo -e "  ${G}Найдены прокси на этом сервере:${N}"
+        for i in "${!cand_lines[@]}"; do
+          echo -e "    ${C}$((i+1)))${N} ${W}${cand_lines[$i]%%|*}${N} ${D}— ${cand_lines[$i]#*|}${N}"
+        done
+        echo -e "    ${C}$(( ${#cand_lines[@]} + 1 )))${N} Ввести другой адрес"
+        echo ""
+        local _sel
+        read -rp "$(echo -e "${C}  Выбор [1-$(( ${#cand_lines[@]} + 1 ))], пусто — отмена: ${N}")" _sel || return 0
+        _sel="${_sel//[[:space:]]/}"
+        [[ -z "$_sel" ]] && { info "Отменено"; return 0; }
+        if [[ "$_sel" =~ ^[0-9]+$ ]] && (( _sel >= 1 && _sel <= ${#cand_lines[@]} )); then
+          url="${cand_lines[$((_sel-1))]%%|*}"
+          info "Выбран ${W}${url}${N}"
+        elif [[ "$_sel" != "$(( ${#cand_lines[@]} + 1 ))" ]]; then
+          err "Неверный выбор"
+          return 1
+        fi
+      fi
+
+      if [[ -z "$url" ]]; then
+        echo ""
+        echo -e "  ${D}Формат: схема://[логин:пароль@]хост:порт${N}"
+        echo -e "  ${D}Например: socks5://127.0.0.1:10808 или http://1.2.3.4:8080${N}"
+        echo ""
+        read -rp "$(echo -e "${C}  Адрес прокси (пусто — отмена): ${N}")" url || return 0
+        url="${url//[[:space:]]/}"
+        [[ -z "$url" ]] && { info "Отменено"; return 0; }
+      fi
       if ! _bot_proxy_valid "$url"; then
         err "Не похоже на адрес прокси: нужна схема из ${W}${BOT_PROXY_SCHEMES// /, }${N}"
         info "Например: ${W}socks5://127.0.0.1:10808${N}"
@@ -5242,6 +5308,7 @@ do_bot_proxy() {
       fi
       _bot_proxy_write "$url" || return 1
       ok "Прокси сохранён: ${W}$(_bot_proxy_mask "$url")${N}"
+      _bot_proxy_local_warn "$url"
       if systemctl is-active --quiet awg-bot 2>/dev/null; then
         systemctl restart awg-bot 2>/dev/null && ok "Бот перезапущен" || \
           warn "Не удалось перезапустить бота"

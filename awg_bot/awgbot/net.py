@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import socket
 from typing import Any
+from urllib.parse import urlsplit
 
 log = logging.getLogger("awgbot.net")
 
@@ -113,12 +114,62 @@ class TelegramFallbackResolver:
             await self._base.close()
 
 
+def mask_proxy(url: str) -> str:
+    """Адрес прокси без логина и пароля — для логов."""
+    if "@" in url and "://" in url:
+        return "%s://***@%s" % (url.split("://", 1)[0], url.rsplit("@", 1)[1])
+    return url
+
+
+def _proxy_hostport(url: str) -> tuple[str, int]:
+    """Хост и порт прокси. Порт по умолчанию — по схеме."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    port = parts.port
+    if not port:
+        port = 80 if parts.scheme in ("http",) else 443 if parts.scheme == "https" else 1080
+    return host, port
+
+
+def proxy_alive(url: str, timeout: float = 4.0) -> bool:
+    """
+    Открыт ли порт прокси. Именно TCP-коннект, а не проверка прокси-протокола:
+    задача — отличить «прокси поднят» от «прокси нет вовсе», и для второго
+    случая хватает отказа в соединении.
+
+    Нужно вот зачем. Самый удобный прокси на нашем сервере — SOCKS-вход Xray
+    (пункт 5 в awg2), но Xray там запускается transient-юнитом и перезагрузку
+    не переживает. Без этой проверки после ребута бот уходил бы в бесконечные
+    попытки достучаться через мёртвый порт — то есть молчал бы, хотя напрямую
+    (с запасными адресами) вполне мог работать.
+    """
+    host, port = _proxy_hostport(url)
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError as e:
+        log.debug("прокси %s:%s не отвечает: %s", host, port, e)
+        return False
+
+
 def build_session(proxy: str = "") -> Any:
     """
     Сессия aiogram с прокси и запасными адресами. Возвращает None, если
     ничего настраивать не требуется — тогда вызывающий создаёт Bot как раньше.
     """
     from aiogram.client.session.aiohttp import AiohttpSession
+
+    if proxy and not proxy_alive(proxy):
+        # Молчать нельзя: бот будет работать, но не так, как настроено, и
+        # если блокировка именно та, ради которой прокси заводили, помощи
+        # от запасных адресов не будет. Пусть в логе стоит причина.
+        log.warning("Прокси %s не отвечает — иду напрямую. Если он поднимается "
+                    "туннелем awg2 (пункт 5), после перезагрузки его надо "
+                    "включить заново, затем: systemctl restart awg-bot",
+                    mask_proxy(proxy))
+        proxy = ""
 
     if proxy:
         try:
@@ -133,7 +184,7 @@ def build_session(proxy: str = "") -> Any:
                 "или переустановите бота: sudo awg2 → 6) Telegram-бот."
             ) from e
         # В логе только адрес: у прокси с авторизацией до @ стоят логин и пароль.
-        log.info("Telegram API через прокси %s", proxy.split("@")[-1])
+        log.info("Telegram API через прокси %s", mask_proxy(proxy))
     else:
         session = AiohttpSession()
 
