@@ -60,6 +60,20 @@ os.chmod(os.path.join(BIN, "awg"), 0o755)
 with open(os.path.join(BIN, "awg-quick"), "w") as f:
     f.write("#!/usr/bin/env bash\nexit 0\n")
 os.chmod(os.path.join(BIN, "awg-quick"), 0o755)
+# core.add_client, не найдя внешний IP в конфиге, идёт за ним на api.ipify.org.
+# На машине без интернета (сборка, контейнер) тест падал тремя провалами
+# «Не удалось определить внешний IP сервера» — то есть по причине, к
+# совместимости версий отношения не имеющей. Отдаём фиксированный адрес; на
+# любой другой URL заглушка молчит, чтобы не подменять настоящие запросы.
+with open(os.path.join(BIN, "curl"), "w") as f:
+    f.write("#!/usr/bin/env bash\n"
+            "for a in \"$@\"; do\n"
+            "  case \"$a\" in\n"
+            "    *ipify.org*|*ifconfig.me*|*icanhazip.com*) echo 198.51.100.7; exit 0 ;;\n"
+            "  esac\n"
+            "done\n"
+            "exit 1\n")
+os.chmod(os.path.join(BIN, "curl"), 0o755)
 # copy2 сохраняет права исходника, а awg2.sh в репозитории не исполняемый —
 # без chmod shutil.which("awg2") его не находил, cps брал несуществующий
 # /usr/local/bin/awg2 и молча отдавал пустую цепочку. Тест при этом «падал»

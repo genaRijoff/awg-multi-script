@@ -47,7 +47,13 @@ try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
     HAVE_CRYPTO = True
-except ImportError:                     # без библиотеки проверяем только структуру
+except BaseException as _e:             # без библиотеки проверяем только структуру
+    # Не ImportError: недособранная python3-cryptography роняет импорт
+    # PanicException из pyo3, а он наследник BaseException и мимо except
+    # ImportError проходит насквозь — тест падал вместо того, чтобы
+    # обойтись структурными проверками. Тот же случай уже ловили в
+    # генераторе цепочки (_CPS_GENERATOR в awg2.sh).
+    print("криптопроверки пропущены: %s: %s" % (type(_e).__name__, _e))
     HAVE_CRYPTO = False
 
 
