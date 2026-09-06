@@ -54,7 +54,7 @@ from aiogram.types import (
     TelegramObject,
 )
 
-from . import admins, core, keyboards as kb, wrapper
+from . import admins, core, keyboards as kb, net, wrapper
 from .config import load_config
 
 logging.basicConfig(
@@ -64,8 +64,13 @@ logging.basicConfig(
 log = logging.getLogger("awgbot")
 
 CFG = load_config()
+# Сессия со своим резолвером (запасные адреса Telegram) и, если задан,
+# прокси. Без этого при блокировке единственного адреса из DNS бот молчит:
+# подставить нечего — см. net.py.
+_SESSION = net.build_session(CFG.proxy)
 bot = Bot(
     token=CFG.token,
+    session=_SESSION,
     default=DefaultBotProperties(
         parse_mode=ParseMode.HTML,
         # Карточки клиентов и статусы содержат ссылки (t.me, документация).

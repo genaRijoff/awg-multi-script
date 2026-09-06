@@ -6,3 +6,6 @@
 aiogram>=3.31,<4
 qrcode[pil]>=7.4
 pexpect>=4.9
+# Нужен только когда BOT_PROXY указывает на socks5/socks4: без него
+# aiogram не умеет socks-схемы. Для http-прокси хватает самого aiohttp.
+aiohttp-socks>=0.9
