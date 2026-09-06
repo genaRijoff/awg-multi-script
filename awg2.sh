@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.14"
+VERSION="v0.8.15"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -5087,6 +5087,193 @@ show_submenu_5() {
 }
 
 
+# ── Telegram-бот: версия и прокси ──────────────────────
+BOT_CONF_PATH="/etc/awg-bot.conf"
+# Те же схемы, что понимает awgbot/net.py. Разъедутся — бот встанет на старте
+# с внятным отказом, но до этого лучше не доводить: проверяем здесь.
+BOT_PROXY_SCHEMES="http https socks4 socks5 socks5h"
+
+# Версия установленного бота, а не той копии, что лежит рядом с awg2: в меню
+# важно, что реально крутится на сервере.
+_bot_version() {
+  local f
+  for f in /opt/awg-bot/awgbot/__init__.py \
+           /usr/local/lib/awg-bot/awgbot/__init__.py; do
+    [[ -f "$f" ]] || continue
+    sed -n 's/^__version__[[:space:]]*=[[:space:]]*["'"'"']\([^"'"'"']\{1,\}\)["'"'"'].*/\1/p' \
+      "$f" | head -1
+    return 0
+  done
+  return 1
+}
+
+_bot_proxy_get() {
+  [[ -f "$BOT_CONF_PATH" ]] || return 1
+  # Порядок важен: сперва хвостовые пробелы, потом кавычки. Наоборот
+  # значение вида  BOT_PROXY = "socks5://h:1080"   (с пробелами после
+  # кавычки) теряло бы только открывающую кавычку.
+  sed -n 's/^[[:space:]]*BOT_PROXY[[:space:]]*=[[:space:]]*//p' "$BOT_CONF_PATH" 2>/dev/null \
+    | tail -1 | sed -e 's/[[:space:]]*$//' -e 's/^["'"'"']//' -e 's/["'"'"']$//' -e 's/[[:space:]]*$//'
+}
+
+# В логах и на экране пароль от прокси показывать нельзя: у него тот же вес,
+# что у токена бота, а меню часто снимают на скриншот.
+_bot_proxy_mask() {
+  local url="$1"
+  if [[ "$url" == *"@"* ]]; then
+    printf '%s://***@%s' "${url%%://*}" "${url##*@}"
+  else
+    printf '%s' "$url"
+  fi
+}
+
+_bot_proxy_valid() {
+  local url="$1" scheme
+  [[ "$url" == *"://"* ]] || return 1
+  scheme="${url%%://*}"
+  [[ -n "${url#*://}" ]] || return 1
+  local s
+  for s in $BOT_PROXY_SCHEMES; do
+    [[ "$scheme" == "$s" ]] && return 0
+  done
+  return 1
+}
+
+# Живая проверка: доходит ли через прокси до Telegram API. Любой ответ HTTP
+# означает, что прокси работает (api.telegram.org на / отдаёт 404, и это
+# нормально); 000 — соединения не было. Код curl подставляем отдельным
+# присваиванием: при неудаче curl сам печатает 000, и `|| echo 000` дописал
+# бы второй — получилось бы 000000, что мимо любой проверки.
+_bot_proxy_probe() {
+  local url="$1" code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 \
+           --proxy "$url" https://api.telegram.org/ 2>/dev/null) || code="000"
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]
+}
+
+# Правка одной строки в конфиге бота. Файл хранит токен, поэтому пишем через
+# временный файл рядом (атомарная замена) и возвращаем права 600.
+_bot_proxy_write() {
+  local url="$1" tmp
+  if [[ ! -f "$BOT_CONF_PATH" ]]; then
+    err "Нет ${W}${BOT_CONF_PATH}${N} — сначала установи бота (пункт 1)"
+    return 1
+  fi
+  tmp=$(mktemp "${BOT_CONF_PATH}.XXXXXX") || { err "Не удалось создать временный файл"; return 1; }
+  grep -vE '^[[:space:]]*BOT_PROXY[[:space:]]*=' "$BOT_CONF_PATH" > "$tmp" || true
+  if [[ -n "$url" ]]; then
+    printf 'BOT_PROXY=%s\n' "$url" >> "$tmp"
+  fi
+  chmod 600 "$tmp" 2>/dev/null || true
+  chown --reference="$BOT_CONF_PATH" "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$BOT_CONF_PATH"; then
+    rm -f "$tmp" 2>/dev/null || true
+    err "Не удалось записать ${BOT_CONF_PATH}"
+    return 1
+  fi
+  return 0
+}
+
+do_bot_proxy() {
+  if [[ $EUID -ne 0 ]]; then
+    err "Правка ${W}${BOT_CONF_PATH}${N} требует root. Запусти: ${W}sudo awg2${N}"
+    return 1
+  fi
+
+  local cur; cur=$(_bot_proxy_get || true)
+  echo ""
+  hdr "Прокси до Telegram API"
+  echo ""
+  if [[ -n "$cur" ]]; then
+    echo -e "  Сейчас: ${W}$(_bot_proxy_mask "$cur")${N}"
+  else
+    echo -e "  Сейчас: ${D}не задан — бот ходит напрямую${N}"
+  fi
+  echo ""
+  echo -e "  ${D}Нужен, если провайдер режет Telegram не по IP: запасные адреса${N}"
+  echo -e "  ${D}в таком случае не спасают. Подойдёт любой SOCKS5 или HTTP-прокси,${N}"
+  echo -e "  ${D}в том числе SOCKS-вход Xray с этого же сервера (пункт 5 → 4).${N}"
+  echo ""
+  echo -e "  ${C}1)${N} Задать / изменить прокси"
+  if [[ -n "$cur" ]]; then
+    echo -e "  ${C}2)${N} Проверить текущий"
+    echo -e "  ${R}3)${N} Убрать прокси ${D}(ходить напрямую)${N}"
+  fi
+  echo -e "  ${W}0)${N} ← Назад"
+  echo ""
+
+  local _pc _pc_max=1
+  [[ -n "$cur" ]] && _pc_max=3
+  read_choice _pc "$(echo -e "${C}  Выбор [0-${_pc_max}]: ${N}")" 0 "$_pc_max" "0"
+
+  case "${_pc:-}" in
+    1)
+      local url=""
+      echo ""
+      echo -e "  ${D}Формат: схема://[логин:пароль@]хост:порт${N}"
+      echo -e "  ${D}Например: socks5://127.0.0.1:10808 или http://1.2.3.4:8080${N}"
+      echo ""
+      read -rp "$(echo -e "${C}  Адрес прокси (пусто — отмена): ${N}")" url || return 0
+      url="${url//[[:space:]]/}"
+      [[ -z "$url" ]] && { info "Отменено"; return 0; }
+      if ! _bot_proxy_valid "$url"; then
+        err "Не похоже на адрес прокси: нужна схема из ${W}${BOT_PROXY_SCHEMES// /, }${N}"
+        info "Например: ${W}socks5://127.0.0.1:10808${N}"
+        return 1
+      fi
+      echo ""
+      info "Проверяю связь с Telegram через прокси..."
+      if _bot_proxy_probe "$url"; then
+        ok "Через прокси Telegram отвечает"
+      else
+        warn "Через прокси до Telegram достучаться не удалось"
+        local _yn
+        read_yesno _yn "$(echo -e "${Y}  Всё равно сохранить? [y/N]: ${N}")" "n"
+        [[ "$_yn" =~ ^[Yy]$ ]] || { info "Отменено — прокси не изменён"; return 0; }
+      fi
+      # socks-схемы aiogram обслуживает через aiohttp_socks. Он в зависимостях
+      # бота, но на давно установленном боте venv может быть старым.
+      if [[ "$url" == socks* ]] && [[ -x /opt/awg-bot/venv/bin/python ]]; then
+        if ! /opt/awg-bot/venv/bin/python -c 'import aiohttp_socks' 2>/dev/null; then
+          info "Доставляю aiohttp-socks в venv бота..."
+          /opt/awg-bot/venv/bin/pip install -q aiohttp-socks 2>/dev/null || \
+            warn "Не удалось поставить aiohttp-socks — обнови бота (пункт 1)"
+        fi
+      fi
+      _bot_proxy_write "$url" || return 1
+      ok "Прокси сохранён: ${W}$(_bot_proxy_mask "$url")${N}"
+      if systemctl is-active --quiet awg-bot 2>/dev/null; then
+        systemctl restart awg-bot 2>/dev/null && ok "Бот перезапущен" || \
+          warn "Не удалось перезапустить бота"
+      fi
+      ;;
+    2)
+      [[ -z "$cur" ]] && { warn "Прокси не задан"; return 0; }
+      echo ""
+      info "Проверяю ${W}$(_bot_proxy_mask "$cur")${N}..."
+      if _bot_proxy_probe "$cur"; then
+        ok "Через прокси Telegram отвечает"
+      else
+        err "Через прокси до Telegram достучаться не удалось"
+        info "Проверь, что прокси поднят: ${W}ss -lntp | grep ${cur##*:}${N}"
+      fi
+      ;;
+    3)
+      [[ -z "$cur" ]] && { warn "Прокси не задан"; return 0; }
+      _bot_proxy_write "" || return 1
+      ok "Прокси убран — бот пойдёт напрямую"
+      if systemctl is-active --quiet awg-bot 2>/dev/null; then
+        systemctl restart awg-bot 2>/dev/null && ok "Бот перезапущен" || \
+          warn "Не удалось перезапустить бота"
+      fi
+      ;;
+    0|"") return 0 ;;
+    *) warn "Неверный выбор" ;;
+  esac
+  return 0
+}
+
+
 # ── Подменю 6: Telegram-бот ────────────────────────────
 show_submenu_6() {
   # BOT_INSTALL_URL — глобальный, зависит от канала обновлений (см. шапку)
@@ -5114,6 +5301,19 @@ show_submenu_6() {
       else
         echo -e "  Статус: ${Y}○ установлен, остановлен${N}"
       fi
+      # Версия — из установленного пакета: по ней видно, доехало ли обновление
+      local _bver; _bver=$(_bot_version || true)
+      if [[ -n "$_bver" ]]; then
+        echo -e "  Версия: ${W}${_bver}${N}"
+      else
+        echo -e "  Версия: ${D}не определена${N}"
+      fi
+      local _bprx; _bprx=$(_bot_proxy_get || true)
+      if [[ -n "$_bprx" ]]; then
+        echo -e "  Прокси: ${W}$(_bot_proxy_mask "$_bprx")${N}"
+      else
+        echo -e "  Прокси: ${D}нет — напрямую${N}"
+      fi
     else
       echo -e "  Статус: ${D}○ не установлен${N}"
     fi
@@ -5125,7 +5325,8 @@ show_submenu_6() {
       echo -e "  ${G}3)${N} Остановить"
       echo -e "  ${G}4)${N} Перезапустить"
       echo -e "  ${C}5)${N} Логи (последние 40 строк)"
-      echo -e "  ${R}6)${N} Полностью удалить бота ${D}(сервис, код, venv, токен)${N}"
+      echo -e "  ${C}6)${N} Прокси до Telegram ${D}(если провайдер блокирует)${N}"
+      echo -e "  ${R}7)${N} Полностью удалить бота ${D}(сервис, код, venv, токен)${N}"
     else
       echo -e "  ${C}1)${N} Установить бота"
     fi
@@ -5134,7 +5335,7 @@ show_submenu_6() {
 
     # Набор пунктов зависит от того, установлен ли бот
     local _bc _bc_max=1
-    $installed && _bc_max=6
+    $installed && _bc_max=7
     read_choice _bc "$(echo -e "${C}  Выбор [0-${_bc_max}]: ${N}")" 0 "$_bc_max" "0"
 
     case "${_bc:-}" in
@@ -5217,6 +5418,13 @@ show_submenu_6() {
         fi
         ;;
       6)
+        if $installed; then
+          do_bot_proxy || true
+        else
+          warn "Бот не установлен"
+        fi
+        ;;
+      7)
         if $installed; then
           do_bot_uninstall || true
         else

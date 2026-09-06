@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v0.8.14-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v0.8.15-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -127,15 +127,18 @@ sudo awg2 --help                  # список аргументов
 что, и бот молча не отвечает.
 
 С версии 2.2.3 бот сам подмешивает к ответу DNS известные адреса Telegram и
-берёт тот, что отвечает. Если режут не по IP, укажите прокси в
-`/etc/awg-bot.conf`:
+берёт тот, что отвечает. Настройки для этого не нужно.
+
+Если режут не по IP, нужен прокси: **пункт 6 → 6 «Прокси до Telegram»**. Меню
+проверит связь через него перед сохранением и само перезапустит бота.
+Подойдёт любой SOCKS5 или HTTP-прокси, в том числе SOCKS-вход Xray с этого же
+сервера (пункт 5 → 4).
+
+Руками — строка в `/etc/awg-bot.conf`, затем `systemctl restart awg-bot`:
 
 ```
 BOT_PROXY=socks5://127.0.0.1:10808
 ```
-
-Подойдёт любой SOCKS5 или HTTP-прокси, в том числе SOCKS-вход Xray с этого же
-сервера (пункт 5 → 4). После правки: `systemctl restart awg-bot`.
 
 Проверить, что запасные адреса подключились:
 
@@ -215,6 +218,6 @@ sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-scri
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v0.8.14** · MIT License
+**AWG Toolza v0.8.15** · MIT License
 
 </div>

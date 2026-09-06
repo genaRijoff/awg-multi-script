@@ -44,7 +44,13 @@ PROXY_SCHEMES = ("http://", "https://", "socks4://", "socks5://", "socks5h://")
 
 def valid_proxy(url: str) -> bool:
     """Похоже ли значение на адрес прокси. Пустая строка — не ошибка."""
-    return bool(url) and url.startswith(PROXY_SCHEMES)
+    if not url.startswith(PROXY_SCHEMES):
+        return False
+    # Схема без хоста ("socks5://") — мусор, но одной проверки схемы ей мало:
+    # такой конфиг принимался на старте, а падал позже и невнятно, уже при
+    # попытке соединиться. Меню awg2 (пункт 6 → 6) отвергает его сразу,
+    # держим оба конца одинаковыми.
+    return bool(url.split("://", 1)[1].strip())
 
 
 class TelegramFallbackResolver:

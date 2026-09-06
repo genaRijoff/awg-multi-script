@@ -154,6 +154,11 @@ def main():
     chk("http:// принимается", net.valid_proxy("http://1.2.3.4:8080"))
     chk("адрес без схемы отвергается", not net.valid_proxy("127.0.0.1:1080"))
     chk("чужая схема отвергается", not net.valid_proxy("ftp://1.2.3.4:21"))
+    chk("схема без хоста отвергается", not net.valid_proxy("socks5://"))
+    chk("схема с пробелом вместо хоста отвергается", not net.valid_proxy("socks5://   "))
+    chk("прокси с логином и паролем принимается",
+        net.valid_proxy("socks5://user:pass@1.2.3.4:1080"))
+    chk("схема в верхнем регистре отвергается", not net.valid_proxy("SOCKS5://h:1"))
 
     # --- сами адреса --------------------------------------------------------
     chk("запасных адресов больше одного", len(net.TELEGRAM_FALLBACK_IPS) > 1)
