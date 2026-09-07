@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.17"
+VERSION="v0.8.18"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -3244,6 +3244,11 @@ do_sniff_test() {
     return 0
   fi
 
+  # Модуль, дописывающий хвост к I1-I5, испортит ровно то, что показывает
+  # этот тест: длины пакетов поедут, а за концом протокола будут лишние байты.
+  # Сказать об этом надо до захвата, а не оставлять гадать над результатом.
+  awg_warn_trailer_fix "$SERVER_CONF" || true
+
   local listen_port
   listen_port=$(awk -F= '/^ListenPort/{gsub(/ /,"",$2); print $2}' "$SERVER_CONF")
   [[ -z "$listen_port" ]] && { warn "ListenPort не найден"; return 0; }
@@ -3742,6 +3747,60 @@ awg_reboot_reason() {
   return 1
 }
 
+# Собран ли модуль из исходников, где RandomTrailers уже не портит мимикрию.
+#
+# До тега v3.1.20260906 модуль дописывал случайный хвост RandomTrailers к
+# пакетам I1-I5 и к junk-пакетам. Для нас это существенно: I1-I5 — это и есть
+# цепочка мимикрии, и лишние байты в хвосте ломают ровно то, ради чего она
+# делается (QUIC Initial перестаёт быть 1200 Б, а за концом валидной структуры
+# протокола идёт мусор — для DPI это аномалия). В исправленной версии трейлеры
+# остались только на настоящих пакетах рукопожатия WireGuard.
+#
+# По версии это не определить: WIREGUARD_VERSION в src/version.h у тегов
+# 20260812, 20260828 и 20260906 одинаковый ("3.1.20260812"), так что
+# `modinfo amneziawg` покажет одно и то же на сломанном и на исправленном.
+# Поэтому смотрим исходники, которые DKMS оставляет на диске: параметр
+# `bool trailer` в объявлении wg_socket_send_buffer_to_peer появился ровно
+# вместе с этим фиксом.
+#
+# Коды: 0 — фикс есть, 1 — фикса точно нет, 2 — проверить не удалось.
+awg_module_trailer_fix() {
+  local f checked=0
+  for f in /usr/src/amneziawg-*/socket.h; do
+    [[ -f "$f" ]] || continue
+    # Файл без этого объявления — не тот, что нам нужен: не делаем по нему
+    # вывода ни в одну сторону.
+    grep -q 'wg_socket_send_buffer_to_peer' "$f" 2>/dev/null || continue
+    checked=1
+    if grep -qE 'bool[[:space:]]+trailer' "$f" 2>/dev/null; then
+      return 0
+    fi
+  done
+  (( checked == 1 )) && return 1
+  return 2
+}
+
+# Предупреждение для сервера на 3.1 с цепочкой мимикрии. Молчит, когда фикс
+# есть, когда проверить не удалось и когда RandomTrailers не включён: пугать
+# там, где мы не уверены, хуже, чем промолчать.
+awg_warn_trailer_fix() {
+  local conf="${1:-$SERVER_CONF}"
+  [[ -f "$conf" ]] || return 0
+  grep -qiE '^[[:space:]]*RandomTrailers[[:space:]]*=[[:space:]]*on' "$conf" 2>/dev/null || return 0
+  grep -qE '^[[:space:]]*I1[[:space:]]*=' "$conf" 2>/dev/null || return 0
+  local st; awg_module_trailer_fix; st=$?
+  (( st == 0 || st == 2 )) && return 0
+
+  echo ""
+  warn "Модуль ядра дописывает случайный хвост к пакетам мимикрии I1-I5"
+  info "Это ослабляет мимикрию: пакет перестаёт совпадать с настоящим"
+  info "протоколом по длине, а за его концом идут лишние байты"
+  info "Исправлено в модуле от 06.09.2026 (тег v3.1.20260906)"
+  info "Обновить: ${W}Сервер (1) → п.1${N}, затем ${W}перезагрузка${N}"
+  echo ""
+  return 1
+}
+
 # Возвращает 0 (true), если файл .ko модуля amneziawg на диске новее момента
 # его последней загрузки в ядро — то есть в памяти сидит устаревшая версия.
 # Возвращает 1 (false), если сравнить не удалось или модуль актуален.
@@ -3826,7 +3885,7 @@ awg_diagnose_up_failure() {
     if [[ -n "$bad" ]] && [[ "$bad" =~ ^${AWG3_KEYS_RE}$ ]]; then
       if [[ "$bad" =~ ^${AWG31_KEYS_RE}$ ]]; then
         info "Это параметр AWG 3.1 — установленный awg собран без его поддержки"
-        info "Нужны amneziawg-tools/модуль v3.1.20260812 или новее"
+        info "Нужны amneziawg-tools/модуль v3.1.20260906 или новее"
       else
         info "Это параметр AWG 3.0 — установленный awg собран без его поддержки"
       fi
@@ -4059,7 +4118,7 @@ awg_compat_gate() {
       ;;
   esac
 
-  [[ "$proto" == "3.1" ]] && hint="Нужны amneziawg-tools и модуль v3.1.20260812 или новее"
+  [[ "$proto" == "3.1" ]] && hint="Нужны amneziawg-tools и модуль v3.1.20260906 или новее"
 
   echo ""
   err "Установленный awg не знает параметров AWG ${proto}"
@@ -5688,7 +5747,9 @@ choose_awg_proto() {
   echo -e "     ${D}DisableCookies — сервер не отвечает cookie-пакетами.${N}"
   echo -e "     ${D}Заголовок шифруется целиком, поэтому диапазоны H не нужны:${N}"
   echo -e "     ${D}ставятся штатные 1/2/3/4, и цены за них нет.${N}"
-  echo -e "     ${D}Нужны amneziawg-tools и модуль v3.1.20260812 или новее${N}"
+  echo -e "     ${D}Нужны amneziawg-tools и модуль v3.1.20260906 или новее:${N}"
+  echo -e "     ${D}до 06.09.2026 модуль дописывал случайный хвост к пакетам${N}"
+  echo -e "     ${D}мимикрии I1-I5 и этим её ослаблял.${N}"
   echo -e "     ${D}И НА СЕРВЕРЕ, И НА КЛИЕНТЕ: старый клиент такой конфиг${N}"
   echo -e "     ${D}даже не прочитает.${N}"
   echo ""
@@ -5789,7 +5850,8 @@ awg_keepalive_value() {
 # совпадать у сервера и всех клиентов, и по ним же диагностика понимает, что
 # конфиг требует компонентов новее.
 #   3.0 — HeaderProtectionKey, ContentPaddingAddition и таймеры;
-#   3.1 — RandomTrailers и DisableCookies (amneziawg-tools v3.1.20260812).
+#   3.1 — RandomTrailers и DisableCookies (amneziawg-tools v3.1.20260812;
+#         модуль — v3.1.20260906 или новее, см. awg_module_trailer_fix).
 AWG3_KEYS_RE="(HeaderProtectionKey|ContentPaddingAddition|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts|RandomTrailers|DisableCookies)"
 # Ключи, которые отличают именно 3.1: по ним выбирается версия пробы.
 AWG31_KEYS_RE="(RandomTrailers|DisableCookies)"
@@ -7561,6 +7623,9 @@ do_gen() {
 
   _setup_autostart
   _warn_bot_needs_update
+  # Сервер уже создан и работает — но если модуль дописывает хвост к I1-I5,
+  # мимикрия слабее, чем показывает выбранный профиль. Лучше узнать сейчас.
+  awg_warn_trailer_fix "$SERVER_CONF" || true
 }
 
 
