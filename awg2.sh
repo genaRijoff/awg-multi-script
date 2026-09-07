@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.19"
+VERSION="v0.8.20"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -3821,7 +3821,7 @@ AWG_SYSFS_MODULE="${AWG_SYSFS_MODULE:-/sys/module/amneziawg}"
 awg_module_stale() {
   [[ -d "$AWG_SYSFS_MODULE" ]] || return 1
 
-  local ko_path live disk ko_time boot_time uptime
+  local ko_path live disk ko_time boot_time uptime src_checked=0
   ko_path=$(modinfo -n amneziawg 2>/dev/null) || return 1
   [[ -n "$ko_path" && -f "$ko_path" ]] || return 1
 
@@ -3829,10 +3829,35 @@ awg_module_stale() {
     live=$(cat "$AWG_SYSFS_MODULE/srcversion" 2>/dev/null || true)
     disk=$(modinfo -F srcversion "$ko_path" 2>/dev/null || true)
     if [[ -n "$live" && -n "$disk" ]]; then
+      src_checked=1
       [[ "$live" != "$disk" ]] && return 0
-      return 1
     fi
   fi
+
+  # Исходники в DKMS новее собранного модуля — значит их положили (git pull,
+  # make dkms-install, ручная правка), а пересобрать забыли. srcversion этого
+  # не ловит: он сравнивает загруженный модуль с дисковым .ko, а оба остаются
+  # прежними, пока dkms build не отработал. Ровно так и вышло на живом
+  # сервере: socket.h от 07.09, .ko от 05.09, srcversion совпадают, фикса в
+  # ядре нет.
+  local src newest_src=0 t
+  for src in /usr/src/amneziawg-*/*.c /usr/src/amneziawg-*/*.h; do
+    [[ -f "$src" ]] || continue
+    t=$(stat -c %Y "$src" 2>/dev/null) || continue
+    (( t > newest_src )) && newest_src=$t
+  done
+  if (( newest_src > 0 )); then
+    ko_time=$(stat -c %Y "$ko_path" 2>/dev/null) || ko_time=0
+    if (( ko_time > 0 && newest_src > ko_time )); then
+      return 0
+    fi
+  fi
+
+  # srcversion сравнить удалось и он совпал, исходники не новее модуля —
+  # больше проверять нечего. Дальше идёт грубая прикидка по времени, и
+  # пускать её сюда нельзя: она даёт ложное «устарел» на свежей установке,
+  # где модуль собран и загружен уже после старта системы.
+  (( src_checked == 1 )) && return 1
 
   # Запасной путь, если srcversion недоступен: файл .ko собран уже после
   # загрузки системы. Модуль при этом почти всегда загружен при старте, то
