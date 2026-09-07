@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.18"
+VERSION="v0.8.19"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -3801,20 +3801,48 @@ awg_warn_trailer_fix() {
   return 1
 }
 
-# Возвращает 0 (true), если файл .ko модуля amneziawg на диске новее момента
-# его последней загрузки в ядро — то есть в памяти сидит устаревшая версия.
-# Возвращает 1 (false), если сравнить не удалось или модуль актуален.
-awg_module_stale() {
-  [[ -d /sys/module/amneziawg ]] || return 1
+# Возвращает 0 (true), если в память ядра загружена не та сборка модуля,
+# что лежит на диске, — то есть dkms install прошёл, а ядро продолжает
+# работать со старым модулем. Возвращает 1 (false), если сборка та же или
+# сравнить не удалось.
+#
+# Раньше это делалось по времени: mtime файла .ko против mtime
+# /sys/module/amneziawg. Так нельзя — sysfs не хранит время создания узла,
+# `stat -c %Y /sys/module/<что угодно>` возвращает ТЕКУЩЕЕ время. Значит
+# mod_time > load_time не выполнялось никогда, проверка молчала всегда, и
+# после пересборки скрипт сообщал «перезагрузка не требуется», хотя в ядре
+# оставался прежний модуль.
+#
+# Сравниваем srcversion — хеш исходников, вшитый в модуль при сборке. У
+# загруженного он в /sys/module/amneziawg/srcversion, у файла его отдаёт
+# modinfo. Разошлись — в памяти другая сборка.
+AWG_SYSFS_MODULE="${AWG_SYSFS_MODULE:-/sys/module/amneziawg}"
 
-  local ko_path load_time mod_time
+awg_module_stale() {
+  [[ -d "$AWG_SYSFS_MODULE" ]] || return 1
+
+  local ko_path live disk ko_time boot_time uptime
   ko_path=$(modinfo -n amneziawg 2>/dev/null) || return 1
   [[ -n "$ko_path" && -f "$ko_path" ]] || return 1
 
-  load_time=$(stat -c %Y /sys/module/amneziawg 2>/dev/null) || return 1
-  mod_time=$(stat -c %Y "$ko_path" 2>/dev/null) || return 1
+  if [[ -r "$AWG_SYSFS_MODULE/srcversion" ]]; then
+    live=$(cat "$AWG_SYSFS_MODULE/srcversion" 2>/dev/null || true)
+    disk=$(modinfo -F srcversion "$ko_path" 2>/dev/null || true)
+    if [[ -n "$live" && -n "$disk" ]]; then
+      [[ "$live" != "$disk" ]] && return 0
+      return 1
+    fi
+  fi
 
-  (( mod_time > load_time ))
+  # Запасной путь, если srcversion недоступен: файл .ko собран уже после
+  # загрузки системы. Модуль при этом почти всегда загружен при старте, то
+  # есть в памяти сборка более ранняя. Ошибка возможна в одну сторону —
+  # предложим лишнюю перезагрузку, а не пропустим нужную.
+  ko_time=$(stat -c %Y "$ko_path" 2>/dev/null) || return 1
+  uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null) || return 1
+  [[ "$uptime" =~ ^[0-9]+$ ]] || return 1
+  boot_time=$(( $(date +%s) - uptime ))
+  (( ko_time > boot_time ))
 }
 
 # Делает net.ipv4.ip_forward=1 постоянным и печатает файл, куда записано.
