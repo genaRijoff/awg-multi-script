@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.24"
+VERSION="v0.8.25"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -6265,22 +6265,34 @@ gen_awg_params() {
 
   local Jc Jmin Jmax S1 S2 S3 S4
 
+  # Jmin/Jmax — размер каждого junk-пакета. README модуля Amnezia:
+  #   Jmin — recommended value is 8
+  #   Jmax — recommended value is 80
+  # Раньше «Мощный» брал Jmin 50-256 и Jmax 300-1000. Это не просто «шире
+  # рекомендации»: junk уходит ПЕРЕД каждым рукопожатием в количестве Jc, то
+  # есть при Jc=12 и Jmax=1000 сервер выплёвывал до 12 КБ мусора на попытку.
+  # Само по себе это и сигнатура (UDP-пакеты странного размера пачкой), и
+  # лишняя задержка рукопожатия.
+  #
+  # Прибивать к 8 и 80 гвоздями нельзя — одинаковые значения у всех серверов
+  # станут сигнатурой сами. Держим разброс вокруг рекомендованных, профили
+  # различаются шириной, а не порядком величины.
   case "${AWG_PROFILE:-pro}" in
     lite)
       # ── «AmneziaVPN»: значения вокруг официального конфига ──
       # Образец конфига официального клиента (AWG 3.1):
       #   Jc=4, Jmin=10, Jmax=50, S1=86, S2=48, S3=16, S4=12, H1..H4 = 1/2/3/4
       Jc=$(rand_range 3 5)              # 4 ±1
-      Jmin=$(rand_range 8 14)           # 10 ±4
-      Jmax=$(rand_range 45 55)          # 50 ±5
+      Jmin=$(rand_range 8 12)           # рекомендация Amnezia: 8
+      Jmax=$(rand_range 70 90)          # рекомендация Amnezia: 80
       S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
     standard)
       # ── Standard (устаревший): промежуточные значения ──
       Jc=$(rand_range 5 8)
-      Jmin=$(rand_range 30 80)
-      Jmax=$(rand_range 100 250)
+      Jmin=$(rand_range 8 16)
+      Jmax=$(rand_range 70 100)
       S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
@@ -6292,8 +6304,8 @@ gen_awg_params() {
       # Каждый junk-пакет уходит перед initiation, так что верх ещё и стоит
       # времени на рукопожатии.
       Jc=$(rand_range 4 12)
-      Jmin=$(rand_range 50 256)
-      Jmax=$(rand_range 300 1000)
+      Jmin=$(rand_range 8 24)
+      Jmax=$(rand_range 80 120)
       S1=$(_awg_rand_s S1); S2=$(_awg_rand_s S2)
       S3=$(_awg_rand_s S3); S4=$(_awg_rand_s S4)
       ;;
