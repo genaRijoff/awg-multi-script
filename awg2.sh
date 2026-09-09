@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-VERSION="v0.8.20"
+VERSION="v0.8.21"
 SCRIPT_PATH="/usr/local/bin/awg2"
 
 # ── Канал обновлений ───────────────────────────────────────
@@ -2549,11 +2549,20 @@ gen_cps_i1() {
   local only_i1="${3:-}"
   local mtu_args=()
   [[ -n "${AWG_CPS_MTU:-}" ]] && mtu_args=(--mtu "$AWG_CPS_MTU")
+  # Потолок применяем здесь, а не только в меню: CPS_BUDGET приходит и из
+  # конфига сервера (маркер AWG_CPS_BUDGET, который читает бот), и из
+  # профильных пресетов, где встречается 0 = «без лимита». Ноль за этой
+  # чертой означал бы цепочку в 12000 символов для quic — втрое выше
+  # порога, за которым awg set падает, а awg show перестаёт читать
+  # интерфейс (см. CPS_HARD_LIMIT).
   local budget_args=()
   local budget="${CPS_BUDGET:-0}"
-  if [[ "$budget" =~ ^[0-9]+$ ]] && (( budget > 0 )); then
-    budget_args=(--budget "$budget")
+  local cap="${CPS_HARD_LIMIT:-3500}"
+  [[ "$budget" =~ ^[0-9]+$ ]] || budget=0
+  if (( budget <= 0 || budget > cap )); then
+    budget=$cap
   fi
+  budget_args=(--budget "$budget")
   python3 -c "$_CPS_GENERATOR" "$profile" "$domain" ${only_i1:+"$only_i1"} \
     ${mtu_args[@]+"${mtu_args[@]}"} ${budget_args[@]+"${budget_args[@]}"}
 }
@@ -2832,6 +2841,20 @@ choose_cps_domain() {
 # Результат: глобальная CPS_BUDGET (символов, 0 = без лимита).
 CPS_BUDGET=0
 
+# Потолок суммарной длины I1-I5. Не наша прихоть, а предел amneziawg-tools:
+# атрибуты уровня устройства пишутся в netlink-буфер 4096 Б (на x86-64 это
+# min(pagesize, 8192)) функциями mnl_attr_put* БЕЗ проверки границ — в
+# отличие от атрибутов пиров, где используются варианты _check. Замеры из
+# amneziawg-tools issue #69:
+#   до 3598 симв — применяется и читается;
+#   3600-3866    — применяется, но `awg show` виснет и отдаёт EMSGSIZE;
+#   от 3868      — `awg set` падает с кодом 134, устройство настроено, но
+#                  прочитать его больше нельзя.
+# Второй и третий случай для нас смертельны: на `awg show` держатся выдача
+# публичного ключа при создании клиента, список пиров и вся статистика.
+# 3500 — с запасом до первого порога.
+CPS_HARD_LIMIT=3500
+
 # Ориентировочная длина ОДНОГО пакета мимикрии в символах конфига.
 # Числа — замеры генератора v2; точная длина зависит от домена и случайных
 # полей, поэтому они годятся только для предупреждения в меню, а итог всегда
@@ -2868,10 +2891,11 @@ _cps_fit_count() {
 # сколько пакетов реально поместится, а не общими словами про «QUIC урежется».
 choose_cps_budget() {
   local profile="${1:-quic}"
-  local pkt fit1500 fit3000
+  local pkt fit1500 fit3000 fitmax
   pkt=$(_cps_pkt_len "$profile")
   fit1500=$(_cps_fit_count 1500 "$pkt")
   fit3000=$(_cps_fit_count 3000 "$pkt")
+  fitmax=$(_cps_fit_count "$CPS_HARD_LIMIT" "$pkt")
 
   CPS_BUDGET=1500
   echo ""
@@ -2890,8 +2914,13 @@ choose_cps_budget() {
 
   echo -e "  ${G}1${N}  ${W}Компактная${N}  ${D}— до ~1500 симв, влезает в QR${N}  → ${W}${fit1500} из 5${N}${_rec1}"
   echo -e "  ${G}2${N}  ${W}Средняя${N}     ${D}— до ~3000 симв${N}              → ${W}${fit3000} из 5${N}"
-  echo -e "  ${G}3${N}  ${W}Без лимита${N}  ${D}— все пять целиком (~$((pkt * 5)) симв)${N} → ${W}5 из 5${N}${_rec3}"
+  echo -e "  ${G}3${N}  ${W}Максимум${N}    ${D}— ${CPS_HARD_LIMIT} симв, предел awg-tools${N}     → ${W}${fitmax} из 5${N}${_rec3}"
   echo -e "  ${D}0   Назад${N}"
+  echo ""
+  echo -e "  ${D}Выше ${CPS_HARD_LIMIT} нельзя не из осторожности: в amneziawg-tools атрибуты${N}"
+  echo -e "  ${D}I1-I5 пишутся в буфер 4 КБ без проверки границ (issue #69). За${N}"
+  echo -e "  ${D}порогом awg show перестаёт читать интерфейс, а на нём держатся${N}"
+  echo -e "  ${D}выдача ключа новому клиенту, список пиров и статистика.${N}"
   if (( fit1500 < 5 )); then
     echo ""
     echo -e "  ${Y}  Все пять в компактный бюджет укладывают только DNS, NTP и RTP.${N}"
@@ -2904,13 +2933,9 @@ choose_cps_budget() {
     0) return 1 ;;
     1) CPS_BUDGET=1500 ;;
     2) CPS_BUDGET=3000 ;;
-    3) CPS_BUDGET=0 ;;
+    3) CPS_BUDGET=$CPS_HARD_LIMIT ;;
   esac
-  if (( CPS_BUDGET > 0 )); then
-    ok "Бюджет цепочки: ${CPS_BUDGET} символов"
-  else
-    ok "Бюджет цепочки: без лимита"
-  fi
+  ok "Бюджет цепочки: ${CPS_BUDGET} символов"
   return 0
 }
 
@@ -3248,6 +3273,7 @@ do_sniff_test() {
   # этот тест: длины пакетов поедут, а за концом протокола будут лишние байты.
   # Сказать об этом надо до захвата, а не оставлять гадать над результатом.
   awg_warn_trailer_fix "$SERVER_CONF" || true
+  awg_warn_cps_oversize "$SERVER_CONF" || true
 
   local listen_port
   listen_port=$(awk -F= '/^ListenPort/{gsub(/ /,"",$2); print $2}' "$SERVER_CONF")
@@ -3783,6 +3809,44 @@ awg_module_trailer_fix() {
 # Предупреждение для сервера на 3.1 с цепочкой мимикрии. Молчит, когда фикс
 # есть, когда проверить не удалось и когда RandomTrailers не включён: пугать
 # там, где мы не уверены, хуже, чем промолчать.
+# Суммарная длина значений I1-I5 в конфиге, в символах.
+_cps_chain_len() {
+  local conf="${1:-$SERVER_CONF}"
+  [[ -f "$conf" ]] || { echo 0; return 0; }
+  awk -F'=' '/^[[:space:]]*I[1-5][[:space:]]*=/ {
+      v = $0; sub(/^[^=]*=[[:space:]]*/, "", v); gsub(/[[:space:]]+$/, "", v)
+      n += length(v)
+    } END { print n + 0 }' "$conf" 2>/dev/null || echo 0
+}
+
+# Конфиг, который amneziawg-tools не сможет прочитать обратно. Пороги — из
+# замеров в amneziawg-tools issue #69, см. CPS_HARD_LIMIT. Это не про
+# качество мимикрии, а про работоспособность: за верхним порогом `awg set`
+# падает, а `awg show` перестаёт отдавать данные, на которых у нас держатся
+# выдача ключа новому клиенту, список пиров и статистика.
+awg_warn_cps_oversize() {
+  local conf="${1:-$SERVER_CONF}"
+  [[ -f "$conf" ]] || return 0
+  local n; n=$(_cps_chain_len "$conf")
+  [[ "$n" =~ ^[0-9]+$ ]] || return 0
+  (( n <= 3598 )) && return 0
+
+  echo ""
+  if (( n >= 3868 )); then
+    err "Цепочка I1-I5 занимает ${n} символов — это выше предела awg-tools"
+    info "На таком конфиге ${W}awg set${N} падает, а ${W}awg show${N} не читает интерфейс"
+  else
+    warn "Цепочка I1-I5 занимает ${n} символов — на грани предела awg-tools"
+    info "${W}awg show${N} на таком конфиге может виснуть и отдавать EMSGSIZE"
+  fi
+  info "Причина не у нас: атрибуты I1-I5 пишутся в буфер 4 КБ без проверки"
+  info "границ (amneziawg-tools issue #69). Безопасный предел — ${CPS_HARD_LIMIT:-3500}"
+  info "Проверить сейчас: ${W}awg show awg0 public-key${N} — если молчит, задето"
+  info "Пересоздать цепочку короче: ${W}Сервер (1) → п.5${N} (сменить профиль/бюджет)"
+  echo ""
+  return 1
+}
+
 awg_warn_trailer_fix() {
   local conf="${1:-$SERVER_CONF}"
   [[ -f "$conf" ]] || return 0
@@ -7679,6 +7743,7 @@ do_gen() {
   # Сервер уже создан и работает — но если модуль дописывает хвост к I1-I5,
   # мимикрия слабее, чем показывает выбранный профиль. Лучше узнать сейчас.
   awg_warn_trailer_fix "$SERVER_CONF" || true
+  awg_warn_cps_oversize "$SERVER_CONF" || true
 }
 
 
