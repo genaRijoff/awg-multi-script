@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v0.8.23-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v0.8.24-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -46,6 +46,27 @@ sudo awg2
 
 Канал влияет и на Telegram-бота: установка из пункта 6 берёт его код из того же
 репозитория.
+
+---
+
+## Требования к клиентам
+
+Версия протокола задаётся на **весь сервер**, поэтому клиент обязан её понимать:
+
+| версия сервера | что нужно клиенту |
+|---|---|
+| AWG 2.0 | любой клиент AmneziaWG |
+| AWG 3.1 | **AmneziaVPN 5.0.1.5 или новее** |
+
+Клиент старше 5.0.1.5 не знает ключей `RandomTrailers` и `DisableCookies` и
+отказывается импортировать конфиг с незнакомым ключом **целиком** — не
+«пропускает строку», а отвергает весь файл. Если среди ваших клиентов есть
+те, кого обновить нельзя, поднимите им отдельный сервер на 2.0.
+
+Отдельно: `HeaderProtectionKey`, `S1`-`S4`, `H1`-`H4` и `RandomTrailers`
+обязаны совпадать у сервера и клиента побайтово. Расхождение проявляется
+молчанием — в `awg show` просто никогда не появится `latest handshake`, без
+единой строки в логах.
 
 ---
 
@@ -225,6 +246,6 @@ sudo bash -c 'curl -fsSL https://raw.githubusercontent.com/pumbaX/awg-multi-scri
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v0.8.23** · MIT License
+**AWG Toolza v0.8.24** · MIT License
 
 </div>
