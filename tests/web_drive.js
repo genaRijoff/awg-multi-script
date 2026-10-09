@@ -327,9 +327,14 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
       await page.waitForSelector("text=Последние события");
       await page.screenshot({ path: `${out}/${name}-аккаунт.png`, fullPage: true });
     });
-    await step("выход — снова экран входа, API закрыт", async () => {
+    await step("выход — снова экран входа, API закрыт; во вкладке снова знак Тулзы, не флаг сервера", async () => {
+      const flagNow = () => page.evaluate(() => /viewBox="0 0 30 20"/.test(decodeURIComponent(document.getElementById("favicon").getAttribute("href") || "")));
+      await page.evaluate(() => { LOOK.tab = "flag"; applyLook(true); });
+      await page.waitForFunction(() => S.status && S.status.country);
+      if (!await flagNow()) throw new Error("перед выходом флаг не показан");
       await page.click("#app button:has-text('Выйти')");
       await page.waitForSelector("form.login");
+      if (await flagNow()) throw new Error("на экране входа во вкладке флаг страны сервера");
       await page.goto(u + "#/clients");
       await page.waitForSelector("form.login");
     });

@@ -384,6 +384,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("новый клиент", async () => {
     await nav("/add", "input");
+    // Кнопка со случайным именем — одна иконка: подпись для чтения с экрана и всплывающая нужны
+    if (await page.locator("button[aria-label='Случайное имя'][title='Случайное имя']").count() !== 1) throw new Error("кнопка «🎲» без подписи");
     await page.fill("input", "carol");
     await page.selectOption("select", "+1d");
     await shot("06-add");
@@ -978,6 +980,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("обфускатор: клиент и комплект", async () => {
     await nav("/wgobf/add", "input");
+    if (await page.locator("button[aria-label='Случайное имя'][title='Случайное имя']").count() !== 1) throw new Error("кнопка «🎲» без подписи");
     await page.fill("input", "kn1");
     await page.click("button:has-text('Создать')");
     await page.waitForURL(/#\/wgobf\/client\/kn1$/);

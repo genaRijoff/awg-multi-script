@@ -108,6 +108,16 @@ check(not ok and 555004 not in admins.invited_ids(), "чужой токен от
 ok, _ = admins.consume_invite("x" * 200, 555005)
 check(not ok, "переросший токен отклонён без падения")
 
+# /start inv_… может прислать любой: неверный токен не должен писать на диск
+# (запись с fsync в цикле бота) — файл переписывается, только если было что чистить
+_saves = []
+_orig_save = admins._save
+admins._save = lambda d: (_saves.append(1), _orig_save(d))[1]
+for i in range(5):
+    admins.consume_invite("левый-токен-%d" % i, 555100 + i)
+check(not _saves, "неверный токен не пишет admins.json", "записей: %d" % len(_saves))
+admins._save = _orig_save
+
 print("\n── приглашение: срок жизни ──")
 reset()
 token, _ = admins.create_invite(created_by=111)
@@ -119,6 +129,14 @@ with open(admins.ADMINS_FILE, "w") as f:
 ok, _ = admins.consume_invite(token, 555006)
 check(not ok and 555006 not in admins.invited_ids(), "просроченная ссылка не работает")
 check(admins.pending_invites() == 0, "просроченное приглашение вычищено")
+# чистка при чужом токене всё же сохраняется, если было что чистить
+token, _ = admins.create_invite(created_by=111)
+data = json.loads(open(admins.ADMINS_FILE).read())
+data["invites"][next(iter(data["invites"]))]["exp"] = 1
+with open(admins.ADMINS_FILE, "w") as f:
+    json.dump(data, f)
+admins.consume_invite("левый-токен", 555008)
+check(json.loads(open(admins.ADMINS_FILE).read())["invites"] == {}, "чужой токен: просроченное всё равно вычищено с диска")
 
 print("\n── отзыв приглашений ──")
 reset()

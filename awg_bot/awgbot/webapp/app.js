@@ -419,7 +419,8 @@ function tzRefresh() {
 function favRefresh() {
   const fav = document.getElementById("favicon");
   if (!fav) return;
-  const st = S.status || {}, cc = String(st.country || "").replace(/[^A-Z]/g, "").slice(0, 2);
+  // Без входа (экран входа, сессия кончилась) сведений о сервере нет — и флага страны тоже
+  const st = (S.me && S.status) || {}, cc = String(st.country || "").replace(/[^A-Z]/g, "").slice(0, 2);
   const set = (href) => { if (fav.getAttribute("href") !== href) fav.href = href; };
   if (!WEB || LOOK.tab !== "flag" || !cc) { set(tzIcon()); return; }
   const dot = { "": "#22c55e", bad: "#ef4444", off: "#9ca3af" }[srvPulse(st)];
@@ -429,7 +430,7 @@ function favRefresh() {
   set("data:image/svg+xml;charset=utf-8," + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
     <defs><clipPath id="c"><rect y="5" width="32" height="22" rx="4"/></clipPath></defs><g clip-path="url(#c)">${body}</g>
     <rect x=".5" y="5.5" width="31" height="21" rx="3.5" fill="none" stroke="rgba(0,0,0,.25)"/>
-    <circle cx="26" cy="25" r="5.5" fill="${dot}" stroke="#fff" stroke-width="2"/></svg>`));
+    <circle cx="25.5" cy="25" r="5.5" fill="${dot}" stroke="#fff" stroke-width="2"/></svg>`));
 }
 
 function applyLook(save = false) {
@@ -2498,7 +2499,7 @@ route(/^\/add$/, async (ctx) => {
   const pro = d.profile === "pro";
   ctx.put(title("➕ Новый клиент"),
     h("label", {}, "Имя — латиница, цифры, _ и -, до 32"),
-    h("div", { class: "row" }, name, h("button", { onclick: () => { name.value = free(); } }, "🎲")),
+    h("div", { class: "row" }, name, h("button", { "aria-label": "Случайное имя", title: "Случайное имя", onclick: () => { name.value = free(); } }, "🎲")),
     exp.nodes,
     pro ? h("div", { style: "margin-top:12px" }, mimLabel, h("button", { class: "btn-block", onclick: async () => {
       const box = h("div", { class: "sheet" }, h("h3", {}, "🎭 Мимикрия"));
@@ -3760,7 +3761,7 @@ route(/^\/wgobf\/add$/, async (ctx) => {
   const name = h("input", { placeholder: "keenetic_home", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
   ctx.put(title("Новый клиент"), hint("Клиент WG + обфускатор — комплект со ссылкой для Keenetic и конфигами."),
     h("label", {}, "Имя — латиница, цифры, _ и -, до 32"),
-    h("div", { class: "row" }, name, h("button", { onclick: () => { name.value = free(); } }, icon("dices"))),
+    h("div", { class: "row" }, name, h("button", { "aria-label": "Случайное имя", title: "Случайное имя", onclick: () => { name.value = free(); } }, icon("dices"))),
     btn("Создать", (b) => {
       const v = name.value.trim() || free();
       if (!/^[A-Za-z0-9_-]{1,32}$/.test(v)) return fail(new Error("Имя: латиница, цифры, _ и -, до 32"));
@@ -4136,6 +4137,7 @@ route(/^\/log\/([a-z0-9-]+)$/, async (ctx, name) => {
 function showLogin(err = "") {
   token++;                       // недорисованный экран не затрёт форму входа своей ошибкой
   S.me = null;
+  favRefresh();                  // вкладка — снова знак Тулзы, флаг сервера только за входом
   // Экран, прерванный на перезагрузке, сам «reloading» уже не снимет (он не live) —
   // иначе форма входа приглушена и не нажимается. Снимки прежней сессии — тоже долой
   root.classList.remove("reloading");

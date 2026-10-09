@@ -230,12 +230,16 @@ def consume_invite(token: str, uid: int, username: str = "") -> tuple[bool, str]
     if not token or len(token) > 64:
         return False, "Ссылка недействительна."
     data = _load()
-    _prune_invites(data)
+    pruned = _prune_invites(data)
     key = _hash(token)
     inv = data["invites"].pop(key, None)
     if inv is None:
-        # сохраняем чистку просроченных, даже если токен не подошёл
-        _save(data)
+        # Чистку просроченных сохраняем, даже если токен не подошёл. Но только
+        # если было что чистить: /start inv_… может прислать кто угодно, и
+        # запись с fsync на каждую такую попытку — синхронная работа с диском
+        # в цикле бота по команде постороннего.
+        if pruned:
+            _save(data)
         return False, "Ссылка недействительна или уже использована."
     if str(uid) in data["admins"]:
         _save(data)

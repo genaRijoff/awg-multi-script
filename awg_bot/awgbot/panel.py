@@ -170,8 +170,10 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         job_id = str(body.get("id") or "")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", job_id):
             raise _bad("id задачи")
-        offset = body.get("offset") or 0
-        return _result(await api.job_status(job_id, int(offset) if str(offset).isdigit() else 0))
+        offset = str(body.get("offset") or 0)
+        # isdigit() пускает и «²» (int() на нём падает), а digits > 4300 int() не берёт вовсе
+        return _result(await api.job_status(job_id, int(offset) if offset.isascii() and offset.isdigit()
+                                            and len(offset) < 12 else 0))
 
     # ── Клиенты: то, что знает только бот ──
     @route("/api/clients")
@@ -249,7 +251,7 @@ def setup(app: web.Application, user_of: UserOf) -> None:
 
     @route("/api/settings")
     async def _settings(request: web.Request, user: dict, body: dict) -> web.Response:
-        if body.get("sort") in cls.SORTS:
+        if isinstance(body.get("sort"), str) and body["sort"] in cls.SORTS:
             store.set_setting("clients_sort", body["sort"])
         return web.json_response({"ok": True})
 
@@ -260,10 +262,10 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         (только владелец: автобэкап уходит владельцам, уведомления — всем)."""
         if any(k in body for k in ("kind", "backup_mode", "backup_keep", "backup_now")):
             _owner(user)
-            if body.get("kind") in alerts.KIND_IDS:
+            if isinstance(body.get("kind"), str) and body["kind"] in alerts.KIND_IDS:
                 alerts.set_enabled(body["kind"], bool(body.get("on")))
             mode, keep = body.get("backup_mode"), body.get("backup_keep")
-            if mode is not None and mode not in alerts.BACKUP_MODES:
+            if mode is not None and not (isinstance(mode, str) and mode in alerts.BACKUP_MODES):
                 raise _bad("backup_mode: off | day | week")
             if keep is not None and keep not in alerts.BACKUP_KEEP:
                 raise _bad("backup_keep: 3 | 7 | 14 | 30")

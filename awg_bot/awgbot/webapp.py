@@ -51,6 +51,8 @@ def check_init_data(init_data: str, token: str, now: float | None = None) -> dic
     """Пользователь из initData или None: подпись не сошлась, данные
     устарели, пользователя нет. Алгоритм — core.telegram.org/bots/webapps
     (секрет = HMAC-SHA256("WebAppData", токен))."""
+    if not (init_data or "").isascii():  # суррогаты/сырые байты из заголовка — не 500
+        return None
     try:
         pairs = dict(parse_qsl(init_data or "", keep_blank_values=True, strict_parsing=True))
     except ValueError:
@@ -67,7 +69,10 @@ def check_init_data(init_data: str, token: str, now: float | None = None) -> dic
     # Поле signature (подпись для сторонних сервисов) клиенты Telegram то
     # включают в проверку hash, то нет — принимаем оба варианта
     no_sig = {k: v for k, v in pairs.items() if k != "signature"}
-    if not (hmac.compare_digest(sign(pairs), got) or hmac.compare_digest(sign(no_sig), got)):
+    # Байтами: compare_digest на строке не из ASCII бросает TypeError — 500 с трейсом в
+    # журнале бота на каждый такой запрос постороннего вместо 401
+    got_b = got.encode()
+    if not (hmac.compare_digest(sign(pairs).encode(), got_b) or hmac.compare_digest(sign(no_sig).encode(), got_b)):
         return None
     try:
         auth = int(pairs.get("auth_date") or 0)
@@ -98,6 +103,16 @@ class MiniApp:
         self._watch: asyncio.Task | None = None
         self.bot: Bot | None = None
         self.menu_error = ""
+        self._mutex: asyncio.Lock | None = None
+
+    def _lock(self) -> asyncio.Lock:
+        """Подъём и остановка сервера — по одному: два start() разом (двойной тап
+        «Перезапустить», смена порта и выпуск сертификата) оба сносили сервер
+        и поднимали свой — второй не мог занять порт, а первый оставался
+        слушать без хозяина, и stop() его уже не закрывал."""
+        if self._mutex is None:
+            self._mutex = asyncio.Lock()
+        return self._mutex
 
     @property
     def running(self) -> bool:
@@ -107,7 +122,8 @@ class MiniApp:
         """Поднять сервер, если есть сертификат и порт; иначе — причина в
         error. Кнопка «Меню» админов — вслед за сервером."""
         self.bot = bot
-        await self._serve(bot)
+        async with self._lock():
+            await self._serve(bot)
         # Всегда: если сервер не поднялся (нет сертификата, порт занят), у
         # админов иначе остаётся кнопка «Меню» на мёртвый адрес с прошлого раза.
         await self.menu_all(bot)
@@ -152,7 +168,8 @@ class MiniApp:
 
     async def shutdown(self) -> None:
         """Выключить совсем: сервер и кнопку «Меню» у админов."""
-        await self.stop()
+        async with self._lock():
+            await self.stop()
         if self.bot:
             await self.menu_all(self.bot)
 
