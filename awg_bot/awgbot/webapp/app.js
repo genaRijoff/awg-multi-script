@@ -1482,8 +1482,31 @@ function wgobfRoutes(wrows, wmdl) {
   }));
 }
 
-// Выход клиента обфускатора словами: WARP выключен — честно «пока напрямую»
-const wgobfRouteText = (route, warpUp) => (route === "warp" ? (warpUp ? "через WARP" : "WARP выключен — пока напрямую") : "напрямую");
+// Выход клиента обфускатора: direct | warp | xray[:выход] | exits[:нода]. Работает
+// только поднятый туннель (в сводке обфускатора warp/xray/exits === "up"), остальные —
+// честно «пока напрямую»
+const WG_TUN = { warp: "WARP", xray: "Xray", exits: "exit-ноды" };
+const wgobfSplit = (route) => { const p = (route || "direct").split(":"); return [p[0], p.slice(1).join(":")]; };
+const wgobfRouteLabel = (route) => {
+  const [k, sub] = wgobfSplit(route);
+  return k === "warp" ? "через WARP" : k === "xray" ? (sub ? "через Xray: " + sub : "через Xray")
+    : k === "exits" ? (sub ? "через exit-ноду " + sub : "через exit-ноды") : "напрямую";
+};
+const wgobfIdle = (route, d) => {
+  const k = wgobfSplit(route)[0], st = (d || {})[k] || "none";
+  if (!WG_TUN[k] || st === "up") return "";
+  return k === "exits" ? (st === "off" ? "exit-ноды выключены" : "exit-нод нет") : `${WG_TUN[k]} ${st === "off" ? "выключен" : "не настроен"}`;
+};
+const wgobfRouteText = (route, d) => { const idle = wgobfIdle(route, d); return idle ? idle + " — пока напрямую" : wgobfRouteLabel(route); };
+// Выходы на выбор — только настроенные туннели; свои выходы Xray — если Xray их умеет
+const wgobfRouteOpts = (d) => {
+  const on = (k) => d[k] && d[k] !== "none", nodes = d.exit_nodes || [];
+  return [["direct", "Напрямую"]].concat(on("warp") ? [["warp", "WARP"]] : [],
+    on("xray") ? [["xray", "Xray"]].concat((d.xray_tags || []).map((t) => ["xray:" + t, "Xray · " + t])) : [],
+    on("exits") ? [["exits", "Exit-ноды"]].concat(nodes.length > 1 ? nodes.map((n) => ["exits:" + n, "Нода " + n]) : []) : []);
+};
+const wgobfPick = (d, cur, apply) => h("div", { class: "chips rchips" }, wgobfRouteOpts(d).map(([v, l]) => h("button", {
+  class: v === cur ? "on" : null, "data-v": v, title: l, onclick: (ev) => (v === cur ? null : apply(ev.currentTarget, v)) }, l)));
 
 // Схема: клиенты → сервер → выходы. Клиентов много — показаны самые активные.
 // opt — та же схема для WG + обфускатора: свой узел (hub), куда ведут нажатия
@@ -1852,8 +1875,11 @@ route(/^\/$/, async (ctx) => {
   const wrows = (Array.isArray(wob) ? wob : []).map((c) => Object.assign({}, c, { online: wgobfOnline(c), blocked: false,
     handshake: c.ago != null, today: (c.rx || 0) + (c.tx || 0),
     sub: wgobfOnline(c) ? `в сети · ${fmtBytes((c.rx || 0) + (c.tx || 0))}` : c.ago != null ? `${fmtDur(c.ago)} назад` : "не подключался" }));
-  // Выход клиентов Phobos — WARP, если их туда увели и WARP сейчас работает (активный туннель)
-  const wmdl = exitsModel(wrows.map((c) => Object.assign({}, c, { warp: c.route === "warp" })), { kind: r.kind === "warp" ? "warp" : "" });
+  // Выход клиентов Phobos — в полях клиента AWG: туннель их маршрута, если он сейчас
+  // работает (активный туннель); tun2socks клиентов обфускатора не возит
+  const wmdl = exitsModel(wrows.map((c) => { const [k, sub] = wgobfSplit(c.route);
+    return Object.assign({}, c, { warp: k === "warp", xray: k === "xray", xray_out: k === "xray" ? sub : "",
+      exit_choice: k === "exits" ? sub || "shared" : "off" }); }), { kind: WG_TUN[r.kind] ? r.kind : "", main: r.main });
   const won = wrows.filter((c) => c.online).length;
   for (const c of rows) c.online = liveOnline(c, S.live);
   const now = new Date();
@@ -1906,9 +1932,16 @@ route(/^\/$/, async (ctx) => {
   const rhLink = h("div", { class: "r" }, rlink(wrows.length && pref("routes-pane", "awg") === "w" ? 1 : 0));
   const vseg = (v) => h("div", { class: "seg rseg", role: "group", "aria-label": "Вид маршрутов" }, [["map", "схема"], ["list", "список"]].map(([k, t]) =>
     h("button", { class: v === k ? "on" : null, "aria-pressed": String(v === k), onclick: () => { setPref("routes", k); drawRoutes(); } }, t)));
-  const wwarp = wrows.filter((c) => c.route === "warp").length;
-  const wvia = !wwarp ? "идут напрямую" : r.kind !== "warp" ? "WARP выключен — пока напрямую"
-    : wwarp === wrows.length ? "идут через WARP" : `через WARP: ${wwarp}`;
+  // Подпись окна Phobos: сколько идут через туннель, сколько ждут выключенный туннель
+  const wtun = wrows.filter((c) => wmdl.of[c.name] !== "direct");
+  const widle = wrows.filter((c) => (c.route || "direct") !== "direct" && wmdl.of[c.name] === "direct");
+  const uniq = (v, i, a) => a.indexOf(v) === i;
+  const wviaT = wtun.map((c) => { const e = wmdl.get(wmdl.of[c.name]); return e.grp || e.short; }).filter(uniq).join("/");
+  const widleK = widle.map((c) => wgobfSplit(c.route)[0]).filter(uniq);
+  const idleT = widleK.length !== 1 ? "туннель выключен" : widleK[0] === "exits" ? "exit-ноды выключены" : WG_TUN[widleK[0]] + " выключен";
+  const wvia = [wtun.length ? (wtun.length === wrows.length ? "идут через " + wviaT : `через ${wviaT}: ${wtun.length}`) : "",
+    widle.length ? (widle.length === wrows.length ? idleT + " — пока напрямую" : `${idleT} — ${widle.length} пока напрямую`) : ""]
+    .filter(Boolean).join(" · ") || "идут напрямую";
   const wcap = () => h("div", { class: "muted small", style: "margin-top:6px" },
     `${won} из ${wrows.length} ${plural(wrows.length, "клиента", "клиентов", "клиентов")} в сети · ${wvia} · трафик с запуска wgobf0`);
   const drawRoutes = () => {
@@ -3729,6 +3762,7 @@ route(/^\/wgobf$/, async (ctx) => {
   const rows = (await call("wgobf", "clients")) || [];
   const online = rows.filter(wgobfOnline).length;
   const mask = (v) => quick(null, "Маскировка " + v, ["wgobf", "masking", v]);
+  const route = d.route || "direct", rk = wgobfSplit(route)[0], idle = wgobfIdle(route, d);
   ctx.put(title("Обфускатор"),
     ecard({ state: d.running ? "on" : "bad", name: "WG + обфускатор", attrs: { "data-name": "wgobf" },
       right: pill(d.running ? "работает" : "остановлен", d.running ? "ok" : "bad"),
@@ -3749,21 +3783,26 @@ route(/^\/wgobf$/, async (ctx) => {
     segText([["STUN", "STUN · видеозвонок"], ["NONE", "NONE · только XOR"]], d.masking, (v) => (v !== d.masking ? mask(v) : null)),
     h("div", { style: "margin-top:10px" }, switchRow("Чистый WG", "пускать и обычный WireGuard без обфускатора (iOS) — его DPI видит",
       d.clean, (on) => call("wgobf", "clean", on ? "1" : "0"))),
-    // Выход всех клиентов (и новых): напрямую или через WARP — тот же туннель, что у клиентов AWG
+    // Выход всех клиентов (и новых): напрямую или через туннель — тот же, что у клиентов AWG;
+    // своему клиенту — в его карточке
     h("label", { "data-name": "wgobf-route" }, "Выход клиентов"),
-    segText([["direct", "Напрямую"], ["warp", "Через WARP"]], d.route || "direct", (v) => (v === (d.route || "direct") ? null
-      : d.warp === "none" && v === "warp" ? fail(new Error("WARP не настроен — Туннели → WARP"))
-        : quick(null, v === "warp" ? "Клиенты обфускатора — через WARP" : "Клиенты обфускатора — напрямую", ["wgobf", "route", "all", v]))),
-    hint(d.warp === "none" ? "WARP не настроен — сначала Туннели → WARP."
-      : d.route === "warp" && d.warp !== "up" ? "WARP выключен — клиенты пока идут напрямую и уйдут в WARP, когда он включится."
-        : "Через WARP — сайты видят адрес Cloudflare, а не сервера. Выбор действует и на новых клиентов."),
+    wgobfPick(d, route, (b, v) => {
+      if (v.indexOf("xray") === 0) toast("Перенастраиваю Xray…", 4000);
+      return quick(b, "Клиенты обфускатора — " + wgobfRouteLabel(v), ["wgobf", "route", "all", v]);
+    }),
+    hint((idle ? idle + " — клиенты пока идут напрямую и уйдут туда, когда он включится. "
+      : rk === "warp" ? "Через WARP — сайты видят адрес Cloudflare, а не сервера. "
+        : rk !== "direct" ? "Сайты видят адрес выхода, а не сервера. " : "")
+      + (["warp", "xray", "exits"].some((k) => d[k] && d[k] !== "none") ? "Выбор — для всех клиентов и новых; своему — в его карточке."
+        : "Туннели не настроены — сначала Туннели → WARP, Xray или exit-ноды.")),
     h("h2", {}, "Клиенты"),
     btn("➕ Добавить клиента", () => go("/wgobf/add"), "btn-primary btn-block"),
     h("div", { style: "margin-top:10px" }, rows.length ? rows.map((c) => {
       const enc = encodeURIComponent(c.name);
       return ecard({ state: wgobfOnline(c) ? "on" : "", name: c.name, attrs: { "data-name": c.name },
         onopen: () => go(`/wgobf/client/${enc}`), right: wgobfSeen(c),
-        lines: [c.ip + (c.rx || c.tx ? ` · ↓ ${fmtBytes(c.rx)} ↑ ${fmtBytes(c.tx)}` : "")],
+        lines: [c.ip + (c.rx || c.tx ? ` · ↓ ${fmtBytes(c.rx)} ↑ ${fmtBytes(c.tx)}` : "")
+          + ((c.route || "direct") !== "direct" ? " · " + wgobfRouteLabel(c.route) : "")],
         acts: [act("file-text", "Комплект", () => go(`/wgobf/client/${enc}`)), act(WEB ? "download" : "send", TO("В чат", "Файл"), (b) => sendWgobf(b, c.name, "wgobf")),
           act("trash-2", "Удалить", (b) => quickAsk(b, `Удалить клиента ${c.name}?`, "Клиент удалён", ["wgobf", "del", c.name]), "bad")] });
     }) : h("div", { class: "card empty" }, "Клиентов нет")),
@@ -3794,13 +3833,20 @@ route(/^\/wgobf\/add$/, async (ctx) => {
 route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
   // Комплект не собрался — статус и мониторинг всё равно на экране, ошибка — плашкой
   const [d, rows, ws] = await Promise.all([post("/api/wgobf/bundle", { name }).catch((e) => ({ error: e.message })),
-    call("wgobf", "clients").catch(() => []), call("wgobf", "status").catch(() => ({}))]);
+    call("wgobf", "clients").catch(() => []), call("wgobf", "status").catch(() => null)]);
   const c = (rows || []).find((x) => x.name === name);
   if (d.error && !c) throw new Error(d.error);
   ctx.put(title(name, pill("обфускатор", "accent")),
     c ? h("div", { class: "card", "data-name": "wgobf-status" }, kv("Статус", wgobfSeen(c)), kv("Адрес", c.ip),
       kv("Трафик с запуска", `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`),
-      kv("Выход", wgobfRouteText(c.route, (ws || {}).warp === "up"))) : null,
+      kv("Выход", wgobfRouteText(c.route, ws))) : null,
+    // Свой выход клиенту — прямо здесь: настроенные туннели, их выходы и ноды
+    c && ws ? h("div", { class: "card rcard", "data-name": "wgobf-client-route" }, h("div", { class: "eyebrow" }, "маршрут"),
+      wgobfPick(ws, c.route || "direct", (b, v) => busy(b, async () => {
+        if (v.indexOf("xray") === 0) toast("Перенастраиваю Xray…", 4000);
+        await call("wgobf", "route", name, v); haptic(); toast(`Выход ${name}: ${wgobfRouteLabel(v)}`); render();
+      })),
+      wgobfIdle(c.route, ws) ? hint(wgobfIdle(c.route, ws) + " — клиент пока идёт напрямую.") : null) : null,
     d.error ? h("div", { class: "card warn small" }, "Комплект клиента не собрался: " + d.error) : null,
     switchRow("Мониторинг", "сообщу в чат, когда клиент пропал (5 минут без связи) и когда вернулся", !!d.mon,
       (on) => post("/api/wgobf/mon", { name, on })),

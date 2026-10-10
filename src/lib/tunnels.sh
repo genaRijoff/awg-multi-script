@@ -89,7 +89,8 @@ peers_all() {  # файл
 # Свои выходы клиентов Xray живут в конфиге самого Xray (правила по адресу):
 # изменились — без пересборки конфига клиент оставался на прежнем выходе,
 # хотя список показывал «по умолчанию» или «напрямую».
-_xray_outs() { grep -F '|' "$XRAY_PEERS" 2>/dev/null | sort; }
+# Клиенты обфускатора со своим выходом — в «.wgobf» рядом.
+_xray_outs() { grep -hF '|' "$XRAY_PEERS" "$XRAY_PEERS.wgobf" 2>/dev/null | sort; }
 _xray_outs_apply() {  # прежний вывод _xray_outs
   [[ "$(_xray_outs)" != "$1" ]] && xray_is_up || return 0
   _xray_prepare || return 1
@@ -114,7 +115,7 @@ tunnel_peers_forget() {
 # опираются только на константы и базовые помощники.
 RT_FUNCS=(valid_ip valid_cidr conf_iface_get server_net ipt_add ipt_ins ipt_del
           ipt_del_grep ipt_del_tagged rp_filter_loose rt_fw_up rt_fw_down rt_up rt_down
-          rt_rules_clear rt_rules_file SERVER_CONF AWG_IF WGOBF_IF)
+          rt_rules_clear rt_rules_file SERVER_CONF AWG_IF WGOBF_IF WGOBF_STATE)
 
 rt_rules_clear() {  # таблица
   local guard=0
@@ -138,14 +139,19 @@ rt_rules_file() {  # файл таблица
 
 # NAT и FORWARD между awg0 и туннелем. Правила помечены «awg2-tun-<dev>».
 rt_fw_up() {  # устройство [nonat]
-  local dev="$1" net tag="awg2-tun-$1"
+  local dev="$1" net wnet tag="awg2-tun-$1"
   net=$(server_net) || return 1
+  # Подсеть WG + обфускатора: его MASQUERADE («всё, что не в wgobf0») стоит в конце
+  wnet=$(sed -n 's/^NET=//p' "$WGOBF_STATE" 2>/dev/null | head -1)
+  valid_cidr "$wnet" || wnet=""
   # nonat — устройство должно видеть адреса клиентов (inbound tun Xray
-  # выбирает выход клиента по его адресу)
+  # выбирает выход клиента по его адресу); клиентам обфускатора — RETURN до их NAT
   if [[ "${2:-}" == nonat ]]; then
     ipt_del -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+    [[ -z "$wnet" ]] || ipt_ins -t nat POSTROUTING -s "$wnet" -o "$dev" -j RETURN -m comment --comment "$tag"
   else
     ipt_add -t nat POSTROUTING -s "$net" -o "$dev" -j MASQUERADE -m comment --comment "$tag"
+    [[ -z "$wnet" ]] || ipt_del -t nat POSTROUTING -s "$wnet" -o "$dev" -j RETURN -m comment --comment "$tag"
   fi
   ipt_ins FORWARD -i "$AWG_IF" -o "$dev" -j ACCEPT -m comment --comment "$tag"
   ipt_ins FORWARD -i "$dev" -o "$AWG_IF" -j ACCEPT -m comment --comment "$tag"

@@ -67,8 +67,23 @@ exits_rules_clear() {
 }
 
 # ── Маршрутизация (awg-exits-routing.service) ─────────────
+# Правило клиента «IP[|нода]»: своя поднятая нода — её таблица, лежащая или
+# удалённая — общий выход, а не в пустоту
+exits_peer_rule() {  # строка «ноды через пробел»
+  local line="${1//[[:space:]]/}" up=" $2 " pip pnode="" table t
+  pip="${line%%|*}"
+  [[ "$line" == *"|"* ]] && pnode="${line#*|}"
+  valid_ip "$pip" || return 0
+  table="$EXITS_TABLE"
+  if [[ -n "$pnode" && "$up" == *" $pnode "* ]] && t=$(exits_table_for "$pnode") \
+     && ip route replace default dev "awg-exit-$pnode" table "$t" 2>/dev/null; then
+    table="$t"
+  fi
+  ip rule add from "$pip" lookup "$table" priority "$EXITS_TABLE" || true
+}
+
 exits_routing_start() {
-  local mode balancer single up=() n i routed="" net line pip pnode table t args
+  local mode balancer single up=() n i routed="" net line args
   mode=$(exits_state_get mode); mode="${mode:-all}"
   balancer=$(exits_state_get balancer)
   single=$(exits_state_get single_exit)
@@ -96,24 +111,16 @@ exits_routing_start() {
   [[ -n "$routed" ]] || ip route replace default dev "awg-exit-$single" table "$EXITS_TABLE" \
     || { echo "не удалось поставить маршрут в таблицу $EXITS_TABLE" >&2; return 1; }
   for n in "${up[@]}"; do rt_fw_up "awg-exit-$n"; done
+  # Клиенты WG + обфускатора — своим списком, при любом режиме клиентов AWG
+  if [[ -f "$EXITS_PEERS.wgobf" ]]; then
+    while IFS= read -r line; do exits_peer_rule "$line" "${up[*]}"; done < "$EXITS_PEERS.wgobf"
+  fi
   if [[ "$mode" == all ]]; then
     ip rule add from "$net" lookup "$EXITS_TABLE" priority "$EXITS_TABLE"
     return 0
   fi
   [[ -f "$EXITS_PEERS" ]] || return 0
-  while IFS= read -r line; do
-    line="${line//[[:space:]]/}"
-    pip="${line%%|*}"; pnode=""
-    [[ "$line" == *"|"* ]] && pnode="${line#*|}"
-    valid_ip "$pip" || continue
-    table="$EXITS_TABLE"
-    # Лежащая или удалённая нода — клиент идёт общим выходом, а не в пустоту
-    if [[ -n "$pnode" && " ${up[*]} " == *" $pnode "* ]] && t=$(exits_table_for "$pnode") \
-       && ip route replace default dev "awg-exit-$pnode" table "$t" 2>/dev/null; then
-      table="$t"
-    fi
-    ip rule add from "$pip" lookup "$table" priority "$EXITS_TABLE" || true
-  done < "$EXITS_PEERS"
+  while IFS= read -r line; do exits_peer_rule "$line" "${up[*]}"; done < "$EXITS_PEERS"
 }
 
 exits_routing_stop() {
@@ -130,7 +137,7 @@ exits_routing_run() {
 _exits_write_unit() {
   emit_script "$EXITS_SCRIPT" 'exits_routing_run "$@"' EXITS_DIR EXITS_STATE EXITS_PEERS EXITS_TABLE \
     EXITS_TABLE_BASE EXITS_TABLE_MAX exits_nodes exits_up_nodes exits_state_get exits_table_for \
-    exits_rules_clear exits_routing_start exits_routing_stop exits_routing_run "${RT_FUNCS[@]}" || return 1
+    exits_rules_clear exits_peer_rule exits_routing_start exits_routing_stop exits_routing_run "${RT_FUNCS[@]}" || return 1
   write_unit "$EXITS_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — маршруты клиентов через exit-ноды
@@ -288,13 +295,13 @@ exits_delete() {
 }
 
 exits_node_del() {  # имя
-  local n="$1"
+  local n="$1" f
   [[ -f "$EXITS_DIR/awg-exit-$n.conf" ]] || { err "Ноды $n нет"; return 1; }
   exits_is_up && exits_routing_stop
   systemctl disable --now "awg-quick@awg-exit-$n" &>/dev/null || true
   rm -f "$EXITS_DIR/awg-exit-$n.conf"
   # Клиенты этой ноды переходят на общий выход
-  [[ -f "$EXITS_PEERS" ]] && sed -i "s/|$n\$//" "$EXITS_PEERS"
+  for f in "$EXITS_PEERS" "$EXITS_PEERS.wgobf"; do [[ -f "$f" ]] && sed -i "s/|$n\$//" "$f"; done
   [[ "$(exits_state_get single_exit)" == "$n" ]] && exits_state_set single_exit ""
   ok "Нода $n удалена"
   if exits_is_up; then

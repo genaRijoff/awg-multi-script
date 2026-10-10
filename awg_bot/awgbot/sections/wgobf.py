@@ -18,8 +18,53 @@ act = ui.Actions(router, "wo")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 # DNS клиентов — те же три, что в меню awg2; кнопка перебирает их по кругу
 DNS = [("Cloudflare", "1.1.1.1, 1.0.0.1"), ("Google", "8.8.8.8, 8.8.4.4"), ("Quad9", "9.9.9.9, 149.112.112.112")]
-# Выход клиентов: напрямую или через WARP — правила awg2 ставит тот же туннель, что у AWG
-ROUTE_LABEL = {"direct": "напрямую", "warp": "через WARP"}
+# Выход клиентов: напрямую или через туннель (WARP, Xray — выход по умолчанию или
+# свой, exit-ноды — общий выход или нода). Правила ставит тот же туннель, что у AWG;
+# работает только поднятый, остальные — напрямую, пока их не включат.
+TUN_NAME = {"warp": "WARP", "xray": "Xray", "exits": "exit-ноды"}
+
+
+def route_label(r: str) -> str:
+    kind, _, sub = (r or "direct").partition(":")
+    if kind == "warp":
+        return "через WARP"
+    if kind == "xray":
+        return f"через Xray: {sub}" if sub else "через Xray"
+    if kind == "exits":
+        return f"через exit-ноду {sub}" if sub else "через exit-ноды"
+    return "напрямую"
+
+
+def route_idle(r: str, d: dict) -> str:
+    """« — WARP выключен, пока напрямую», если туннель маршрута не работает."""
+    kind = (r or "direct").partition(":")[0]
+    st = d.get(kind) or "none"
+    if kind not in TUN_NAME or st == "up":
+        return ""
+    if kind == "exits":
+        return " — exit-ноды выключены, пока напрямую" if st == "off" else " — exit-нод нет, пока напрямую"
+    return f" — {TUN_NAME[kind]} {'выключен' if st == 'off' else 'не настроен'}, пока напрямую"
+
+
+def route_options(d: dict) -> list[tuple[str, str, str]]:
+    """(код кнопки, маршрут, подпись) из настроенных туннелей. Код — номер
+    выхода или ноды в списке: тег в 64 байта колбэка не всегда влезет."""
+    opts = [("d", "direct", "Напрямую")]
+    if (d.get("warp") or "none") != "none":
+        opts.append(("w", "warp", "Через WARP"))
+    if (d.get("xray") or "none") != "none":
+        opts.append(("x", "xray", "Xray: по умолчанию"))
+        opts += [(f"x{i}", f"xray:{t}", f"Xray: {t}") for i, t in enumerate(d.get("xray_tags") or [])]
+    nodes = d.get("exit_nodes") or []
+    if (d.get("exits") or "none") != "none":
+        opts.append(("e", "exits", "Exit-ноды: общий"))
+        if len(nodes) > 1:
+            opts += [(f"e{i}", f"exits:{n}", f"Нода {n}") for i, n in enumerate(nodes)]
+    return opts
+
+
+def active_tunnel(d: dict) -> str:
+    return next((TUN_NAME[k] for k in ("warp", "xray", "exits") if d.get(k) == "up"), "")
 
 
 async def _bundle_data(bot: Bot, chat_id: int, name: str) -> dict | None:
@@ -93,19 +138,15 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
                         ui.kb(("📦 Установить", act.data("install")), ui.back()))
         return
     mask = "NONE" if d.get("masking") == "STUN" else "STUN"
-    route, warp = d.get("route") or "direct", d.get("warp") or "none"
-    rline = f"🌐 Выход клиентов: <b>{ROUTE_LABEL.get(route, esc(route))}</b>"
-    if route == "warp" and warp != "up":
-        rline += " — WARP выключен, пока напрямую" if warp == "off" else " — WARP не настроен, пока напрямую"
-    # WARP не настроен — кнопки «→ WARP» нет: туда некуда (вернуть напрямую можно всегда)
-    to = "direct" if route == "warp" else "warp"
+    route = d.get("route") or "direct"
+    rline = f"🌐 Выход клиентов: <b>{esc(route_label(route))}</b>{route_idle(route, d)}"
     await ui.render(cb, "<b>🛡 WG + обфускатор</b>\n" + ui.pre(r.log, 1500, tail=False) + f"\n{rline}\n"
                     + f"\n<i>🎭 — маскировка клиентов: {esc(d.get('masking') or '?')} → {mask}\n"
                       "Чистый WG — пускать и обычный WireGuard без обфускатора (iOS); его DPI видит\n"
-                      "🌐 — выход всех клиентов (и новых): напрямую или через WARP</i>", ui.kb(
+                      "🌐 — выход всех клиентов (и новых): напрямую или через туннель; своему — в карточке</i>", ui.kb(
         ("➕ Добавить", act.data("add")),
         ("👥 Клиенты", act.data("list")),
-        (f"🌐 → {'напрямую' if to == 'direct' else 'WARP'}", act.data("route", to)) if to == "direct" or warp != "none" else None,
+        ("🌐 Выход клиентов", act.data("rt", "*")),
         (f"🎭 → {mask}", act.data("mask", mask)),
         (f"{'✅' if d.get('clean') else '⬜️'} Чистый WG", act.data("clean", "0" if d.get("clean") else "1")),
         ("🔄 Перезапустить", act.data("restart")),
@@ -235,6 +276,7 @@ async def _list(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     page = min(page, pages - 1)
     lines = [f"{dot(r)} <b>{esc(r['name'])}</b> <code>{esc(r['ip'])}</code>"
              + (f" · {ui.fmt_dur(r['ago'])} назад" if r.get("ago") is not None else "")
+             + (f" · 🌐 {esc(route_label(r['route']))}" if (r.get("route") or "direct") != "direct" else "")
              for r in rows[page * 20:(page + 1) * 20]]
     await ui.render(cb, "<b>👥 Клиенты WG + обфускатор</b>"
                         + (f" · стр. {page + 1} из {pages}" if pages > 1 else "") + "\n\n"
@@ -258,6 +300,7 @@ async def _view(cb: ui.Target, state: FSMContext, name: str) -> None:
     await ui.render(cb, f"<b>🛡 {esc(name)}</b> — WG + обфускатор\n\nIP: <code>{esc(c['ip'])}</code>\n"
                         f"Статус: {seen}\n"
                         f"Трафик с запуска: ↓ {ui.fmt_bytes(c.get('rx'))} · ↑ {ui.fmt_bytes(c.get('tx'))}\n"
+                        f"Выход: {esc(route_label(c.get('route') or 'direct'))}\n"
                         f"Мониторинг: {'🔔 вкл' if mon else '🔕 выкл'}\n\n"
                         "<i>📄 Конфиг — ссылка и конфиг текстом, плюс один файл .conf со всеми данными\n"
                         "📦 Архив — wg.conf, obfuscator.conf и установщик для Linux\n"
@@ -265,6 +308,7 @@ async def _view(cb: ui.Target, state: FSMContext, name: str) -> None:
                     ui.kb(("📄 Конфиг", act.data("bundle", name)),
                           ("📦 Архив", act.data("zip", name)),
                           ("🔕 Выключить мониторинг" if mon else "🔔 Мониторинг", act.data("mon", name)),
+                          ("🌐 Маршрут", act.data("rt", name)),
                           ("🗑 Удалить", act.data("del", name)),
                           ui.back(act.data("list"))))
 
@@ -318,12 +362,48 @@ async def _restart(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await _quick(cb, "Перезапуск", "wgobf", "restart")
 
 
-@act("route")
-async def _route(cb: CallbackQuery, state: FSMContext, v: str) -> None:
-    if v not in ROUTE_LABEL:
+# ── Выход клиентов ────────────────────────────────────────
+# «*» — все клиенты и новые по умолчанию, иначе имя клиента
+@act("rt")
+async def _rt(cb: CallbackQuery, state: FSMContext, who: str) -> None:
+    back_to = "wo" if who == "*" else act.data("v", who)
+    if who != "*" and not NAME_RE.match(who):
         await cb.answer("Кнопка устарела — открой раздел заново", show_alert=True)
         return
-    await _quick(cb, f"Выход клиентов {ROUTE_LABEL[v]}", "wgobf", "route", "all", v)
+    d = await api.data("wgobf", "status", default={}) or {}
+    if who == "*":
+        cur, title = d.get("route") or "direct", "все клиенты обфускатора (и новые)"
+    else:
+        rows = await api.data("wgobf", "clients", default=[]) or []
+        c = next((r for r in rows if r.get("name") == who), None)
+        if c is None:
+            await ui.render(cb, f"Клиента <b>{esc(who)}</b> нет.", ui.kb(ui.back(act.data("list"))))
+            return
+        cur, title = c.get("route") or "direct", esc(who)
+    tun = active_tunnel(d)
+    buttons = [(f"{'🔘' if route == cur else '⚪️'} {label}", act.data("rs", f"{who}|{code}"))
+               for code, route, label in route_options(d)]
+    await ui.render(cb, f"<b>🌐 Выход: {title}</b>\n\nСейчас: <b>{esc(route_label(cur))}</b>{route_idle(cur, d)}\n"
+                        + (f"Работает туннель: {tun}.\n" if tun else "Туннели выключены — все идут напрямую.\n")
+                        + "\n<i>Одновременно работает один туннель: клиенты другого идут напрямую, "
+                          "пока его не включат. Здесь — туннели, которые настроены.</i>",
+                    ui.kb(buttons, ui.back(back_to)))
+
+
+@act("rs")
+async def _rs(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    who, _, code = arg.partition("|")
+    route = next((r for c, r, _ in route_options(await api.data("wgobf", "status", default={}) or {}) if c == code), None)
+    if route is None or (who != "*" and not NAME_RE.match(who)):
+        await _rt(cb, state, who)            # выходы поменялись — экран заново
+        return
+    if route.startswith("xray"):
+        await cb.answer("Перенастраиваю Xray…")
+    r = await api.call("wgobf", "route", "all" if who == "*" else who, route)
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Выход клиентов"), ui.kb(ui.back(act.data("rt", who))))
+        return
+    await _rt(cb, state, who)
 
 
 @act("mask")

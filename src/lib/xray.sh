@@ -161,14 +161,18 @@ xray_del_outbound() {
   xray_del_tag "$CHOSEN"
 }
 
-# Клиенты удалённых выходов — на выход по умолчанию; печатает, сколько их.
+# Клиенты удалённых выходов (и клиенты обфускатора) — на выход по умолчанию;
+# печатает, сколько их.
 _xray_peers_untag() {  # тег...
-  local f="$XRAY_PEERS"
-  [[ -f "$f" ]] || { echo 0; return 0; }
-  awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {c++} END {print c + 0}' \
-    <(printf '%s\n' "$@") "$f"
-  awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {print $1; next} {print}' \
-    <(printf '%s\n' "$@") "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"
+  local f n=0 c
+  for f in "$XRAY_PEERS" "$XRAY_PEERS.wgobf"; do
+    [[ -f "$f" ]] || continue
+    c=$(awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {c++} END {print c + 0}' <(printf '%s\n' "$@") "$f")
+    n=$((n + c))
+    awk -F'|' 'NR == FNR {d[$0] = 1; next} NF > 1 && ($2 in d) {print $1; next} {print}' \
+      <(printf '%s\n' "$@") "$f" > "$f.tmp" && mv -f "$f.tmp" "$f"
+  done
+  echo "$n"
 }
 
 xray_del_tag() {  # тег

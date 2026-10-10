@@ -1633,6 +1633,10 @@ def cmd_xray_prepare(path, mode, peers=""):
                 r.pop("outboundTag", None)
     rules = [r for r in rules if r.get("outboundTag") or r.get("balancerTag")]
     lst = _peers_list(peers) if peers and mode == "native" else None
+    # Клиенты WG + обфускатора со своим выходом — рядом, в «<список>.wgobf»
+    wlst = _peers_list(peers + ".wgobf") if peers and mode == "native" else None
+    if wlst:
+        lst = dict(lst or {}, **wlst)
     if lst:
         by_tag = {}
         for ip, tag in lst.items():

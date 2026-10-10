@@ -355,37 +355,105 @@ wgobf_show_bundle() {
 
 # ── Выход клиентов через туннель ──────────────────────────
 # Клиента wgobf0 можно увести в туннель так же, как клиента AWG: его адрес —
-# в «<список туннеля>.wgobf», правило «адрес → таблица туннеля» ставит тот же
-# rt_up при каждом подъёме туннеля, после перезагрузки и в хуке usque. NAT и
-# FORWARD для wgobf0 уже есть (MASQUERADE всего, что уходит не в wgobf0).
-WGOBF_ROUTES=(direct warp)
+# в «<список туннеля>.wgobf» («адрес» или «адрес|выход Xray / нода»), правило
+# «адрес → таблица туннеля» ставит тот же rt_up при каждом подъёме туннеля,
+# после перезагрузки и в хуке usque; свой выход Xray — правило по адресу в
+# конфиге Xray, своя нода — служба exit-нод. NAT и FORWARD для wgobf0 уже есть
+# (MASQUERADE всего, что уходит не в wgobf0).
+# Маршрут: direct | warp | xray | xray:выход | exits | exits:нода. Работает
+# только туннель, который сейчас поднят; остальные — напрямую, пока он лежит.
+wgobf_route_files() { printf '%s\n' "$WARP_PEERS.wgobf" "$XRAY_PEERS.wgobf" "$EXITS_PEERS.wgobf"; }
 
-wgobf_route_files() { printf '%s\n' "$WARP_PEERS.wgobf"; }
+_wgobf_route_file() {  # warp|xray|exits → список
+  case "$1" in
+    warp) echo "$WARP_PEERS.wgobf" ;; xray) echo "$XRAY_PEERS.wgobf" ;;
+    exits) echo "$EXITS_PEERS.wgobf" ;; *) return 1 ;;
+  esac
+}
 
 wgobf_client_ip() {  # ИМЯ → адрес без /32
   awk -v t="# client=$1" '$0 == t {f = 1; next} f && /^AllowedIPs = / {sub(/\/32$/, "", $3); print $3; exit}' \
     "$WGOBF_WG_CONF" 2>/dev/null
 }
 
-wgobf_route_of() {  # адрес → direct|warp
-  peers_has "$WARP_PEERS.wgobf" "$1" && { echo warp; return; }
+wgobf_route_of() {  # адрес → маршрут
+  local k line
+  for k in warp xray exits; do
+    line=$(grep -E "^${1//./\\.}(\||$)" "$(_wgobf_route_file "$k")" 2>/dev/null | head -1)
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == *"|"* ]]; then echo "$k:${line#*|}"; else echo "$k"; fi
+    return
+  done
   echo direct
 }
 
+_wgobf_route_label() {  # маршрут → «через …»
+  case "$1" in
+    warp) echo "через WARP" ;;
+    xray) echo "через Xray" ;; xray:*) echo "через Xray: ${1#xray:}" ;;
+    exits) echo "через exit-ноды" ;; exits:*) echo "через exit-ноду ${1#exits:}" ;;
+    *) echo напрямую ;;
+  esac
+}
+
+# Почему маршрут сейчас не выбрать; пусто и 0 — можно
+_wgobf_route_why() {  # маршрут
+  local sub="${1#*:}"
+  [[ "$1" == *:* ]] || sub=""
+  case "${1%%:*}" in
+    direct) ;;
+    warp) warp_configured || { echo "WARP не настроен — Туннели → WARP"; return 1; } ;;
+    xray)
+      xray_installed || { echo "Xray не установлен — Туннели → Xray"; return 1; }
+      [[ -z "$sub" ]] && return 0
+      xray_tags | grep -qxF "$sub" || { echo "Выхода Xray $sub нет"; return 1; }
+      xray_tun_supported || { echo "Свой выход Xray — только с inbound tun в самом Xray: обнови Xray"; return 1; } ;;
+    exits)
+      [[ -n "$(exits_nodes)" ]] || { echo "Exit-нод нет — Туннели → Exit-ноды"; return 1; }
+      [[ -z "$sub" || -f "$EXITS_DIR/awg-exit-$sub.conf" ]] || { echo "Ноды $sub нет"; return 1; } ;;
+    *) echo "Выход: direct | warp | xray[:выход] | exits[:нода]"; return 1 ;;
+  esac
+  return 0
+}
+
+# Туннель маршрута выключен (или включён другой) — что сказать
+_wgobf_route_idle() {  # маршрут
+  case "${1%%:*}" in
+    warp) warp_is_up || echo "WARP сейчас выключен" ;;
+    xray) xray_is_up || echo "Xray сейчас выключен" ;;
+    exits) exits_is_up || echo "Exit-ноды сейчас выключены" ;;
+  esac
+  return 0
+}
+
 # Адрес — в список выбранного туннеля (из прочих — прочь), его старые правила — сняты
-_wgobf_route_put() {  # адрес direct|warp
-  local f
+_wgobf_route_put() {  # адрес маршрут
+  local f sub="${2#*:}"
+  [[ "$2" == *:* ]] || sub=""
   while IFS= read -r f; do peers_del "$f" "$1"; done < <(wgobf_route_files)
-  [[ "$2" == warp ]] && peers_add "$WARP_PEERS.wgobf" "$1"
+  f=$(_wgobf_route_file "${2%%:*}") && peers_add "$f" "$1" "$1${sub:+|$sub}"
   while ip rule del from "$1" 2>/dev/null; do :; done
 }
 
-# Правила туннелей заново по спискам — только у поднятых
-_wgobf_route_refresh() { _tunnel_rules_refresh "$WARP_PEERS" "$WARP_IF" "$WARP_TABLE"; }
+# Правила поднятого туннеля заново по спискам. Свои выходы Xray изменились —
+# конфиг Xray пересобирается и туннель перезапускается; список exit-нод
+# обфускатора изменился — перезапускается их маршрутизация.
+_wgobf_route_refresh() {  # прежние _xray_outs и список exit-нод обфускатора
+  _tunnel_rules_refresh "$WARP_PEERS" "$WARP_IF" "$WARP_TABLE"
+  if xray_is_up; then
+    # Обфускатор поставлен после Xray — RETURN до его NAT ещё нет
+    if grep -qx 'tun_mode=native' "$XRAY_STATE" 2>/dev/null; then rt_fw_up "$XRAY_IF" nonat || true; fi
+    _tunnel_rules_refresh "$XRAY_PEERS" "$XRAY_IF" "$XRAY_TABLE"
+    _xray_outs_apply "${1-}" || true
+  fi
+  [[ "$(sort "$EXITS_PEERS.wgobf" 2>/dev/null)" == "${2-}" ]] || exits_reapply
+  return 0
+}
 
 # Прежние адреса — из всех списков и правил (обфускатор удалён или ставится заново)
 _wgobf_routes_clear() {
-  local f line
+  local f line xo ex
+  xo=$(_xray_outs); ex=$(sort "$EXITS_PEERS.wgobf" 2>/dev/null)
   while IFS= read -r f; do
     [[ -f "$f" ]] || continue
     while IFS= read -r line; do
@@ -394,14 +462,24 @@ _wgobf_routes_clear() {
     done < "$f"
     rm -f "$f"
   done < <(wgobf_route_files)
+  _wgobf_route_refresh "$xo" "$ex"
 }
 
-# Выход клиента (ИМЯ) или всех (all — и новых по умолчанию): direct | warp
+# Выход клиента (ИМЯ) или всех (all — и новых по умолчанию):
+# direct | warp | xray[:выход] | exits[:нода]
 wgobf_route_set() {
-  local who="${1:-}" r="${2:-}" ip name n=0
+  local who="${1:-}" r="${2:-}" ip name n=0 why xo ex
   wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
-  [[ -n "$who" && " ${WGOBF_ROUTES[*]} " == *" $r "* ]] || { err "Выход: ${WGOBF_ROUTES[*]// / | }"; return 1; }
-  [[ "$r" != warp ]] || warp_configured || { err "WARP не настроен — Туннели → WARP"; return 1; }
+  # Выход и нода — одной строкой без «|» и пробелов: они ложатся строкой в список
+  [[ -n "$who" && "$r" =~ ^(direct|warp|xray(:[^|[:space:][:cntrl:]]+)?|exits(:[A-Za-z0-9_]{1,6})?)$ ]] \
+    || { err "Выход: direct | warp | xray[:выход] | exits[:нода]"; return 1; }
+  why=$(_wgobf_route_why "$r") || { err "$why"; return 1; }
+  if [[ "$who" != all ]]; then
+    wgobf_clients | grep -qxF "$who" || { err "Клиента $who нет"; return 1; }
+    ip=$(wgobf_client_ip "$who")
+    valid_ip "$ip" || { err "У клиента $who нет адреса"; return 1; }
+  fi
+  xo=$(_xray_outs); ex=$(sort "$EXITS_PEERS.wgobf" 2>/dev/null)
   if [[ "$who" == all ]]; then
     while IFS= read -r name; do
       ip=$(wgobf_client_ip "$name")
@@ -409,38 +487,67 @@ wgobf_route_set() {
     done < <(wgobf_clients)
     wgobf_set ROUTE "$r"
   else
-    wgobf_clients | grep -qxF "$who" || { err "Клиента $who нет"; return 1; }
-    ip=$(wgobf_client_ip "$who")
-    valid_ip "$ip" || { err "У клиента $who нет адреса"; return 1; }
     _wgobf_route_put "$ip" "$r"; n=1
   fi
-  _wgobf_route_refresh
+  _wgobf_route_refresh "$xo" "$ex"
   log_info "wgobf: выход $who → $r"
-  if [[ "$r" == direct ]]; then ok "Клиенты обфускатора напрямую: $n"
-  elif warp_is_up; then ok "Клиенты обфускатора через WARP: $n"
-  else ok "Клиенты обфускатора через WARP: $n"; warn "WARP сейчас выключен — пока напрямую, уйдут в WARP, когда он включится"; fi
+  ok "Клиенты обфускатора $(_wgobf_route_label "$r"): $n"
+  why=$(_wgobf_route_idle "$r")
+  [[ -z "$why" ]] || warn "$why — пока напрямую, туда уйдут, когда туннель включится"
+}
+
+# Выбор маршрута из настроенных туннелей → CHOSEN
+_wgobf_route_pick() {
+  local opts=(direct) labels=(Напрямую) tags=() nodes=() t i c
+  if warp_configured; then opts+=(warp); labels+=("Через WARP"); fi
+  if xray_installed; then
+    opts+=(xray); labels+=("Через Xray — выход по умолчанию")
+    if xray_tun_supported; then
+      mapfile -t tags < <(xray_tags)
+      for t in "${tags[@]}"; do opts+=("xray:$t"); labels+=("Через Xray — $t"); done
+    fi
+  fi
+  mapfile -t nodes < <(exits_nodes)
+  if (( ${#nodes[@]} )); then
+    opts+=(exits); labels+=("Через exit-ноды — общий выход")
+    if (( ${#nodes[@]} > 1 )); then
+      for t in "${nodes[@]}"; do opts+=("exits:$t"); labels+=("Через exit-ноду $t"); done
+    fi
+  fi
+  for i in "${!opts[@]}"; do echo -e "  ${C}$((i + 1)))${N} ${labels[$i]}"; done
+  read_choice c "${C}  Выход (0 — отмена): ${N}" 0 "${#opts[@]}" 0
+  (( c )) || return 1
+  CHOSEN="${opts[$((c - 1))]}"
 }
 
 wgobf_route_menu() {
-  local c cur
-  cur=$(wgobf_get ROUTE); [[ -n "$cur" ]] || cur=direct
-  echo ""
-  hdr "Выход клиентов обфускатора"
-  echo -e "  Сейчас: ${W}$([[ "$cur" == warp ]] && echo WARP || echo напрямую)${N} ${D}(и для новых клиентов)${N}"
-  warp_configured || echo -e "  ${D}WARP не настроен — Туннели → WARP${N}"
-  echo -e "  ${C}1)${N} Напрямую"
-  echo -e "  ${C}2)${N} Через WARP"
-  echo -e "  ${W}0)${N} ← Назад"
-  read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
-  case "$c" in
-    1) wgobf_route_set all direct ;;
-    2) wgobf_route_set all warp ;;
-  esac
+  local c names=() i ip def who
+  while true; do
+    mapfile -t names < <(wgobf_clients)
+    def=$(wgobf_get ROUTE)
+    echo ""
+    hdr "Выход клиентов обфускатора"
+    echo -e "  Всем и новым: ${W}$(_wgobf_route_label "${def:-direct}")${N}"
+    for i in "${!names[@]}"; do
+      ip=$(wgobf_client_ip "${names[$i]}")
+      echo -e "  ${C}$((i + 1)))${N} ${names[$i]} ${D}$ip${N}  $(_wgobf_route_label "$(wgobf_route_of "$ip")")"
+    done
+    echo -e "  ${C}a)${N} Всем клиентам"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Номер клиента или a: ${N}" 0 "${#names[@]}" 0 "a"
+    case "$c" in
+      0) return 0 ;;
+      a) who=all ;;
+      *) who="${names[$((c - 1))]}" ;;
+    esac
+    _wgobf_route_pick || continue
+    wgobf_route_set "$who" "$CHOSEN" || true
+  done
 }
 
 # ── Клиенты ───────────────────────────────────────────────
 wgobf_add_client() {
-  local name="$1" base i ip="" priv pub psk bak
+  local name="$1" base i ip="" priv pub psk bak r xo ex
   [[ "$name" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { err "Имя: латиница, цифры, _ и -, до 32 символов"; return 1; }
   wgobf_clients | grep -qxF "$name" && { err "Клиент $name уже есть"; return 1; }
   base=$(wgobf_get NET); base="${base%.*}"
@@ -461,10 +568,14 @@ wgobf_add_client() {
   wgobf_write_bundle "$name" "$priv" "$ip/32" "$psk" || return 1
   ok "Клиент $name: $ip"
   log_info "wgobf: добавлен клиент $name ($ip)"
-  # Выход для новых — как у всех (WARP не настроен — напрямую)
-  if [[ "$(wgobf_get ROUTE)" == warp ]] && warp_configured; then
-    _wgobf_route_put "$ip" warp; _wgobf_route_refresh
-    info "Выход: WARP"
+  # Выход для новых — как у всех: выхода Xray или ноды уже нет — общий выход
+  # туннеля (как у прежних клиентов), туннель не настроен — напрямую
+  r=$(wgobf_get ROUTE)
+  [[ "$r" == *:* ]] && ! _wgobf_route_why "$r" >/dev/null && r="${r%%:*}"
+  if [[ -n "$r" && "$r" != direct ]] && _wgobf_route_why "$r" >/dev/null; then
+    xo=$(_xray_outs); ex=$(sort "$EXITS_PEERS.wgobf" 2>/dev/null)
+    _wgobf_route_put "$ip" "$r"; _wgobf_route_refresh "$xo" "$ex"
+    info "Выход: $(_wgobf_route_label "$r")"
   else
     _wgobf_route_put "$ip" direct
   fi
@@ -472,7 +583,7 @@ wgobf_add_client() {
 }
 
 wgobf_delete_client() {
-  local name="$1" bak ip
+  local name="$1" bak ip xo ex
   wgobf_clients | grep -qxF "$name" || { err "Клиента $name нет"; return 1; }
   ip=$(wgobf_client_ip "$name")
   mktmp bak || return 1
@@ -491,7 +602,10 @@ wgobf_delete_client() {
   rm -rf "${WGOBF_CLIENTS:?}/$name"
   # Его адрес — из списков туннелей и правил: новый клиент на том же адресе
   # иначе унаследовал бы чужой выход
-  valid_ip "$ip" && _wgobf_route_put "$ip" direct
+  if valid_ip "$ip"; then
+    xo=$(_xray_outs); ex=$(sort "$EXITS_PEERS.wgobf" 2>/dev/null)
+    _wgobf_route_put "$ip" direct; _wgobf_route_refresh "$xo" "$ex"
+  fi
   ok "Клиент $name удалён"
   log_info "wgobf: удалён клиент $name"
 }
@@ -790,7 +904,7 @@ do_wgobf_menu() {
     echo -e "  ${C}5)${N} Статус и журнал"
     echo -e "  ${C}6)${N} Перезапустить"
     echo -e "  ${C}7)${N} Настройки"
-    echo -e "  ${C}8)${N} Выход клиентов ${D}— $([[ "$(wgobf_get ROUTE)" == warp ]] && echo "через WARP" || echo напрямую)${N}"
+    echo -e "  ${C}8)${N} Выход клиентов ${D}— $(_wgobf_route_label "$(wgobf_get ROUTE)")${N}"
     echo -e "  ${R}9)${N} Удалить WG + обфускатор"
     echo -e "  ${W}0)${N} ← Назад"
     read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0

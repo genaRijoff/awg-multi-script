@@ -1125,23 +1125,55 @@ async def run():
     chk("архив для Linux — отдельной кнопкой", docs(sent) and docs(sent)[0].document.filename == "wgobf-clus.zip",
         [n for n, _ in sent])
 
-    # Выход клиентов обфускатора: WARP не настроен — кнопки «→ WARP» нет
+    # Выход клиентов обфускатора: на выбор — только настроенные туннели
     text, buttons = screen(await press("wo"))
-    chk("обфускатор: «Выход клиентов: напрямую», без настроенного WARP кнопки «→ WARP» нет",
-        "Выход клиентов: <b>напрямую</b>" in text and not any(d.startswith("wo:route") for _, d in buttons), [text, buttons])
+    chk("обфускатор: «Выход клиентов: напрямую» и кнопка выбора выхода",
+        "Выход клиентов: <b>напрямую</b>" in text and ("🌐 Выход клиентов", "wo:rt:*") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:rt:*"))
+    chk("на выбор — настроенные туннели (WARP не настроен — его нет), свои выходы Xray, какой туннель работает",
+        ("🔘 Напрямую", "wo:rs:*|d") in buttons and not any(d == "wo:rs:*|w" for _, d in buttons)
+        and ("⚪️ Xray: по умолчанию", "wo:rs:*|x") in buttons and ("⚪️ Xray: de", "wo:rs:*|x0") in buttons
+        and "Работает туннель: exit-ноды." in text, [text, buttons])
     warp_conf, wl = os.path.join(ROOT, "etc/wireguard/warp0.conf"), os.path.join(ROOT, "warp.peers.wgobf")
     with open(warp_conf, "w") as f:
         f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n")
+    text, buttons = screen(await press("wo:rt:*"))
+    chk("WARP настроен — «Через WARP» на выбор", ("⚪️ Через WARP", "wo:rs:*|w") in buttons
+        and ("🔘 Напрямую", "wo:rs:*|d") in buttons, buttons)
+    text, buttons = screen(await press("wo:rs:*|w"))
+    chk("«Через WARP» — адреса клиентов обфускатора в списке WARP, экран: выбрано, WARP выключен",
+        os.path.exists(wl) and open(wl).read().split() == ["10.77.1.2"] and ("🔘 Через WARP", "wo:rs:*|w") in buttons
+        and "через WARP</b> — WARP выключен, пока напрямую" in text, [text, buttons])
     text, buttons = screen(await press("wo"))
-    chk("WARP настроен — кнопка «🌐 → WARP»", ("🌐 → WARP", "wo:route:warp") in buttons, buttons)
-    await press("wo:route:warp")
-    chk("«→ WARP» — адреса клиентов обфускатора в списке WARP",
-        os.path.exists(wl) and open(wl).read().split() == ["10.77.1.2"], open(wl).read() if os.path.exists(wl) else "нет файла")
-    text, buttons = screen(await press("wo"))
-    chk("экран: «через WARP — WARP выключен, пока напрямую», кнопка «→ напрямую»",
-        "через WARP</b> — WARP выключен, пока напрямую" in text and ("🌐 → напрямую", "wo:route:direct") in buttons, [text, buttons])
-    await press("wo:route:direct")
-    chk("«→ напрямую» — список WARP клиентов обфускатора пуст", not open(wl).read().strip(), open(wl).read())
+    chk("главный экран: «через WARP — WARP выключен, пока напрямую»",
+        "через WARP</b> — WARP выключен, пока напрямую" in text, text)
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка клиента: выход и кнопка «Маршрут»", "Выход: через WARP" in text
+        and ("🌐 Маршрут", "wo:rt:clus") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:list"))
+    chk("в списке клиентов — выход, если не напрямую", "🌐 через WARP" in text, text)
+    text, buttons = screen(await press("wo:rs:clus|d"))
+    chk("свой выход клиенту — «напрямую»: из списка WARP, экран клиента", not open(wl).read().strip()
+        and "Выход: clus" in text and ("🔘 Напрямую", "wo:rs:clus|d") in buttons, [text, buttons, open(wl).read()])
+    text, buttons = screen(await press("wo:rs:clus|x3"))
+    chk("устаревшая кнопка (выхода нет) — экран выбора заново, без записи", ("🔘 Напрямую", "wo:rs:clus|d") in buttons
+        and not open(wl).read().strip(), [text, buttons])
+    # Exit-ноды есть (две) — общий выход и каждая нода на выбор
+    ex_dir = os.path.join(ROOT, "etc/amnezia/amneziawg")
+    for n in ("q1", "q2"):
+        open(os.path.join(ex_dir, f"awg-exit-{n}.conf"), "w").close()
+    text, buttons = screen(await press("wo:rt:clus"))
+    chk("exit-ноды на выбор: общий выход и каждая нода", ("⚪️ Exit-ноды: общий", "wo:rs:clus|e") in buttons
+        and any(d.startswith("wo:rs:clus|e") and "Нода q2" in t for t, d in buttons), buttons)
+    q2 = next(d for t, d in buttons if "Нода q2" in t)
+    text, buttons = screen(await press(q2))
+    el = os.path.join(ex_dir, "exits_peers.list.wgobf")
+    chk("клиент → нода q2: в списке exit-нод обфускатора «адрес|нода», экран: выбрано (ноды работают)",
+        open(el).read().split() == ["10.77.1.2|q2"] and "через exit-ноду q2</b>\n" in text
+        and any(t.startswith("🔘 Нода q2") for t, _ in buttons), [text, buttons, open(el).read()])
+    await press("wo:rs:clus|d")
+    for n in ("q1", "q2"):
+        os.remove(os.path.join(ex_dir, f"awg-exit-{n}.conf"))
     os.remove(warp_conf)
 
     # Трафик и мониторинг клиента обфускатора: dump wgobf0 — рукопожатие минуту назад

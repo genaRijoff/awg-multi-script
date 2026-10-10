@@ -516,17 +516,40 @@ with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
     f.write("active\ntun_mode=tun2socks\n")
 run_and_check("Xray: клиенты из списка в таблицу 201", "XRAY_ROUTING_SCRIPT", "start",
               must=[r"ip route replace default dev xray0 table 201", r"-A POSTROUTING .* -o xray0 -j MASQUERADE"])
+with open(os.path.join(ROOT, "xray.peers.wgobf"), "w") as f:
+    f.write("10.77.1.6|A\n")
+run_and_check("Xray (tun2socks): клиенты обфускатора в таблицу 201, их NAT не трогаем", "XRAY_ROUTING_SCRIPT", "start",
+              must=[r"ip rule add from 10\.77\.1\.6 lookup 201 priority 201"],
+              must_not=[r"-I POSTROUTING 1 -s 10\.77\.1\.0/24 -o xray0 -j RETURN"])
 with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
     f.write("active\ntun_mode=native\n")
-run_and_check("Xray с inbound tun: без NAT — Xray видит адрес клиента", "XRAY_ROUTING_SCRIPT", "start",
-              must=[r"ip route replace default dev xray0 table 201", r"-D POSTROUTING .* -o xray0 -j MASQUERADE"],
+run_and_check("Xray с inbound tun: без NAT — Xray видит адрес клиента (и клиента обфускатора)", "XRAY_ROUTING_SCRIPT", "start",
+              must=[r"ip route replace default dev xray0 table 201", r"-D POSTROUTING .* -o xray0 -j MASQUERADE",
+                    r"ip rule add from 10\.77\.1\.6 lookup 201 priority 201",
+                    r"-t nat -I POSTROUTING 1 -s 10\.77\.1\.0/24 -o xray0 -j RETURN -m comment --comment awg2-tun-xray0"],
               must_not=[r"-A POSTROUTING .* -o xray0 -j MASQUERADE"])
 os.remove(os.path.join(ROOT, "etc/xray/state"))
-run_and_check("Exit-ноды: ECMP и персональная нода", "EXITS_SCRIPT", "start",
+os.remove(os.path.join(ROOT, "xray.peers.wgobf"))
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_peers.list.wgobf"), "w") as f:
+    f.write("10.77.1.7|nl\n10.77.1.8\n10.77.1.9|gone\n")
+run_and_check("Exit-ноды: ECMP и персональная нода (и у клиентов обфускатора)", "EXITS_SCRIPT", "start",
               must=[r"nexthop dev awg-exit-de weight 1 nexthop dev awg-exit-nl weight 1",
                     r"ip route replace default dev awg-exit-nl table 211",
                     r"ip rule add from 10\.23\.45\.2 lookup 211 priority 202",
-                    r"ip rule add from 10\.23\.45\.3 lookup 202 priority 202"])
+                    r"ip rule add from 10\.23\.45\.3 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.7 lookup 211 priority 202",
+                    r"ip rule add from 10\.77\.1\.8 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.9 lookup 202 priority 202"])
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state"), "w") as f:
+    f.write("active\nmode=all\nbalancer=ecmp\nsingle_exit=\n")
+run_and_check("Exit-ноды «все клиенты AWG»: подсеть awg0 целиком, клиенты обфускатора — своим списком", "EXITS_SCRIPT", "start",
+              must=[r"ip rule add from 10\.23\.45\.0/24 lookup 202 priority 202",
+                    r"ip rule add from 10\.77\.1\.7 lookup 211 priority 202",
+                    r"ip rule add from 10\.77\.1\.8 lookup 202 priority 202"],
+              must_not=[r"from 10\.23\.45\.2 lookup"])
+with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state"), "w") as f:
+    f.write("active\nmode=peers\nbalancer=ecmp\nsingle_exit=\n")
+os.remove(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_peers.list.wgobf"))
 run_and_check("Exit-ноды: остановка", "EXITS_SCRIPT", "stop", must_not=[r"-A "])
 # Клиенты WG + обфускатора в WARP: список «.wgobf» рядом со списком WARP читает тот же rt_up
 rc, out, _ = bash('echo 10.23.45.2 > "$WARP_PEERS"; printf "10.77.1.5\\n" > "$WARP_PEERS.wgobf"; echo "$WARP_PEERS"')
@@ -2243,8 +2266,12 @@ rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
 chk("один клиент — напрямую: из списка WARP и его правила сняты", r.get("ok") and wl() == ["10.66.66.2"]
     and rows["wb"]["route"] == "direct" and "ip rule del from 10.66.66.3" in calls(), [r, wl()])
 r = api("wgobf", "route", "nobody", "warp")
-r2 = api("wgobf", "route", "wa", "xray")
-chk("нет клиента и неизвестный выход — отказ", r.get("ok") is False and r2.get("ok") is False, [r, r2])
+r2 = api("wgobf", "route", "wa", "tor")
+r3 = api("wgobf", "route", "wa", "warp:x")
+r4 = api("wgobf", "route", "wa", "xray:A\n10.66.66.9|B")
+r5 = api("wgobf", "route", "wa", "exits:../x")
+chk("нет клиента и неизвестный выход — отказ; перевод строки и чужие символы в выходе — тоже",
+    all(x.get("ok") is False for x in (r, r2, r3, r4, r5)) and wl() == ["10.66.66.2"], [r, r2, r3, r4, r5, wl()])
 rc, out, _ = bash('peers_all "$WARP_PEERS"; peers_sync "$WARP_PEERS"; : > "$WARP_PEERS"; cat "$WARP_PEERS.wgobf"')
 chk("«все клиенты AWG» и синхронизация списка WARP клиентов обфускатора не трогают", out.split() == ["10.66.66.2"], out)
 rc, out, _ = bash('_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; wgobf_add_client wc >/dev/null 2>&1; cat "$WARP_PEERS.wgobf"; '
@@ -2256,6 +2283,84 @@ os.remove(os.path.join(ROOT, "etc/wireguard/warp0.conf"))
 with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
     f.write("[Interface]\nPrivateKey = X\n\n[Peer]\n# client=wa\nPublicKey = WAPUB=\nAllowedIPs = 10.66.66.2/32\n\n"
             "[Peer]\n# client=wb\nPublicKey = WBPUB=\nAllowedIPs = 10.66.66.3/32\n")
+
+print("\n── WG + обфускатор: свой маршрут клиента — Xray и exit-ноды ──")
+XCONF = os.path.join(ROOT, "etc/xray/config.json")
+xconf_was = open(XCONF).read() if os.path.exists(XCONF) else None
+fake_xray(tun=True)
+os.makedirs(os.path.dirname(XCONF), exist_ok=True)
+with open(XCONF, "w") as f:
+    json.dump({"inbounds": [{"protocol": "tun", "tag": "tun-in", "settings": {"name": "xray0"}}],
+               "outbounds": [{"protocol": "vless", "tag": "A"}, {"protocol": "vless", "tag": "B"},
+                             {"protocol": "freedom", "tag": "direct"}],
+               "routing": {"rules": [{"type": "field", "inboundTag": ["tun-in"], "outboundTag": "A"}]}}, f)
+for n in ("p1", "p2"):
+    open(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf"), "w").close()
+st = api("wgobf", "status").get("data") or {}
+chk("api wgobf status: туннели на выбор — Xray с выходами (умеет tun), exit-ноды",
+    st.get("xray") in ("off", "up") and st.get("xray_tags") == ["A", "B"] and st.get("exits") in ("off", "up")
+    and {"p1", "p2"} <= set(st.get("exit_nodes") or []), st)
+# Xray поднят в режиме tun: свой выход клиента — правило в конфиге Xray и перезапуск
+WSTUB = 'xray_restart() { echo XRAY-RESTART; }; exits_reapply() { echo EXITS-REAPPLY; }; '
+with open(LINKS, "w") as f:
+    f.write("xray0\n")
+with open(os.path.join(ROOT, "etc/xray/state"), "w") as f:
+    f.write("active\ntun_mode=native\n")
+reset_calls()
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:A; echo "--"; cat "$XRAY_PEERS.wgobf"')
+xr = [r for r in json.load(open(XCONF))["routing"]["rules"] if r.get("source")]
+chk("клиент обфускатора → свой выход Xray: список, правило по адресу в конфиге, перезапуск, без NAT в xray0",
+    rc == 0 and "XRAY-RESTART" in out and out.split("--")[1].split() == ["10.66.66.2|A"]
+    and any(r.get("source") == ["10.66.66.2"] and r.get("outboundTag") == "A" for r in xr)
+    and "ip rule add from 10.66.66.2 lookup 201 priority 201" in calls()
+    and "-t nat -I POSTROUTING 1 -s 10.66.66.0/24 -o xray0 -j RETURN" in calls() and "EXITS-REAPPLY" not in out,
+    [out, xr, calls()])
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:A; echo "--"; wgobf_route_set wa xray; echo "--"; wgobf_route_set wa xray')
+parts = out.split("--")
+chk("тот же выход — без перезапуска; на выход по умолчанию — перезапуск один раз, дальше без него",
+    rc == 0 and len(parts) == 3 and "XRAY-RESTART" not in parts[0] and "XRAY-RESTART" in parts[1]
+    and "XRAY-RESTART" not in parts[2], out)
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wb exits:p2; echo "--"; cat "$EXITS_PEERS.wgobf"; echo "--"; wgobf_route_set wb exits:p2')
+parts = out.split("--")
+chk("клиент обфускатора → своя exit-нода: список, маршрутизация нод перезапускается, повтор — без перезапуска",
+    rc == 0 and "EXITS-REAPPLY" in parts[0] and parts[1].split() == ["10.66.66.3|p2"] and "EXITS-REAPPLY" not in parts[2], out)
+r1 = api("wgobf", "route", "wb", "exits:zz")
+r2 = api("wgobf", "route", "wb", "xray:Q")
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("нет ноды или выхода Xray — отказ; в clients — маршрут каждого",
+    r1.get("ok") is False and "Ноды zz нет" in r1.get("error", "") and r2.get("ok") is False
+    and "Выхода Xray Q нет" in r2.get("error", "") and rows.get("wa", {}).get("route") == "xray"
+    and rows.get("wb", {}).get("route") == "exits:p2", [r1, r2, rows])
+rc, out, _ = bash(WSTUB + 'wgobf_route_set wa xray:B >/dev/null; _xray_peers_untag B; cat "$XRAY_PEERS.wgobf"')
+chk("выход Xray удалён — клиент обфускатора на выходе по умолчанию",
+    len(out.split()) == 2 and int(out.split()[0]) >= 1 and out.split()[1] == "10.66.66.2", out)
+rc, out, _ = bash(WSTUB + 'exits_node_del p2 >/dev/null; : > "$EXITS_DIR/awg-exit-p3.conf"; cat "$EXITS_PEERS.wgobf"')
+chk("нода удалена — клиент обфускатора на общем выходе", out.split() == ["10.66.66.3"], out)
+rc, out, _ = bash(WSTUB + '_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; '
+                  'wgobf_route_set all exits:p1 >/dev/null; wgobf_get ROUTE; wgobf_add_client wc >/dev/null 2>&1; '
+                  'rm -f "$EXITS_DIR/awg-exit-p1.conf"; wgobf_add_client wd >/dev/null 2>&1; cat "$EXITS_PEERS.wgobf"; '
+                  'echo "--"; cat "$XRAY_PEERS.wgobf"; echo "--"; wgobf_route_of 10.66.66.5')
+chk("новые клиенты — за всеми (exits:p1); ноды уже нет — общий выход exit-нод; в одном списке за раз",
+    out.split() == ["exits:p1", "10.66.66.2|p1", "10.66.66.3|p1", "10.66.66.4|p1", "10.66.66.5", "--", "--", "exits"], out)
+rc, out, _ = bash('_backup_tunnel_paths; printf "%s\n" "${_BACKUP_TUNNEL_PATHS[@]}"')
+chk("бэкап туннелей — со списком exit-нод клиентов обфускатора", "exits_peers.list.wgobf" in out, out)
+rc, out, _ = bash(WSTUB + '_wgobf_routes_clear; ls "$EXITS_PEERS.wgobf" "$XRAY_PEERS.wgobf" 2>&1 | grep -c "No such"')
+chk("обфускатор удалён — списки Xray и exit-нод его клиентов убраны, маршрутизация нод перезапущена",
+    out.split() == ["EXITS-REAPPLY", "2"], out)
+os.remove(os.path.join(ROOT, "etc/xray/state"))
+open(LINKS, "w").close()
+for n in ("p1", "p2", "p3"):
+    if os.path.exists(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf")):
+        os.remove(os.path.join(ROOT, f"etc/amnezia/amneziawg/awg-exit-{n}.conf"))
+if xconf_was is None:
+    os.remove(XCONF)
+else:
+    with open(XCONF, "w") as f:
+        f.write(xconf_was)
+with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = X\n\n[Peer]\n# client=wa\nPublicKey = WAPUB=\nAllowedIPs = 10.66.66.2/32\n\n"
+            "[Peer]\n# client=wb\nPublicKey = WBPUB=\nAllowedIPs = 10.66.66.3/32\n")
+bash('wgobf_set ROUTE direct')
 
 r = api("traffic", "now")
 d = r.get("data") or {}
