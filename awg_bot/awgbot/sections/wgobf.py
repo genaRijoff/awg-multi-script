@@ -18,6 +18,8 @@ act = ui.Actions(router, "wo")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 # DNS клиентов — те же три, что в меню awg2; кнопка перебирает их по кругу
 DNS = [("Cloudflare", "1.1.1.1, 1.0.0.1"), ("Google", "8.8.8.8, 8.8.4.4"), ("Quad9", "9.9.9.9, 149.112.112.112")]
+# Выход клиентов: напрямую или через WARP — правила awg2 ставит тот же туннель, что у AWG
+ROUTE_LABEL = {"direct": "напрямую", "warp": "через WARP"}
 
 
 async def _bundle_data(bot: Bot, chat_id: int, name: str) -> dict | None:
@@ -91,11 +93,19 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
                         ui.kb(("📦 Установить", act.data("install")), ui.back()))
         return
     mask = "NONE" if d.get("masking") == "STUN" else "STUN"
-    await ui.render(cb, "<b>🛡 WG + обфускатор</b>\n" + ui.pre(r.log, 1500, tail=False)
+    route, warp = d.get("route") or "direct", d.get("warp") or "none"
+    rline = f"🌐 Выход клиентов: <b>{ROUTE_LABEL.get(route, esc(route))}</b>"
+    if route == "warp" and warp != "up":
+        rline += " — WARP выключен, пока напрямую" if warp == "off" else " — WARP не настроен, пока напрямую"
+    # WARP не настроен — кнопки «→ WARP» нет: туда некуда (вернуть напрямую можно всегда)
+    to = "direct" if route == "warp" else "warp"
+    await ui.render(cb, "<b>🛡 WG + обфускатор</b>\n" + ui.pre(r.log, 1500, tail=False) + f"\n{rline}\n"
                     + f"\n<i>🎭 — маскировка клиентов: {esc(d.get('masking') or '?')} → {mask}\n"
-                      "Чистый WG — пускать и обычный WireGuard без обфускатора (iOS); его DPI видит</i>", ui.kb(
+                      "Чистый WG — пускать и обычный WireGuard без обфускатора (iOS); его DPI видит\n"
+                      "🌐 — выход всех клиентов (и новых): напрямую или через WARP</i>", ui.kb(
         ("➕ Добавить", act.data("add")),
         ("👥 Клиенты", act.data("list")),
+        (f"🌐 → {'напрямую' if to == 'direct' else 'WARP'}", act.data("route", to)) if to == "direct" or warp != "none" else None,
         (f"🎭 → {mask}", act.data("mask", mask)),
         (f"{'✅' if d.get('clean') else '⬜️'} Чистый WG", act.data("clean", "0" if d.get("clean") else "1")),
         ("🔄 Перезапустить", act.data("restart")),
@@ -306,6 +316,14 @@ async def _quick(cb: CallbackQuery, title: str, *args: str) -> None:
 @act("restart")
 async def _restart(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await _quick(cb, "Перезапуск", "wgobf", "restart")
+
+
+@act("route")
+async def _route(cb: CallbackQuery, state: FSMContext, v: str) -> None:
+    if v not in ROUTE_LABEL:
+        await cb.answer("Кнопка устарела — открой раздел заново", show_alert=True)
+        return
+    await _quick(cb, f"Выход клиентов {ROUTE_LABEL[v]}", "wgobf", "route", "all", v)
 
 
 @act("mask")

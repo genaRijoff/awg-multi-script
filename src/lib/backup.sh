@@ -159,7 +159,7 @@ _restore_warp() {  # каталог бэкапа
     # служба выполняет от root, — его Тулза пишет сама, из бэкапа не берём.
     # Состояние «включён» тоже не переносим — туннель включают руками.
     mkdir -p "$WARP_DIR" && chmod 700 "$WARP_DIR"
-    for f in "$WARP_ACCOUNT" "$WARP_PROFILE" "$WARP_PEERS" "$WARP_DIR/account_type"; do
+    for f in "$WARP_ACCOUNT" "$WARP_PROFILE" "$WARP_PEERS" "$WARP_PEERS.wgobf" "$WARP_DIR/account_type"; do
       [[ -f "$src/wgcf/${f##*/}" ]] && install -D -m 600 "$src/wgcf/${f##*/}" "$f"
     done
     rm -f "$WARP_STATE" "$WARP_STATE.failed"

@@ -528,6 +528,13 @@ run_and_check("Exit-ноды: ECMP и персональная нода", "EXITS
                     r"ip rule add from 10\.23\.45\.2 lookup 211 priority 202",
                     r"ip rule add from 10\.23\.45\.3 lookup 202 priority 202"])
 run_and_check("Exit-ноды: остановка", "EXITS_SCRIPT", "stop", must_not=[r"-A "])
+# Клиенты WG + обфускатора в WARP: список «.wgobf» рядом со списком WARP читает тот же rt_up
+rc, out, _ = bash('echo 10.23.45.2 > "$WARP_PEERS"; printf "10.77.1.5\\n" > "$WARP_PEERS.wgobf"; echo "$WARP_PEERS"')
+run_and_check("WARP (хук usque): клиенты AWG и обфускатора — в таблицу 200, MSS и для wgobf0", "USQUE_UP_HOOK",
+              must=[r"ip rule add from 10\.23\.45\.2 lookup 200 priority 200",
+                    r"ip rule add from 10\.77\.1\.5 lookup 200 priority 200",
+                    r"-i warp0 -o wgobf0 -p tcp .*TCPMSS"])
+bash('rm -f "$WARP_PEERS" "$WARP_PEERS.wgobf"')
 run_and_check("WG+обфускатор: правила по метке", "WGOBF_FW", "up",
               must=[r"-I INPUT 1 -p udp --dport 40001 ! -i lo -j DROP -m comment --comment awg-wgobf",
                     r"-t nat -A POSTROUTING -s 10\.77\.1\.0/24 ! -o wgobf0 -j MASQUERADE"])
@@ -2217,6 +2224,39 @@ rows = {x["name"]: x for x in r.get("data") or []}
 chk("клиенты обфускатора: рукопожатие и трафик с запуска; у второго (нет в dump) — пусто, не цифры соседа",
     r.get("ok") and rows.get("wa", {}).get("rx") == 5000 and rows["wa"].get("tx") == 7000 and 30 <= rows["wa"].get("ago", -1) <= 120
     and rows.get("wb", {}).get("rx") == 0 and rows["wb"].get("ago") is None, r)
+print("\n── WG + обфускатор: выход через WARP ──")
+r = api("wgobf", "route", "all", "warp")
+chk("выход через WARP без настроенного WARP — отказ с подсказкой", r.get("ok") is False and "WARP не настроен" in r.get("error", ""), r)
+with open(os.path.join(ROOT, "etc/wireguard/warp0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n[Peer]\nPublicKey = Q\nEndpoint = 162.159.192.1:2408\n")
+reset_calls()
+r = api("wgobf", "route", "all", "warp")
+wl = lambda: bash('cat "$WARP_PEERS.wgobf" 2>/dev/null')[1].split()
+st = (api("wgobf", "status").get("data") or {})
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("все клиенты обфускатора — в WARP: список .wgobf, выход в status и clients, WARP выключен — подсказка",
+    r.get("ok") and wl() == ["10.66.66.2", "10.66.66.3"] and st.get("route") == "warp" and st.get("warp") == "off"
+    and rows.get("wa", {}).get("route") == "warp" and rows.get("wb", {}).get("route") == "warp"
+    and "WARP сейчас выключен" in r.get("_err", "") + json.dumps(r, ensure_ascii=False), [r, wl(), st, rows])
+r = api("wgobf", "route", "wb", "direct")
+rows = {x["name"]: x for x in api("wgobf", "clients").get("data") or []}
+chk("один клиент — напрямую: из списка WARP и его правила сняты", r.get("ok") and wl() == ["10.66.66.2"]
+    and rows["wb"]["route"] == "direct" and "ip rule del from 10.66.66.3" in calls(), [r, wl()])
+r = api("wgobf", "route", "nobody", "warp")
+r2 = api("wgobf", "route", "wa", "xray")
+chk("нет клиента и неизвестный выход — отказ", r.get("ok") is False and r2.get("ok") is False, [r, r2])
+rc, out, _ = bash('peers_all "$WARP_PEERS"; peers_sync "$WARP_PEERS"; : > "$WARP_PEERS"; cat "$WARP_PEERS.wgobf"')
+chk("«все клиенты AWG» и синхронизация списка WARP клиентов обфускатора не трогают", out.split() == ["10.66.66.2"], out)
+rc, out, _ = bash('_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; wgobf_add_client wc >/dev/null 2>&1; cat "$WARP_PEERS.wgobf"; '
+                  'wgobf_delete_client wa >/dev/null 2>&1; echo "--"; cat "$WARP_PEERS.wgobf"')
+chk("новый клиент — туда же, куда все (WARP); удалённый — из списка", out.split() == ["10.66.66.2", "10.66.66.4", "--", "10.66.66.4"], out)
+rc, out, _ = bash('_wgobf_routes_clear; [[ -e "$WARP_PEERS.wgobf" ]] && echo LEFT || echo GONE')
+chk("удаление или новая установка обфускатора — список выходов прежних клиентов убран", out.strip() == "GONE", out)
+os.remove(os.path.join(ROOT, "etc/wireguard/warp0.conf"))
+with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = X\n\n[Peer]\n# client=wa\nPublicKey = WAPUB=\nAllowedIPs = 10.66.66.2/32\n\n"
+            "[Peer]\n# client=wb\nPublicKey = WBPUB=\nAllowedIPs = 10.66.66.3/32\n")
+
 r = api("traffic", "now")
 d = r.get("data") or {}
 chk("api traffic now — клиенты обфускатора отдельно (wpeers): живая скорость считает и их",

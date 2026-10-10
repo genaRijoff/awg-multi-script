@@ -1466,19 +1466,24 @@ function routesView(rows, mdl) {
   ];
 }
 
-// Клиенты WG + обфускатора в виде «список»: одна строка — все идут напрямую,
+// Клиенты WG + обфускатора в виде «список»: строка на выход (напрямую, WARP),
 // клиенты чипами (нажатие — карточка клиента обфускатора)
-function wgobfRoutes(wrows) {
-  const on = wrows.filter((c) => c.online).length, n = wrows.length;
-  const total = wrows.reduce((a, c) => a + (c.today || 0), 0);
-  return h("div", { class: "rlist" }, h("div", { class: "rx", onclick: () => go("/wgobf") },
-    h("i", { class: "sw", style: "background:var(--muted)" }),
-    h("div", { class: "rm" }, h("b", {}, "wgobf0 → напрямую"),
-      h("span", {}, `${n} ${plural(n, "клиент", "клиента", "клиентов")}` + (on ? ` · ${on} в сети` : " · никого в сети")),
-      h("div", { class: "rc" }, sortRows(wrows, "activity").map((c) => h("a", { class: "cchip" + (c.online ? " on" : ""), title: c.sub,
-        onclick: (ev) => { ev.stopPropagation(); go("/wgobf/client/" + encodeURIComponent(c.name)); } }, c.name)))),
-    h("div", { class: "rv" }, fmtBytes(total), h("small", {}, "с запуска"))));
+function wgobfRoutes(wrows, wmdl) {
+  const groups = wmdl.ex.map((e) => ({ e, rows: wrows.filter((c) => wmdl.of[c.name] === e.id) })).filter((g) => g.rows.length);
+  return h("div", { class: "rlist" }, groups.map(({ e, rows }) => {
+    const on = rows.filter((c) => c.online).length, n = rows.length, total = rows.reduce((a, c) => a + (c.today || 0), 0);
+    return h("div", { class: "rx", onclick: () => go("/wgobf") },
+      h("i", { class: "sw", style: `background:${e.c}` }),
+      h("div", { class: "rm" }, h("b", {}, `wgobf0 → ${e.id === "direct" ? "напрямую" : exitLabel(e)}`),
+        h("span", {}, `${n} ${plural(n, "клиент", "клиента", "клиентов")}` + (on ? ` · ${on} в сети` : " · никого в сети")),
+        h("div", { class: "rc" }, sortRows(rows, "activity").map((c) => h("a", { class: "cchip" + (c.online ? " on" : ""), title: c.sub,
+          onclick: (ev) => { ev.stopPropagation(); go("/wgobf/client/" + encodeURIComponent(c.name)); } }, c.name)))),
+      h("div", { class: "rv" }, fmtBytes(total), h("small", {}, "с запуска")));
+  }));
 }
+
+// Выход клиента обфускатора словами: WARP выключен — честно «пока напрямую»
+const wgobfRouteText = (route, warpUp) => (route === "warp" ? (warpUp ? "через WARP" : "WARP выключен — пока напрямую") : "напрямую");
 
 // Схема: клиенты → сервер → выходы. Клиентов много — показаны самые активные.
 // opt — та же схема для WG + обфускатора: свой узел (hub), куда ведут нажатия
@@ -1847,7 +1852,9 @@ route(/^\/$/, async (ctx) => {
   const wrows = (Array.isArray(wob) ? wob : []).map((c) => Object.assign({}, c, { online: wgobfOnline(c), blocked: false,
     handshake: c.ago != null, today: (c.rx || 0) + (c.tx || 0),
     sub: wgobfOnline(c) ? `в сети · ${fmtBytes((c.rx || 0) + (c.tx || 0))}` : c.ago != null ? `${fmtDur(c.ago)} назад` : "не подключался" }));
-  const wmdl = exitsModel(wrows, {}), won = wrows.filter((c) => c.online).length;
+  // Выход клиентов Phobos — WARP, если их туда увели и WARP сейчас работает (активный туннель)
+  const wmdl = exitsModel(wrows.map((c) => Object.assign({}, c, { warp: c.route === "warp" })), { kind: r.kind === "warp" ? "warp" : "" });
+  const won = wrows.filter((c) => c.online).length;
   for (const c of rows) c.online = liveOnline(c, S.live);
   const now = new Date();
   const eyebrow = now.toLocaleDateString("ru-RU", { weekday: "long", day: "numeric", month: "long" }) + " · "
@@ -1899,8 +1906,11 @@ route(/^\/$/, async (ctx) => {
   const rhLink = h("div", { class: "r" }, rlink(wrows.length && pref("routes-pane", "awg") === "w" ? 1 : 0));
   const vseg = (v) => h("div", { class: "seg rseg", role: "group", "aria-label": "Вид маршрутов" }, [["map", "схема"], ["list", "список"]].map(([k, t]) =>
     h("button", { class: v === k ? "on" : null, "aria-pressed": String(v === k), onclick: () => { setPref("routes", k); drawRoutes(); } }, t)));
+  const wwarp = wrows.filter((c) => c.route === "warp").length;
+  const wvia = !wwarp ? "идут напрямую" : r.kind !== "warp" ? "WARP выключен — пока напрямую"
+    : wwarp === wrows.length ? "идут через WARP" : `через WARP: ${wwarp}`;
   const wcap = () => h("div", { class: "muted small", style: "margin-top:6px" },
-    `${won} из ${wrows.length} ${plural(wrows.length, "клиента", "клиентов", "клиентов")} в сети · идут напрямую · трафик с запуска wgobf0`);
+    `${won} из ${wrows.length} ${plural(wrows.length, "клиента", "клиентов", "клиентов")} в сети · ${wvia} · трафик с запуска wgobf0`);
   const drawRoutes = () => {
     if (!ctx.live()) return;
     const v = pref("routes", "map") === "list" ? "list" : "map";
@@ -1909,7 +1919,7 @@ route(/^\/$/, async (ctx) => {
       tA.textContent = clErr ? "—" : `${rows.filter((c) => c.online).length}/${rows.length}`;
       tW.textContent = `${won}/${wrows.length}`;
       const wtopo = v === "map" ? h("div", { class: "topo" }) : null;
-      wgIn.replaceChildren(h("div", { class: "rhead" }, wcap(), vseg(v)), wtopo || wgobfRoutes(wrows));
+      wgIn.replaceChildren(h("div", { class: "rhead" }, wcap(), vseg(v)), wtopo || wgobfRoutes(wrows, wmdl));
       if (wtopo) requestAnimationFrame(() => { if (ctx.live()) topology(wtopo, wrows, wmdl, "WG + обфускатор",
         { hub: "wgobf0", hubPath: "/wgobf", exitPath: "/wgobf", key: "w", esub: (n) => `${fmtBytes(n)} с запуска`,
           cpath: (n) => "/wgobf/client/" + encodeURIComponent(n) }); });
@@ -3739,6 +3749,14 @@ route(/^\/wgobf$/, async (ctx) => {
     segText([["STUN", "STUN · видеозвонок"], ["NONE", "NONE · только XOR"]], d.masking, (v) => (v !== d.masking ? mask(v) : null)),
     h("div", { style: "margin-top:10px" }, switchRow("Чистый WG", "пускать и обычный WireGuard без обфускатора (iOS) — его DPI видит",
       d.clean, (on) => call("wgobf", "clean", on ? "1" : "0"))),
+    // Выход всех клиентов (и новых): напрямую или через WARP — тот же туннель, что у клиентов AWG
+    h("label", { "data-name": "wgobf-route" }, "Выход клиентов"),
+    segText([["direct", "Напрямую"], ["warp", "Через WARP"]], d.route || "direct", (v) => (v === (d.route || "direct") ? null
+      : d.warp === "none" && v === "warp" ? fail(new Error("WARP не настроен — Туннели → WARP"))
+        : quick(null, v === "warp" ? "Клиенты обфускатора — через WARP" : "Клиенты обфускатора — напрямую", ["wgobf", "route", "all", v]))),
+    hint(d.warp === "none" ? "WARP не настроен — сначала Туннели → WARP."
+      : d.route === "warp" && d.warp !== "up" ? "WARP выключен — клиенты пока идут напрямую и уйдут в WARP, когда он включится."
+        : "Через WARP — сайты видят адрес Cloudflare, а не сервера. Выбор действует и на новых клиентов."),
     h("h2", {}, "Клиенты"),
     btn("➕ Добавить клиента", () => go("/wgobf/add"), "btn-primary btn-block"),
     h("div", { style: "margin-top:10px" }, rows.length ? rows.map((c) => {
@@ -3775,13 +3793,14 @@ route(/^\/wgobf\/add$/, async (ctx) => {
 
 route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
   // Комплект не собрался — статус и мониторинг всё равно на экране, ошибка — плашкой
-  const [d, rows] = await Promise.all([post("/api/wgobf/bundle", { name }).catch((e) => ({ error: e.message })),
-    call("wgobf", "clients").catch(() => [])]);
+  const [d, rows, ws] = await Promise.all([post("/api/wgobf/bundle", { name }).catch((e) => ({ error: e.message })),
+    call("wgobf", "clients").catch(() => []), call("wgobf", "status").catch(() => ({}))]);
   const c = (rows || []).find((x) => x.name === name);
   if (d.error && !c) throw new Error(d.error);
   ctx.put(title(name, pill("обфускатор", "accent")),
     c ? h("div", { class: "card", "data-name": "wgobf-status" }, kv("Статус", wgobfSeen(c)), kv("Адрес", c.ip),
-      kv("Трафик с запуска", `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`)) : null,
+      kv("Трафик с запуска", `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`),
+      kv("Выход", wgobfRouteText(c.route, (ws || {}).warp === "up"))) : null,
     d.error ? h("div", { class: "card warn small" }, "Комплект клиента не собрался: " + d.error) : null,
     switchRow("Мониторинг", "сообщу в чат, когда клиент пропал (5 минут без связи) и когда вернулся", !!d.mon,
       (on) => post("/api/wgobf/mon", { name, on })),

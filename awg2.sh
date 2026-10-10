@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.28"
+VERSION="v1.2.29"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -4305,11 +4305,26 @@ tunnel_peers_forget() {
 # опираются только на константы и базовые помощники.
 RT_FUNCS=(valid_ip valid_cidr conf_iface_get server_net ipt_add ipt_ins ipt_del
           ipt_del_grep ipt_del_tagged rp_filter_loose rt_fw_up rt_fw_down rt_up rt_down
-          rt_rules_clear SERVER_CONF AWG_IF)
+          rt_rules_clear rt_rules_file SERVER_CONF AWG_IF WGOBF_IF)
 
 rt_rules_clear() {  # таблица
   local guard=0
   while (( guard++ < 256 )) && ip rule del lookup "$1" 2>/dev/null; do :; done
+}
+
+# Правила «адрес → таблица» по списку («IP» или «IP|выход» в строке). Рядом —
+# «<список>.wgobf»: клиенты WG + обфускатора (wgobf0), уведённые в тот же
+# туннель. Отдельный файл — синхронизация со списком клиентов AWG его не трогает.
+rt_rules_file() {  # файл таблица
+  local f line ip
+  for f in "$1" "$1.wgobf"; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r line; do
+      ip="${line%%|*}"
+      valid_ip "$ip" && ip rule add from "$ip" lookup "$2" priority "$2"
+    done < "$f"
+  done
+  return 0
 }
 
 # NAT и FORWARD между awg0 и туннелем. Правила помечены «awg2-tun-<dev>».
@@ -4329,9 +4344,12 @@ rt_fw_up() {  # устройство [nonat]
   # до клиента доходит не всегда — без клампа крупные TCP-сессии виснут.
   ipt_add -t mangle FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
   ipt_add -t mangle FORWARD -i "$dev" -o "$AWG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
+  # Клиенты WG + обфускатора в этом туннеле: NAT и FORWARD для wgobf0 ставит
+  # он сам («всё, что не в wgobf0»), здесь — только MSS на обратном пути
+  ipt_add -t mangle FORWARD -i "$dev" -o "$WGOBF_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
   # Обратная проверка пути для адреса клиента ведёт в таблицу туннеля, а не
   # на awg0 — строгий rp_filter такие пакеты молча дропает.
-  rp_filter_loose "$dev" "$AWG_IF"
+  rp_filter_loose "$dev" "$AWG_IF" "$WGOBF_IF"
 }
 
 # Снимает правила и этой версии, и прежних (те ставились без метки).
@@ -4353,7 +4371,7 @@ rt_fw_down() {  # устройство
 # rt_up УСТРОЙСТВО ТАБЛИЦА ФАЙЛ_КЛИЕНТОВ|- [SRC]
 # «-» вместо файла — вся подсеть клиентов (как у tun2socks).
 rt_up() {  # устройство таблица peers|- [src] [nonat]
-  local dev="$1" table="$2" peers="$3" src="${4:-}" net ip line
+  local dev="$1" table="$2" peers="$3" src="${4:-}" net
   net=$(server_net) || return 1
   if [[ -n "$src" ]]; then
     ip route replace default dev "$dev" src "$src" table "$table" || return 1
@@ -4363,11 +4381,8 @@ rt_up() {  # устройство таблица peers|- [src] [nonat]
   rt_rules_clear "$table"
   if [[ "$peers" == - ]]; then
     ip rule add from "$net" lookup "$table" priority "$table" || return 1
-  elif [[ -f "$peers" ]]; then
-    while IFS= read -r line; do
-      ip="${line%%|*}"
-      valid_ip "$ip" && ip rule add from "$ip" lookup "$table" priority "$table"
-    done < "$peers"
+  else
+    rt_rules_file "$peers" "$table"
   fi
   rt_fw_up "$dev" "${5:-}"
 }
@@ -4440,13 +4455,9 @@ tunnels_panic_reset() {
 # ── Выбор клиентов для туннеля ────────────────────────────
 # Правила работающего туннеля пересобираются по списку целиком.
 _tunnel_rules_refresh() {  # файл устройство таблица
-  local ip
   ip link show "$2" &>/dev/null || return 0
   rt_rules_clear "$3"
-  while IFS= read -r ip; do
-    valid_ip "${ip%%|*}" && ip rule add from "${ip%%|*}" lookup "$3" priority "$3"
-  done < "$1"
-  return 0
+  rt_rules_file "$1" "$3"
 }
 
 # tunnel_client warp|xray ИМЯ|all|none on|off
@@ -4557,6 +4568,8 @@ warp_backend() {
 }
 
 warp_wg_possible()    { modprobe wireguard 2>/dev/null || [[ -d /sys/module/wireguard ]]; }
+# Профиль есть (wg или usque) — WARP можно включать
+warp_configured()     { [[ -f "$WARP_CONF" || -s "$USQUE_CONF" ]]; }
 warp_usque_possible() {
   [[ -n "$(go_arch)" ]] || return 1
   [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null
@@ -7392,6 +7405,91 @@ wgobf_show_bundle() {
   info "Забрать папку: scp -r root@$(wgobf_get ENDPOINT):$dir ."
 }
 
+# ── Выход клиентов через туннель ──────────────────────────
+# Клиента wgobf0 можно увести в туннель так же, как клиента AWG: его адрес —
+# в «<список туннеля>.wgobf», правило «адрес → таблица туннеля» ставит тот же
+# rt_up при каждом подъёме туннеля, после перезагрузки и в хуке usque. NAT и
+# FORWARD для wgobf0 уже есть (MASQUERADE всего, что уходит не в wgobf0).
+WGOBF_ROUTES=(direct warp)
+
+wgobf_route_files() { printf '%s\n' "$WARP_PEERS.wgobf"; }
+
+wgobf_client_ip() {  # ИМЯ → адрес без /32
+  awk -v t="# client=$1" '$0 == t {f = 1; next} f && /^AllowedIPs = / {sub(/\/32$/, "", $3); print $3; exit}' \
+    "$WGOBF_WG_CONF" 2>/dev/null
+}
+
+wgobf_route_of() {  # адрес → direct|warp
+  peers_has "$WARP_PEERS.wgobf" "$1" && { echo warp; return; }
+  echo direct
+}
+
+# Адрес — в список выбранного туннеля (из прочих — прочь), его старые правила — сняты
+_wgobf_route_put() {  # адрес direct|warp
+  local f
+  while IFS= read -r f; do peers_del "$f" "$1"; done < <(wgobf_route_files)
+  [[ "$2" == warp ]] && peers_add "$WARP_PEERS.wgobf" "$1"
+  while ip rule del from "$1" 2>/dev/null; do :; done
+}
+
+# Правила туннелей заново по спискам — только у поднятых
+_wgobf_route_refresh() { _tunnel_rules_refresh "$WARP_PEERS" "$WARP_IF" "$WARP_TABLE"; }
+
+# Прежние адреса — из всех списков и правил (обфускатор удалён или ставится заново)
+_wgobf_routes_clear() {
+  local f line
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r line; do
+      valid_ip "${line%%|*}" || continue
+      while ip rule del from "${line%%|*}" 2>/dev/null; do :; done
+    done < "$f"
+    rm -f "$f"
+  done < <(wgobf_route_files)
+}
+
+# Выход клиента (ИМЯ) или всех (all — и новых по умолчанию): direct | warp
+wgobf_route_set() {
+  local who="${1:-}" r="${2:-}" ip name n=0
+  wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
+  [[ -n "$who" && " ${WGOBF_ROUTES[*]} " == *" $r "* ]] || { err "Выход: ${WGOBF_ROUTES[*]// / | }"; return 1; }
+  [[ "$r" != warp ]] || warp_configured || { err "WARP не настроен — Туннели → WARP"; return 1; }
+  if [[ "$who" == all ]]; then
+    while IFS= read -r name; do
+      ip=$(wgobf_client_ip "$name")
+      valid_ip "$ip" && { _wgobf_route_put "$ip" "$r"; n=$((n + 1)); }
+    done < <(wgobf_clients)
+    wgobf_set ROUTE "$r"
+  else
+    wgobf_clients | grep -qxF "$who" || { err "Клиента $who нет"; return 1; }
+    ip=$(wgobf_client_ip "$who")
+    valid_ip "$ip" || { err "У клиента $who нет адреса"; return 1; }
+    _wgobf_route_put "$ip" "$r"; n=1
+  fi
+  _wgobf_route_refresh
+  log_info "wgobf: выход $who → $r"
+  if [[ "$r" == direct ]]; then ok "Клиенты обфускатора напрямую: $n"
+  elif warp_is_up; then ok "Клиенты обфускатора через WARP: $n"
+  else ok "Клиенты обфускатора через WARP: $n"; warn "WARP сейчас выключен — пока напрямую, уйдут в WARP, когда он включится"; fi
+}
+
+wgobf_route_menu() {
+  local c cur
+  cur=$(wgobf_get ROUTE); [[ -n "$cur" ]] || cur=direct
+  echo ""
+  hdr "Выход клиентов обфускатора"
+  echo -e "  Сейчас: ${W}$([[ "$cur" == warp ]] && echo WARP || echo напрямую)${N} ${D}(и для новых клиентов)${N}"
+  warp_configured || echo -e "  ${D}WARP не настроен — Туннели → WARP${N}"
+  echo -e "  ${C}1)${N} Напрямую"
+  echo -e "  ${C}2)${N} Через WARP"
+  echo -e "  ${W}0)${N} ← Назад"
+  read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+  case "$c" in
+    1) wgobf_route_set all direct ;;
+    2) wgobf_route_set all warp ;;
+  esac
+}
+
 # ── Клиенты ───────────────────────────────────────────────
 wgobf_add_client() {
   local name="$1" base i ip="" priv pub psk bak
@@ -7415,11 +7513,20 @@ wgobf_add_client() {
   wgobf_write_bundle "$name" "$priv" "$ip/32" "$psk" || return 1
   ok "Клиент $name: $ip"
   log_info "wgobf: добавлен клиент $name ($ip)"
+  # Выход для новых — как у всех (WARP не настроен — напрямую)
+  if [[ "$(wgobf_get ROUTE)" == warp ]] && warp_configured; then
+    _wgobf_route_put "$ip" warp; _wgobf_route_refresh
+    info "Выход: WARP"
+  else
+    _wgobf_route_put "$ip" direct
+  fi
+  return 0
 }
 
 wgobf_delete_client() {
-  local name="$1" bak
+  local name="$1" bak ip
   wgobf_clients | grep -qxF "$name" || { err "Клиента $name нет"; return 1; }
+  ip=$(wgobf_client_ip "$name")
   mktmp bak || return 1
   cp -a "$WGOBF_WG_CONF" "$bak"
   awk -v target="# client=$name" '
@@ -7434,6 +7541,9 @@ wgobf_delete_client() {
     return 1
   fi
   rm -rf "${WGOBF_CLIENTS:?}/$name"
+  # Его адрес — из списков туннелей и правил: новый клиент на том же адресе
+  # иначе унаследовал бы чужой выход
+  valid_ip "$ip" && _wgobf_route_put "$ip" direct
   ok "Клиент $name удалён"
   log_info "wgobf: удалён клиент $name"
 }
@@ -7559,6 +7669,8 @@ wgobf_install_opts() {
   net=$(taken_networks | py pick-net) || { err "Нет свободной /24"; return 1; }
   priv=$(wg genkey)
   rm -f "$WGOBF_STATE"
+  # Новая установка: выходы прежних клиентов (адреса в новой подсети совпадут) — прочь
+  _wgobf_routes_clear
   wgobf_set PORT "$port"; wgobf_set WG_PORT "$wg_port"; wgobf_set KEY "$(py rand-key 32)"
   wgobf_set MASKING "$mask"; wgobf_set ALLOW_CLEAN "$clean"; wgobf_set NET "$net"
   wgobf_set MTU "$WGOBF_MTU"; wgobf_set DNS "$dns"; wgobf_set ENDPOINT "$ep"
@@ -7614,6 +7726,7 @@ wgobf_remove() {
   [[ -d "$WGOBF_CLIENTS" ]] && items+=("$WGOBF_CLIENTS")
   tar -czf "$arch" "${items[@]}" 2>/dev/null && chmod 600 "$arch" && info "Архив на всякий случай: $arch"
   _wgobf_teardown drop
+  _wgobf_routes_clear
   ok "WG + обфускатор удалён"
   log_info "wgobf: удалён"
 }
@@ -7729,9 +7842,10 @@ do_wgobf_menu() {
     echo -e "  ${C}5)${N} Статус и журнал"
     echo -e "  ${C}6)${N} Перезапустить"
     echo -e "  ${C}7)${N} Настройки"
-    echo -e "  ${R}8)${N} Удалить WG + обфускатор"
+    echo -e "  ${C}8)${N} Выход клиентов ${D}— $([[ "$(wgobf_get ROUTE)" == warp ]] && echo "через WARP" || echo напрямую)${N}"
+    echo -e "  ${R}9)${N} Удалить WG + обфускатор"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-8]: ${N}" 0 8 0
+    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
     case "$c" in
       1) read_line name "${C}  Имя клиента: ${N}"
          name="${name// /}"
@@ -7743,7 +7857,8 @@ do_wgobf_menu() {
       5) wgobf_status; journalctl -u "$WGOBF_UNIT" -n 12 --no-pager 2>/dev/null | sed 's/^/  /' || true ;;
       6) wgobf_restart && ok "Перезапущено" || true ;;
       7) wgobf_settings || true ;;
-      8) wgobf_remove || true ;;
+      8) wgobf_route_menu || true ;;
+      9) wgobf_remove || true ;;
       0) return 0 ;;
     esac
     pause
@@ -8135,7 +8250,7 @@ _restore_warp() {  # каталог бэкапа
     # служба выполняет от root, — его Тулза пишет сама, из бэкапа не берём.
     # Состояние «включён» тоже не переносим — туннель включают руками.
     mkdir -p "$WARP_DIR" && chmod 700 "$WARP_DIR"
-    for f in "$WARP_ACCOUNT" "$WARP_PROFILE" "$WARP_PEERS" "$WARP_DIR/account_type"; do
+    for f in "$WARP_ACCOUNT" "$WARP_PROFILE" "$WARP_PEERS" "$WARP_PEERS.wgobf" "$WARP_DIR/account_type"; do
       [[ -f "$src/wgcf/${f##*/}" ]] && install -D -m 600 "$src/wgcf/${f##*/}" "$f"
     done
     rm -f "$WARP_STATE" "$WARP_STATE.failed"
@@ -10956,7 +11071,7 @@ _api_warp() {
   case "$a" in
     status)
       { _kv backend "$be"; _kv up:b "$(_b warp_is_up)"
-        _kv configured:b "$([[ -f "$WARP_CONF" || -s "$USQUE_CONF" ]] && echo 1 || echo 0)"
+        _kv configured:b "$(_b warp_configured)"
         _kv failed:b "$(_b test -f "$WARP_STATE.failed")"
         _kv health:b "$(_b unit_active awg-warp-healthcheck.timer)"
         _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"; } | api_obj
@@ -11134,6 +11249,9 @@ _api_wgobf() {
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
+          # Выход для всех и новых клиентов и состояние WARP: none | off | up
+          _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
+          _kv warp "$(if warp_is_up; then echo up; elif warp_configured; then echo off; else echo none; fi)"
         fi; } | api_obj
       wgobf_installed && wgobf_status
       return 0 ;;
@@ -11149,8 +11267,9 @@ _api_wgobf() {
         read -r hs rx tx < <(awk -v k="$pub" '$1 == k {print $5, $6, $7; exit}' <<< "$dump") || true
         [[ "${hs:-}" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
         [[ "${rx:-}" =~ ^[0-9]+$ ]] || rx=0; [[ "${tx:-}" =~ ^[0-9]+$ ]] || tx=0
-        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx"
-      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n ;;
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx" "$(wgobf_route_of "${ip%/32}")"
+      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n route ;;
+    route) wgobf_route_set "${1:-}" "${2:-}" ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -11172,7 +11291,7 @@ _api_wgobf() {
     clean) wgobf_set_clean "${1:-}" ;;
     rotate-key) wgobf_rotate_key ;;
     remove) wgobf_remove quiet ;;
-    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
+    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|route ИМЯ|all direct|warp|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
   esac
 }
 
@@ -15792,5 +15911,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=9235d926916ea39f
+_BUILD_SUM=3cb60f962658eb04
 main "$@"

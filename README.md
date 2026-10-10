@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v1.2.28-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v1.2.29-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -298,6 +298,10 @@ XOR-обфусцируется. Снаружи виден только порт 
   обфускатора» — такие подключаются обычным WireGuard (`wg-direct.conf`),
   но их трафик DPI видит как WireGuard.
 - Смена ключа обфускатора — **Настройки → Сменить ключ** (комплекты перевыпускаются сами).
+- **Выход клиентов: напрямую или через WARP** — пункт меню «Выход клиентов», в
+  боте кнопка «🌐 → WARP», в панели выбор на экране «Обфускатор». Действует и на
+  новых клиентов; туннель тот же, что у клиентов AWG (Туннели → WARP), и после
+  перезагрузки, и при отказе WARP клиенты не теряют интернет — идут напрямую.
 - В Telegram-боте — тот же раздел «🛡 WG + обфускатор»: установка, клиенты,
   комплект одним архивом и ссылка `phobos://`, настройки, смена ключа.
 - Без меню: `awg2 --wgobf add|del|bundle ИМЯ`, `awg2 --wgobf rotate-key|restart`.
@@ -518,6 +522,6 @@ python3 tests/test_admins.py && python3 tests/test_net.py
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v1.2.28** · MIT License
+**AWG Toolza v1.2.29** · MIT License
 
 </div>

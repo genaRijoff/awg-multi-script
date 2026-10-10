@@ -11,6 +11,8 @@ warp_backend() {
 }
 
 warp_wg_possible()    { modprobe wireguard 2>/dev/null || [[ -d /sys/module/wireguard ]]; }
+# Профиль есть (wg или usque) — WARP можно включать
+warp_configured()     { [[ -f "$WARP_CONF" || -s "$USQUE_CONF" ]]; }
 warp_usque_possible() {
   [[ -n "$(go_arch)" ]] || return 1
   [[ -c /dev/net/tun ]] || modprobe tun 2>/dev/null

@@ -1125,6 +1125,25 @@ async def run():
     chk("архив для Linux — отдельной кнопкой", docs(sent) and docs(sent)[0].document.filename == "wgobf-clus.zip",
         [n for n, _ in sent])
 
+    # Выход клиентов обфускатора: WARP не настроен — кнопки «→ WARP» нет
+    text, buttons = screen(await press("wo"))
+    chk("обфускатор: «Выход клиентов: напрямую», без настроенного WARP кнопки «→ WARP» нет",
+        "Выход клиентов: <b>напрямую</b>" in text and not any(d.startswith("wo:route") for _, d in buttons), [text, buttons])
+    warp_conf, wl = os.path.join(ROOT, "etc/wireguard/warp0.conf"), os.path.join(ROOT, "warp.peers.wgobf")
+    with open(warp_conf, "w") as f:
+        f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n")
+    text, buttons = screen(await press("wo"))
+    chk("WARP настроен — кнопка «🌐 → WARP»", ("🌐 → WARP", "wo:route:warp") in buttons, buttons)
+    await press("wo:route:warp")
+    chk("«→ WARP» — адреса клиентов обфускатора в списке WARP",
+        os.path.exists(wl) and open(wl).read().split() == ["10.77.1.2"], open(wl).read() if os.path.exists(wl) else "нет файла")
+    text, buttons = screen(await press("wo"))
+    chk("экран: «через WARP — WARP выключен, пока напрямую», кнопка «→ напрямую»",
+        "через WARP</b> — WARP выключен, пока напрямую" in text and ("🌐 → напрямую", "wo:route:direct") in buttons, [text, buttons])
+    await press("wo:route:direct")
+    chk("«→ напрямую» — список WARP клиентов обфускатора пуст", not open(wl).read().strip(), open(wl).read())
+    os.remove(warp_conf)
+
     # Трафик и мониторинг клиента обфускатора: dump wgobf0 — рукопожатие минуту назад
     import time as _t
     from awgbot import monitor as _mon

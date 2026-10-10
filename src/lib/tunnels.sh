@@ -114,11 +114,26 @@ tunnel_peers_forget() {
 # опираются только на константы и базовые помощники.
 RT_FUNCS=(valid_ip valid_cidr conf_iface_get server_net ipt_add ipt_ins ipt_del
           ipt_del_grep ipt_del_tagged rp_filter_loose rt_fw_up rt_fw_down rt_up rt_down
-          rt_rules_clear SERVER_CONF AWG_IF)
+          rt_rules_clear rt_rules_file SERVER_CONF AWG_IF WGOBF_IF)
 
 rt_rules_clear() {  # таблица
   local guard=0
   while (( guard++ < 256 )) && ip rule del lookup "$1" 2>/dev/null; do :; done
+}
+
+# Правила «адрес → таблица» по списку («IP» или «IP|выход» в строке). Рядом —
+# «<список>.wgobf»: клиенты WG + обфускатора (wgobf0), уведённые в тот же
+# туннель. Отдельный файл — синхронизация со списком клиентов AWG его не трогает.
+rt_rules_file() {  # файл таблица
+  local f line ip
+  for f in "$1" "$1.wgobf"; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r line; do
+      ip="${line%%|*}"
+      valid_ip "$ip" && ip rule add from "$ip" lookup "$2" priority "$2"
+    done < "$f"
+  done
+  return 0
 }
 
 # NAT и FORWARD между awg0 и туннелем. Правила помечены «awg2-tun-<dev>».
@@ -138,9 +153,12 @@ rt_fw_up() {  # устройство [nonat]
   # до клиента доходит не всегда — без клампа крупные TCP-сессии виснут.
   ipt_add -t mangle FORWARD -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
   ipt_add -t mangle FORWARD -i "$dev" -o "$AWG_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
+  # Клиенты WG + обфускатора в этом туннеле: NAT и FORWARD для wgobf0 ставит
+  # он сам («всё, что не в wgobf0»), здесь — только MSS на обратном пути
+  ipt_add -t mangle FORWARD -i "$dev" -o "$WGOBF_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu -m comment --comment "$tag"
   # Обратная проверка пути для адреса клиента ведёт в таблицу туннеля, а не
   # на awg0 — строгий rp_filter такие пакеты молча дропает.
-  rp_filter_loose "$dev" "$AWG_IF"
+  rp_filter_loose "$dev" "$AWG_IF" "$WGOBF_IF"
 }
 
 # Снимает правила и этой версии, и прежних (те ставились без метки).
@@ -162,7 +180,7 @@ rt_fw_down() {  # устройство
 # rt_up УСТРОЙСТВО ТАБЛИЦА ФАЙЛ_КЛИЕНТОВ|- [SRC]
 # «-» вместо файла — вся подсеть клиентов (как у tun2socks).
 rt_up() {  # устройство таблица peers|- [src] [nonat]
-  local dev="$1" table="$2" peers="$3" src="${4:-}" net ip line
+  local dev="$1" table="$2" peers="$3" src="${4:-}" net
   net=$(server_net) || return 1
   if [[ -n "$src" ]]; then
     ip route replace default dev "$dev" src "$src" table "$table" || return 1
@@ -172,11 +190,8 @@ rt_up() {  # устройство таблица peers|- [src] [nonat]
   rt_rules_clear "$table"
   if [[ "$peers" == - ]]; then
     ip rule add from "$net" lookup "$table" priority "$table" || return 1
-  elif [[ -f "$peers" ]]; then
-    while IFS= read -r line; do
-      ip="${line%%|*}"
-      valid_ip "$ip" && ip rule add from "$ip" lookup "$table" priority "$table"
-    done < "$peers"
+  else
+    rt_rules_file "$peers" "$table"
   fi
   rt_fw_up "$dev" "${5:-}"
 }
@@ -249,13 +264,9 @@ tunnels_panic_reset() {
 # ── Выбор клиентов для туннеля ────────────────────────────
 # Правила работающего туннеля пересобираются по списку целиком.
 _tunnel_rules_refresh() {  # файл устройство таблица
-  local ip
   ip link show "$2" &>/dev/null || return 0
   rt_rules_clear "$3"
-  while IFS= read -r ip; do
-    valid_ip "${ip%%|*}" && ip rule add from "${ip%%|*}" lookup "$3" priority "$3"
-  done < "$1"
-  return 0
+  rt_rules_file "$1" "$3"
 }
 
 # tunnel_client warp|xray ИМЯ|all|none on|off

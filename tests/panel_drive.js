@@ -976,6 +976,30 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".seg button:has-text('NONE')");
     await page.waitForSelector(".toast >> text=NONE");
   });
+  await step("обфускатор: выход клиентов — напрямую или через WARP", async () => {
+    await nav("/wgobf", "[data-name=wgobf-route]");
+    await page.waitForSelector("text=WARP не настроен — сначала Туннели → WARP.");
+    await expectAlert("WARP не настроен", () => page.click(".seg button:has-text('Через WARP')"));
+    // Профиль WARP есть, но туннель не поднят (работают exit-ноды): выход сохраняется, клиенты пока напрямую
+    const fs = require("fs"), warpConf = `${sandboxRoot}/etc/wireguard/warp0.conf`;
+    fs.writeFileSync(warpConf, "[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n");
+    try {
+      // Сводку обфускатора бот держит в кэше 5 с — профиль WARP появился мимо awg2
+      await page.waitForTimeout(5500);
+      await nav("/wgobf", "#app:not(.reloading) [data-name=wgobf-route]");
+      await page.waitForSelector("text=Через WARP — сайты видят адрес Cloudflare");
+      await page.click(".seg button:has-text('Через WARP')");
+      await page.waitForSelector(".toast >> text=через WARP");
+      await page.waitForSelector("text=WARP выключен — клиенты пока идут напрямую");
+      await nav("/wgobf/client/ob1", "[data-name=wgobf-status]");
+      await page.waitForSelector("[data-name=wgobf-status] >> text=WARP выключен — пока напрямую");
+      await nav("/", "#app:not(.reloading) [data-name=routes] .ptabs");
+      await page.waitForFunction(() => /WARP выключен — пока напрямую/.test(document.querySelector("[data-name=wgobf-routes]").textContent));
+      await nav("/wgobf", "#app:not(.reloading) [data-name=wgobf-route]");
+      await page.click(".seg button:has-text('Напрямую')");
+      await page.waitForSelector(".toast >> text=напрямую");
+    } finally { fs.unlinkSync(warpConf); }
+  });
   await step("обфускатор: клиент и комплект", async () => {
     await nav("/wgobf/add", "input");
     await page.fill("input", "kn1");

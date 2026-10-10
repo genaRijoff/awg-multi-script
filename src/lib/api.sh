@@ -481,7 +481,7 @@ _api_warp() {
   case "$a" in
     status)
       { _kv backend "$be"; _kv up:b "$(_b warp_is_up)"
-        _kv configured:b "$([[ -f "$WARP_CONF" || -s "$USQUE_CONF" ]] && echo 1 || echo 0)"
+        _kv configured:b "$(_b warp_configured)"
         _kv failed:b "$(_b test -f "$WARP_STATE.failed")"
         _kv health:b "$(_b unit_active awg-warp-healthcheck.timer)"
         _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"; } | api_obj
@@ -659,6 +659,9 @@ _api_wgobf() {
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
+          # Выход для всех и новых клиентов и состояние WARP: none | off | up
+          _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
+          _kv warp "$(if warp_is_up; then echo up; elif warp_configured; then echo off; else echo none; fi)"
         fi; } | api_obj
       wgobf_installed && wgobf_status
       return 0 ;;
@@ -674,8 +677,9 @@ _api_wgobf() {
         read -r hs rx tx < <(awk -v k="$pub" '$1 == k {print $5, $6, $7; exit}' <<< "$dump") || true
         [[ "${hs:-}" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
         [[ "${rx:-}" =~ ^[0-9]+$ ]] || rx=0; [[ "${tx:-}" =~ ^[0-9]+$ ]] || tx=0
-        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx"
-      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n ;;
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx" "$(wgobf_route_of "${ip%/32}")"
+      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n route ;;
+    route) wgobf_route_set "${1:-}" "${2:-}" ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -697,7 +701,7 @@ _api_wgobf() {
     clean) wgobf_set_clean "${1:-}" ;;
     rotate-key) wgobf_rotate_key ;;
     remove) wgobf_remove quiet ;;
-    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
+    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|route ИМЯ|all direct|warp|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
   esac
 }
 

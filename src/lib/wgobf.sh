@@ -353,6 +353,91 @@ wgobf_show_bundle() {
   info "Забрать папку: scp -r root@$(wgobf_get ENDPOINT):$dir ."
 }
 
+# ── Выход клиентов через туннель ──────────────────────────
+# Клиента wgobf0 можно увести в туннель так же, как клиента AWG: его адрес —
+# в «<список туннеля>.wgobf», правило «адрес → таблица туннеля» ставит тот же
+# rt_up при каждом подъёме туннеля, после перезагрузки и в хуке usque. NAT и
+# FORWARD для wgobf0 уже есть (MASQUERADE всего, что уходит не в wgobf0).
+WGOBF_ROUTES=(direct warp)
+
+wgobf_route_files() { printf '%s\n' "$WARP_PEERS.wgobf"; }
+
+wgobf_client_ip() {  # ИМЯ → адрес без /32
+  awk -v t="# client=$1" '$0 == t {f = 1; next} f && /^AllowedIPs = / {sub(/\/32$/, "", $3); print $3; exit}' \
+    "$WGOBF_WG_CONF" 2>/dev/null
+}
+
+wgobf_route_of() {  # адрес → direct|warp
+  peers_has "$WARP_PEERS.wgobf" "$1" && { echo warp; return; }
+  echo direct
+}
+
+# Адрес — в список выбранного туннеля (из прочих — прочь), его старые правила — сняты
+_wgobf_route_put() {  # адрес direct|warp
+  local f
+  while IFS= read -r f; do peers_del "$f" "$1"; done < <(wgobf_route_files)
+  [[ "$2" == warp ]] && peers_add "$WARP_PEERS.wgobf" "$1"
+  while ip rule del from "$1" 2>/dev/null; do :; done
+}
+
+# Правила туннелей заново по спискам — только у поднятых
+_wgobf_route_refresh() { _tunnel_rules_refresh "$WARP_PEERS" "$WARP_IF" "$WARP_TABLE"; }
+
+# Прежние адреса — из всех списков и правил (обфускатор удалён или ставится заново)
+_wgobf_routes_clear() {
+  local f line
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    while IFS= read -r line; do
+      valid_ip "${line%%|*}" || continue
+      while ip rule del from "${line%%|*}" 2>/dev/null; do :; done
+    done < "$f"
+    rm -f "$f"
+  done < <(wgobf_route_files)
+}
+
+# Выход клиента (ИМЯ) или всех (all — и новых по умолчанию): direct | warp
+wgobf_route_set() {
+  local who="${1:-}" r="${2:-}" ip name n=0
+  wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
+  [[ -n "$who" && " ${WGOBF_ROUTES[*]} " == *" $r "* ]] || { err "Выход: ${WGOBF_ROUTES[*]// / | }"; return 1; }
+  [[ "$r" != warp ]] || warp_configured || { err "WARP не настроен — Туннели → WARP"; return 1; }
+  if [[ "$who" == all ]]; then
+    while IFS= read -r name; do
+      ip=$(wgobf_client_ip "$name")
+      valid_ip "$ip" && { _wgobf_route_put "$ip" "$r"; n=$((n + 1)); }
+    done < <(wgobf_clients)
+    wgobf_set ROUTE "$r"
+  else
+    wgobf_clients | grep -qxF "$who" || { err "Клиента $who нет"; return 1; }
+    ip=$(wgobf_client_ip "$who")
+    valid_ip "$ip" || { err "У клиента $who нет адреса"; return 1; }
+    _wgobf_route_put "$ip" "$r"; n=1
+  fi
+  _wgobf_route_refresh
+  log_info "wgobf: выход $who → $r"
+  if [[ "$r" == direct ]]; then ok "Клиенты обфускатора напрямую: $n"
+  elif warp_is_up; then ok "Клиенты обфускатора через WARP: $n"
+  else ok "Клиенты обфускатора через WARP: $n"; warn "WARP сейчас выключен — пока напрямую, уйдут в WARP, когда он включится"; fi
+}
+
+wgobf_route_menu() {
+  local c cur
+  cur=$(wgobf_get ROUTE); [[ -n "$cur" ]] || cur=direct
+  echo ""
+  hdr "Выход клиентов обфускатора"
+  echo -e "  Сейчас: ${W}$([[ "$cur" == warp ]] && echo WARP || echo напрямую)${N} ${D}(и для новых клиентов)${N}"
+  warp_configured || echo -e "  ${D}WARP не настроен — Туннели → WARP${N}"
+  echo -e "  ${C}1)${N} Напрямую"
+  echo -e "  ${C}2)${N} Через WARP"
+  echo -e "  ${W}0)${N} ← Назад"
+  read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+  case "$c" in
+    1) wgobf_route_set all direct ;;
+    2) wgobf_route_set all warp ;;
+  esac
+}
+
 # ── Клиенты ───────────────────────────────────────────────
 wgobf_add_client() {
   local name="$1" base i ip="" priv pub psk bak
@@ -376,11 +461,20 @@ wgobf_add_client() {
   wgobf_write_bundle "$name" "$priv" "$ip/32" "$psk" || return 1
   ok "Клиент $name: $ip"
   log_info "wgobf: добавлен клиент $name ($ip)"
+  # Выход для новых — как у всех (WARP не настроен — напрямую)
+  if [[ "$(wgobf_get ROUTE)" == warp ]] && warp_configured; then
+    _wgobf_route_put "$ip" warp; _wgobf_route_refresh
+    info "Выход: WARP"
+  else
+    _wgobf_route_put "$ip" direct
+  fi
+  return 0
 }
 
 wgobf_delete_client() {
-  local name="$1" bak
+  local name="$1" bak ip
   wgobf_clients | grep -qxF "$name" || { err "Клиента $name нет"; return 1; }
+  ip=$(wgobf_client_ip "$name")
   mktmp bak || return 1
   cp -a "$WGOBF_WG_CONF" "$bak"
   awk -v target="# client=$name" '
@@ -395,6 +489,9 @@ wgobf_delete_client() {
     return 1
   fi
   rm -rf "${WGOBF_CLIENTS:?}/$name"
+  # Его адрес — из списков туннелей и правил: новый клиент на том же адресе
+  # иначе унаследовал бы чужой выход
+  valid_ip "$ip" && _wgobf_route_put "$ip" direct
   ok "Клиент $name удалён"
   log_info "wgobf: удалён клиент $name"
 }
@@ -520,6 +617,8 @@ wgobf_install_opts() {
   net=$(taken_networks | py pick-net) || { err "Нет свободной /24"; return 1; }
   priv=$(wg genkey)
   rm -f "$WGOBF_STATE"
+  # Новая установка: выходы прежних клиентов (адреса в новой подсети совпадут) — прочь
+  _wgobf_routes_clear
   wgobf_set PORT "$port"; wgobf_set WG_PORT "$wg_port"; wgobf_set KEY "$(py rand-key 32)"
   wgobf_set MASKING "$mask"; wgobf_set ALLOW_CLEAN "$clean"; wgobf_set NET "$net"
   wgobf_set MTU "$WGOBF_MTU"; wgobf_set DNS "$dns"; wgobf_set ENDPOINT "$ep"
@@ -575,6 +674,7 @@ wgobf_remove() {
   [[ -d "$WGOBF_CLIENTS" ]] && items+=("$WGOBF_CLIENTS")
   tar -czf "$arch" "${items[@]}" 2>/dev/null && chmod 600 "$arch" && info "Архив на всякий случай: $arch"
   _wgobf_teardown drop
+  _wgobf_routes_clear
   ok "WG + обфускатор удалён"
   log_info "wgobf: удалён"
 }
@@ -690,9 +790,10 @@ do_wgobf_menu() {
     echo -e "  ${C}5)${N} Статус и журнал"
     echo -e "  ${C}6)${N} Перезапустить"
     echo -e "  ${C}7)${N} Настройки"
-    echo -e "  ${R}8)${N} Удалить WG + обфускатор"
+    echo -e "  ${C}8)${N} Выход клиентов ${D}— $([[ "$(wgobf_get ROUTE)" == warp ]] && echo "через WARP" || echo напрямую)${N}"
+    echo -e "  ${R}9)${N} Удалить WG + обфускатор"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-8]: ${N}" 0 8 0
+    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
     case "$c" in
       1) read_line name "${C}  Имя клиента: ${N}"
          name="${name// /}"
@@ -704,7 +805,8 @@ do_wgobf_menu() {
       5) wgobf_status; journalctl -u "$WGOBF_UNIT" -n 12 --no-pager 2>/dev/null | sed 's/^/  /' || true ;;
       6) wgobf_restart && ok "Перезапущено" || true ;;
       7) wgobf_settings || true ;;
-      8) wgobf_remove || true ;;
+      8) wgobf_route_menu || true ;;
+      9) wgobf_remove || true ;;
       0) return 0 ;;
     esac
     pause
