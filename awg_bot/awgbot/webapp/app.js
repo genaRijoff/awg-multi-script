@@ -509,10 +509,12 @@ function lookPanel() {
         h("div", { class: "eyebrow tsep" }, "фон"),
         slider("bgHue", "Оттенок фона", 0, 360, LOOK.bgHue != null ? LOOK.bgHue : 220, "°", "hue"),
         slider("tint", "Тонировка", 0, 40, LOOK.tint, "%"),
-        WEB ? h("div", {}, h("div", { class: "eyebrow tsep" }, "значок вкладки браузера"), h("div", { class: "even2", "data-name": "tab-icon" },
+        // Заголовок раздела — прямо в сетке, как у «фон» и «форма»: его отрицательный
+        // нижний отступ рассчитан на зазор сетки, внутри обёртки кнопки наезжали на него
+        WEB ? [h("div", { class: "eyebrow tsep" }, "значок вкладки браузера"), h("div", {}, h("div", { class: "even2", "data-name": "tab-icon" },
           [["logo", "Знак Тулзы"], ["flag", "Флаг страны"]].map(([k, t]) =>
             h("button", { class: "chip" + (LOOK.tab === k ? " on" : ""), onclick: () => { LOOK.tab = k; applyLook(true); favRefresh(); draw(); } }, t))),
-        h("div", { class: "muted small", style: "margin-top:6px" }, "много вкладок с разными серверами — флаг страны и точка состояния awg0")) : null,
+        h("div", { class: "muted small", style: "margin-top:6px" }, "много вкладок с разными серверами — флаг страны и точка состояния awg0"))] : null,
         h("div", { class: "eyebrow tsep" }, "форма и размер"),
         slider("rb", "Скругление углов", 0, 24, LOOK.rb, " px"),
         slider("zoom", "Масштаб", ZOOM_MIN, ZOOM_MAX, LOOK.zoom, "%"),

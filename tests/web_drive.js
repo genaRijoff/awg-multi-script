@@ -78,6 +78,14 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
           /viewBox="0 0 30 20"/.test(decodeURIComponent(document.getElementById("favicon").getAttribute("href") || "")) === on, on);
         if (await isFlag()) throw new Error("по умолчанию во вкладке флаг, а не знак");
         await page.click(".top button[aria-label='Тема']");
+        // Заголовки разделов темы не перекрыты тем, что под ними (кнопки значка вкладки наезжали на свой)
+        await page.waitForSelector("[data-name=tab-icon]");
+        const overlap = await page.evaluate(() => [...document.querySelectorAll(".tsep")].filter((e) => e.offsetParent)
+          .map((e) => { const n = e.nextElementSibling; const a = e.getBoundingClientRect(), b = n ? n.getBoundingClientRect() : null;
+            return { t: e.textContent, gap: b ? Math.round(b.top - a.bottom) : 99 }; }).filter((x) => x.gap < 4));
+        if (overlap.length) throw new Error("заголовок раздела темы перекрыт: " + JSON.stringify(overlap));
+        await page.evaluate(() => document.querySelector("[data-name=tab-icon]").scrollIntoView({ block: "center" }));
+        await page.screenshot({ path: `${out}/${name}-тема-значок.png` });
         await page.click("[data-name=tab-icon] button:has-text('Флаг страны')");
         await waitFlag(true);
         await page.keyboard.press("Escape");
