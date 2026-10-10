@@ -1786,12 +1786,24 @@ const evRow = (e) => h("div", { class: "ev", style: e.name && !/\s/.test(e.name)
 h("time", {}, e.day === todayIso() ? e.time : e.date), h("span", { class: "ic", style: `color:${e.col};background:color-mix(in srgb, ${e.col} 14%, transparent)` }, icon(e.ic)),
 h("div", { class: "t" }, e.t, e.x ? h("span", { class: "x" }, e.x) : null));
 
+// «Нужна перезагрузка» можно убрать крестиком — на этом устройстве и до нового
+// повода: текст другой (новое ядро — другой номер), и замечание вернётся.
+// Серьёзное (awg0 лежит, ядро без модуля) не убирается
+const hiddenAlerts = () => { try { return JSON.parse(pref("hidden-alerts", "[]")) || []; } catch (_) { return []; } };
+const alertHidden = (t) => hiddenAlerts().indexOf(t) >= 0;
+const hideAlert = (t) => setPref("hidden-alerts", JSON.stringify(hiddenAlerts().filter((x) => x !== t).concat([t]).slice(-10)));
+// Карточка замечаний: [текст, куда ведёт, можно убрать]
+const alertCard = (alerts) => (alerts.length ? h("div", { class: "card warn", "data-name": "alerts" }, alerts.map(([a, path, can]) =>
+  h("div", { class: "row", style: "cursor:pointer;padding:3px 0", onclick: () => go(path) }, icon("triangle-alert"), h("span", { class: "grow" }, a),
+    can ? h("button", { class: "ibtn sm", "aria-label": "Убрать", title: "Убрать — до следующего раза",
+      onclick: (ev) => { ev.stopPropagation(); hideAlert(a); render(); } }, icon("x")) : null))) : null);
+
 // Предупреждения сервера — те же, что были на главной
 function homeAlerts(d) {
   const s = d.server || {}, c = d.components || {};
   return [
     s.exists && !s.up ? ["awg0 не поднят — Сервер → Починить", "/server"] : null,
-    c.installed && c.reboot ? [c.reboot, "/server/module"] : null,
+    c.installed && c.reboot && !alertHidden(c.reboot) ? [c.reboot, "/server/module", !/не (собран|загружен)/.test(c.reboot)] : null,
     c.kernel_gap ? [`Ядро ${c.kernel_gap} без модуля AWG — пересобрать до перезагрузки`, "/server/module"] : null,
     d.update ? [`Доступна ${d.update} — обновить`, "/update"] : null,
   ].filter(Boolean);
@@ -1899,8 +1911,7 @@ route(/^\/$/, async (ctx) => {
     return ctx.put(head(eyebrow, "Сервер не создан", comp.installed ? "Компоненты стоят — осталось создать сервер: те же вопросы, что в меню awg2"
       : "Сначала компоненты AmneziaWG, затем сервер", [btn("✨ Создать сервер", () => go("/server/create"), "btn-primary"),
       btn("🖥 Сервер", () => go("/server"))]),
-    alerts.length ? h("div", { class: "card warn" }, alerts.map(([a, path]) => h("div", { class: "row", style: "cursor:pointer;padding:3px 0",
-      onclick: () => go(path) }, icon("triangle-alert"), a))) : null,
+    alertCard(alerts),
     h("div", { class: "kpis" }, kpiTxt("система", d.os || "—", null, h("span", {}, d.kernel || "")),
       kpi("компоненты", comp.installed ? "есть" : "нет", null, h("span", {}, comp.module ? "модуль " + comp.module : "модуль не собран")),
       kpiTxt("адрес", d.ip || "—", null, h("span", {}, d.host || "")),
@@ -1985,8 +1996,7 @@ route(/^\/$/, async (ctx) => {
   ctx.put(
     head(eyebrow, !s.up ? "awg0 не поднят" : alerts.length ? "Нужно внимание" : "Всё работает", sub, [
       btn("🩺 Проверить", () => go("/diag")), btn("➕ Новый клиент", () => go("/add"), "btn-primary")]),
-    alerts.length ? h("div", { class: "card warn" }, alerts.map(([a, path]) => h("div", { class: "row", style: "cursor:pointer;padding:3px 0",
-      onclick: () => go(path) }, icon("triangle-alert"), a))) : null,
+    alertCard(alerts),
     clErr ? clFail() : null,
     h("div", { class: "kpis" },
       kpi("в сети", kOnline, `/ ${rows.length}`, h("span", {}, tun ? `${tun} через ${via}` : "все напрямую"), () => go("/clients")),
@@ -2614,11 +2624,9 @@ route(/^\/server$/, async (ctx) => {
   // Подсказка о переходе на 3.1 — не предупреждение: сервер на 2.0 — обычный выбор,
   // а переход — в «Протоколе»; в карточке — только то, что правда требует внимания
   const d = r.data || {};
-  const warnings = [d.reboot].filter(Boolean);
   const state = !d.exists ? "" : d.up ? "on" : "bad";
   ctx.put(title("Сервер"),
-    warnings.length ? h("div", { class: "card warn small" }, warnings.map((w) => h("div", { class: "row", style: "padding:2px 0" },
-      icon("triangle-alert"), w))) : null,
+    d.reboot && !alertHidden(d.reboot) ? alertCard([[d.reboot, "/server/module", !/не (собран|загружен)/.test(d.reboot)]]) : null,
     d.exists ? ecard({ state, name: "awg0", attrs: { "data-name": "awg0" },
       right: pill(d.up ? "поднят" : "не поднят", d.up ? "ok" : "bad"),
       meta: [tag("AWG " + (d.proto || "?"), "accent"), tag(d.profile_label || PROFILES[d.profile] || d.profile || ""),

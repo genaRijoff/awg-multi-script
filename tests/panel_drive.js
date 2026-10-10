@@ -976,6 +976,28 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".seg button:has-text('NONE')");
     await page.waitForSelector(".toast >> text=NONE");
   });
+  await step("обзор: «нужна перезагрузка» — коротко, убирается крестиком до нового ядра", async () => {
+    const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ";
+    fs.writeFileSync(f, "новое ядро 6.8.0-146 — нужна перезагрузка\n");
+    try {
+      // Сводку бот держит в кэше 5 с — повод появился мимо awg2
+      await page.waitForTimeout(5500);
+      await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146 — нужна перезагрузка");
+      await shot("04-reboot-alert");
+      await nav("/server", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146");
+      await page.click("[data-name=alerts] .row:has-text('новое ядро') button[aria-label=Убрать]");
+      await page.waitForSelector("text=новое ядро 6.8.0-146", { state: "detached" });
+      await nav("/", R + "[data-name=routes]");
+      if (await page.$("text=новое ядро 6.8.0-146")) throw new Error("на обзоре убранное замечание вернулось");
+      // Ещё более новое ядро — другой текст: замечание снова на месте
+      fs.writeFileSync(f, "новое ядро 6.8.0-150 — нужна перезагрузка\n");
+      await page.waitForTimeout(5500);
+      await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-150 — нужна перезагрузка");
+    } finally {
+      fs.unlinkSync(f);
+      await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts"));
+    }
+  });
   await step("обфускатор: выход клиентов — напрямую или через туннель, всем и своему", async () => {
     const R = "#app:not(.reloading) ";
     await nav("/wgobf", "[data-name=wgobf-route]");

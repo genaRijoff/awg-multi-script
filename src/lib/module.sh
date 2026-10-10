@@ -114,12 +114,14 @@ reboot_reason() {
     return 0
   fi
   newest=$(installed_kernels | tail -1)
+  # Коротко и с номером ядра без «-generic»: панель прячет замечание до
+  # следующего нового ядра — по этому тексту
   if [[ -n "$newest" && "$newest" != "$running" ]]; then
-    echo "работает ядро $running, установлено более новое $newest"
+    echo "новое ядро ${newest%%-[a-z]*} — нужна перезагрузка"
   elif mod_stale; then
     echo "в памяти прежняя сборка модуля — нужна перезагрузка модуля"
   elif [[ -f /run/reboot-required ]]; then
-    echo "система просит перезагрузку после обновления пакетов"
+    echo "обновлены пакеты — нужна перезагрузка"
   fi
 }
 

@@ -24,6 +24,11 @@ from sandbox import *  # noqa: E402,F401,F403
 
 TOKEN = "123456:" + "A" * 35
 API = api_wrapper()
+# Повод перезагрузиться — из файла reboot.txt в песочнице: тест панели кладёт и убирает
+with open(API) as f:
+    _w = f.read()
+with open(API, "w") as f:
+    f.write(_w.replace('api_main "$@"', f'[[ -f "{ROOT}/reboot.txt" ]] && reboot_reason() {{ cat "{ROOT}/reboot.txt"; }}\napi_main "$@"'))
 fake_acme()
 
 # Канал обновлений «отвечает»: в нём v9.9.9 (проверка — первые 4 КБ файла)
