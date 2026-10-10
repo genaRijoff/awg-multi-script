@@ -158,6 +158,7 @@ WGOBF_WG_CONF="/etc/wireguard/${WGOBF_IF}.conf"
 WGOBF_LIB="/usr/local/lib/awg2"
 WGOBF_BIN="$WGOBF_LIB/wg-obfuscator"
 WGOBF_FW="$WGOBF_LIB/wgobf-fw.sh"
+WGOBF_AA_DIR="/etc/apparmor.d"   # профиль wg-quick (Ubuntu 25.10+) и его local-дополнение
 WGOBF_UNIT="awg-wgobf.service"
 WGOBF_CLIENTS="/root/wgobf"
 WGOBF_TAG="awg-wgobf"

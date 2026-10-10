@@ -123,7 +123,7 @@ for v in DNS_PERSIST_SCRIPT DNS_HEALTH_SCRIPT CASCADE_SCRIPT T2S_ROUTING_SCRIPT 
 done
 CASCADE_DIR="{ROOT}/etc/awg-cascade"; CASCADE_RULES="$CASCADE_DIR/rules.conf"; CASCADE_LOG="{ROOT}/cascade.log"
 WGOBF_DIR="{ROOT}/etc/awg-wgobf"; WGOBF_STATE="$WGOBF_DIR/state"
-WGOBF_WG_CONF="{ROOT}/etc/wireguard/wgobf0.conf"; WGOBF_CLIENTS="{ROOT}/root/wgobf"
+WGOBF_WG_CONF="{ROOT}/etc/wireguard/wgobf0.conf"; WGOBF_CLIENTS="{ROOT}/root/wgobf"; WGOBF_AA_DIR="{ROOT}/etc/apparmor.d"
 CERT_DIR="{ROOT}/etc/awg2/cert"; CERT_FULL="$CERT_DIR/fullchain.pem"; CERT_KEY="$CERT_DIR/key.pem"
 CERT_STATE="{ROOT}/var/lib/awg2/cert"; ACME_DIR="{ROOT}/acme.sh"; ACME_HOME="{ROOT}/var/lib/awg2/acme"
 CERT_FIND_ROOT="{ROOT}"

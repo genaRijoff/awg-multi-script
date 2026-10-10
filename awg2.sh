@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.32"
+VERSION="v1.2.33"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -514,6 +514,7 @@ WGOBF_WG_CONF="/etc/wireguard/${WGOBF_IF}.conf"
 WGOBF_LIB="/usr/local/lib/awg2"
 WGOBF_BIN="$WGOBF_LIB/wg-obfuscator"
 WGOBF_FW="$WGOBF_LIB/wgobf-fw.sh"
+WGOBF_AA_DIR="/etc/apparmor.d"   # профиль wg-quick (Ubuntu 25.10+) и его local-дополнение
 WGOBF_UNIT="awg-wgobf.service"
 WGOBF_CLIENTS="/root/wgobf"
 WGOBF_TAG="awg-wgobf"
@@ -7119,10 +7120,41 @@ wgobf_fw_run() {
   iptables -I INPUT 1 -p udp --dport "$wg_port" ! -i lo -j DROP -m comment --comment "$WGOBF_TAG" || return 1
 }
 
+# Ubuntu 25.10+ держит wg-quick в профиле AppArmor: хуки PostUp/PostDown
+# запускают только его список (ip, iptables, sysctl…), скрипт правил wgobf0 —
+# «Permission denied», и wgobf0 не поднимается. Разрешение — штатным путём, в
+# дополнении профиля local/wg-quick, своим блоком (чужие строки не трогаем);
+# профиль перечитывается, только если блок изменился. drop — убрать блок.
+WGOBF_AA_BEGIN="# awg2-wgobf: begin — правила wgobf0 (AWG Toolza)"
+WGOBF_AA_END="# awg2-wgobf: end"
+_wgobf_apparmor() {  # [drop]
+  local prof="$WGOBF_AA_DIR/wg-quick" loc="$WGOBF_AA_DIR/local/wg-quick" tmp
+  [[ -f "$prof" ]] || return 0
+  if [[ "${1:-}" == drop ]]; then
+    [[ -f "$loc" ]] || return 0
+  elif ! grep -q 'local/wg-quick' "$prof"; then
+    warn "Профиль AppArmor $prof без local/wg-quick — правила $WGOBF_IF могут не запуститься"
+    return 0
+  fi
+  mktmp tmp || return 1
+  awk -v b="$WGOBF_AA_BEGIN" -v e="$WGOBF_AA_END" '$0 == b {s = 1; next} $0 == e {s = 0; next} !s' \
+    "$loc" > "$tmp" 2>/dev/null || true
+  [[ "${1:-}" == drop ]] || printf '%s\nfile PUx %s,\n%s\n' "$WGOBF_AA_BEGIN" "$WGOBF_FW" "$WGOBF_AA_END" >> "$tmp"
+  cmp -s "$tmp" "$loc" && return 0
+  install -D -m 644 "$tmp" "$loc" || return 1
+  if ! apparmor_parser -r "$prof" &>/dev/null; then
+    warn "AppArmor: профиль wg-quick не перечитался — правила $WGOBF_IF могут не запуститься"
+    return 0
+  fi
+  [[ "${1:-}" == drop ]] || info "AppArmor: хукам $WGOBF_IF разрешён скрипт правил ($loc)"
+  return 0
+}
+
 _wgobf_write_service_files() {
   local clean
   emit_script "$WGOBF_FW" 'wgobf_fw_run "$@"' WGOBF_STATE WGOBF_TAG WGOBF_IF \
     ipt_del_grep ipt_del_tagged wgobf_get wgobf_fw_run || return 1
+  _wgobf_apparmor || true
   clean=$(wgobf_get ALLOW_CLEAN)
   # masking = AUTO: сервер понимает и STUN, и голый XOR — режим выбирает клиент
   write_file "$WGOBF_OBF_CONF" 600 <<EOF
@@ -7839,6 +7871,7 @@ _wgobf_teardown() {  # keep|drop — клиентские комплекты
   [[ -n "$port" ]] && ufw_delete_matching "$WGOBF_TAG"
   remove_unit "$WGOBF_UNIT"
   rm -f "$WGOBF_WG_CONF" "$WGOBF_BIN" "$WGOBF_FW"
+  _wgobf_apparmor drop || true
   rmdir "$WGOBF_LIB" 2>/dev/null || true
   rm -rf "$WGOBF_DIR"
   [[ "${1:-keep}" == drop ]] && rm -rf "$WGOBF_CLIENTS"
@@ -16052,5 +16085,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=74b377adc32f41d0
+_BUILD_SUM=c3252e69c5646321
 main "$@"

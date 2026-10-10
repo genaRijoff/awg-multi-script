@@ -2287,6 +2287,39 @@ with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf"), "w") as f:
     f.write("[Interface]\nPrivateKey = X\n\n[Peer]\n# client=wa\nPublicKey = WAPUB=\nAllowedIPs = 10.66.66.2/32\n\n"
             "[Peer]\n# client=wb\nPublicKey = WBPUB=\nAllowedIPs = 10.66.66.3/32\n")
 
+print("\n── WG + обфускатор: AppArmor wg-quick (Ubuntu 25.10+) ──")
+with open(os.path.join(BIN, "apparmor_parser"), "w") as f:
+    f.write('#!/usr/bin/env bash\necho "apparmor_parser $*" >> "$CALLS"\nexit 0\n')
+os.chmod(os.path.join(BIN, "apparmor_parser"), 0o755)
+AA = os.path.join(ROOT, "etc/apparmor.d")
+AAL = os.path.join(AA, "local/wg-quick")
+reset_calls()
+rc, out, _ = bash('WGOBF_FW=/usr/local/lib/awg2/wgobf-fw.sh; _wgobf_apparmor; [[ -e "$WGOBF_AA_DIR/local/wg-quick" ]] && echo MADE || echo NONE')
+chk("профиля wg-quick нет — AppArmor не трогаем", out.strip().endswith("NONE") and "apparmor_parser" not in calls(), [out, calls()])
+os.makedirs(os.path.join(AA, "local"), exist_ok=True)
+with open(os.path.join(AA, "wg-quick"), "w") as f:
+    f.write("profile wg-quick /usr/bin/wg-quick {\n  include if exists <local/wg-quick>\n}\n")
+with open(AAL, "w") as f:
+    f.write("# своё\nfile r /etc/my-hook.conf,\n")
+reset_calls()
+rc, out, _ = bash('WGOBF_FW=/usr/local/lib/awg2/wgobf-fw.sh; _wgobf_apparmor; _wgobf_apparmor')
+loc = open(AAL).read()
+chk("профиль wg-quick есть — скрипт правил wgobf0 разрешён в local/wg-quick, своё на месте, профиль перечитан один раз",
+    "file PUx /usr/local/lib/awg2/wgobf-fw.sh," in loc and loc.startswith("# своё\nfile r /etc/my-hook.conf,\n")
+    and loc.count("awg2-wgobf: begin") == 1 and calls().count("apparmor_parser -r") == 1
+    and os.path.join(AA, "wg-quick") in calls(), [loc, calls()])
+reset_calls()
+rc, out, _ = bash('_wgobf_apparmor drop')
+loc = open(AAL).read()
+chk("удаление обфускатора — свой блок убран, чужие строки остались, профиль перечитан",
+    loc == "# своё\nfile r /etc/my-hook.conf,\n" and calls().count("apparmor_parser -r") == 1, [loc, calls()])
+with open(os.path.join(AA, "wg-quick"), "w") as f:
+    f.write("profile wg-quick /usr/bin/wg-quick {\n}\n")
+os.remove(AAL)
+rc, out, err = bash('_wgobf_apparmor')
+chk("профиль без local/wg-quick — предупреждение, файл не создаём", not os.path.exists(AAL) and "local/wg-quick" in out + err, [out, err])
+os.remove(os.path.join(AA, "wg-quick"))
+
 print("\n── WG + обфускатор: свой маршрут клиента — Xray и exit-ноды ──")
 XCONF = os.path.join(ROOT, "etc/xray/config.json")
 xconf_was = open(XCONF).read() if os.path.exists(XCONF) else None
