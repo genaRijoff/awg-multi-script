@@ -2373,15 +2373,15 @@ SRVPRE = (f'SERVER_CONF="{SRV}/awg0.conf"; CLIENT_DIR="{SRV}/cl"; TRAFFIC_DB="{S
           'auto_backup() { :; }; tunnels_panic_reset() { :; }; ')
 bash(WACC + SRVPRE + 'web_access_set vpn >/dev/null')
 rc, out, err = bash(WACC + SRVPRE + 'server_reset; web_conf_get WEB_ACCESS; web_conf_get WEB_ALLOW')
-chk("сервер сброшен, других VPN нет, доступ «только через VPN» — теперь по сохранённым адресам, с предупреждением",
-    out.split()[-2:] == ["ip", "198.51.100.0/24"] and "только с адресов: 198.51.100.0/24" in out
-    and open(WNETS).read().split() == ["198.51.100.0/24"] and ipset_set("awg2-web") == ["198.51.100.0/24"]
-    and len(webacl()) == 1, [out, err, open(WNETS).read()])
-rc, out, err = bash(WACC + SRVPRE + 'web_conf_set WEB_ACCESS vpn; sed -i "/^WEB_ALLOW=/d" "$WEB_CONF"; web_vpn_changed; '
-                    'web_conf_get WEB_ACCESS; web_conf_set WEB_ALLOW 198.51.100.0/24')
-chk("VPN не осталось и списка адресов нет — «для всех» с предупреждением, правило и список сняты",
-    out.split()[-1:] == ["all"] and "для всех" in out and not webacl() and not os.path.exists(WNETS), [out, err])
-bash(WACC + 'web_conf_set WEB_ACCESS all')
+chk("сервер сброшен, других VPN нет, доступ «только через VPN» — режим тот же, снаружи закрыта, с предупреждением",
+    out.split()[-2:] == ["vpn", "198.51.100.0/24"] and "снаружи она закрыта" in out
+    and open(WNETS).read().split() == [] and ipset_set("awg2-web") == [] and len(webacl()) == 1,
+    [out, err, open(WNETS).read()])
+rc, out, err = bash(WACC + 'web_vpn_changed; web_conf_get WEB_ACCESS')
+chk("VPN снова есть (новый сервер) — «только через VPN» открывается через него сам, без предупреждения",
+    out.split()[-1:] == ["vpn"] and "закрыта" not in out and open(WNETS).read().split() == VPN
+    and sorted(ipset_set("awg2-web") or []) == sorted(VPN) and len(webacl()) == 1, [out, err, open(WNETS).read()])
+bash(WACC + 'web_conf_set WEB_ACCESS all; web_fw_run apply')
 
 print("\n── WG + обфускатор: клиенты с трафиком ──")
 os.makedirs(os.path.join(ROOT, "etc/awg-wgobf"), exist_ok=True)

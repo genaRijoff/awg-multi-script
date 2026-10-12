@@ -236,19 +236,13 @@ def client_ip(raw: str | None) -> ipaddress.IPv4Address | ipaddress.IPv6Address 
     return a.ipv4_mapped if a.version == 6 and a.ipv4_mapped else a
 
 
-def local_ip(request: web.Request) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    """Адрес сервера, на который пришло подключение."""
-    sock = request.transport.get_extra_info("sockname") if request.transport else None
-    return client_ip(sock[0]) if isinstance(sock, (tuple, list)) and sock else None
-
-
 def from_self(request: web.Request) -> bool:
-    """Подключение с самого сервера: 127.0.0.1 или с его адреса на него же — так
-    приходят через прокси на этом же сервере (VLESS и т.п.: панель открывает
-    сам прокси). Снаружи такой источник не подделать: ядро отбрасывает пакеты
-    с адресом сервера в источнике, пришедшие не через lo."""
+    """С самого сервера по 127.0.0.1 / ::1 (SSH-туннель) — при любом доступе.
+    С внешнего адреса сервера на него же — нет: так приходят пользователи прокси
+    на этом сервере (3x-ui и т. п.), и «по адресам» и «только через VPN» они бы
+    обходили. Пускать их — адрес сервера в списке «по адресам»."""
     a = client_ip(request.remote)
-    return a is not None and (a.is_loopback or a == local_ip(request))
+    return a is not None and a.is_loopback
 
 
 class Access:
@@ -290,10 +284,9 @@ class Access:
                 pass
         self.key, self.mode, self.nets = (ck, nk), mode if mode in ("ip", "vpn") else "all", nets
 
-    def allowed(self, raw: str | None, local: bool = False) -> bool:
-        """local — подключение с самого сервера (from_self): пускаем всегда."""
+    def allowed(self, raw: str | None) -> bool:
         self.refresh()
-        if self.mode == "all" or local:
+        if self.mode == "all":
             return True
         a = client_ip(raw)
         if a is None:
@@ -413,7 +406,7 @@ class WebPanel:
     @web.middleware
     async def guard_mw(self, request: web.Request, handler):  # type: ignore[no-untyped-def]
         # Адрес не из разрешённых — как незнакомый путь: 404, страница входа не видна
-        if not self.access.allowed(request.remote, from_self(request)):
+        if not self.access.allowed(request.remote):
             now = time.monotonic()
             if now - self.deny_logged >= 10:
                 self.deny_logged = now

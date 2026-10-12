@@ -247,7 +247,7 @@ async def go(remote, local="203.0.113.50"):
     except aw.HTTPException as e:
         return e.status
 out["mw"] = [asyncio.run(go("203.0.113.1")), asyncio.run(go("10.8.0.5")), asyncio.run(go("203.0.113.50")),
-             asyncio.run(go("::ffff:203.0.113.50")), asyncio.run(go("2001:db8::7", "2001:db8::7"))]
+             asyncio.run(go("::ffff:203.0.113.50")), asyncio.run(go("2001:db9::7", "2001:db9::7"))]
 print(json.dumps(out))
 """
     ud = os.path.join(ROOT, "..", "acc-unit")
@@ -268,8 +268,8 @@ print(json.dumps(out))
     chk("панель сама: «для всех» — все; «через VPN» — только свой VPN", u.get("all") is True
         and u.get("vpn") == [True, False], u)
     chk("панель сама: чужой адрес — 404 до входа и API, свой — дальше", u.get("mw", [])[:2] == [404, 200], u)
-    chk("панель сама: с адреса сервера на него же (через прокси на этом же сервере) — пускает",
-        u.get("mw", [])[2:] == [200, 200, 200], u)
+    chk("панель сама: с адреса сервера на него же (прокси на сервере, 3x-ui и т. п.) — как чужой адрес, 404",
+        u.get("mw", [])[2:] == [404, 404, 404], u)
     # Возврат правила: любой сбой одного круга (здесь — не-UTF-8 в stderr apply) не останавливает задачу
     fw = os.path.join(ud, "fw.sh")
     open(fw, "w").write("#!/bin/bash\necho \"$1\" >> \"$(dirname \"$0\")/fw.calls\"\n"
