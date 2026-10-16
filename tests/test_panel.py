@@ -69,10 +69,10 @@ for profile in ("lite", "pro", "none"):
         chk("стенд панели поднялся", err == "-", err)
         try:
             run = subprocess.run([node, os.path.join(HERE, "panel_drive.js"), port, init, out, THEMES[profile], profile, root],
-                                 env=env, capture_output=True, text=True, timeout=400)
+                                 env=env, capture_output=True, text=True, timeout=900)
             output = run.stdout + run.stderr
         except subprocess.TimeoutExpired:
-            output = "сценарий не уложился в 400 с"
+            output = "сценарий не уложился в 900 с"
         log = os.path.join(out, "run.log")
         lines = open(log).read().splitlines() if os.path.exists(log) else []
         chk("сценарий браузера отработал", bool(lines), output[-800:])

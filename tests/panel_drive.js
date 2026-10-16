@@ -1358,6 +1358,62 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     });
   }
 
+  // ── Все экраны: низ содержимого не под нижней панелью и плашкой действий, страница не шире экрана ──
+  if (profile === "lite") {
+    await step("все экраны: ничего не уходит под нижнюю панель и плашку действий, нет прокрутки вбок", async () => {
+      const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
+        + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /clients "
+        + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/antiscan /server/create /server/endpoint /server/module "
+        + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
+        + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
+        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");
+      const bad = [];
+      for (const [skin, w, hgt] of [["toolza", 390, 844], ["cards", 390, 844], ["toolza", 320, 640]]) {
+        const c = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: hgt } });
+        await c.route(/telegram\.org/, (r) => r.abort());
+        await c.addInitScript(({ initData, theme, skin }) => {
+          const noop = () => {};
+          window.Telegram = { WebApp: { initData, colorScheme: theme, ready: noop, expand: noop, onEvent: noop, close: noop,
+            BackButton: { show: noop, hide: noop, onClick: noop }, HapticFeedback: { notificationOccurred: noop },
+            showConfirm: (t, cb) => cb(false), showAlert: noop } };
+          try { localStorage.setItem("awg-look", JSON.stringify({ skin })); } catch (_) { /* без localStorage — как есть */ }
+        }, { initData, theme, skin });
+        const p = await c.newPage();
+        p.on("pageerror", (e) => bad.push(`${skin} ${w} ${p.url().split("#")[1]}: ${e}`));
+        for (const r of routes) {
+          await p.goto(base + "#" + r, { waitUntil: "domcontentloaded" });
+          await p.waitForFunction(() => { const a = document.getElementById("app"); return a && a.childElementCount && !a.querySelector(":scope > .spin"); },
+            null, { timeout: 15000 }).catch(() => {});
+          await p.waitForTimeout(700);
+          await p.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+          await p.waitForTimeout(300);
+          const m = await p.evaluate(() => {
+            const vis = (el) => { const cs = getComputedStyle(el); return cs.display !== "none" && cs.visibility !== "hidden"; };
+            const pinned = (el) => { for (let x = el; x && x !== document.body; x = x.parentElement) {
+              const pos = getComputedStyle(x).position; if (pos === "fixed" || pos === "sticky") return true; } return false; };
+            let bottom = 0, who = "";
+            document.querySelectorAll("#app *").forEach((el) => {
+              if (!vis(el) || pinned(el) || el instanceof SVGElement && el.tagName !== "svg") return;
+              if (el.closest("details:not([open]) > :not(summary)")) return;   // свёрнутое — не на экране
+              const b = el.getBoundingClientRect();
+              if (b.width > 0 && b.height > 0 && b.bottom > bottom) { bottom = b.bottom; who = el.tagName.toLowerCase() + "." + String(el.className).split(" ")[0]; }
+            });
+            // Нижняя панель разделов и плашка «Сбросить / Применить» стоят поверх страницы
+            let top = innerHeight;
+            const tb = document.getElementById("tabbar");
+            if (tb && vis(tb) && tb.childElementCount) top = Math.min(top, tb.getBoundingClientRect().top);
+            document.querySelectorAll("#app > .bar").forEach((b) => { if (vis(b)) top = Math.min(top, b.getBoundingClientRect().top); });
+            return { over: Math.round(bottom - top), who, wide: document.documentElement.scrollWidth - document.documentElement.clientWidth };
+          });
+          if (m.over > 0) bad.push(`${skin} ${w} ${r}: ${m.who} под панелью на ${m.over}px`);
+          if (m.wide > 0) bad.push(`${skin} ${w} ${r}: шире экрана на ${m.wide}px`);
+        }
+        await c.close();
+      }
+      if (bad.length) throw new Error(bad.join("; "));
+    });
+  }
+
   const log = await page.evaluate(() => window.__log);
   say("ALERTS", JSON.stringify(log.filter((l) => l.startsWith("alert:"))));
   say("ERRORS", JSON.stringify(errors));
