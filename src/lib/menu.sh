@@ -1,7 +1,7 @@
 # Главное меню и шапка. Нумерация разделов — как в прежних версиях.
 
 show_header() {
-  local ch="" upd n prof st hint why
+  local ch="" upd n prof st why
   clear
   [[ "$UPDATE_CHANNEL" == beta ]] && ch=" ${Y}[beta]${N}"
   upd=$(update_available || true)
@@ -16,9 +16,8 @@ show_header() {
     prof="AWG $(server_proto), $(profile_label "$(server_profile)")"
     if iface_up; then st="${G}● работает${N}"; else st="${R}○ не поднят${N}"; fi
     echo -e "  Сервер     : ${W}$(endpoint_host):$(server_port)${N}  $st"
+    # Перехода на 3.1 здесь не предлагаем: 2.0 — такой же обычный выбор (Сервер → Протокол)
     echo -e "  Профиль    : ${W}$prof${N}, клиентов ${W}$n${N}"
-    hint=$(proto_upgrade_hint)
-    [[ -n "$hint" ]] && echo -e "  $hint"
   else
     echo -e "  Сервер     : ${D}не создан — Сервер → Создать сервер${N}"
   fi

@@ -405,6 +405,9 @@ PHINT = {
     "MaxHandshakeAttempts": "сколько раз повторять рукопожатие: число или a-b",
 }
 PMATCH = "S и H обязаны совпадать у клиентов — после их правки старые конфиги не подключатся."
+# Не обязаны совпадать у клиентов: «🎲 без S и H» старые конфиги не ломает
+PFREE = ("Jc", "Jmin", "Jmax", "ContentPaddingAddition", "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime",
+         "KeepaliveTimeout", "MaxHandshakeAttempts")
 PVAL_RE = re.compile(r"^\d{1,10}(-\d{1,10})?$")
 
 
@@ -455,6 +458,7 @@ async def params_screen(target: ui.Target, state: FSMContext) -> None:
     ready = changed and not d.get("errors")
     await ui.render(target, text, ui.kb(
         *rows,
+        ui.Row(("🎲 Кроме S и H", act.data("prnd", "free")), ("🎲 Все поля", act.data("prnd", "all"))),
         ("✅ Применить", act.data("pgo")) if ready else None,
         ("↩️ Сбросить правки", act.data("preset")) if changed else None,
         ui.back("srv")))
@@ -486,6 +490,23 @@ async def _param_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     edits[ctx["param"]] = v
     await state.update_data(params=edits)
     await params_screen(msg, state)
+
+
+# Случайные значения от awg2 (server params gen — пределы генератора сервера) —
+# в правки, как ручной ввод: проверка на экране, запись — «Применить»
+@act("prnd")
+async def _params_random(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    r = await api.call("server", "params", "gen")
+    if not r.ok or not isinstance(r.data, dict):
+        await ui.render(cb, ui.fail(r, "Параметры AWG"), ui.kb(("◀️ Назад", act.data("pview"))))
+        return
+    data = await state.get_data()
+    vals, edits = data.get("params_vals") or {}, dict(data.get("params") or {})
+    for k, v in (r.data.get("values") or {}).items():
+        if k in vals and k not in PSWITCH and (arg == "all" or k in PFREE):
+            edits[k] = str(v)
+    await state.update_data(params=edits)
+    await params_screen(cb, state)
 
 
 @act("preset")

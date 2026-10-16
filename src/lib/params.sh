@@ -141,6 +141,26 @@ gen_awg_params() {
   _check_mtu_headroom "$S4"
 }
 
+# Случайные значения для формы параметров (бот, панель, «кубик»): ничего не
+# пишет и не применяет — дальше обычная проверка (params check) и запись.
+# Диапазоны — генератора (lite — как AmneziaVPN, pro — от допустимого минимума
+# до разумного верха), версия — текущая сервера. MTU сервера не трогается:
+# набор, которому не хватает запаса до него, перебирается заново.
+PARAMS_GEN=""
+params_gen() {  # ПРОФИЛЬ → PARAMS_GEN («ключ<TAB>значение», без HeaderProtectionKey)
+  local profile="$1" proto mtu s4 tries=0
+  proto=$(server_proto); mtu=$(conf_iface_get MTU)
+  while :; do
+    # Пустой MTU — генератор не спрашивает про его снижение
+    MTU="" gen_awg_params "$profile" "$proto" || return 1
+    [[ "$mtu" =~ ^[0-9]+$ ]] || break
+    s4=$(sed -n 's/^S4 = //p' <<< "$AWG_PARAMS")
+    (( mtu + AWG_MTU_OVERHEAD + ${s4:-0} + AWG3_CPA_MAX <= 1500 - AWG_MTU_SAFETY )) && break
+    (( ++tries < 20 )) || break
+  done
+  PARAMS_GEN=$(sed -n 's/^\([A-Za-z0-9]*\) = \(.*\)$/\1\t\2/p' <<< "$AWG_PARAMS" | grep -v '^HeaderProtectionKey' || true)
+}
+
 # MTU без запаса до пути в 1500 даёт не обрыв, а загадочную просадку скорости:
 # крупные пакеты режутся, а PMTU discovery по UDP работает не везде.
 _check_mtu_headroom() {

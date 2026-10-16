@@ -20,6 +20,25 @@ exits_nodes() {
   done | LC_ALL=C sort
 }
 
+# Ноды для карточек панели: имя, поднята, адрес, рукопожатие, принято, отдано,
+# протокол (awg — есть параметры обфускации, иначе wg)
+exits_node_rows() {
+  local n f ep up hs rx tx proto dump
+  while IFS= read -r n; do
+    f="$EXITS_DIR/awg-exit-$n.conf"
+    ep=$(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '\t\r')
+    if grep -qE '^[[:space:]]*(Jc|S1|H1)[[:space:]]*=' "$f" 2>/dev/null; then proto=awg; else proto=wg; fi
+    up=0 hs=0 rx=0 tx=0
+    if ip link show "awg-exit-$n" &>/dev/null; then
+      up=1
+      dump=$(awg show "awg-exit-$n" dump 2>/dev/null | sed -n 2p)
+      [[ -z "$dump" ]] || IFS=$'\t' read -r _ _ _ _ hs rx tx _ <<< "$dump"
+    fi
+    [[ "$hs" =~ ^[0-9]+$ ]] || hs=0; [[ "$rx" =~ ^[0-9]+$ ]] || rx=0; [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$up" "$ep" "$hs" "$rx" "$tx" "$proto"
+  done < <(exits_nodes)
+}
+
 exits_up_nodes() {
   local n
   while IFS= read -r n; do

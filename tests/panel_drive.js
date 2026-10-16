@@ -16,6 +16,11 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       showConfirm: (t, cb) => { window.__log.push("confirm:" + t); cb(true); },
       showAlert: (t) => { window.__log.push("alert:" + t); },
     } };
+    // Сценарий ниже — про «Классику» (нижняя панель разделов); «Карточки» — в конце
+    try {
+      const v = JSON.parse(localStorage.getItem("awg-look") || "null") || {};
+      if (!v.skin) { v.skin = "toolza"; localStorage.setItem("awg-look", JSON.stringify(v)); }
+    } catch (_) { /* без localStorage — как есть */ }
   }, { initData, theme });
   const page = await ctx.newPage();
   page.setDefaultTimeout(15000);
@@ -570,13 +575,16 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
 
   // ── Туннели и DNS ──
   await step("туннели", async () => {
-    await nav("/tunnels", ".ecard");
-    const n = await page.locator(".ecard").count();
+    // Экран туннелей — карточками и в «Классике»
+    await nav("/tunnels", ".kcard");
+    await page.click(".ktabs button[data-tab=tun]");
+    const n = await page.locator(".kcard").count();
     if (n !== 6) throw new Error("ждали 6 карточек (4 туннеля, каскад, DNS), есть " + n);
-    await page.waitForSelector(".sgrid >> text=Exit-ноды");
+    await page.waitForSelector(".kstats >> text=Exit-ноды");
+    if (await page.evaluate(() => document.documentElement.dataset.skin) !== "toolza") throw new Error("по умолчанию не «Классика»");
     await shot("30-tunnels");
   });
-  await step("WARP", async () => { await page.click("[data-name=WARP] .name"); await page.waitForSelector("text=Бэкенд"); await shot("31-warp"); });
+  await step("WARP", async () => { await page.click("[data-name=WARP] .kc-n"); await page.waitForSelector("text=Бэкенд"); await shot("31-warp"); });
   await step("клиенты в WARP", async () => {
     await nav("/tunnels/warp/clients", ".item");
     await page.click(".item >> text=alice");
@@ -667,7 +675,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("DNS", async () => { await nav("/tunnels/dns", "text=Включить"); await shot("39-dns"); });
   await step("всё напрямую", async () => {
-    await nav("/tunnels", ".ecard");
+    await nav("/tunnels", ".kcard");
     await page.click("text=Всё напрямую");
     await page.waitForSelector(".toast >> text=клиенты идут напрямую");
   });
@@ -1239,6 +1247,116 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       if (!labels.some((l) => l.startsWith(t))) throw new Error("нет раздела " + t + ": " + labels.join(", "));
     }
   });
+
+  // ── Стиль «Карточки»: включается в «Теме», меню в шапке, туннели и клиенты карточками ──
+  await step("«Карточки»: включаются в «Теме», шрифт Plex, меню в шапке вместо нижней панели", async () => {
+    await nav("/", "h1");
+    await page.click(".top button[aria-label='Тема']");
+    await page.click(".drawer.on [data-name=skin] button:has-text('Карточки')");
+    await page.waitForSelector(".drawer.on [data-name=skin] button.on:has-text('Карточки')");
+    await page.click(".drawer.on button:has-text('Готово')");
+    const st = await page.evaluate(() => ({ skin: document.documentElement.dataset.skin, rb: document.documentElement.style.getPropertyValue("--rb").trim(),
+      font: getComputedStyle(document.body).fontFamily, tabs: getComputedStyle(document.getElementById("tabbar")).display }));
+    if (st.skin !== "cards" || st.rb !== "20px" || !/IBM Plex Sans/.test(st.font) || st.tabs !== "none") throw new Error(JSON.stringify(st));
+    await page.waitForFunction(() => [...document.fonts].some((f) => f.family.indexOf("IBM Plex Sans") >= 0 && f.status === "loaded"), null, { timeout: 5000 })
+      .catch(() => { throw new Error("шрифт Plex не загрузился"); });
+    await page.click(".top .kburger");
+    await page.waitForSelector("#more.on .kmenu a:has-text('Бэкапы')");
+    if (await page.getAttribute(".top .kburger", "aria-expanded") !== "true") throw new Error("aria-expanded у меню");
+    await shot("80-cards-menu");
+    await page.click("#more .kmenu a:has-text('Бэкапы')");
+    await page.waitForURL(/#\/backup$/);
+    if (await page.locator("#more.on").count()) throw new Error("меню не закрылось");
+  });
+  await step("«Карточки»: туннели — вкладки, сводка, карточки, вид, скрытый адрес ноды", async () => {
+    await nav("/tunnels", ".kstats");
+    if (await page.locator(".ktabs button").count() !== 3 || await page.locator(".kstats > div").count() !== 4) throw new Error("вкладки/сводка");
+    for (const t of ["WARP", "Xray", "tun2socks", "Exit-ноды WG"]) await page.waitForSelector(`.kcard[data-name='${t}']`);
+    await page.waitForSelector(".kcard[data-name='Шифрованный DNS']");
+    await shot("81-cards-tunnels");
+    // Вид «Список» — без подробностей, запоминается
+    await page.click(".ktools .seg button[aria-label='Список']");
+    if (await page.locator(".kcard .kc-kv").count()) throw new Error("в списке — подробности");
+    await nav("/tunnels", ".kstats");
+    if (await page.locator(".ktools .seg button.on[aria-label='Список']").count() !== 1) throw new Error("вид не запомнился");
+    await page.click(".ktools .seg button[aria-label='Сетка']");
+    await page.waitForSelector(".kcard .kc-kv.g2", { state: "attached" }).catch(() => {});
+    await page.click(".ktools .seg button[aria-label='Подробно']");
+    // Поиск по карточкам
+    await page.fill(".ktools input[type=search]", "warp");
+    if (await page.locator(".klist .kcard").count() !== 1) throw new Error("поиск: " + await page.locator(".klist .kcard").count());
+    await page.fill(".ktools input[type=search]", "");
+    if (profile !== "none") {
+      await page.waitForSelector(".kcard.on[data-tunnel=exits] .kswitch[aria-checked=true]");
+      await page.click(".ktabs button[data-tab=nodes]");
+      const node = page.locator(".kcard[data-name=node-n1]");
+      await node.waitFor();
+      if ((await node.textContent()).includes("1.2.3.4")) throw new Error("адрес ноды не скрыт");
+      await node.locator(".eyeb").click();
+      await node.locator("text=1.2.3.4:51820").waitFor();
+      await shot("82-cards-nodes");
+      await page.click(".ktabs button[data-tab=xray]");
+      await page.waitForSelector(".kempty button:has-text('Установить Xray')");
+      await page.click(".ktabs button[data-tab=tun]");
+    }
+  });
+  await step("«Карточки»: клиенты — сводка, карточка с графиком, окно графика, выбор", async () => {
+    await nav("/clients", ".kstats");
+    if (await page.locator(".ktabs button").count() !== 4) throw new Error("вкладки фильтров");
+    const first = page.locator(".klist .kcard").first();
+    if (!await first.count()) { await page.waitForSelector(".kempty"); return; }
+    await first.locator(".kc-ch svg path.ln").waitFor({ timeout: 10000 });
+    await page.waitForSelector(".kstats .lb >> text=За 14 дней");
+    await shot("83-cards-clients");
+    await first.locator(".kc-ch").click();
+    await page.waitForSelector(".kchs .chart svg");
+    await page.click(".kchs .kpills button:has-text('7 дн.')");
+    await page.waitForSelector(".kchs .kpills button.on:has-text('7 дн.')");
+    await page.waitForFunction(() => /последние 7/.test(document.querySelector(".kchs").textContent));
+    await shot("84-cards-chart");
+    await page.keyboard.press("Escape");
+    await page.click(".kline button[aria-label='Выбрать несколько']");
+    await first.locator(".kc-h").click();
+    await page.waitForSelector(".klist .kcard.sel");
+    await page.waitForSelector(".bar button:has-text('Удалить 1')");
+    await page.click(".bar button:has-text('Отмена')");
+    if (await page.locator(".klist .kcard.sel").count()) throw new Error("выбор не снялся");
+  });
+  await step("«Карточки» в старом движке (Edge 18): туннели, клиенты, меню — без ошибок", async () => {
+    const p4 = await ctx.newPage();
+    const errs = [];
+    p4.on("pageerror", (e) => errs.push(String(e)));
+    await p4.addInitScript(() => {
+      window.AWG_FORCE_NOGAP = true;
+      delete Array.prototype.flat; delete Object.fromEntries; delete String.prototype.trimStart;
+      [Element, Document, DocumentFragment].forEach((C) => { delete C.prototype.replaceChildren; });
+      try { Object.defineProperty(document, "fonts", { get: () => undefined }); } catch (_) { /* нет — так нет */ }
+    });
+    await p4.goto(base + "#/tunnels", { waitUntil: "domcontentloaded" });
+    await p4.waitForSelector(".kstats .lb");
+    if (await p4.locator(".boot-fail").count()) throw new Error(await p4.textContent(".boot-fail"));
+    if (!await p4.locator(".kcard [data-gapm], .ktabs [data-gapm]").count()) throw new Error("обход gap у flex в карточках не сработал");
+    await p4.click(".ktabs button[data-tab=nodes]");
+    await p4.evaluate(() => { location.hash = "#/clients"; });
+    await p4.waitForSelector(".kstats .lb");
+    await p4.click(".top .kburger");
+    await p4.waitForSelector("#more.on .kmenu a");
+    if (errs.length) throw new Error(errs.join(" | "));
+    await p4.close();
+  });
+  if (profile !== "none") {
+    await step("«Карточки»: переключатель выключает туннель (с вопросом), awg2 отвечает", async () => {
+      await nav("/tunnels", ".kstats");
+      await page.click(".ktabs button[data-tab=tun]");          // вкладка запоминается — прошлый шаг мог оставить другую
+      // systemctl песочницы — заглушка: служба «работает» и после остановки, поэтому
+      // проверяем вопрос и ответ awg2 на exits down, а не состояние после
+      await page.click(".kcard[data-tunnel=exits] .kswitch");
+      await page.waitForSelector(".toast >> text=Exit-ноды выключены", { timeout: 30000 });
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:Выключить Exit-ноды WG?"));
+      if (!asked) throw new Error("не спросил");
+      await page.waitForSelector(".kstats");                     // экран перерисован после действия
+    });
+  }
 
   const log = await page.evaluate(() => window.__log);
   say("ALERTS", JSON.stringify(log.filter((l) => l.startsWith("alert:"))));

@@ -8,6 +8,13 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
   const browser = await chromium.launch();
   for (const [name, vp, scale] of [["ПК", { width: 1366, height: 860 }, 1], ["телефон", { width: 390, height: 844 }, 2]]) {
     const ctx = await browser.newContext({ ignoreHTTPSErrors: true, viewport: vp, deviceScaleFactor: scale, acceptDownloads: true });
+    // Сценарий — про «Классику» (лента и нижняя панель); «Карточки» — отдельным шагом ниже
+    await ctx.addInitScript(() => {
+      try {
+        const v = JSON.parse(localStorage.getItem("awg-look") || "null") || {};
+        if (!v.skin) { v.skin = "toolza"; localStorage.setItem("awg-look", JSON.stringify(v)); }
+      } catch (_) { /* без localStorage — как есть */ }
+    });
     const page = await ctx.newPage();
     page.setDefaultTimeout(20000);
     page.on("pageerror", (e) => console.log(`ERR ${name}: ${e}`));
@@ -329,6 +336,26 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
         await page.waitForURL(/#\/clients$/);
       });
     }
+    await step("«Карточки»: шрифт свой, туннели и клиенты карточками" + (name === "ПК" ? ", лента на месте" : ", меню в шапке"), async () => {
+      await page.evaluate(() => { const v = JSON.parse(localStorage.getItem("awg-look")); v.skin = "cards"; localStorage.setItem("awg-look", JSON.stringify(v)); });
+      await page.goto(u + "#/tunnels");
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForSelector(".kstats");
+      await page.waitForSelector(".kcard[data-tunnel=exits]");
+      const st = await page.evaluate(() => ({ rail: !!document.querySelector("#rail a"), tabs: getComputedStyle(document.getElementById("tabbar")).display,
+        burger: !!document.querySelector(".top .kburger"), over: document.documentElement.scrollWidth - document.documentElement.clientWidth }));
+      if (name === "ПК" ? !st.rail || st.burger : st.rail || !st.burger || st.tabs !== "none") throw new Error(JSON.stringify(st));
+      if (st.over > 0) throw new Error("страница шире экрана на " + st.over + " px");
+      await page.waitForFunction(() => [...document.fonts].some((f) => f.family.indexOf("IBM Plex") >= 0 && f.status === "loaded"));
+      await page.screenshot({ path: `${out}/${name}-карточки-туннели.png`, fullPage: true });
+      await page.goto(u + "#/clients");
+      await page.waitForSelector(".kstats");
+      if (name === "ПК") await page.waitForSelector(".ktools .seg button[aria-label='Таблица']");
+      await page.screenshot({ path: `${out}/${name}-карточки-клиенты.png`, fullPage: true });
+      await page.evaluate(() => { const v = JSON.parse(localStorage.getItem("awg-look")); v.skin = "toolza"; localStorage.setItem("awg-look", JSON.stringify(v)); });
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForSelector("#app h1");
+    });
     await step("аккаунт: смена пароля и сессии", async () => {
       await page.goto(u + "#/account");
       await page.waitForSelector("text=Сменить пароль");

@@ -26,6 +26,8 @@ API_ARGS=()
 # j готовый JSON, f содержимое файла; без типа — строка.
 _kv() { printf '%s\t%s\n' "$1" "${2//[$'\n\r']/ }"; }
 _b() { if "$@" &>/dev/null; then echo 1; else echo 0; fi; }
+# Счётчик из файла или вывода команды: не число (нет интерфейса) — 0
+_n() { local v; v=$("$@" 2>/dev/null | head -1); [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
 api_obj() { py json-kv > "$API_DATA"; }
 api_rows() { py json-rows "$@" > "$API_DATA"; }
 api_list() { py json-list > "$API_DATA"; }
@@ -142,7 +144,6 @@ _api_server() {
           _kv clients:n "$(client_files | grep -c . || true)"
         fi
       } | api_obj
-      server_exists && proto_upgrade_hint
       return 0 ;;
     install) do_install ;;
     create)
@@ -163,11 +164,16 @@ _api_server() {
             _kv errors:j "$(py json-list <<< "$PARAMS_ERR")"; _kv warnings:j "$(py json-list <<< "$PARAMS_WARN")"
             _kv changed:j "$(py json-list <<< "$PARAMS_CHANGED")"; _kv breaking:j "$(py json-list <<< "$PARAMS_BREAKING")"
           } | api_obj ;;
+        gen)
+          [[ "${1:-pro}" =~ ^(lite|pro)$ ]] || { _api_usage "server params gen [lite|pro]"; return; }
+          params_gen "${1:-pro}" || return 1
+          { _kv proto "$(server_proto)"
+            while IFS=$'\t' read -r k v; do [[ -n "$k" ]] && _kv "values.$k" "$v"; done <<< "$PARAMS_GEN"; } | api_obj ;;
         set)
           server_params_set "$@" || return 1
           { _kv changed:j "$(py json-list <<< "$PARAMS_CHANGED")"; _kv breaking:j "$(py json-list <<< "$PARAMS_BREAKING")"
             _kv clients:n "$PARAMS_CLIENTS"; } | api_obj ;;
-        *) _api_usage "server params [check|set [force]] [Ключ=значение...]" ;;
+        *) _api_usage "server params [check|gen [lite|pro]|set [force]] [Ключ=значение...]" ;;
       esac ;;
     proto)
       [[ "${1:-}" =~ ^(2\.0|3\.1)$ ]] || { _api_usage "server proto 2.0|3.1"; return; }
@@ -455,7 +461,13 @@ _api_tunnels() {
         _kv exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
         _kv cascade:n "$(cascade_count)"
         if dns_installed; then _kv dns "$(dns_running && echo up || echo off)"; else _kv dns none; fi
-        _kv active "$(tunnel_conflict none)"; } | api_obj ;;
+        _kv active "$(tunnel_conflict none)"
+        # Счётчики интерфейсов туннелей (для карточек и сводки панели): есть — поднят
+        _kv ifs:j "$(for i in "$WARP_IF" "$XRAY_IF" "$T2S_IF"; do
+                      [[ -r "/sys/class/net/$i/statistics/rx_bytes" ]] || continue
+                      printf '%s\t%s\t%s\n' "$i" "$(_n cat "/sys/class/net/$i/statistics/rx_bytes")" \
+                        "$(_n cat "/sys/class/net/$i/statistics/tx_bytes")"
+                    done | py json-rows iface rx:n tx:n)"; } | api_obj ;;
     panic) tunnels_panic_reset quiet; ok "Туннели выключены — клиенты идут напрямую" ;;
     clients)
       case "${2:-}" in
@@ -484,7 +496,13 @@ _api_warp() {
         _kv configured:b "$(_b warp_configured)"
         _kv failed:b "$(_b test -f "$WARP_STATE.failed")"
         _kv health:b "$(_b unit_active awg-warp-healthcheck.timer)"
-        _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"; } | api_obj
+        _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"
+        # Для карточки: интерфейс, адрес Cloudflare, рукопожатие (wg) и счётчики
+        _kv iface "$WARP_IF"
+        _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
+        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <(wg show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
+        _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
+        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
       warp_status ;;
     install) if [[ "$be" == wg ]]; then warp_wg_install; else warp_usque_install; fi ;;
     up) warp_up ;;
@@ -526,6 +544,8 @@ _api_xray() {
         _kv main "$(xray_installed && py xray-main-get "$XRAY_CONF" 2>/dev/null)"
         _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
+        # Выходы для карточек: протокол, защита, транспорт, адрес
+        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
         _kv ru:b "$(_b xray_ru_on)"; } | api_obj
       xray_status ;;
     install) xray_install update ;;
@@ -577,9 +597,7 @@ _api_exits() {
     status)
       { _kv up:b "$(_b exits_is_up)"; _kv mode "$(exits_state_get mode)"
         _kv balancer "$(exits_state_get balancer)"; _kv single "$(exits_state_get single_exit)"
-        _kv nodes:j "$(while IFS= read -r n; do
-                          printf '%s\t%s\n' "$n" "$(_b ip link show "awg-exit-$n")"
-                        done < <(exits_nodes) | py json-rows name up:b)"; } | api_obj
+        _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto)"; } | api_obj
       exits_status; exits_list ;;
     add)
       [[ -n "${1:-}" ]] || { _api_usage "exits add ИМЯ < конфиг"; return; }

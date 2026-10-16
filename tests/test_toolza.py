@@ -329,6 +329,13 @@ chk("Hysteria2 — в формате Xray 26: hysteria v2, пароль, SNI, h3
     and st["tlsSettings"]["serverName"] == "h2.example.site" and st["tlsSettings"]["alpn"] == ["h3"]
     and st["tlsSettings"]["echConfigList"] == "AGb+DQBi" and st["tlsSettings"]["pinnedPeerCertSha256"].count(",") == 1,
     [rc, out[-600:]])
+rc, out, _ = bash(XRAY_ENV + 'py xray-outs "$XRAY_CONF" | py json-rows tag proto sec net host port:n')
+outs = {o["tag"]: o for o in json.loads(out)} if rc == 0 and out.startswith("[") else {}
+chk("xray-outs — выходы для карточек: протокол, защита, транспорт, адрес (без direct и block)",
+    outs.get("proxy_dash_example_site") == {"tag": "proxy_dash_example_site", "proto": "vless", "sec": "tls", "net": "tcp",
+                                            "host": "dash.example.site", "port": 8443}
+    and outs.get("proxy_h2_example_site", {}).get("host") == "h2.example.site"
+    and outs["proxy_h2_example_site"]["net"] == "hysteria" and "direct" not in outs and "block" not in outs, out)
 bash(XRAY_ENV + "xray_del_tag proxy_h2_example_site >/dev/null")
 rc, out, _ = bash(XRAY_ENV + "xray_add_link 'vless://11111111-2222-3333-4444-555555555555@x.example.site:443?security=tls&type=tcp#dup'"
                   " >/dev/null; xray_add_link 'vless://11111111-2222-3333-4444-555555555555@x.example.site:443?security=tls&type=tcp#dup'")
@@ -635,6 +642,13 @@ chk("фоновая проверка обновлений не держит от
 d = r.get("data") or {}
 chk("api status", r.get("ok") and d["server"]["exists"] and d["server"]["clients"] == 2
     and d["server"]["proto"] == "2.0" and d["tunnels"]["warp"] == "none", r)
+r = api("tunnels", "status")
+chk("api tunnels status — счётчики интерфейсов туннелей (поднятых нет — пусто)",
+    r.get("ok") and (r.get("data") or {}).get("ifs") == [], r)
+r = api("warp", "status")
+d = r.get("data") or {}
+chk("api warp status — интерфейс и счётчики для карточки",
+    r.get("ok") and d.get("iface") == "warp0" and d.get("rx") == 0 and d.get("hs") == 0 and "endpoint" in d, r)
 r = api("clients", "list")
 rows = r.get("data") or []
 chk("api clients list", [c["name"] for c in rows] == ["alice", "bob"] and rows[0]["ip"] == "10.23.45.2"
@@ -799,6 +813,9 @@ r = api("traffic", "daily")
 d = r.get("data") or {}
 chk("api traffic daily — сервер за 30 дней с разбивкой по клиентам", r.get("ok") and len(d.get("days", [])) == 30
     and d["days"][-1] == day and d.get("total") == 5 * 2**20 + 200 and d["clients"][0]["name"] == "alice", r)
+al = (d.get("clients") or [{}])[0]
+chk("api traffic daily — у клиента ряд по дням для мини-графика", len(al.get("d") or []) == 30
+    and sum(al["d"]) == al["rx"] + al["tx"], al)
 r = api("traffic", "daily", "alice", "7")
 chk("api traffic daily ИМЯ ДНЕЙ", r.get("ok") and len(r["data"]["days"]) == 7 and r["data"]["name"] == "alice"
     and "clients" not in r["data"], r)
@@ -1378,6 +1395,10 @@ with open(EXIT2) as f:
     ex2 = f.read()
 chk("exit-нода из бэкапа — без хуков, с Table = off", "PostUp" not in ex2 and "Table = off" in ex2
     and not os.path.exists(os.path.join(AWGD, "x.conf")), ex2)
+nodes = {n["name"]: n for n in (api("exits", "status").get("data") or {}).get("nodes") or []}
+chk("api exits status — у ноды адрес, протокол и счётчики",
+    nodes.get("n2", {}).get("endpoint") == "1.2.3.4:51820" and nodes["n2"]["proto"] == "wg"
+    and nodes["n2"]["up"] is False and nodes["n2"]["rx"] == 0 and nodes["n2"]["hs"] == 0, nodes)
 with open(os.path.join(ROOT, "etc/awg-cascade/rules.conf")) as f:
     rules = f.read()
 chk("каскад из бэкапа — только с проверками добавления: публичная цель, порты, вход не занят, без дублей",

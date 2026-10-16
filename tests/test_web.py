@@ -109,6 +109,14 @@ try:
         and hd.get("X-Content-Type-Options") == "nosniff", hd)
     st, _, js = c.req(BASE + "web.js")
     chk("web.js: базовый путь для запросов", st == 200 and BASE.encode() in js, js)
+    st, hd, font = c.req(BASE + "fonts/plex-sans-cyrillic-400.woff2")
+    chk("шрифт «Карточек»: woff2, кэш на неделю, без входа (страница входа — тем же шрифтом)",
+        st == 200 and font[:4] == b"wOF2" and hd.get("Content-Type") == "font/woff2"
+        and hd.get("Cache-Control") == "public, max-age=604800" and "script-src 'self'" in hd.get("Content-Security-Policy", ""),
+        [st, hd.get("Content-Type"), hd.get("Cache-Control")])
+    st = [c.req(BASE + p)[0] for p in ("fonts/nope.woff2", "fonts/OFL.txt", "fonts/..%2fapp.js", "fonts/plex-sans-latin-400.woff")]
+    chk("шрифты: только существующие .woff2 из каталога шрифтов", st == [404, 404, 404, 404], st)
+    chk("остальное по-прежнему без кэша", c.req(BASE + "web.js")[1].get("Cache-Control") == "no-store")
 
     print("Без входа")
     for path in ("api/me", "api/status", "api/call", "api/clients", "api/download", "api/web/account", "api/backup/upload"):

@@ -245,7 +245,7 @@ proto31_cached() {
   bin=$(command -v awg) || return 1
   key="$(mod_tag)|$(stat -c %s:%Y "$bin" 2>/dev/null)|$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null)"
   if [[ -f "$f" ]] && IFS=$'\t' read -r k v < "$f" && [[ "$k" == "$key" && "$v" =~ ^[01]$ ]]; then
-    _PROTO_PROBE[31]=$v           # proto_upgrade_hint в том же вызове не пробует заново
+    _PROTO_PROBE[31]=$v           # повторный вопрос в том же вызове (server info) не пробует заново
     return "$v"
   fi
   proto_supported 3.1 || rc=$?
@@ -744,17 +744,6 @@ mimicry_module_warnings() {
         "$CLIENT_DIR"/*_awg[23].conf 2>/dev/null | sort -n | tail -1)
   (( ${n:-0} > 3598 )) && warn "Цепочка I1-I5 длиннее $n симв — выше предела awg-tools (буфер 4 КБ)"
   return 0
-}
-
-# Подсказка для шапки: предложить переход на 3.1.
-proto_upgrade_hint() {
-  server_exists || return 0
-  [[ "$(server_proto)" == 3.1 ]] && return 0
-  if proto_supported 3.1; then
-    echo -e "${G}⬆ доступен переход на AWG 3.1${N} ${D}— Сервер → Протокол${N}"
-  else
-    echo -e "${Y}для AWG 3.1 обнови модуль${N} ${D}— Сервер → Модуль ядра${N}"
-  fi
 }
 
 # Снимок конфигов сервера и клиентов — откат, если awg0 не поднимется.

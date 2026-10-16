@@ -1337,8 +1337,17 @@ async def run():
                               ("разворот объекта", r"\{\s*\.\.\.|,\s*\.\.\.[\w.]+\s*\}"), ("\\p{} в регулярке", r"/[^/\n]*\\p\{")):
                 legacy += [f"{fn}: {what}" for _ in re.findall(pat, code)]
         chk("панель — без синтаксиса новее ES2017 (Edge 18 в Telegram Desktop)", not legacy, legacy)
+        async with http.get(base + "/fonts/plex-mono-latin-500.woff2") as r:
+            chk("шрифт «Карточек» отдаётся: woff2, кэш на неделю", r.status == 200 and (await r.read())[:4] == b"wOF2"
+                and r.headers.get("Content-Type") == "font/woff2" and r.headers.get("Cache-Control") == "public, max-age=604800",
+                [r.status, dict(r.headers)])
+        bad = []
+        for path in ("/fonts/OFL.txt", "/fonts/none.woff2", "/fonts/..%2fapp.js", "/fonts/"):
+            async with http.get(base + path) as r:
+                bad += [path] if r.status != 404 else []
+        chk("шрифты: только .woff2 из своего каталога", not bad, bad)
         async with http.get(base + "/panel.py") as r:
-            chk("кроме страницы, скрипта и иконок — ничего", r.status == 404, r.status)
+            chk("кроме страницы, скрипта, иконок и шрифтов — ничего", r.status == 404, r.status)
         st, body = await api_("/api/call", {"args": ["status"]})
         chk("панель: общий вызов awg2 api", st == 200 and body["ok"] and body["data"].get("version"), [st, str(body)[:200]])
         # Неверные типы в теле — отказ или игнор, а не 500 с трейсом

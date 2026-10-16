@@ -816,7 +816,8 @@ def cmd_traffic_daily(conf, db, transfer, name="", days="30"):
         for p, n in names.items():
             _, r, s = t.series([p], days)
             if sum(r) + sum(s):
-                rows.append({"name": n or p[:8], "rx": sum(r), "tx": sum(s)})
+                # d — по дням (приём + отдача): мини-график в карточке клиента
+                rows.append({"name": n or p[:8], "rx": sum(r), "tx": sum(s), "d": [a + b for a, b in zip(r, s)]})
         out["clients"] = sorted(rows, key=lambda c: -(c["rx"] + c["tx"]))
     print(json.dumps(out, ensure_ascii=False))
 
@@ -1412,6 +1413,20 @@ def cmd_xray_restore_clean(path):
 def cmd_xray_tags(path):
     for t in proxy_tags(jload(path)):
         print(t)
+
+
+def cmd_xray_outs(path):
+    """Выходы для карточек панели: тег, протокол, защита, транспорт, адрес, порт (TSV)."""
+    clean = lambda v: str(v).replace("\t", " ").replace("\n", " ")  # noqa: E731
+    for o in jload(path).get("outbounds", []):
+        if not o.get("tag") or o.get("protocol") in SKIP_PROTO:
+            continue
+        st, sets = o.get("streamSettings") or {}, o.get("settings") or {}
+        srv = (sets.get("vnext") or sets.get("servers") or [sets])[0] or {}
+        port = srv.get("port") or 0
+        print("\t".join(clean(v) for v in (o["tag"], o.get("protocol", ""), st.get("security") or "none",
+                                          st.get("network") or "tcp", srv.get("address", ""),
+                                          port if isinstance(port, int) else 0)))
 
 
 def probe_conf(outbound):
@@ -2267,7 +2282,7 @@ COMMANDS = {
     "rand-key": cmd_rand_key, "phobos-link": cmd_phobos_link, "exit-conf-fix": cmd_exit_conf_fix,
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
-    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
+    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-outs": cmd_xray_outs, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
     "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,

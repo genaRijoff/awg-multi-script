@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.35"
+VERSION="v1.2.36"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -2011,6 +2011,26 @@ gen_awg_params() {
   _check_mtu_headroom "$S4"
 }
 
+# Случайные значения для формы параметров (бот, панель, «кубик»): ничего не
+# пишет и не применяет — дальше обычная проверка (params check) и запись.
+# Диапазоны — генератора (lite — как AmneziaVPN, pro — от допустимого минимума
+# до разумного верха), версия — текущая сервера. MTU сервера не трогается:
+# набор, которому не хватает запаса до него, перебирается заново.
+PARAMS_GEN=""
+params_gen() {  # ПРОФИЛЬ → PARAMS_GEN («ключ<TAB>значение», без HeaderProtectionKey)
+  local profile="$1" proto mtu s4 tries=0
+  proto=$(server_proto); mtu=$(conf_iface_get MTU)
+  while :; do
+    # Пустой MTU — генератор не спрашивает про его снижение
+    MTU="" gen_awg_params "$profile" "$proto" || return 1
+    [[ "$mtu" =~ ^[0-9]+$ ]] || break
+    s4=$(sed -n 's/^S4 = //p' <<< "$AWG_PARAMS")
+    (( mtu + AWG_MTU_OVERHEAD + ${s4:-0} + AWG3_CPA_MAX <= 1500 - AWG_MTU_SAFETY )) && break
+    (( ++tries < 20 )) || break
+  done
+  PARAMS_GEN=$(sed -n 's/^\([A-Za-z0-9]*\) = \(.*\)$/\1\t\2/p' <<< "$AWG_PARAMS" | grep -v '^HeaderProtectionKey' || true)
+}
+
 # MTU без запаса до пути в 1500 даёт не обрыв, а загадочную просадку скорости:
 # крупные пакеты режутся, а PMTU discovery по UDP работает не везде.
 _check_mtu_headroom() {
@@ -2596,7 +2616,7 @@ proto31_cached() {
   bin=$(command -v awg) || return 1
   key="$(mod_tag)|$(stat -c %s:%Y "$bin" 2>/dev/null)|$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null)"
   if [[ -f "$f" ]] && IFS=$'\t' read -r k v < "$f" && [[ "$k" == "$key" && "$v" =~ ^[01]$ ]]; then
-    _PROTO_PROBE[31]=$v           # proto_upgrade_hint в том же вызове не пробует заново
+    _PROTO_PROBE[31]=$v           # повторный вопрос в том же вызове (server info) не пробует заново
     return "$v"
   fi
   proto_supported 3.1 || rc=$?
@@ -3095,17 +3115,6 @@ mimicry_module_warnings() {
         "$CLIENT_DIR"/*_awg[23].conf 2>/dev/null | sort -n | tail -1)
   (( ${n:-0} > 3598 )) && warn "Цепочка I1-I5 длиннее $n симв — выше предела awg-tools (буфер 4 КБ)"
   return 0
-}
-
-# Подсказка для шапки: предложить переход на 3.1.
-proto_upgrade_hint() {
-  server_exists || return 0
-  [[ "$(server_proto)" == 3.1 ]] && return 0
-  if proto_supported 3.1; then
-    echo -e "${G}⬆ доступен переход на AWG 3.1${N} ${D}— Сервер → Протокол${N}"
-  else
-    echo -e "${Y}для AWG 3.1 обнови модуль${N} ${D}— Сервер → Модуль ядра${N}"
-  fi
 }
 
 # Снимок конфигов сервера и клиентов — откат, если awg0 не поднимется.
@@ -6592,6 +6601,25 @@ exits_nodes() {
     [[ -f "$f" ]] || continue
     n="${f##*/awg-exit-}"; echo "${n%.conf}"
   done | LC_ALL=C sort
+}
+
+# Ноды для карточек панели: имя, поднята, адрес, рукопожатие, принято, отдано,
+# протокол (awg — есть параметры обфускации, иначе wg)
+exits_node_rows() {
+  local n f ep up hs rx tx proto dump
+  while IFS= read -r n; do
+    f="$EXITS_DIR/awg-exit-$n.conf"
+    ep=$(sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$f" 2>/dev/null | head -1 | tr -d '\t\r')
+    if grep -qE '^[[:space:]]*(Jc|S1|H1)[[:space:]]*=' "$f" 2>/dev/null; then proto=awg; else proto=wg; fi
+    up=0 hs=0 rx=0 tx=0
+    if ip link show "awg-exit-$n" &>/dev/null; then
+      up=1
+      dump=$(awg show "awg-exit-$n" dump 2>/dev/null | sed -n 2p)
+      [[ -z "$dump" ]] || IFS=$'\t' read -r _ _ _ _ hs rx tx _ <<< "$dump"
+    fi
+    [[ "$hs" =~ ^[0-9]+$ ]] || hs=0; [[ "$rx" =~ ^[0-9]+$ ]] || rx=0; [[ "$tx" =~ ^[0-9]+$ ]] || tx=0
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$up" "$ep" "$hs" "$rx" "$tx" "$proto"
+  done < <(exits_nodes)
 }
 
 exits_up_nodes() {
@@ -10958,7 +10986,7 @@ do_diag_menu() {
 # Главное меню и шапка. Нумерация разделов — как в прежних версиях.
 
 show_header() {
-  local ch="" upd n prof st hint why
+  local ch="" upd n prof st why
   clear
   [[ "$UPDATE_CHANNEL" == beta ]] && ch=" ${Y}[beta]${N}"
   upd=$(update_available || true)
@@ -10973,9 +11001,8 @@ show_header() {
     prof="AWG $(server_proto), $(profile_label "$(server_profile)")"
     if iface_up; then st="${G}● работает${N}"; else st="${R}○ не поднят${N}"; fi
     echo -e "  Сервер     : ${W}$(endpoint_host):$(server_port)${N}  $st"
+    # Перехода на 3.1 здесь не предлагаем: 2.0 — такой же обычный выбор (Сервер → Протокол)
     echo -e "  Профиль    : ${W}$prof${N}, клиентов ${W}$n${N}"
-    hint=$(proto_upgrade_hint)
-    [[ -n "$hint" ]] && echo -e "  $hint"
   else
     echo -e "  Сервер     : ${D}не создан — Сервер → Создать сервер${N}"
   fi
@@ -11107,6 +11134,8 @@ API_ARGS=()
 # j готовый JSON, f содержимое файла; без типа — строка.
 _kv() { printf '%s\t%s\n' "$1" "${2//[$'\n\r']/ }"; }
 _b() { if "$@" &>/dev/null; then echo 1; else echo 0; fi; }
+# Счётчик из файла или вывода команды: не число (нет интерфейса) — 0
+_n() { local v; v=$("$@" 2>/dev/null | head -1); [[ "$v" =~ ^[0-9]+$ ]] && echo "$v" || echo 0; }
 api_obj() { py json-kv > "$API_DATA"; }
 api_rows() { py json-rows "$@" > "$API_DATA"; }
 api_list() { py json-list > "$API_DATA"; }
@@ -11223,7 +11252,6 @@ _api_server() {
           _kv clients:n "$(client_files | grep -c . || true)"
         fi
       } | api_obj
-      server_exists && proto_upgrade_hint
       return 0 ;;
     install) do_install ;;
     create)
@@ -11244,11 +11272,16 @@ _api_server() {
             _kv errors:j "$(py json-list <<< "$PARAMS_ERR")"; _kv warnings:j "$(py json-list <<< "$PARAMS_WARN")"
             _kv changed:j "$(py json-list <<< "$PARAMS_CHANGED")"; _kv breaking:j "$(py json-list <<< "$PARAMS_BREAKING")"
           } | api_obj ;;
+        gen)
+          [[ "${1:-pro}" =~ ^(lite|pro)$ ]] || { _api_usage "server params gen [lite|pro]"; return; }
+          params_gen "${1:-pro}" || return 1
+          { _kv proto "$(server_proto)"
+            while IFS=$'\t' read -r k v; do [[ -n "$k" ]] && _kv "values.$k" "$v"; done <<< "$PARAMS_GEN"; } | api_obj ;;
         set)
           server_params_set "$@" || return 1
           { _kv changed:j "$(py json-list <<< "$PARAMS_CHANGED")"; _kv breaking:j "$(py json-list <<< "$PARAMS_BREAKING")"
             _kv clients:n "$PARAMS_CLIENTS"; } | api_obj ;;
-        *) _api_usage "server params [check|set [force]] [Ключ=значение...]" ;;
+        *) _api_usage "server params [check|gen [lite|pro]|set [force]] [Ключ=значение...]" ;;
       esac ;;
     proto)
       [[ "${1:-}" =~ ^(2\.0|3\.1)$ ]] || { _api_usage "server proto 2.0|3.1"; return; }
@@ -11536,7 +11569,13 @@ _api_tunnels() {
         _kv exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
         _kv cascade:n "$(cascade_count)"
         if dns_installed; then _kv dns "$(dns_running && echo up || echo off)"; else _kv dns none; fi
-        _kv active "$(tunnel_conflict none)"; } | api_obj ;;
+        _kv active "$(tunnel_conflict none)"
+        # Счётчики интерфейсов туннелей (для карточек и сводки панели): есть — поднят
+        _kv ifs:j "$(for i in "$WARP_IF" "$XRAY_IF" "$T2S_IF"; do
+                      [[ -r "/sys/class/net/$i/statistics/rx_bytes" ]] || continue
+                      printf '%s\t%s\t%s\n' "$i" "$(_n cat "/sys/class/net/$i/statistics/rx_bytes")" \
+                        "$(_n cat "/sys/class/net/$i/statistics/tx_bytes")"
+                    done | py json-rows iface rx:n tx:n)"; } | api_obj ;;
     panic) tunnels_panic_reset quiet; ok "Туннели выключены — клиенты идут напрямую" ;;
     clients)
       case "${2:-}" in
@@ -11565,7 +11604,13 @@ _api_warp() {
         _kv configured:b "$(_b warp_configured)"
         _kv failed:b "$(_b test -f "$WARP_STATE.failed")"
         _kv health:b "$(_b unit_active awg-warp-healthcheck.timer)"
-        _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"; } | api_obj
+        _kv wg_possible:b "$(_b warp_wg_possible)"; _kv usque_possible:b "$(_b warp_usque_possible)"
+        # Для карточки: интерфейс, адрес Cloudflare, рукопожатие (wg) и счётчики
+        _kv iface "$WARP_IF"
+        _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
+        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <(wg show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
+        _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
+        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
       warp_status ;;
     install) if [[ "$be" == wg ]]; then warp_wg_install; else warp_usque_install; fi ;;
     up) warp_up ;;
@@ -11607,6 +11652,8 @@ _api_xray() {
         _kv main "$(xray_installed && py xray-main-get "$XRAY_CONF" 2>/dev/null)"
         _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
+        # Выходы для карточек: протокол, защита, транспорт, адрес
+        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
         _kv ru:b "$(_b xray_ru_on)"; } | api_obj
       xray_status ;;
     install) xray_install update ;;
@@ -11658,9 +11705,7 @@ _api_exits() {
     status)
       { _kv up:b "$(_b exits_is_up)"; _kv mode "$(exits_state_get mode)"
         _kv balancer "$(exits_state_get balancer)"; _kv single "$(exits_state_get single_exit)"
-        _kv nodes:j "$(while IFS= read -r n; do
-                          printf '%s\t%s\n' "$n" "$(_b ip link show "awg-exit-$n")"
-                        done < <(exits_nodes) | py json-rows name up:b)"; } | api_obj
+        _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto)"; } | api_obj
       exits_status; exits_list ;;
     add)
       [[ -n "${1:-}" ]] || { _api_usage "exits add ИМЯ < конфиг"; return; }
@@ -14113,7 +14158,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=8a849d804dcec477
+_PY_HELPER_SUM=d902da5b90c33093
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -14933,7 +14978,8 @@ def cmd_traffic_daily(conf, db, transfer, name="", days="30"):
         for p, n in names.items():
             _, r, s = t.series([p], days)
             if sum(r) + sum(s):
-                rows.append({"name": n or p[:8], "rx": sum(r), "tx": sum(s)})
+                # d — по дням (приём + отдача): мини-график в карточке клиента
+                rows.append({"name": n or p[:8], "rx": sum(r), "tx": sum(s), "d": [a + b for a, b in zip(r, s)]})
         out["clients"] = sorted(rows, key=lambda c: -(c["rx"] + c["tx"]))
     print(json.dumps(out, ensure_ascii=False))
 
@@ -15529,6 +15575,20 @@ def cmd_xray_restore_clean(path):
 def cmd_xray_tags(path):
     for t in proxy_tags(jload(path)):
         print(t)
+
+
+def cmd_xray_outs(path):
+    """Выходы для карточек панели: тег, протокол, защита, транспорт, адрес, порт (TSV)."""
+    clean = lambda v: str(v).replace("\t", " ").replace("\n", " ")  # noqa: E731
+    for o in jload(path).get("outbounds", []):
+        if not o.get("tag") or o.get("protocol") in SKIP_PROTO:
+            continue
+        st, sets = o.get("streamSettings") or {}, o.get("settings") or {}
+        srv = (sets.get("vnext") or sets.get("servers") or [sets])[0] or {}
+        port = srv.get("port") or 0
+        print("\t".join(clean(v) for v in (o["tag"], o.get("protocol", ""), st.get("security") or "none",
+                                          st.get("network") or "tcp", srv.get("address", ""),
+                                          port if isinstance(port, int) else 0)))
 
 
 def probe_conf(outbound):
@@ -16384,7 +16444,7 @@ COMMANDS = {
     "rand-key": cmd_rand_key, "phobos-link": cmd_phobos_link, "exit-conf-fix": cmd_exit_conf_fix,
     "conf-hooks": cmd_conf_hooks, "mod-compat-patch": cmd_mod_compat_patch,
     "xray-link": cmd_xray_link, "xray-default": cmd_xray_default, "xray-add": cmd_xray_add,
-    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
+    "xray-del": cmd_xray_del, "xray-tags": cmd_xray_tags, "xray-outs": cmd_xray_outs, "xray-restore-clean": cmd_xray_restore_clean, "xray-probe": cmd_xray_probe,
     "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
@@ -16415,5 +16475,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=4a3cb70ae9642cb4
+_BUILD_SUM=c95b8b76356aac97
 main "$@"

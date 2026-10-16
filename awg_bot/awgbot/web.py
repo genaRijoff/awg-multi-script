@@ -430,7 +430,8 @@ class WebPanel:
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["Referrer-Policy"] = "no-referrer"
-        resp.headers["Cache-Control"] = "no-store"
+        # Всё — без кэша, кроме шрифтов (свой Cache-Control у их ответа)
+        resp.headers.setdefault("Cache-Control", "no-store")
         resp.headers["Content-Security-Policy"] = (
             "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
             "script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
@@ -447,6 +448,16 @@ class WebPanel:
 
     async def static(self, request: web.Request) -> web.FileResponse:
         return web.FileResponse(STATIC / request.match_info["file"])
+
+    async def font(self, request: web.Request) -> web.StreamResponse:
+        """Шрифт оформления «Карточки» (IBM Plex, OFL): имя — только из списка
+        в маршруте; файлы между версиями не меняются — браузер держит неделю."""
+        f = STATIC / "fonts" / request.match_info["file"]
+        if not f.is_file():
+            raise web.HTTPNotFound()
+        resp = web.FileResponse(f, headers={"Content-Type": "font/woff2"})
+        resp.headers["Cache-Control"] = "public, max-age=604800"
+        return resp
 
     # ── вход и выход ──
     async def login(self, request: web.Request) -> web.Response:
@@ -606,6 +617,7 @@ class WebPanel:
         sub.router.add_get("/", self.index)
         sub.router.add_get("/web.js", self.web_js)
         sub.router.add_get(r"/{file:(app|icons)\.js}", self.static)
+        sub.router.add_get(r"/fonts/{file:[a-z0-9-]{1,40}\.woff2}", self.font)
         sub.router.add_post("/api/login", self.login)
         sub.router.add_post("/api/logout", self.logout)
         sub.router.add_post("/api/me", self.me)

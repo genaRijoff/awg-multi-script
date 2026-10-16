@@ -149,6 +149,7 @@ class MiniApp:
             app.router.add_get("/", self._index)
             app.router.add_get("/app.js", self._static)
             app.router.add_get("/icons.js", self._static)
+            app.router.add_get(r"/fonts/{file:[a-z0-9-]{1,40}\.woff2}", self._font)
             app.router.add_post("/api/me", self._me)
             app.router.add_post("/api/status", self._status)
             panel.setup(app, self._user)
@@ -243,6 +244,17 @@ class MiniApp:
     async def _index(request: web.Request) -> web.StreamResponse:
         resp = web.FileResponse(STATIC / "index.html")
         resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @staticmethod
+    async def _font(request: web.Request) -> web.StreamResponse:
+        """Шрифт оформления «Карточки» (IBM Plex, OFL): имя — только из списка
+        в маршруте, файлы не меняются между версиями — браузер держит неделю."""
+        f = STATIC / "fonts" / request.match_info["file"]
+        if not f.is_file():
+            raise web.HTTPNotFound()
+        resp = web.FileResponse(f, headers={"Content-Type": "font/woff2"})
+        resp.headers["Cache-Control"] = "public, max-age=604800"
         return resp
 
     @staticmethod
