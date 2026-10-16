@@ -181,6 +181,10 @@
 
   #app { padding: 26px 28px calc(60px + 0px); padding: 26px 28px calc(60px + env(safe-area-inset-bottom)); max-width: 1480px; margin: 0 auto; }
   body:not(.rail-on) #app { padding-bottom: calc(104px + 0px); padding-bottom: calc(104px + env(safe-area-inset-bottom)); }
+  /* Плашка действий внизу (форма параметров, выбор нескольких) висит над нижней
+     панелью — запас, чтобы последнее поле прокручивалось выше неё, а не под неё */
+  body:not(.rail-on) #app:has(> .bar) { padding-bottom: calc(160px + 0px); padding-bottom: calc(160px + env(safe-area-inset-bottom)); }
+  body.rail-on #app:has(> .bar) { padding-bottom: 96px; }
   /* Экраны-формы — узкой колонкой */
   #app:has(> input:not([type=file]), > textarea, > select, > .row > input, > .pgrid) { max-width: 760px; }
 
