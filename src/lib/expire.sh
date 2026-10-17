@@ -73,8 +73,16 @@ traffic_tick() {  # [1 — записать базу сейчас]
       UNLIMIT)
         echo "$(date '+%F %T') unlimit: $name ($arg)" >> "$EXPIRE_LOG"
         _expire_notify "✅ Клиент <b>$(_expire_esc "$name")</b> разблокирован — трафик в пределах лимита: ${arg}." ;;
+      SLOW)
+        echo "$(date '+%F %T') slow: $name до $arg Мбит/с ($text)" >> "$EXPIRE_LOG"
+        _expire_notify "🐢 Клиент <b>$(_expire_esc "$name")</b> замедлен до ${arg} Мбит/с: исчерпан лимит трафика — ${text}." ;;
+      UNSLOW)
+        echo "$(date '+%F %T') unslow: $name ($arg)" >> "$EXPIRE_LOG"
+        _expire_notify "✅ Клиент <b>$(_expire_esc "$name")</b> — снова полная скорость: трафик в пределах лимита — ${arg}." ;;
     esac
   done <<< "$out"
+  # Замедление по лимиту и своя скорость клиентов — в tc
+  speed_check
   return 0
 }
 
@@ -132,7 +140,9 @@ expire_install() {
   mkdir -p "$EXPIRE_STATE_DIR"
   emit_script "$EXPIRE_BIN" 'expire_check_run' \
     SERVER_CONF AWG_IF EXPIRE_SUSPEND_IP EXPIRE_STATE_DIR EXPIRE_LOG BOT_CONF BOT_ADMINS TRAFFIC_DB _PY_HELPER STATE_DIR EXPIRE_LOCK_MAX \
-    py _expire_notify _expire_esc _expire_sync _traffic_snapshot traffic_tick expire_check_run || return 1
+    SPEED_IFB SPEED_H SPEED_MAX SPEED_ERR \
+    py _expire_notify _expire_esc _expire_sync _traffic_snapshot traffic_tick expire_check_run \
+    _speed_root _speed_burst _speed_batch _speed_undo _speed_build speed_clear speed_apply speed_check || return 1
   write_unit awg2-expire.service <<EOF
 [Unit]
 Description=AWG Toolza — сроки и трафик клиентов
@@ -188,6 +198,7 @@ expire_watchdog() {
 }
 
 expire_remove() {
+  speed_clear
   remove_unit awg2-expire.timer awg2-expire.service
   rm -f "$EXPIRE_BIN" "$TRAFFIC_DB" "$TRAFFIC_DB.lock"
   rm -rf "$EXPIRE_STATE_DIR"
@@ -245,17 +256,17 @@ do_traffic_days() {
 do_expire_menu() {
   server_exists || { err "Сервер не создан"; return 1; }
   expire_install
-  local c name pub ts rows=() n=0 exp orig lim per used month _ by ans
+  local c name pub ts rows=() n=0 exp orig lim per used month _ by ans sp slow sby
   local -A tl=()
   while true; do
     echo ""
-    hdr "Сроки и лимиты трафика"
+    hdr "Сроки, лимиты трафика и скорость"
     tl=()
     while IFS='|' read -r name lim per used month _ by; do
       [[ -n "$name" && "$lim" != 0 ]] && tl[x$name]="$lim/$per|$used|$by"
     done < <(traffic_rows)
-    while IFS='|' read -r name pub _ exp orig _; do
-      [[ -n "$exp" || -n "${tl[x$name]:-}" ]] || continue
+    while IFS='|' read -r name pub _ exp orig _ _ _ sp slow sby; do
+      [[ -n "$exp" || -n "${tl[x$name]:-}" || -n "$sp" ]] || continue
       n=$((n + 1))
       by="${tl[x$name]:-}"; by="${by##*|}"
       if [[ -n "$orig" && "$by" == traffic ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован: исчерпан лимит${N}"
@@ -264,10 +275,12 @@ do_expire_menu() {
       else echo -e "  ${C}📶 ${name}${N}"; fi
       if [[ -n "${tl[x$name]:-}" ]]; then
         IFS='|' read -r lim used _ <<< "${tl[x$name]}"
-        echo -e "     ${D}трафик: $(limit_fmt "$lim" "$used")${N}"
+        echo -e "     ${D}трафик: $(limit_fmt "$lim" "$used")${slow:+, исчерпал — замедлять до $slow Мбит/с}${N}"
       fi
+      sp=$(speed_fmt "$sp" "$slow" "$sby")
+      [[ -n "$sp" ]] && echo -e "     ${D}скорость: $sp${N}"
     done < <(clients_psv)
-    (( n )) || echo -e "  ${D}Сроков и лимитов нет — все клиенты бессрочные и без лимита${N}"
+    (( n )) || echo -e "  ${D}Сроков, лимитов и ограничений скорости нет${N}"
     n=0
     echo ""
     echo -e "  ${C}1)${N} Поставить срок"
@@ -277,8 +290,9 @@ do_expire_menu() {
     echo -e "  ${C}5)${N} Обнулить счётчик лимита"
     echo -e "  ${C}6)${N} Трафик по дням"
     echo -e "  ${R}7)${N} Удалить с истёкшим сроком"
+    echo -e "  ${C}8)${N} Скорость клиента"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
+    read_choice c "${C}  Выбор [0-8]: ${N}" 0 8 0
     case "$c" in
       1) _pick_client || continue
          name="${CHOSEN%%$'\t'*}"
@@ -291,7 +305,10 @@ do_expire_menu() {
          name="${CHOSEN%%$'\t'*}"
          [[ -n "$name" ]] || { warn "У клиента нет имени"; continue; }
          ans=$(_ask_limit)
-         [[ -n "$ans" ]] && { client_limit_set "$name" "${ans% *}" "${ans#* }" || true; } ;;
+         [[ -n "$ans" ]] || continue
+         client_limit_set "$name" "${ans% *}" "${ans#* }" || continue
+         ans=$(_ask_limit_mode)
+         client_limit_mode "$name" "$ans" || true ;;
       4) _pick_client || continue
          client_limit_set "${CHOSEN%%$'\t'*}" off || true ;;
       5) _pick_client || continue
@@ -301,6 +318,11 @@ do_expire_menu() {
          (( ${#rows[@]} )) || { info "Клиентов с истёкшим сроком нет"; continue; }
          warn "Будут удалены навсегда: ${rows[*]}"
          read_confirm "${R}  Подтверди (введи yes): ${N}" && clients_purge_blocked ;;
+      8) _pick_client || continue
+         name="${CHOSEN%%$'\t'*}"
+         [[ -n "$name" ]] || { warn "У клиента нет имени"; continue; }
+         ans=$(_ask_speed)
+         [[ -n "$ans" ]] && { client_speed_set "$name" "$ans" || true; } ;;
       0) return 0 ;;
     esac
   done

@@ -293,6 +293,14 @@ def limit_text(c: dict) -> str:
             f" ({min(999, used * 100 // max(lim, 1))}%)")
 
 
+def speed_text(c: dict) -> str:
+    """«20 Мбит/с», «🐢 2 Мбит/с — лимит исчерпан» или пусто."""
+    sp, slow = c.get("speed"), c.get("limit_slow")
+    if c.get("slowed") and slow and not (sp and sp < slow):
+        return f"🐢 {slow} Мбит/с — лимит трафика исчерпан"
+    return f"{sp} Мбит/с" if sp else ""
+
+
 def card_text(c: dict, route: dict) -> str:
     name = c["name"]
     note = store.strip_tag(store.note(name))
@@ -304,7 +312,9 @@ def card_text(c: dict, route: dict) -> str:
         f"Статус: {icon(c)} {seen(c)}",
         f"Трафик: ↓{ui.fmt_bytes(c.get('rx'))} ↑{ui.fmt_bytes(c.get('tx'))}"
         + (f" · за месяц {ui.fmt_bytes(month)}, сегодня {ui.fmt_bytes(c.get('today'))}" if month is not None else ""),
-        f"Лимит: {limit_text(c)}" if c.get("limit") else "",
+        f"Лимит: {limit_text(c)}" + (f" · исчерпал — 🐢 до {c['limit_slow']} Мбит/с" if c.get("limit_slow") else "")
+        if c.get("limit") else "",
+        f"Скорость: {speed_text(c)}" if speed_text(c) else "",
         f"Адрес клиента: <code>{esc(c['endpoint'].rsplit(':', 1)[0])}</code>" if c.get("endpoint") else "",
         f"Срок: {ui.fmt_expire(c.get('expires'))}",
         f"Мимикрия: {esc(c['mimicry']) if c.get('mimicry') not in (None, '', 'none') else 'без I1-I5'}",
@@ -325,6 +335,7 @@ async def card(target: ui.Target, name: str) -> None:
         ("✏️ Переименовать", act.data("ren", name)),
         ("⏳ Срок действия", act.data("exp", name)),
         ("📶 Лимит трафика", act.data("lim", name)),
+        ("🚀 Скорость", act.data("spd", name)),
         ("📊 Трафик по дням", act.data("tday", name)),
         ("🎭 Мимикрия", act.data("mim", name)),
         ("🌐 Маршрут", act.data("tun", name)) if route["kind"] in ("warp", "xray", "exits") else None,
@@ -578,19 +589,38 @@ async def _lim(cb: CallbackQuery, state: FSMContext, name: str) -> None:
     chosen, _, p = ((await state.get_data()).get("lim_period") or "").rpartition("|")
     period = p if chosen == name and p in PERIOD else c.get("period") or "month"
     other = "total" if period == "month" else "month"
+    slow = c.get("limit_slow")
+    mode = f"замедлять до {slow} Мбит/с" if slow else "блокировать"
     await ui.render(cb, f"<b>📶 Лимит трафика: {esc(name)}</b>\n"
                         f"Сейчас: {limit_text(c) or 'без лимита'}\n"
-                        f"За этот месяц: {ui.fmt_bytes(c.get('month'))}\n\n"
-                        "Исчерпал лимит — клиент блокируется, как истёкший. «В месяц» — счётчик "
-                        "обнуляется 1-го числа, и клиент разблокируется сам; «всего» — считается с "
-                        "момента установки, без сброса.\n\n"
+                        f"За этот месяц: {ui.fmt_bytes(c.get('month'))}\n"
+                        f"Исчерпал лимит — <b>{mode}</b>\n\n"
+                        "«Блокировать» — клиент отключается, как истёкший; «замедлять» — остаётся на связи, "
+                        "но на малой скорости. «В месяц» — счётчик обнуляется 1-го числа, и всё снимается "
+                        "само; «всего» — считается с момента установки, без сброса.\n\n"
                         f"Период для новых значений: <b>{PERIOD[period]}</b>",
                     ui.kb([(f"📶 {v[:-1]} ГБ", act.data("ls", f"{name}|{v}|{period}")) for v in LIMITS],
                           ("✏️ Свой размер…", act.data("ls", f"{name}|ask|{period}")),
                           (f"🔁 {'Всего' if other == 'total' else 'В месяц'}", act.data("lp", f"{name}|{other}")),
                           ("🔄 Обнулить", act.data("lr", name)) if c.get("limit") else None,
+                          [(("✅ " if (m == "block" and not slow) or str(slow) == m else "")
+                            + ("🚫 Блокировать" if m == "block" else f"🐢 {m} Мбит/с"), act.data("lm", f"{name}|{m}"))
+                           for m in SLOW_MODES],
                           ("♾ Снять лимит", act.data("ls", f"{name}|off|{period}")) if c.get("limit") else None,
                           ui.back(act.data("v", name))))
+
+
+SLOW_MODES = ["block", "1", "2", "5"]
+
+
+@act("lm")
+async def _lim_mode(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    name, _, m = arg.partition("|")
+    r = await api.call("client", "limit-mode", name, m if m in SLOW_MODES else "block")
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Лимит трафика"), ui.kb(ui.back(act.data("lim", name))))
+        return
+    await _lim(cb, state, name)
 
 
 @act("lp")
@@ -635,6 +665,53 @@ async def _lim_reset(cb: CallbackQuery, state: FSMContext, name: str) -> None:
         return
     await cb.answer("Счётчик обнулён")
     await card(cb, name)
+
+
+# ── Скорость ──────────────────────────────────────────────
+SPEEDS = ["5", "10", "20", "50", "100"]
+
+
+@act("spd")
+async def _spd(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    c = await client(name)
+    if c is None:
+        await card(cb, name)
+        return
+    sp = c.get("speed")
+    await ui.render(cb, f"<b>🚀 Скорость: {esc(name)}</b>\n"
+                        f"Сейчас: {speed_text(c) or 'без ограничения'}\n\n"
+                        "Одна цифра на скачивание и отдачу, Мбит/с. Действует при любом маршруте — "
+                        "напрямую, WARP, Xray, exit-ноды. Если один конфиг стоит на нескольких "
+                        "устройствах, они делят скорость.",
+                    ui.kb([(("✅ " if str(sp) == v else "") + f"🚀 {v} Мбит/с", act.data("ss", f"{name}|{v}"))
+                           for v in SPEEDS],
+                          ("✏️ Своя…", act.data("ss", f"{name}|ask")),
+                          ("♾ Без лимита", act.data("ss", f"{name}|off")) if sp else None,
+                          ui.back(act.data("v", name))))
+
+
+@act("ss")
+async def _spd_set(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    name, _, v = arg.partition("|")
+    if v == "ask":
+        await ask.ask(cb, state, "cl_speed", "Скорость в Мбит/с: целое число от 1 до 10000, "
+                                             "<code>0</code> — без ограничения",
+                      act.data("spd", name), name=name)
+        return
+    r = await api.call("client", "speed", name, v)
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Скорость"), ui.kb(ui.back(act.data("spd", name))))
+        return
+    await card(cb, name)
+
+
+@ask.on("cl_speed")
+async def _spd_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
+    r = await api.call("client", "speed", ctx["name"], ask.text_of(msg).strip() or "0")
+    if not r.ok:
+        await ask.retry(msg, state, ctx, r.message)
+        return
+    await card(msg, ctx["name"])
 
 
 # ── Трафик по дням ────────────────────────────────────────

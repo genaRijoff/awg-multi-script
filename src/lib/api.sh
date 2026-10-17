@@ -340,7 +340,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -369,7 +369,13 @@ _api_client() {
       [[ -n "${1:-}" ]] || { _api_usage "client limit ИМЯ 50G|500M|off [month|total]"; return; }
       client_limit_set "$name" "$1" "${2:-month}" ;;
     limit-reset) client_limit_reset "$name" ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset ИМЯ ..." ;;
+    limit-mode)
+      [[ -n "${1:-}" ]] || { _api_usage "client limit-mode ИМЯ block|Мбит/с"; return; }
+      client_limit_mode "$name" "$1" ;;
+    speed)
+      [[ -n "${1:-}" ]] || { _api_usage "client speed ИМЯ Мбит/с|off"; return; }
+      client_speed_set "$name" "$1" ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed ИМЯ ..." ;;
   esac
 }
 

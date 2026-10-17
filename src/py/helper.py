@@ -138,7 +138,8 @@ def cmd_peers(conf):
             continue
         print("\t".join([peer_name(b), pub, peer_field(b, "AllowedIPs"),
                          peer_meta(b, "expires"), peer_meta(b, "orig_ips"),
-                         peer_meta(b, "mimicry"), peer_meta(b, "limit"), peer_meta(b, "blocked_by")]))
+                         peer_meta(b, "mimicry"), peer_meta(b, "limit"), peer_meta(b, "blocked_by"),
+                         peer_meta(b, "speed"), peer_meta(b, "limit_slow"), peer_meta(b, "slowed_by")]))
 
 
 def cmd_meta_set(conf, name, key, value):
@@ -673,10 +674,20 @@ def _unblock(b, suspend):
 PERIOD_WORD = {"month": "за месяц", "total": "всего"}
 
 
+def _mbit(value):
+    """Метка скорости (Мбит/с) → число; не число или 0 — 0 (без ограничения)."""
+    return int(value) if (value or "").isdigit() and 0 < int(value) <= SPEED_MAX else 0
+
+
+SPEED_MAX = 10000
+
+
 def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
     """Проход таймера: прирост трафика в базу и проверка лимитов. События:
     CHANGED; LIMIT<TAB>имя<TAB>адрес<TAB>текст; WARN90<TAB>имя<TAB>текст;
-    UNLIMIT<TAB>имя<TAB>текст."""
+    UNLIMIT<TAB>имя<TAB>текст; SLOW<TAB>имя<TAB>Мбит/с<TAB>текст;
+    UNSLOW<TAB>имя<TAB>текст. Мягкий лимит («# limit_slow=N»): исчерпавший
+    не блокируется, а замедляется до N Мбит/с («# slowed_by=traffic»)."""
     lock = _traffic_lock(db)
     try:
         text = read(conf)
@@ -694,25 +705,41 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
         alive.add(pub)
         name = peer_name(b) or pub[:8]
         limit, period = parse_limit(peer_meta(b, "limit"))
+        slow = _mbit(peer_meta(b, "limit_slow"))
         by_traffic = peer_meta(b, "blocked_by") == "traffic"
+        slowed = peer_meta(b, "slowed_by") == "traffic"
         exp = peer_meta(b, "expires")
         expired = exp.isdigit() and now >= int(exp)
         used = t.used(pub, period) if limit else 0
         word = "%s из %s %s" % (fmt_bytes(used), fmt_bytes(limit), PERIOD_WORD.get(period, "")) if limit else ""
-        if by_traffic and (not limit or used < limit):
+        over = bool(limit) and used >= limit
+        # Блокировку за трафик снимает и смена режима на «замедлять»
+        if by_traffic and (not over or slow):
             if expired:
                 # Лимит отпустил, но истёк срок: блокировку держит уже он,
                 # и снимается она сроком
                 peers[i] = set_meta(b, "blocked_by", "")
             else:
                 peers[i] = _unblock(b, suspend)
-                events.append("UNLIMIT\t%s\t%s" % (name, word or "лимит снят"))
+                if not over:
+                    events.append("UNLIMIT\t%s\t%s" % (name, word or "лимит снят"))
             changed = True
-        elif limit and used >= limit and aip != suspend:
+            b, aip = peers[i], peer_field(peers[i], "AllowedIPs")
+        if slowed and not (over and slow):
+            peers[i] = b = set_meta(b, "slowed_by", "")
+            changed = True
+            if not over:
+                events.append("UNSLOW\t%s\t%s" % (name, word or "лимит снят"))
+        if over and slow:
+            if not slowed:
+                peers[i] = set_meta(b, "slowed_by", "traffic")
+                changed = True
+                events.append("SLOW\t%s\t%d\t%s" % (name, slow, word))
+        elif over and aip != suspend:
             peers[i] = _block(b, suspend, aip, "traffic")
             changed = True
             events.append("LIMIT\t%s\t%s\t%s" % (name, aip, word))
-        elif limit and used >= limit * 0.9 and aip != suspend:
+        elif limit and not over and used >= limit * 0.9 and aip != suspend:
             mark = "%s:%d" % (t.period_key(period), limit)
             if t.d["warned"].get(pub) != mark:
                 t.d["warned"][pub] = mark
@@ -726,6 +753,32 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
     del lock
     for e in events:
         print(e)
+
+
+def cmd_speed_plan(conf, suspend):
+    """План скорости для tc: «адрес<TAB>Мбит/с» на каждый адрес клиента с
+    ограничением — своей скоростью («# speed=N») или мягким лимитом трафика
+    (замедлен — «# slowed_by=traffic», до «# limit_slow=N»); действует
+    меньшее. Заблокированные (адрес-заглушка) — без строк."""
+    import ipaddress
+    try:
+        _, peers = split_peers(read(conf))
+    except OSError:
+        return
+    for b in peers:
+        aip = peer_field(b, "AllowedIPs")
+        if not aip or aip == suspend:
+            continue
+        rates = [r for r in (_mbit(peer_meta(b, "speed")),
+                             _mbit(peer_meta(b, "limit_slow")) if peer_meta(b, "slowed_by") == "traffic" else 0) if r]
+        if not rates:
+            continue
+        for a in aip.split(","):
+            try:
+                net = ipaddress.ip_network(a.strip(), strict=False)
+            except ValueError:
+                continue
+            print("%s\t%d" % (net, min(rates)))
 
 
 def _traffic_lock(db):
@@ -1882,6 +1935,9 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
         by = peer_meta(b, "blocked_by")
         row.update(limit=limit or None, period=period or None,
                    blocked_by=(by or "expire") if orig else None,
+                   speed=_mbit(peer_meta(b, "speed")) or None,
+                   limit_slow=_mbit(peer_meta(b, "limit_slow")) or None,
+                   slowed=peer_meta(b, "slowed_by") == "traffic",
                    used=traffic.used(pub, period) if traffic and limit else None,
                    month=traffic.raw_used(pub, "month") if traffic else None,
                    today=sum((traffic.d["days"].get(today) or {}).get(pub) or [0, 0]) if traffic else None)
@@ -2276,6 +2332,7 @@ COMMANDS = {
     "traffic-tick": cmd_traffic_tick, "traffic-daily": cmd_traffic_daily, "traffic-now": cmd_traffic_now,
     "traffic-rows": cmd_traffic_rows, "traffic-report": cmd_traffic_report,
     "limit-set": cmd_limit_set, "limit-reset": cmd_limit_reset, "size-parse": cmd_size_parse,
+    "speed-plan": cmd_speed_plan,
     "web-hash": cmd_web_hash,
     "net-of": cmd_net_of, "pick-net": cmd_pick_net, "net-overlaps": cmd_net_overlaps,
     "allowed-except": cmd_allowed_except,

@@ -97,6 +97,23 @@ exit 0''',
 exit 1''',
     "ufw": r'''exit 1''',
     "modprobe": r'''exit 0''',
+    # tc: журнал; корень awg0 помнится в файле (своя HTB после -batch, снятие — del);
+    # TC_FAIL — файл: -batch падает с этой ошибкой; TC_ROOT_BUSY — чужая очередь
+    "tc": r'''echo "tc $*" >> "$CALLS"
+st="$CALLS.tcroot"
+if [[ "$1" == -batch ]]; then
+  sed 's/^/tc> /' "$2" >> "$CALLS"
+  [[ -f "$CALLS.tcfail" ]] && { cat "$CALLS.tcfail" >&2; exit 1; }
+  grep -q "^qdisc add dev awg0 root handle a2:" "$2" && echo "qdisc htb a2: root refcnt 2 r2q 10 default 0x1" > "$st"
+  exit 0
+fi
+if [[ "$1" == qdisc && "$2" == show ]]; then
+  [[ "$*" == *root* ]] || exit 0
+  if [[ -f "$CALLS.tcbusy" ]]; then cat "$CALLS.tcbusy"; elif [[ -f "$st" ]]; then cat "$st"; else echo "qdisc noqueue 0: root refcnt 2"; fi
+  exit 0
+fi
+[[ "$1" == qdisc && "$2" == del && "$*" == *"dev awg0 root"* ]] && rm -f "$st"
+exit 0''',
 }
 for name, body in STUBS.items():
     p = os.path.join(BIN, name)

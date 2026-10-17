@@ -8,7 +8,8 @@
   cert    сертификат Mini App скоро истечёт — значит, продление не сработало;
   disk    диск заполнен на DISK_WARN% (повтор — только после спада ниже DISK_OK%);
   update  вышла новая версия AWG Toolza — одной строкой, «Обновить» и «Что нового»;
-  kernel  установлено ядро без модуля AWG — после перезагрузки VPN не поднимется.
+  kernel  установлено ядро без модуля AWG — после перезагрузки VPN не поднимется;
+  support по пятницам — напоминание поддержать проект, только владельцам.
 
 Каждое событие — один раз, пока не сменится (новая версия, другое ядро).
 Сроки и лимиты трафика клиентов сообщает таймер awg2: он работает и без бота.
@@ -56,11 +57,19 @@ SEND_MAX = 49 * 1024 * 1024                     # документ бота — 
 # id, подпись кнопки (полстроки в боте), полное название
 KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("reboot", "Перезагрузка", "Сервер перезагрузился"),
          ("update", "Новая версия", "Новая версия Тулзы"), ("kernel", "Ядро без AWG", "Ядро без модуля AWG"),
-         ("cert", "Сертификат", "Сертификат Mini App истекает"), ("disk", f"Диск {DISK_WARN}%", f"Диск заполнен на {DISK_WARN}%")]
+         ("cert", "Сертификат", "Сертификат Mini App истекает"), ("disk", f"Диск {DISK_WARN}%", f"Диск заполнен на {DISK_WARN}%"),
+         ("support", "Поддержка", "Пятница: поддержать проект")]
 KIND_IDS = {k for k, _, _ in KINDS}
 BACKUP_MODES = {"off": "выключен", "day": "ежедневно", "week": "еженедельно"}
 BACKUP_PERIOD = {"day": 86400, "week": 7 * 86400}
 BACKUP_KEEP = (3, 7, 14, 30)
+# Напоминание о поддержке: пятница, с полудня по времени сервера, раз в неделю;
+# первое — не раньше чем через SUPPORT_GRACE после установки или обновления бота
+SUPPORT_WDAY, SUPPORT_HOUR = 4, 12
+SUPPORT_GRACE = 3 * 86400
+SUPPORT_TEXT = ("💚 <b>AWG Toolza</b> бесплатна и развивается на донаты.\n"
+                "Если Тулза тебе помогает — поддержи проект: так выходят новые версии.\n"
+                "<i>Раз в неделю, по пятницам. Выключить — Бот → 🔔 Уведомления.</i>")
 
 
 # ── Настройки ─────────────────────────────────────────────
@@ -188,6 +197,22 @@ def update_text(d: dict[str, Any], upd: str) -> str:
     return f"🚀 AWG Toolza{beta}: есть обновление <b>{esc(upd)}</b>"
 
 
+async def support_tick(bot: Bot, st: dict[str, Any], now: int) -> None:
+    """Пятничное напоминание — владельцам: админы сервер не оплачивают."""
+    since = int(st.setdefault("support_since", now))
+    if since > now:                                 # часы уходили вперёд — отсчёт заново
+        since = st["support_since"] = now
+    lt = time.localtime(now)
+    week = time.strftime("%G-W%V", lt)
+    if (lt.tm_wday != SUPPORT_WDAY or lt.tm_hour < SUPPORT_HOUR or st.get("support") == week
+            or now - since < SUPPORT_GRACE or not enabled("support")):
+        return
+    st["support"] = week
+    markup = ui.kb(ui.Row(("Поддержать 💚", ui.SUPPORT_URL)))
+    for uid in sorted(access.owners()):
+        await _deliver(lambda u: bot.send_message(u, SUPPORT_TEXT, reply_markup=markup), uid)
+
+
 async def tick(bot: Bot, st: dict[str, Any]) -> bool:
     """Один проход. False — сводка awg2 не получена."""
     d = await api.data("status")
@@ -264,6 +289,8 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
                                   "Автопродление не сработало: Telegram-бот → 📱 Mini App → 🔐 На IP или 🌍 На домен…",
                              ui.kb(("📱 Mini App", "app")), owner_markup=True)
             st["cert"] = expires
+
+    await support_tick(bot, st, now)
     return True
 
 
