@@ -69,7 +69,7 @@ SUPPORT_WDAY, SUPPORT_HOUR = 4, 12
 SUPPORT_GRACE = 3 * 86400
 SUPPORT_TEXT = ("💚 <b>AWG Toolza</b> бесплатна и развивается на донаты.\n"
                 "Если Тулза тебе помогает — поддержи проект: так выходят новые версии.\n"
-                "<i>Раз в неделю, по пятницам. Выключить — кнопкой ниже или в Бот → 🔔 Уведомления.</i>")
+                "<i>Раз в неделю, по пятницам. Выключить — Бот → 🔔 Уведомления.</i>")
 
 
 # ── Настройки ─────────────────────────────────────────────
@@ -208,7 +208,7 @@ async def support_tick(bot: Bot, st: dict[str, Any], now: int) -> None:
             or now - since < SUPPORT_GRACE or not enabled("support")):
         return
     st["support"] = week
-    markup = ui.kb(ui.Row(("Поддержать 💚", ui.SUPPORT_URL)), ui.Row(("🔕 Не напоминать", "ntf:off:support")))
+    markup = ui.kb(ui.Row(("Поддержать 💚", ui.SUPPORT_URL)))
     for uid in sorted(access.owners()):
         await _deliver(lambda u: bot.send_message(u, SUPPORT_TEXT, reply_markup=markup), uid)
 

@@ -908,9 +908,9 @@ async def run():
     await al.support_tick(BOT, sst, fri)
     sup = support(mark)
     rows = sup[0].reply_markup.inline_keyboard if sup and sup[0].reply_markup else []
-    chk("пятница после полудня — владельцу, не админу: «Поддержать 💚» ссылкой, зелёная, и «Не напоминать»",
-        [m.chat_id for m in sup] == [111] and len(rows) == 2 and rows[0][0].url == "https://t.me/awgToolza/156/157"
-        and rows[0][0].style == "success" and rows[1][0].callback_data == "ntf:off:support", [sup, rows])
+    chk("пятница после полудня — владельцу, не админу: одна кнопка «Поддержать 💚» ссылкой, зелёная",
+        [m.chat_id for m in sup] == [111] and len(rows) == 1 and len(rows[0]) == 1
+        and rows[0][0].url == "https://t.me/awgToolza/156/157" and rows[0][0].style == "success", [sup, rows])
     mark = len(SESSION.sent)
     await al.support_tick(BOT, sst, fri + 3 * 3600)
     chk("в ту же пятницу — один раз", not support(mark))
@@ -922,14 +922,10 @@ async def run():
     await al.support_tick(BOT, fresh, fri + 2 * 86400 + 3600)
     chk("сразу после установки или обновления бота — не пишет (первые 3 дня)",
         not support(mark) and fresh.get("support_since") == fri, fresh)
-    chk("«Не напоминать» — только владелец", "только владелец" in " ".join(alerts(await press("ntf:off:support", User(
-        id=333, is_bot=False, first_name="Admin")))) and al.enabled("support"))
-    await press("ntf:off:support")
-    await press("ntf:off:support")
+    await press("ntf:t:support")
     mark = len(SESSION.sent)
     await al.support_tick(BOT, sst, fri + 14 * 86400)
-    chk("«Не напоминать» выключает (повторное нажатие не включает), напоминаний нет",
-        not al.enabled("support") and not support(mark), al.config())
+    chk("выключено в «Уведомлениях» — напоминаний нет", not al.enabled("support") and not support(mark), al.config())
     al.set_enabled("support", True)
     admins.remove(333, removed_by=111)
 

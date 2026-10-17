@@ -70,15 +70,6 @@ async def _ntf_toggle(cb: CallbackQuery, state: FSMContext, kind: str) -> None:
     await _ntf(cb, state)
 
 
-@ntf("off")
-async def _ntf_off(cb: CallbackQuery, state: FSMContext, kind: str) -> None:
-    """«Не напоминать» в самом уведомлении: только выключает — повторное
-    нажатие на старом сообщении не включит обратно."""
-    if kind in alerts.KIND_IDS:
-        alerts.set_enabled(kind, False)
-    await _ntf(cb, state)
-
-
 @act("update")
 async def _update(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await ui.confirm(cb, "Обновить бота из канала обновлений AWG Toolza? Он перезапустится и продолжит "
