@@ -290,6 +290,11 @@ const meter = (used, limit) => {
 };
 const PERIOD = { month: "за месяц", total: "всего" };
 const limitText = (c) => `${fmtBytes(c.used)} из ${fmtBytes(c.limit)} ${PERIOD[c.period] || ""}`;
+// Скорость клиента: своя или замедление по лимиту (действует меньшая); пусто — без ограничения
+const speedNow = (c) => (c.slowed && c.limit_slow && !(c.speed && c.speed < c.limit_slow) ? c.limit_slow : c.speed || 0);
+const speedText = (c) => (!speedNow(c) ? "" : speedNow(c) === c.speed ? `${c.speed} Мбит/с` : `🐢 ${c.limit_slow} Мбит/с — лимит исчерпан`);
+const SPEEDS = [5, 10, 20, 50, 100];
+const SLOW_MODES = [["block", "🚫 Блокировать"], ["1", "🐢 1 Мбит/с"], ["2", "🐢 2 Мбит/с"], ["5", "🐢 5 Мбит/с"]];
 
 // ── Вид: иконки, тема, шапка, общие детали ────────────────
 function icon(name) {
@@ -309,7 +314,7 @@ const EMOJI_ICON = {
   "📅": "calendar-clock", "♾": "infinity", "🚪": "door-open", "☁": "cloud", "🛰": "satellite", "🧦": "waypoints",
   "🔐": "lock-keyhole", "🧪": "flask-conical", "🖥": "server", "🛡": "shield", "📁": "folder", "🗜": "file-archive",
   "◀": "arrow-left", "✅": "circle-check", "❌": "circle-x", "✖": "x", "🔃": "arrow-down-up", "📂": "folder",
-  "👮": "user", "🎨": "palette", "📶": "gauge", "📊": "chart-column", "📈": "chart-column", "🕒": "clock", "🎛": "sliders-horizontal", "↩": "undo-2", "💬": "message-square-text", "📱": "smartphone", "🔗": "share-2", "🙋": "user-plus", "🧯": "eraser",
+  "👮": "user", "🎨": "palette", "📶": "gauge", "🚀": "zap", "🐢": "timer", "🚫": "circle-x", "📊": "chart-column", "📈": "chart-column", "🕒": "clock", "🎛": "sliders-horizontal", "↩": "undo-2", "💬": "message-square-text", "📱": "smartphone", "🔗": "share-2", "🙋": "user-plus", "🧯": "eraser",
 };
 // \p{…} старый движок не знает (вся панель падала на этой строке) — там
 // эмодзи узнаётся по суррогатной паре или блоку символов
@@ -2191,6 +2196,7 @@ function clientTags(c) {
     c.mimicry && c.mimicry !== "none" ? tag(c.mimicry, "accent", "drama") : tag("без I1-I5"),
     expLive(c) ? tag(expShort(c.expires), left < 3 * 86400 ? "warn" : "", "hourglass") : null,
     c.limit ? tag(`лимит ${Math.min(999, Math.round(c.used * 100 / c.limit))}%`, c.used >= c.limit * 0.9 ? "warn" : "", "gauge") : null,
+    speedNow(c) ? tag(`${speedNow(c)} Мбит/с`, speedNow(c) !== c.speed ? "warn" : "", speedNow(c) !== c.speed ? "timer" : "zap") : null,
     routeTag(c, (S.clients && S.clients.route) || {}),
     c.mon ? tag("мониторинг", "", "bell") : null,
   ];
@@ -2576,13 +2582,25 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
   async function setLimit(btn) {
     const v = await sheet("Лимит трафика · " + name, [
       ...["10", "50", "100", "300"].map((g) => ({ label: `📶 ${g} ГБ в месяц`, value: g + "G" })),
-      { label: "✏️ Свой размер или «всего»…", value: "custom" },
+      { label: "✏️ Свой размер, «всего», при исчерпании…", value: "custom" },
       ...(c.limit ? [{ label: "🔄 Обнулить счётчик", value: "reset" }, { label: "♾ Снять лимит", value: "off" }] : [])]);
     if (!v) return;
     if (v === "custom") return go(`/client/${enc}/limit`);
     await busy(btn, async () => {
       await (v === "reset" ? call("client", "limit-reset", name) : call("client", "limit", name, v, "month"));
       haptic(); toast(v === "off" ? "Лимит снят" : v === "reset" ? "Счётчик обнулён" : "Лимит установлен"); render();
+    });
+  }
+  async function setSpeed(btn) {
+    const v = await sheet("Скорость · " + name, [
+      ...SPEEDS.map((n) => ({ label: `${c.speed === n ? "✅" : "🚀"} ${n} Мбит/с`, value: String(n) })),
+      { label: "✏️ Своя…", value: "custom" },
+      ...(c.speed ? [{ label: "♾ Без ограничения", value: "off" }] : [])]);
+    if (!v) return;
+    if (v === "custom") return go(`/client/${enc}/speed`);
+    await busy(btn, async () => {
+      await call("client", "speed", name, v);
+      haptic(); toast(v === "off" ? "Скорость без ограничения" : `Скорость ${v} Мбит/с`); render();
     });
   }
   // Маршрут клиента — выбор прямо в карточке: варианты работающего туннеля
@@ -2633,7 +2651,9 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       c.note ? kv("Заметка", c.note) : null), routeCard()),
     area("traf", h("div", { class: "card" },
       kv("За месяц", fmtBytes(c.month)), kv("Сегодня", fmtBytes(c.today)),
-      kv("Лимит", c.limit ? limitText(c) : "нет"), c.limit ? meter(c.used, c.limit) : null, chartBox)),
+      kv("Лимит", c.limit ? limitText(c) + (c.limit_slow ? ` · исчерпал — 🐢 до ${c.limit_slow} Мбит/с` : "") : "нет"),
+      c.limit ? meter(c.used, c.limit) : null,
+      kv("Скорость", speedText(c) || "без ограничения"), chartBox)),
     // Сообщает Telegram-бот: в веб-панели без бота присылать некому — так и говорим
     area("mon", switchRow("Мониторинг активности", noBot() ? "уведомления присылает Telegram-бот — он не установлен"
       : "уведомления в чат, когда клиент пропал и вернулся", c.mon, async (on) => {
@@ -2646,6 +2666,7 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       h("button", { onclick: () => go(`/client/${enc}/rename`) }, "✏️ Имя"),
       h("button", { onclick: (ev) => setExpire(ev.currentTarget) }, "⏳ Срок"),
       h("button", { onclick: (ev) => setLimit(ev.currentTarget) }, "📶 Лимит"),
+      h("button", { onclick: (ev) => setSpeed(ev.currentTarget) }, "🚀 Скорость"),
       h("button", { onclick: () => go(`/client/${enc}/mimicry`) }, "🎭 Мимикрия"),
       h("button", { onclick: () => go(`/client/${enc}/note`) }, "📝 Заметка"))),
     // После удаления — шаг назад к списку, а не второй список поверх первого
@@ -2720,16 +2741,48 @@ route(/^\/client\/([^/]+)\/limit$/, async (ctx, name) => {
   const seg = h("div");
   const drawSeg = () => seg.replaceChildren(segText([["month", "В месяц"], ["total", "Всего"]], period, (p) => { period = p; drawSeg(); }));
   drawSeg();
+  // Что делать при исчерпании — сразу, без «Сохранить»: работает и для уже стоящего лимита
+  let mode = c.limit_slow ? String(c.limit_slow) : "block";
+  const modes = h("div");
+  const drawModes = () => modes.replaceChildren(h("div", { class: "chips", "data-name": "limit-mode" }, SLOW_MODES.map(([k, l]) =>
+    h("button", { class: k === mode ? "on" : null, "data-v": k, onclick: (ev) => (k === mode ? null : busy(ev.currentTarget, async () => {
+      await call("client", "limit-mode", name, k); mode = k; haptic(); drawModes();
+      toast(k === "block" ? "Исчерпал — блокировать" : `Исчерпал — замедлять до ${k} Мбит/с`);
+    })) }, l))));
+  drawModes();
   ctx.put(title("📶 Лимит · " + name),
     h("label", {}, "Размер: 50G, 500MB, 1.5T; число без буквы — гигабайты"), input, seg,
-    hint("Исчерпал лимит — клиент блокируется, как истёкший. «В месяц» — счётчик обнуляется 1-го числа, и клиент "
-      + "разблокируется сам; «всего» — считается с этой минуты, без сброса."),
+    h("label", {}, "Исчерпал лимит"), modes,
+    hint("«Блокировать» — клиент отключается, как истёкший; «замедлять» — остаётся на связи на малой скорости. "
+      + "«В месяц» — счётчик обнуляется 1-го числа, и всё снимается само; «всего» — считается с этой минуты, без сброса."),
     enterTo(h("button", { class: "btn-primary btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
       const v = input.value.trim().replace(/\s+/g, "").toUpperCase().replace("ГБ", "G").replace("МБ", "M").replace("ТБ", "T").replace("КБ", "K");
       // Как parse_size в awg2: 50G, 50GB, 50GiB, 500M; число без буквы — гигабайты
       if (!/^\d{1,7}([.,]\d{1,3})?([KMGT](I?B)?)?$/.test(v)) throw new Error("Размер: например 50G или 500M");
       await call("client", "limit", name, v, period); haptic(); toast("Лимит установлен"); back();
     }) }, "Сохранить"), input));
+  input.focus();
+});
+
+route(/^\/client\/([^/]+)\/speed$/, async (ctx, name) => {
+  await loadClients();
+  const c = byName(name) || {};
+  const input = h("input", { placeholder: "20", inputmode: "numeric", value: c.speed ? String(c.speed) : "", autocomplete: "off" });
+  const save = (v) => call("client", "speed", name, v).then(() => {
+    haptic(); toast(v === "off" ? "Скорость без ограничения" : `Скорость ${v} Мбит/с`); back();
+  });
+  ctx.put(title("🚀 Скорость · " + name),
+    h("label", {}, "Мбит/с — одна цифра на скачивание и отдачу"), input,
+    h("div", { class: "chips" }, SPEEDS.map((n) => h("button", { class: c.speed === n ? "on" : null,
+      onclick: () => { input.value = String(n); input.focus(); } }, `${n}`))),
+    hint("Действует при любом маршруте — напрямую, WARP, Xray, exit-ноды. Если один конфиг стоит на нескольких "
+      + "устройствах, они делят скорость. Исчерпал лимит трафика с «замедлять» — действует меньшая из двух."),
+    enterTo(h("button", { class: "btn-primary btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
+      const v = input.value.trim();
+      if (!/^\d{1,5}$/.test(v) || +v < 1 || +v > 10000) throw new Error("Скорость: целое число Мбит/с от 1 до 10000");
+      await save(String(+v));
+    }) }, "Сохранить"), input),
+    c.speed ? h("button", { class: "btn-block", onclick: (ev) => busy(ev.currentTarget, () => save("off")) }, "♾ Без ограничения") : null);
   input.focus();
 });
 

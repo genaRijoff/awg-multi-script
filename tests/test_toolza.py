@@ -801,7 +801,7 @@ a = cl("alice")
 chk("лимит меньше израсходованного — сразу блок", r.get("ok") and a.get("blocked") and a.get("blocked_by") == "traffic"
     and a.get("limit") == 2**20 and a.get("period") == "month" and a.get("used", 0) >= 2**20, [r, a])
 rc, out, _ = bash('clients_tsv | grep "^alice"')
-chk("блок за трафик: адрес в orig_ips, метка blocked_by", "127.0.0.2/32" in out and out.rstrip("\n").endswith("\ttraffic"),
+chk("блок за трафик: адрес в orig_ips, метка blocked_by", "127.0.0.2/32" in out and out.split("\t")[7] == "traffic",
     repr(out))
 rc, out, _ = bash('client_expire_set alice $(( $(date +%s) + 86400 )) >/dev/null; clients_tsv | grep "^alice"')
 chk("новый срок блок за трафик не снимает", "\t127.0.0.2/32\t" in out, repr(out))
@@ -896,6 +896,182 @@ tick()
 chk("пустой снимок: накопленное до учёта не идёт в сегодня", cl("alice").get("today") == 0, cl("alice"))
 rc, out, _ = bash('ls "$EXPIRE_STATE_DIR" | grep "^transfer"')
 chk("снимки счётчиков не остаются — только последний, для сторожа таймера", out.split() == ["transfer"], out)
+# ── Скорость клиентов и мягкий лимит ──
+print("Скорость клиентов")
+with open(LINKS, "a") as f:
+    f.write("awg0\n")
+TCB = CALLS + ".tcbusy"
+TCF = CALLS + ".tcfail"
+rc, out, _ = bash("""f=$(mktemp); cat > "$f" <<'EOC'
+[Interface]
+PrivateKey = x
+
+[Peer]
+# s1
+# speed=20
+PublicKey = P1=
+AllowedIPs = 10.9.0.2/32, fd00::2/128
+
+[Peer]
+# s2
+# speed=50
+# limit_slow=2
+# slowed_by=traffic
+PublicKey = P2=
+AllowedIPs = 10.9.0.3/32
+
+[Peer]
+# s3
+# limit_slow=5
+PublicKey = P3=
+AllowedIPs = 10.9.0.4/32
+
+[Peer]
+# s4
+# speed=10
+# orig_ips=10.9.0.5/32
+PublicKey = P4=
+AllowedIPs = 127.0.0.2/32
+
+[Peer]
+# s5
+# speed=12x
+PublicKey = P5=
+AllowedIPs = 10.9.0.6/32 junk
+EOC
+py speed-plan "$f" 127.0.0.2/32""")
+chk("план скорости: своя скорость, замедленный — меньшее из двух, IPv6, без заблокированных и мусора",
+    out.splitlines() == ["10.9.0.2/32\t20", "fd00::2/128\t20", "10.9.0.3/32\t2"], repr(out))
+r = api("client", "speed", "alice", "20")
+reset_calls()
+r = api("client", "speed", "alice", "20")
+c = calls()
+chk("api client speed: повторно то же — tc не трогается", r.get("ok") and "tc -batch" not in c, [r, c])
+api("client", "speed", "alice", "off")
+reset_calls()
+r = api("client", "speed", "alice", "25")
+c = calls()
+a = cl("alice")
+ipa = a.get("ip")
+chk("api client speed 25: HTB на awg0, вход — в ifb, полоса по адресу клиента в обе стороны",
+    r.get("ok") and a.get("speed") == 25 and "tc> qdisc add dev awg0 root handle a2: htb default 1" in c
+    and f"tc> filter add dev awg0 parent a2: protocol ip prio 1 u32 match ip dst {ipa}/32 flowid a2:2" in c
+    and f"match ip src {ipa}/32 action mirred egress redirect dev awg0-ifb" in c
+    and "tc> class add dev awg0-ifb parent a2: classid a2:2 htb rate 25mbit ceil 25mbit" in c
+    and "ip link add awg0-ifb type ifb" in c, [r, a, c])
+rc, out, _ = bash('grep -c "^# speed=25" "$SERVER_CONF"; cat "$EXPIRE_STATE_DIR/speed"')
+chk("скорость — меткой у клиента в конфиге сервера; план записан", out.split("\n")[0] == "1" and f"{ipa}/32\t25" in out, out)
+for bad in ("0.5", "-3", "много", "20000", "99999999"):
+    r = api("client", "speed", "alice", bad)
+    if r.get("ok"):
+        break
+chk("api client speed: не число, дробь, больше 10000 — отказ", r.get("ok") is False and "Мбит/с" in (r.get("error") or ""), [bad, r])
+r = api("client", "speed", "alice", "020")
+chk("api client speed «020» — 20, а не восьмеричное", r.get("ok") and cl("alice").get("speed") == 20, cl("alice"))
+r = api("client", "speed", "nobody", "5")
+chk("api client speed: нет клиента", r.get("ok") is False, r)
+# Чужая очередь на awg0 — не трогаем
+api("client", "speed", "alice", "off")
+with open(TCB, "w") as f:
+    f.write("qdisc cake 8001: root refcnt 2 bandwidth 100Mbit\n")
+reset_calls()
+r = api("client", "speed", "alice", "30")
+os.remove(TCB)
+chk("своя очередь tc на awg0 (поставлена руками) — не трогаем, честная ошибка",
+    r.get("ok") is False and "своя очередь" in (r.get("error") or "") and "tc -batch" not in calls(), [r, calls()])
+# Ядро без fq_codel — ставится sfq; без ifb и полисера — хотя бы скачивание
+with open(TCF, "w") as f:
+    f.write("Error: Specified qdisc kind is unknown.\n")
+reset_calls()
+rc, out, _ = bash('speed_apply; echo "rc=$? $SPEED_ERR"')
+os.remove(TCF)
+c = calls()
+chk("tc отверг всё — перебраны очереди (fq_codel, sfq, pfifo) и режимы отдачи (ifb, полисер, без), ошибка с текстом tc",
+    "rc=1 tc: Error: Specified qdisc kind is unknown." in out and "sfq perturb 10" in c and "pfifo limit 1000" in c
+    and "police rate 30mbit" in c and c.count("tc -batch") == 9 and "tc qdisc del dev awg0 ingress" in c, [out, c[-300:]])
+reset_calls()
+rc, out, _ = bash('speed_apply; echo "rc=$?"; tc qdisc show dev awg0 root')
+chk("после ошибки — следующий проход ставит заново", "rc=0" in out and "htb a2:" in out, out)
+# Перезапуск awg0: корень снова «по умолчанию» — таймер ставит заново
+reset_calls()
+rc, out, _ = bash('rm -f "$CALLS.tcroot"; speed_check; tc qdisc show dev awg0 root')
+chk("перезапуск awg0 (правила tc пропали) — проход таймера ставит их заново", "htb a2:" in out and "tc -batch" in calls(), out)
+reset_calls()
+bash('speed_check')
+chk("проход таймера: ничего не изменилось — tc не трогается", "tc -batch" not in calls(), calls())
+# Ограничений не осталось — правила снимаются, ifb удаляется
+with open(LINKS, "a") as f:
+    f.write("awg0-ifb\n")
+reset_calls()
+r = api("client", "speed", "alice", "off")
+c = calls()
+rc, out, _ = bash('ls "$EXPIRE_STATE_DIR" | grep "^speed" ; tc qdisc show dev awg0 root')
+chk("speed off у последнего — tc снят (корень, вход, ifb), состояние стёрто",
+    r.get("ok") and "tc qdisc del dev awg0 root" in c and "tc qdisc del dev awg0 ingress" in c
+    and "ip link del awg0-ifb" in c and "noqueue" in out and "speed" not in out.split("qdisc")[0], [c, out])
+reset_calls()
+bash('speed_check')
+chk("ограничений нет — проход таймера tc не зовёт", "tc " not in calls(), calls())
+# Мягкий лимит: исчерпал — замедлен, не заблокирован
+dump_with({"alice": (100, 100), "bob": (10, 10)})
+tick()
+r = api("client", "limit-mode", "alice", "2")
+chk("api client limit-mode 2", r.get("ok") and cl("alice").get("limit_slow") == 2, [r, cl("alice")])
+api("client", "limit", "alice", "1M", "total")
+dump_with({"alice": (100 + 3 * 2**20, 100), "bob": (10, 10)})
+reset_calls()
+with open(os.path.join(ROOT, "bot.conf"), "w") as f:
+    f.write('BOT_TOKEN="1:AA"\nADMIN_ID=11\n')
+rc, out, _ = bash('curl() { cat >> "$CALLS"; }; traffic_tick; tail -2 "$EXPIRE_LOG"')
+a = cl("alice")
+c = calls()
+chk("мягкий лимит: исчерпал — замедлен до 2 Мбит/с, не заблокирован, админу — сообщение",
+    not a.get("blocked") and a.get("slowed") and "rate 2mbit" in c and "замедлен до 2 Мбит/с" in c
+    and "slow: alice до 2 Мбит/с" in out, [a, out, c[-600:]])
+api("client", "speed", "alice", "1")
+rc, out, _ = bash('cat "$EXPIRE_STATE_DIR/speed"')
+chk("своя скорость меньше «замедления» — действует меньшая", out.strip().endswith("\t1"), out)
+api("client", "speed", "alice", "off")
+# Режим «блокировать» у замедленного — блок
+reset_calls()
+r = api("client", "limit-mode", "alice", "block")
+a = cl("alice")
+chk("limit-mode block у замедленного — блок вместо замедления, tc снят", r.get("ok") and a.get("blocked_by") == "traffic"
+    and not a.get("slowed") and "tc qdisc del dev awg0 root" in calls(), [r, a])
+# И обратно: заблокированный за трафик при «замедлять» — разблокирован и замедлен
+r = api("client", "limit-mode", "alice", "5")
+a = cl("alice")
+chk("limit-mode 5 у заблокированного за трафик — разблокирован и замедлен до 5", r.get("ok") and not a.get("blocked")
+    and a.get("slowed") and a.get("ip") == ipa, [r, a])
+r = api("client", "limit-mode", "alice", "ноль")
+chk("api client limit-mode: не block и не число — отказ", r.get("ok") is False, r)
+# Лимит снят — снова полная скорость
+reset_calls()
+rc, out, _ = bash('curl() { cat >> "$CALLS"; }; client_limit_set alice off >/dev/null; tail -1 "$EXPIRE_LOG"')
+a = cl("alice")
+chk("лимит снят — замедление снято, сообщение «снова полная скорость», tc снят",
+    not a.get("slowed") and "unslow: alice" in out and "снова полная скорость" in calls()
+    and "tc qdisc del dev awg0 root" in calls(), [a, out])
+os.remove(os.path.join(ROOT, "bot.conf"))
+# Скрипт таймера несёт функции скорости
+api("client", "speed", "bob", "7")
+bash('rm -f "$CALLS.tcroot"')
+reset_calls()
+r = subprocess.run(["bash", SCR("EXPIRE_BIN")], capture_output=True, text=True, timeout=60, cwd="/",
+                   env={k: v for k, v in ENV.items() if k in ("PATH", "CALLS", "LINKS", "ACTIVE", "IPT_SAVE", "AWG_DUMP")})
+chk("скрипт таймера: правила скорости ставит сам, без ошибок", r.returncode == 0 and not r.stderr.strip()
+    and "rate 7mbit" in calls(), [r.stderr[-400:], calls()[-400:]])
+rc, out, _ = bash('clients_tsv | grep "^bob" | cut -f9')
+chk("clients_tsv: скорость — 9-й столбец", out.strip() == "7", repr(out))
+api("client", "limit-mode", "alice", "block")
+api("client", "speed", "bob", "off")
+with open(LINKS) as f:
+    links = f.read()
+with open(LINKS, "w") as f:
+    f.write(links.replace("awg0\n", "", 1).replace("awg0-ifb\n", ""))
+# Счётчики — к прежним: дальше тесты считают прирост от них
+dump_with({"alice": (100, 100), "bob": (10, 10)})
+tick()
 # Размер лимита: «500B» — не 500 ГБ; переполнение и не-ASCII цифры — ошибка
 rc, out, _ = bash('for v in 500B 500iB 2000000T 9999999T "١٢G" 0.0001K; do py size-parse "$v" >/dev/null 2>&1 && echo "$v"; done; '
                   'for v in 500MB 1.5T 50 2GiB 1024T; do py size-parse "$v" >/dev/null 2>&1 || echo "!$v"; done')

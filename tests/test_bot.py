@@ -771,6 +771,40 @@ async def run():
     chk("обнулить счётчик", "Счётчик обнулён" in alerts(sent), alerts(sent))
     text, _ = screen(await press("cl:ls:alice|off|month"))
     chk("снять лимит", "Лимит:" not in text and "📶 Лимит трафика" in [t for t, _ in screen(SESSION.sent)[1]], text)
+    text, buttons = screen(await press("cl:lim:alice"))
+    chk("экран лимита: что делать при исчерпании — блок (выбран) или замедлять до 1, 2, 5 Мбит/с",
+        "Исчерпал лимит — <b>блокировать</b>" in text
+        and [d for _, d in buttons if d.startswith("cl:lm:")] == ["cl:lm:alice|block", "cl:lm:alice|1", "cl:lm:alice|2",
+                                                                   "cl:lm:alice|5"]
+        and any(t.startswith("✅") and "Блокировать" in t for t, _ in buttons), [text, buttons])
+    text, buttons = screen(await press("cl:lm:alice|2"))
+    chk("«замедлять до 2» — выбрано, в тексте экрана", "Исчерпал лимит — <b>замедлять до 2 Мбит/с</b>" in text
+        and any(t.startswith("✅") and "2 Мбит/с" in t for t, _ in buttons), [text, buttons])
+    await press("cl:ls:alice|50G|month")
+    text, _ = screen(SESSION.sent)
+    chk("в карточке — лимит и что при исчерпании", "Лимит: 0 Б из 50.0 ГБ за месяц (0%) · исчерпал — 🐢 до 2 Мбит/с" in text,
+        text)
+    await press("cl:ls:alice|off|month")
+    await press("cl:lm:alice|block")
+    text, buttons = screen(await press("cl:spd:alice"))
+    chk("экран скорости: без ограничения, готовые 5–100 Мбит/с, своя", "Скорость: alice" in text
+        and "без ограничения" in text and "cl:ss:alice|20" in [d for _, d in buttons]
+        and "cl:ss:alice|ask" in [d for _, d in buttons] and "cl:ss:alice|off" not in [d for _, d in buttons],
+        [text, buttons])
+    text, buttons = screen(await press("cl:ss:alice|20"))
+    chk("скорость 20 — в карточке", "Скорость: 20 Мбит/с" in text and "cl:spd:alice" in [d for _, d in buttons], text)
+    text, buttons = screen(await press("cl:spd:alice"))
+    chk("экран скорости: выбранная отмечена, «Без лимита» появилась",
+        any(t.startswith("✅") and "20 Мбит/с" in t for t, _ in buttons) and "cl:ss:alice|off" in [d for _, d in buttons],
+        buttons)
+    text, _ = screen(await press("cl:ss:alice|ask"))
+    chk("своя скорость — вопрос", "Мбит/с" in text and "10000" in text, text)
+    text, _ = screen(await say("много"))
+    chk("своя скорость: не число — повтор вопроса с причиной", "Мбит/с" in text and "Скорость: 20" not in text, text)
+    text, _ = screen(await say("35"))
+    chk("своя скорость 35", "Скорость: 35 Мбит/с" in text, text)
+    text, _ = screen(await press("cl:ss:alice|off"))
+    chk("снять ограничение скорости", "Скорость:" not in text, text)
     text, buttons = screen(await press("cl:tday:alice"))
     chk("трафик клиента по дням — столбиками", "трафик по дням" in text and "<pre>" in text
         and text.count("\n", text.index("<pre>")) >= 14, text)
@@ -1092,7 +1126,7 @@ async def run():
     print("Все экраны")
     screens = ["srv", "mod", "srv:proto", "srv:par", "srv:ep", "srv:install", "srv:reset", "srv:reboot",
                "cl:activity", "cl:exp:alice", "cl:mim:alice", "cl:tun:alice", "cl:ren:alice",
-               "cl:lim:alice", "cl:tday:alice", "cl:tsrv", "ntf", "abk",
+               "cl:lim:alice", "cl:spd:alice", "cl:tday:alice", "cl:tsrv", "ntf", "abk",
                "diag", "diag:status", "diag:dpi", "diag:logs", "diag:log:manager", "diag:sniff",
                "bk", "bk:list", "tun", "tc::warp", "warp", "warp:backend", "xr", "t2s", "ex", "cas", "dns",
                "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web"]

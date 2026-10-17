@@ -362,6 +362,43 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".sheet >> text=Снять лимит");
     await page.waitForSelector(".kv >> text=нет");
   });
+  await step("лимит трафика: исчерпал — замедлять (сразу, без «Сохранить»), в карточке видно", async () => {
+    await nav("/client/alice/limit", "#app:not(.reloading) input");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v=block]");
+    await page.click("[data-name=limit-mode] button[data-v='2']");
+    await page.waitForSelector(".toast >> text=замедлять до 2 Мбит/с");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v='2']");
+    await page.fill("#app input", "10G");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".kv >> text=/из 10.0 ГБ за месяц · исчерпал — 🐢 до 2 Мбит\\/с/");
+    await shot("03c-limit-slow");
+    await nav("/client/alice/limit", "#app:not(.reloading) input");
+    await page.click("[data-name=limit-mode] button[data-v=block]");
+    await page.waitForSelector("[data-name=limit-mode] button.on[data-v=block]");
+    await nav("/client/alice", ".actions");
+    await page.click(".actions button:has-text('Лимит')"); await page.waitForSelector(".sheet");
+    await page.click(".sheet >> text=Снять лимит");
+    await page.waitForSelector(".kv >> text=нет");
+  });
+  await step("скорость: готовая из листа — в карточке строкой и меткой", async () => {
+    await page.waitForSelector(".kv >> text=без ограничения");
+    await page.click(".actions button:has-text('Скорость')"); await page.waitForSelector(".sheet");
+    await page.click(".sheet >> text=20 Мбит/с");
+    await page.waitForSelector(".kv >> text=20 Мбит/с");
+    await page.waitForSelector(".tag >> text=20 Мбит/с");
+    await shot("03d-speed");
+  });
+  await step("скорость: своя — проверка ввода, 35, «Без ограничения»", async () => {
+    await nav("/client/alice/speed", "#app:not(.reloading) input");
+    if (await page.inputValue("#app input") !== "20") throw new Error("поле без текущей скорости");
+    await expectAlert("целое число", async () => { await page.fill("#app input", "0.5"); await page.click("button:has-text('Сохранить')"); });
+    await page.fill("#app input", "35");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".kv >> text=35 Мбит/с");
+    await nav("/client/alice/speed", "#app:not(.reloading) input");
+    await page.click("button:has-text('Без ограничения')");
+    await page.waitForSelector(".kv >> text=без ограничения");
+  });
   await step("QR", async () => { await page.click("text=Конфиг и QR"); await page.waitForSelector("img.qr"); await shot("04-qr"); });
   await step("в чат (одна кнопка, без ZIP — он только в веб-панели)", async () => {
     if (await page.$(".confbtns") || await page.$("button:has-text('ZIP')")) throw new Error("в Mini App кнопка ZIP");
@@ -1363,7 +1400,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   if (profile === "lite") {
     await step("все экраны: ничего не уходит под нижнюю панель и плашку действий, нет прокрутки вбок", async () => {
       const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
-        + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /clients "
+        + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
         + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/antiscan /server/create /server/endpoint /server/module "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
