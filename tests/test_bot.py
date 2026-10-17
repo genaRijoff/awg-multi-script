@@ -894,6 +894,45 @@ async def run():
     chk("диск: после спада ниже 85% — снова тревога", len(said(mark)) == 1 and "93%" in said(mark)[0], said(mark))
     al.api.data, al.disk_pct = real_data, real_disk
 
+    # Пятничное напоминание о поддержке: время — по часам сервера
+    fri = int(time.mktime((2026, 10, 16, 13, 0, 0, 0, 0, -1)))     # пятница, 13:00
+
+    def support(mark):
+        return [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "донаты" in (m.text or "")]
+    admins.add(333, 111)
+    sst = {"support_since": fri - 10 * 86400}
+    mark = len(SESSION.sent)
+    await al.support_tick(BOT, sst, fri - 86400)                     # четверг
+    await al.support_tick(BOT, sst, fri - 2 * 3600)                  # пятница, 11:00
+    chk("о поддержке — не в четверг и не до полудня пятницы", not support(mark) and "support" not in sst, sst)
+    await al.support_tick(BOT, sst, fri)
+    sup = support(mark)
+    rows = sup[0].reply_markup.inline_keyboard if sup and sup[0].reply_markup else []
+    chk("пятница после полудня — владельцу, не админу: «Поддержать 💚» ссылкой, зелёная, и «Не напоминать»",
+        [m.chat_id for m in sup] == [111] and len(rows) == 2 and rows[0][0].url == "https://t.me/awgToolza/156/157"
+        and rows[0][0].style == "success" and rows[1][0].callback_data == "ntf:off:support", [sup, rows])
+    mark = len(SESSION.sent)
+    await al.support_tick(BOT, sst, fri + 3 * 3600)
+    chk("в ту же пятницу — один раз", not support(mark))
+    await al.support_tick(BOT, sst, fri + 7 * 86400)
+    chk("через неделю — снова", len(support(mark)) == 1, support(mark))
+    fresh = {}
+    mark = len(SESSION.sent)
+    await al.support_tick(BOT, fresh, fri)
+    await al.support_tick(BOT, fresh, fri + 2 * 86400 + 3600)
+    chk("сразу после установки или обновления бота — не пишет (первые 3 дня)",
+        not support(mark) and fresh.get("support_since") == fri, fresh)
+    chk("«Не напоминать» — только владелец", "только владелец" in " ".join(alerts(await press("ntf:off:support", User(
+        id=333, is_bot=False, first_name="Admin")))) and al.enabled("support"))
+    await press("ntf:off:support")
+    await press("ntf:off:support")
+    mark = len(SESSION.sent)
+    await al.support_tick(BOT, sst, fri + 14 * 86400)
+    chk("«Не напоминать» выключает (повторное нажатие не включает), напоминаний нет",
+        not al.enabled("support") and not support(mark), al.config())
+    al.set_enabled("support", True)
+    admins.remove(333, removed_by=111)
+
     print("Автобэкап")
     text, buttons = screen(await press("bk"))
     chk("в «Бэкапах» — строка и кнопка автобэкапа", "Автобэкап: выключен" in text and ("🕒 Автобэкап", "abk") in buttons,

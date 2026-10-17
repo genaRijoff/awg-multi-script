@@ -4411,7 +4411,7 @@ route(/^\/bot$/, async (ctx) => {
       d.owner ? menuItem("👮 Админы", `владельцев ${d.owners}, приглашённых ${d.invited}`, () => go("/bot/admins")) : null,
       d.owner && !WEB ? menuItem("🎨 Оформление", "иконки custom emoji в боте", () => go("/bot/look")) : null,
       d.owner ? menuItem("📱 Mini App и сертификат", w.running ? w.url : "не запущена", () => go("/bot/app")) : null,
-      d.owner ? menuItem("🔔 Уведомления", "awg0, перезагрузка, ядро, новая версия, диск", () => go("/bot/alerts")) : null),
+      d.owner ? menuItem("🔔 Уведомления", "awg0, перезагрузка, ядро, новая версия, диск, поддержка", () => go("/bot/alerts")) : null),
     d.owner ? btn("🗑 Удалить бота", async () => {
       if (!await confirmTg("Удалить бота: службу, код и конфиг с токеном? AWG не затрагивается, конфиг копируется в бэкапы.")) return;
       if (!await confirmTg("Точно удалить? Панель и бот перестанут работать.")) return;
@@ -4430,6 +4430,7 @@ const ALERT_HINTS = {
   kernel: "apt поставил ядро, под которое модуль AWG не собрался",
   cert: "сертификат панели скоро истечёт — продление не сработало",
   disk: "место на диске почти кончилось",
+  support: "по пятницам, раз в неделю — ссылка, чтобы поддержать проект; только владельцу",
 };
 route(/^\/bot\/alerts$/, async (ctx) => {
   const a = await post("/api/alerts");

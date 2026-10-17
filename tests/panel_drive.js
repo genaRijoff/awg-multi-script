@@ -1192,11 +1192,12 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot", "text=Уведомления");
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
-    if (await page.locator(".switch.on").count() !== 6) throw new Error("ждали 6 включённых уведомлений");
+    if (await page.locator(".switch.on").count() !== 7) throw new Error("ждали 7 включённых уведомлений");
+    await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
-    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 5);
+    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 6);
     await nav("/bot/alerts", ".switch");
-    if (await page.locator(".switch.on").count() !== 5) throw new Error("выключенное уведомление не сохранилось");
+    if (await page.locator(".switch.on").count() !== 6) throw new Error("выключенное уведомление не сохранилось");
     await shot("52a-alerts");
   });
   await step("меню бота в чат", async () => {

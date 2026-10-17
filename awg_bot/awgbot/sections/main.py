@@ -14,7 +14,7 @@ router = Router()
 act = ui.Actions(router, "main")
 
 PROFILE = {"lite": "AmneziaVPN", "pro": "Мощный", "standard": "Standard"}
-SUPPORT_URL = "https://t.me/awgToolza/156/157"
+SUPPORT_URL = ui.SUPPORT_URL
 
 
 def plural(n: int, one: str, few: str, many: str) -> str:

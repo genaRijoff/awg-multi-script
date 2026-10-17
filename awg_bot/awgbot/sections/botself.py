@@ -56,6 +56,7 @@ async def _ntf(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
     await ui.render(cb, "<b>🔔 Уведомления</b>\n\nБот пишет владельцам и админам, когда с сервером что-то "
                         f"случилось; проверка — раз в {max(1, o['interval'] // 60)} мин. Каждое событие — один раз.\n\n"
                         f"{lines}\n\n"
+                        "Напоминание о поддержке — только владельцу, по пятницам, раз в неделю.\n"
                         "Сроки и лимиты трафика клиентов сообщает таймер awg2 — они приходят всегда, "
                         "даже когда бот остановлен.",
                     ui.kb([(f"{'✅' if k['on'] else '⬜️'} {k['short']}", ntf.data("t", k["id"])) for k in o["kinds"]],
@@ -66,6 +67,15 @@ async def _ntf(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
 async def _ntf_toggle(cb: CallbackQuery, state: FSMContext, kind: str) -> None:
     if kind in alerts.KIND_IDS:
         alerts.set_enabled(kind, not alerts.enabled(kind))
+    await _ntf(cb, state)
+
+
+@ntf("off")
+async def _ntf_off(cb: CallbackQuery, state: FSMContext, kind: str) -> None:
+    """«Не напоминать» в самом уведомлении: только выключает — повторное
+    нажатие на старом сообщении не включит обратно."""
+    if kind in alerts.KIND_IDS:
+        alerts.set_enabled(kind, False)
     await _ntf(cb, state)
 
 
