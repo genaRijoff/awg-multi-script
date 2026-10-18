@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.38"
+VERSION="v1.2.39"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -280,10 +280,17 @@ rand_range() {
   echo $(( lo + r % span ))
 }
 
-rand_name() {  # xkqve_73
+rand_name() {  # qtrbka7 — 6 букв и цифра (SRANDOM — криптостойкий)
   local a='abcdefghijklmnopqrstuvwxyz' s='' i
-  for i in 1 2 3 4 5; do s+="${a:$(rand_range 0 25):1}"; done
-  printf '%s_%02d\n' "$s" "$(rand_range 0 99)"
+  for i in 1 2 3 4 5 6; do s+="${a:$(rand_range 0 25):1}"; done
+  printf '%s%d\n' "$s" "$(rand_range 0 9)"
+}
+
+# Случайное имя, которого нет среди клиентов.
+rand_client_name() {
+  local n i
+  for i in 1 2 3 4 5 6 7 8; do n=$(rand_name); _name_free "$n" && { echo "$n"; return 0; }; done
+  return 1
 }
 
 fmt_duration() {  # 5с / 3м12с / 2ч15м / 3д4ч
@@ -1286,16 +1293,16 @@ mod_built_for() { modinfo -k "$1" "$MOD_NAME" &>/dev/null; }
 # случай «исходники обновили, а пересобрать забыли».
 mod_stale() {
   mod_loaded || return 1
-  local ko live disk newest=0 t kt
+  local ko live disk newest kt
   ko=$(modinfo -n "$MOD_NAME" 2>/dev/null) || return 1
   [[ -f "$ko" ]] || return 1
   live=$(cat "/sys/module/$MOD_NAME/srcversion" 2>/dev/null || true)
   disk=$(modinfo -F srcversion "$ko" 2>/dev/null || true)
   [[ -n "$live" && -n "$disk" && "$live" != "$disk" ]] && return 0
-  for t in "$MOD_SRC_DIR"/*.[ch]; do
-    [[ -f "$t" ]] || continue
-    t=$(stat -c %Y "$t"); (( t > newest )) && newest=$t
-  done
+  # Самый новый файл исходников — одним stat, а не процессом на каждый из десятков
+  # файлов: reboot_reason зовут сводка и server info на каждом экране панели
+  newest=$(stat -c %Y "$MOD_SRC_DIR"/*.[ch] 2>/dev/null | sort -n | tail -1)
+  [[ "$newest" =~ ^[0-9]+$ ]] || newest=0
   kt=$(stat -c %Y "$ko" 2>/dev/null || echo 0)
   (( newest > 0 && kt > 0 && newest > kt ))
 }
@@ -3662,10 +3669,12 @@ _client_mimicry() {
 
 do_add_client() {
   server_exists || { err "Сервер не создан"; return 1; }
-  local name addr ip expire base
+  local name addr ip expire base rnd
   while true; do
-    read_line name "${C}  Имя клиента (латиница, цифры, _ -): ${N}"
-    [[ -z "$name" ]] && return 0
+    rnd=$(rand_client_name) || rnd=""
+    read_line name "${C}  Имя клиента (латиница, цифры, _ -)${rnd:+; Enter — случайное ${rnd}}; 0 — отмена: ${N}"
+    [[ "$name" == 0 ]] && return 0
+    [[ -z "$name" ]] && { [[ -n "$rnd" ]] || return 0; name="$rnd"; }
     _name_free "$name" && break
     valid_client_name "$name" && warn "Клиент $name уже есть" || warn "Имя: латиница, цифры, _ и -, до 32 символов"
   done
@@ -7137,13 +7146,13 @@ _exits_node_line() {  # нода → строка статуса
   fi
 }
 
-exits_list() {
+exits_list() {  # [fast] — без проверки выхода в интернет через ноды
   local nodes=() n ip sample
   mapfile -t nodes < <(exits_nodes)
   (( ${#nodes[@]} )) || { info "Нод нет"; return 0; }
   for n in "${nodes[@]}"; do
     echo -e "  ${W}$n${N}  $(_exits_node_line "$n")"
-    if ip link show "awg-exit-$n" &>/dev/null; then
+    if [[ "${1:-}" != fast ]] && ip link show "awg-exit-$n" &>/dev/null; then
       ip=$(iface_egress_ip "awg-exit-$n" 5)
       if [[ -n "$ip" ]]; then echo -e "      выход в интернет: ${G}$ip${N}"; else echo -e "      ${R}выхода в интернет нет${N}"; fi
     fi
@@ -11452,6 +11461,9 @@ _api_ts() {
 _api_status() {
   local n=0
   os_detect
+  # Адрес сервера — здесь, в этой оболочке: внутри $(…) ниже кэш public_ip_cached
+  # не сохраняется, и без этого адрес узнавался дважды (ip и endpoint)
+  public_ip_cached >/dev/null
   update_check_async || true
   upstream_refresh_async || true
   country_refresh_async || true
@@ -11982,7 +11994,10 @@ _api_exits() {
       { _kv up:b "$(_b exits_is_up)"; _kv mode "$(exits_state_get mode)"
         _kv balancer "$(exits_state_get balancer)"; _kv single "$(exits_state_get single_exit)"
         _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto)"; } | api_obj
-      exits_status; exits_list ;;
+      # Проверка выхода в интернет через каждую ноду (до 5 с на ноду) — только по
+      # «exits status check», для экрана exit-нод: список клиентов, обзор и туннели
+      # зовут status на каждом открытии и ждать её не должны
+      exits_status; exits_list "$([[ "${1:-}" == check ]] || echo fast)" ;;
     add)
       [[ -n "${1:-}" ]] || { _api_usage "exits add ИМЯ < конфиг"; return; }
       _api_stdin
@@ -12002,7 +12017,7 @@ _api_exits() {
       # all / none без второго аргумента — все клиенты; с ним — клиент с таким именем
       [[ "${1:-}" == all || "${1:-}" == none || -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА | all | none"; return; }
       exits_client "$1" "${2:-}" ;;
-    *) _api_usage "exits status|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
+    *) _api_usage "exits status [check]|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
   esac
 }
 
@@ -16808,5 +16823,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=da34ff1f73d95169
+_BUILD_SUM=ebeeb7e377a2dd8d
 main "$@"
