@@ -196,9 +196,8 @@ PAGE = """<!doctype html>
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
 main { max-width: 440px; margin: 0 auto; padding: 16px 16px 40px; }
-.top { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; justify-content: flex-end; }
-@media (max-width: 400px) { .top b { display: none; } }
-.top b { font-size: 15px; margin-right: auto; white-space: nowrap; }
+.top { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 20px; }
+.top svg { width: 20px; height: 20px; flex: none; }
 .top a { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line);
   background: var(--card); color: var(--text); text-decoration: none; font-family: inherit; font-size: 14px; font-weight: 600;
   line-height: 1; white-space: nowrap; }
@@ -241,16 +240,20 @@ GONE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, nofollow">
 <title>Ссылка недействительна</title>
 <style>:root{color-scheme:light dark}body{margin:0;font:16px/1.45 system-ui,sans-serif}main{max-width:440px;margin:0 auto;padding:16px}
-.top{display:flex;align-items:center;gap:8px;margin-bottom:20px;flex-wrap:wrap;justify-content:flex-end}@media (max-width:400px){.top b{display:none}}.top b{font-size:15px;margin-right:auto;white-space:nowrap}
-.top a{padding:8px 12px;border-radius:999px;border:1px solid #8884;text-decoration:none;color:inherit;font-size:14px;font-weight:600;line-height:1;white-space:nowrap}
+.top{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:20px}.top svg{width:20px;height:20px;flex:none}
+.top a{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;border:1px solid #8884;text-decoration:none;color:inherit;font-size:14px;font-weight:600;line-height:1;white-space:nowrap}
 .top a.don{background:#0d9a5f;border-color:#0d9a5f;color:#fff}</style>
 </head><body><main>{top}<h1>Ссылка недействительна</h1>
 <p>Срок ссылки (5 минут) истёк или её отозвали. Попросите новую у того, кто её прислал.</p></main></body></html>
 """
 
 # Шапка: Тулза в Telegram и «Поддержать» — те же адреса, что у кнопок бота
-TOP = (f'<div class="top"><b>AWG Toolza</b>'
-       f'<a href="{ui.CHANNEL_URL}" target="_blank" rel="noopener noreferrer">✈️ Канал</a>'
+# Значок Telegram — свой SVG в странице (внешних файлов страница не грузит)
+TG_ICON = ('<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="12" fill="#2AABEE"/>'
+           '<path fill="#fff" d="M5.4 11.7l11.7-4.5c.6-.2 1 .1.9.9l-2 9.4c-.1.7-.6.8-1.1.5l-3.1-2.3-1.5 1.4c-.2.2-.3.3-.6.3'
+           'l.2-3.1 5.7-5.2c.3-.2 0-.4-.4-.1l-7 4.4-3-.9c-.7-.2-.7-.6.2-.8z"/></svg>')
+TOP = (f'<div class="top">'
+       f'<a href="{ui.CHANNEL_URL}" target="_blank" rel="noopener noreferrer">{TG_ICON}Telegram</a>'
        f'<a class="don" href="{ui.SUPPORT_URL}" target="_blank" rel="noopener noreferrer">💚 Поддержать</a></div>')
 
 JS = r"""(function () {

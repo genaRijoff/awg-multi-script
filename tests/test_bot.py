@@ -1484,10 +1484,10 @@ async def run():
             and hd.get("X-Frame-Options") == "DENY" and "default-src 'none'" in hd.get("Content-Security-Policy", "")
             and "frame-ancestors 'none'" in hd.get("Content-Security-Policy", "") and hd.get("Referrer-Policy") == "no-referrer",
             [r.status, dict(hd)])
-        chk("в шапке страницы ссылки — канал Тулзы и «Поддержать», в новой вкладке, без referrer",
+        chk("в шапке страницы ссылки — «Telegram» со значком слева и «Поддержать» справа, в новой вкладке, без referrer",
             'href="https://t.me/awgToolza" target="_blank" rel="noopener noreferrer"' in page
             and 'href="https://t.me/awgToolza/156/157" target="_blank" rel="noopener noreferrer"' in page
-            and "Поддержать" in page, page[:600])
+            and "Поддержать" in page and ">Telegram</a>" in page and "<svg" in page, page[:600])
         async with http.post(base + f"/s/{tok}/data", json={}) as r:
             sd = await r.json(content_type=None)
         chk("по кнопке — конфиг, QR и имя файла", r.status == 200 and "PrivateKey" in (sd.get("text") or "")
