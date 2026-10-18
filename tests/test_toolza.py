@@ -642,6 +642,11 @@ chk("фоновая проверка обновлений не держит от
 d = r.get("data") or {}
 chk("api status", r.get("ok") and d["server"]["exists"] and d["server"]["clients"] == 2
     and d["server"]["proto"] == "2.0" and d["tunnels"]["warp"] == "none", r)
+open(CALLS, "w").close()
+r = api("status")
+with open(CALLS) as f:
+    n = sum(1 for ln in f if ln.startswith("ip -4 -o addr show"))
+chk("api status: адрес сервера узнаётся один раз (не в каждой подоболочке)", r.get("ok") and n == 1, n)
 r = api("tunnels", "status")
 chk("api tunnels status — счётчики интерфейсов туннелей (поднятых нет — пусто)",
     r.get("ok") and (r.get("data") or {}).get("ifs") == [], r)

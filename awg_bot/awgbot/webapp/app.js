@@ -1976,12 +1976,13 @@ function setStatus(d, gen) {
 
 // Вторичное на главной (график за 14 дней, события, клиенты Phobos) экран не
 // держит: сводку и клиентов рисуем, как только пришли, а это ждём не дольше
-// HOME_EXTRA_WAIT — опоздавшее дорисуется само, тем, что пришло (без нового запроса).
+// HOME_EXTRA_WAIT — опоздавшее дорисуется само, тем, что пришло. Дорисовка — со
+// сводкой и клиентами, что уже на экране: без новых запросов (раньше она заново
+// ждала awg2, и экран всё это время был притушен и не нажимался).
 // Каждый заход на главную берёт свежее; идущий запрос не повторяется
 const HOME_EXTRA_WAIT = 250;
-let homeExtra = null, homeExtraNext = null;
+let homeExtra = null, homeRedraw = null;
 function homeExtraLoad() {
-  if (homeExtraNext) { const x = homeExtraNext; homeExtraNext = null; return x; }
   if (homeExtra && !homeExtra.v) return homeExtra;
   const p = Promise.all([call("traffic", "daily", "all", 14).catch(() => null), callR(["log", "expire", "80"]).catch(() => null),
     call("wgobf", "clients").catch(() => null)]);
@@ -1991,12 +1992,15 @@ function homeExtraLoad() {
 }
 
 route(/^\/$/, async (ctx) => {
-  let clErr = null;
   const gen = chanGen;
-  const ex = homeExtraLoad();
-  const [me, d, cl] = await Promise.all([post("/api/me"), post("/api/status"), post("/api/clients").catch((e) => { clErr = e; return null; })]);
+  const redraw = homeRedraw;
+  homeRedraw = null;
+  let clErr = redraw ? redraw.clErr : null;
+  const ex = redraw ? redraw.ex : homeExtraLoad();
+  const [me, d, cl] = redraw ? redraw.main
+    : await Promise.all([post("/api/me"), post("/api/status"), post("/api/clients").catch((e) => { clErr = e; return null; })]);
   const extra = ex.v || await Promise.race([ex.p, new Promise((ok) => setTimeout(() => ok(null), HOME_EXTRA_WAIT))]);
-  if (!extra) ex.p.then(() => { if (ctx.live() && curPath() === "/") { homeExtraNext = ex; render(); } });
+  if (!extra) ex.p.then(() => { if (ctx.live() && curPath() === "/") { homeRedraw = { ex, main: [me, d, cl], clErr }; render(); } });
   const [traffic, evlog, wob] = extra || [null, null, null];
   S.me = me;
   setStatus(d, gen);

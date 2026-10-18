@@ -874,6 +874,30 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click("[data-name=traffic] .chips button >> text=Все");
     await page.waitForSelector("[data-name=traffic] .chart .bar");
   });
+  await step("обзор: опоздавший график дорисовывается без новых запросов сводки и клиентов", async () => {
+    await nav("/clients", "[data-name]");
+    const seen = { status: 0, clients: 0 };
+    const onReq = (r) => { const m = /\/api\/(status|clients)$/.exec(r.url()); if (m) seen[m[1]]++; };
+    let release;
+    const gate = new Promise((ok) => { release = ok; });
+    const slow = async (r) => { if ((r.request().postData() || "").includes('"traffic","daily"')) await gate; await r.continue(); };
+    page.on("request", onReq);
+    await page.route("**/api/call", slow);
+    try {
+      await page.evaluate(() => { location.hash = "/"; });
+      await page.waitForFunction(() => { const a = document.getElementById("app"); return !a.querySelector(".spin") && !a.classList.contains("reloading"); });
+      await page.waitForTimeout(500);
+      if (await page.locator("[data-name=traffic] .chart").count()) throw new Error("график ещё не пришёл, а он на экране");
+      release();
+      await page.waitForSelector("[data-name=traffic] .chart");
+      await page.waitForTimeout(300);
+      if (seen.status !== 1 || seen.clients !== 1) throw new Error("дорисовка запросила заново: " + JSON.stringify(seen));
+    } finally {
+      release();
+      page.off("request", onReq);
+      await page.unroute("**/api/call", slow);
+    }
+  });
   await step("диагностика", async () => { await nav("/diag", "text=Система"); await shot("40-diag"); });
   await step("домены мимикрии", async () => {
     await page.click("text=Домены мимикрии: мир");

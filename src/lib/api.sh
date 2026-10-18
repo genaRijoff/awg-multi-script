@@ -74,6 +74,9 @@ _api_ts() {
 _api_status() {
   local n=0
   os_detect
+  # Адрес сервера — здесь, в этой оболочке: внутри $(…) ниже кэш public_ip_cached
+  # не сохраняется, и без этого адрес узнавался дважды (ip и endpoint)
+  public_ip_cached >/dev/null
   update_check_async || true
   upstream_refresh_async || true
   country_refresh_async || true
