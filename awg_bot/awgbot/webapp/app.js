@@ -3835,6 +3835,15 @@ route(/^\/tunnels\/tun2socks$/, async (ctx) => {
 route(/^\/tunnels\/exits$/, async (ctx) => {
   const [r, cl] = await Promise.all([callR(["exits", "status"]), loadClients().catch(() => ({ rows: [] }))]);
   const d = r.data || {}, nodes = d.nodes || [], up = !!d.up, mode = d.mode === "peers" ? "peers" : "all";
+  // Журнал — сразу, а проверка выхода в интернет через ноды (до 5 с на ноду) дописывает его следом
+  let logBox = logCard(r.log);
+  if (nodes.some((n) => n.up)) {
+    callR(["exits", "status", "check"]).then((c) => {
+      if (!ctx.live() || !logBox.isConnected) return;
+      const next = logCard(c.log);
+      logBox.replaceWith(next); logBox = next;
+    }).catch(() => {});
+  }
   // Выход каждого клиента в режиме «выбранные»: off — напрямую, shared — общий выход, иначе нода
   const rows = (cl.rows || []).map((c) => ({ name: c.name, ip: c.ip, online: c.online, exit: c.exit == null ? "shared" : c.exit }));
   const label = (v) => (v === "shared" ? "общий выход" : "нода " + v);
@@ -3916,7 +3925,7 @@ route(/^\/tunnels\/exits$/, async (ctx) => {
     h("div", { class: "actions", style: "margin-top:8px" },
       nodes.length ? btn("⚖️ Балансировка", balance) : null,
       btn("📜 Журнал", () => go("/log/exits"))),
-    logCard(r.log));
+    logBox);
 });
 
 route(/^\/tunnels\/exits\/add$/, async (ctx) => {

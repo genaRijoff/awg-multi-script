@@ -687,6 +687,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(".item >> text=n1");
     await page.waitForSelector("[data-tunnel=on] .switch.on");
     await page.waitForSelector("[data-tunnel=on] >> text=включён · все клиенты");
+    // Проверка выхода в интернет через ноду — следом, в журнал на том же экране
+    await page.waitForSelector(".card >> text=выхода в интернет нет");
     await shot("35-exits");
     await page.click(".exmode button:has-text('Выбранные')");
     await page.waitForSelector(".exl .item[data-name=alice]");

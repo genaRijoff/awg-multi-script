@@ -1580,6 +1580,20 @@ nodes = {n["name"]: n for n in (api("exits", "status").get("data") or {}).get("n
 chk("api exits status — у ноды адрес, протокол и счётчики",
     nodes.get("n2", {}).get("endpoint") == "1.2.3.4:51820" and nodes["n2"]["proto"] == "wg"
     and nodes["n2"]["up"] is False and nodes["n2"]["rx"] == 0 and nodes["n2"]["hs"] == 0, nodes)
+# Поднятая нода: проверка выхода в интернет через неё (curl) — только по «status check»
+with open(LINKS) as f:
+    links0 = f.read()
+with open(LINKS, "a") as f:
+    f.write("awg-exit-n2\n")
+t0 = time.time()
+r = api("exits", "status", env={"PATH": SLOW + ":" + ENV["PATH"]})
+chk("api exits status не ждёт проверку выхода через ноды (её зовут список клиентов и обзор)",
+    r.get("ok") and time.time() - t0 < 4 and "интернет" not in r.get("log", ""), [time.time() - t0, r.get("log", "")[-300:]])
+r = api("exits", "status", "check")
+chk("api exits status check — с проверкой выхода в интернет через ноду", r.get("ok") and "интернет" in r.get("log", ""),
+    r.get("log", "")[-300:])
+with open(LINKS, "w") as f:
+    f.write(links0)
 with open(os.path.join(ROOT, "etc/awg-cascade/rules.conf")) as f:
     rules = f.read()
 chk("каскад из бэкапа — только с проверками добавления: публичная цель, порты, вход не занят, без дублей",
@@ -1780,6 +1794,13 @@ rc, out, _ = bash(KG + 'mod_built_for() { [[ $1 == 6.8.0-100-generic ]]; }; kern
 chk("новое ядро без модуля — в списке, старое — нет", out == "6.8.0-110-generic нет-заголовков\n--\n6.8.0-110-generic (нет заголовков)\n", out)
 rc, out, _ = bash(KG + 'mod_built_for() { true; }; kernel_gap; echo "[$(kernel_gap_line)]"')
 chk("модуль собран под все ядра — пусто", out == "[]\n", out)
+# Сборка в памяти и исходники: исходники новее .ko — «прежняя сборка», старше или их нет — нет
+MS = ('MOD_SRC_DIR="$STATE_DIR/modsrc2"; mkdir -p "$MOD_SRC_DIR"; mod_loaded() { true; }; '
+      'KO="$STATE_DIR/fake.ko"; touch -d "2026-01-02" "$KO"; '
+      'modinfo() { [[ $1 == -n ]] && echo "$KO"; return 0; }; ')
+rc, out, _ = bash(MS + 'mod_stale && echo stale || echo fresh; touch -d "2026-01-01" "$MOD_SRC_DIR/a.c" "$MOD_SRC_DIR/b.h"; '
+                  'mod_stale && echo stale || echo fresh; touch -d "2026-01-03" "$MOD_SRC_DIR/b.h"; mod_stale && echo stale || echo fresh')
+chk("mod_stale: исходников нет / старше .ko / один новее .ko", out == "fresh\nfresh\nstale\n", out)
 rc, out, _ = bash(KG + 'mod_built_for() { true; }; mod_stale() { false; }; reboot_reason; components_summary')
 chk("новое ядро — коротко: номер без «-generic» и «нужна перезагрузка» (и в шапке меню)",
     out.splitlines()[0] == "новое ядро 6.8.0-110 — нужна перезагрузка" and "▲ новое ядро 6.8.0-110 — нужна перезагрузка" in out, out)

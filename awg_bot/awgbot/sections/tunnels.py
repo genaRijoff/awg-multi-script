@@ -429,7 +429,7 @@ async def _t2s_rm_ok(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 # ── AWG exit-ноды ─────────────────────────────────────────
 @ex()
 async def exits_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
-    r = await api.call("exits", "status")
+    r = await api.call("exits", "status", "check")     # с проверкой выхода в интернет через ноды
     if not r.ok or not isinstance(r.data, dict):
         await ui.render(cb, ui.fail(r, "Exit-ноды"), ui.kb(ui.back("tun")))
         return
