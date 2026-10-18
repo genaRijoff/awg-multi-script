@@ -33,7 +33,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from . import api, media, store
+from . import api, media, store, ui
 
 log = logging.getLogger("awgbot.share")
 
@@ -195,11 +195,18 @@ PAGE = """<!doctype html>
   --line: #2c2f33; --acc: #33c28a; --bad: #ff6b66; } }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
-main { max-width: 440px; margin: 0 auto; padding: 24px 16px 40px; }
+main { max-width: 440px; margin: 0 auto; padding: 16px 16px 40px; }
+.top { display: flex; align-items: center; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; justify-content: flex-end; }
+@media (max-width: 400px) { .top b { display: none; } }
+.top b { font-size: 15px; margin-right: auto; white-space: nowrap; }
+.top a { display: inline-flex; align-items: center; gap: 6px; padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--card); color: var(--text); text-decoration: none; font-family: inherit; font-size: 14px; font-weight: 600;
+  line-height: 1; white-space: nowrap; }
+.top a.don { background: var(--acc); border-color: var(--acc); color: #fff; }
 h1 { font-size: 24px; margin: 0 0 4px; }
 .muted { color: var(--muted); font-size: 14px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 16px; margin-top: 16px; }
-button { width: 100%; font: 600 16px/1 inherit; padding: 14px; border-radius: 12px; border: 1px solid var(--line);
+button { width: 100%; font-family: inherit; font-size: 16px; font-weight: 600; line-height: 1; padding: 14px; border-radius: 12px; border: 1px solid var(--line);
   background: var(--card); color: var(--text); margin-top: 10px; cursor: pointer; }
 button.main { background: var(--acc); border-color: var(--acc); color: #fff; }
 button:disabled { opacity: .5; }
@@ -211,6 +218,7 @@ pre { white-space: pre-wrap; word-break: break-all; font: 12px/1.4 ui-monospace,
 form { margin: 0; }
 </style></head>
 <body><main data-exp="{exp}">
+{top}
 <h1>Конфиг AmneziaWG</h1>
 <div class="muted" id="left">{left}</div>
 <div id="intro" class="card">
@@ -232,10 +240,18 @@ form { margin: 0; }
 GONE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, nofollow">
 <title>Ссылка недействительна</title>
-<style>:root{color-scheme:light dark}body{margin:0;font:16px/1.45 system-ui,sans-serif}main{max-width:440px;margin:0 auto;padding:32px 16px}</style>
-</head><body><main><h1>Ссылка недействительна</h1>
+<style>:root{color-scheme:light dark}body{margin:0;font:16px/1.45 system-ui,sans-serif}main{max-width:440px;margin:0 auto;padding:16px}
+.top{display:flex;align-items:center;gap:8px;margin-bottom:20px;flex-wrap:wrap;justify-content:flex-end}@media (max-width:400px){.top b{display:none}}.top b{font-size:15px;margin-right:auto;white-space:nowrap}
+.top a{padding:8px 12px;border-radius:999px;border:1px solid #8884;text-decoration:none;color:inherit;font-size:14px;font-weight:600;line-height:1;white-space:nowrap}
+.top a.don{background:#0d9a5f;border-color:#0d9a5f;color:#fff}</style>
+</head><body><main>{top}<h1>Ссылка недействительна</h1>
 <p>Срок ссылки (5 минут) истёк или её отозвали. Попросите новую у того, кто её прислал.</p></main></body></html>
 """
+
+# Шапка: Тулза в Telegram и «Поддержать» — те же адреса, что у кнопок бота
+TOP = (f'<div class="top"><b>AWG Toolza</b>'
+       f'<a href="{ui.CHANNEL_URL}" target="_blank" rel="noopener noreferrer">✈️ Канал</a>'
+       f'<a class="don" href="{ui.SUPPORT_URL}" target="_blank" rel="noopener noreferrer">💚 Поддержать</a></div>')
 
 JS = r"""(function () {
   var main = document.querySelector("main"), exp = +main.getAttribute("data-exp") * 1000;
@@ -295,9 +311,9 @@ async def page(request: web.Request) -> web.Response:
     rec = _lookup(token)
     if rec is None:
         _fail(ip)
-        return _resp(GONE, 404)
+        return _resp(GONE.replace("{top}", TOP), 404)
     left = max(0, int(rec["exp"] - time.time()))
-    return _resp(PAGE.replace("{exp}", str(int(rec["exp"]))).replace("{token}", token)
+    return _resp(PAGE.replace("{top}", TOP).replace("{exp}", str(int(rec["exp"]))).replace("{token}", token)
                  .replace("{left}", f"Ссылка действует ещё {left // 60}:{left % 60:02d}"))
 
 

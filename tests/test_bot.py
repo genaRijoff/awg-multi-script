@@ -1484,6 +1484,10 @@ async def run():
             and hd.get("X-Frame-Options") == "DENY" and "default-src 'none'" in hd.get("Content-Security-Policy", "")
             and "frame-ancestors 'none'" in hd.get("Content-Security-Policy", "") and hd.get("Referrer-Policy") == "no-referrer",
             [r.status, dict(hd)])
+        chk("в шапке страницы ссылки — канал Тулзы и «Поддержать», в новой вкладке, без referrer",
+            'href="https://t.me/awgToolza" target="_blank" rel="noopener noreferrer"' in page
+            and 'href="https://t.me/awgToolza/156/157" target="_blank" rel="noopener noreferrer"' in page
+            and "Поддержать" in page, page[:600])
         async with http.post(base + f"/s/{tok}/data", json={}) as r:
             sd = await r.json(content_type=None)
         chk("по кнопке — конфиг, QR и имя файла", r.status == 200 and "PrivateKey" in (sd.get("text") or "")
@@ -1496,7 +1500,9 @@ async def run():
         async with http.get(base + "/s.js") as r:
             chk("скрипт страницы ссылки отдаётся", r.status == 200 and "Скопировать" in await r.text(), r.status)
         async with http.get(base + "/s/" + "A" * 32) as r:
-            chk("чужая ссылка — «недействительна», 404", r.status == 404 and "недействительна" in await r.text(), r.status)
+            gone = await r.text()
+            chk("чужая ссылка — «недействительна», 404, шапка та же", r.status == 404 and "недействительна" in gone
+                and "https://t.me/awgToolza/156/157" in gone, r.status)
         st, d2 = await api_("/api/client/share/revoke", {"id": d.get("id")})
         async with http.post(base + f"/s/{tok}/data", json={}) as r:
             chk("«Отозвать» — ссылка больше не отдаёт конфиг", st == 200 and d2.get("ok") is True and r.status == 404,
