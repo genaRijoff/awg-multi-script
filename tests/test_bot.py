@@ -751,6 +751,36 @@ async def run():
         f.write(saved_conf)
     store.set_note("alice", "#ping")
 
+    print("Ссылка на конфиг без Mini App")
+    text, _ = screen(await press("cl:shr:alice"))
+    chk("ссылку отдавать некому (Mini App выключена, веб-панели нет) — так и сказано, ссылка не создана",
+        "ни одна из них не работает" in text and "/s/" not in text, text)
+
+    print("Шкала обновления")
+    from awgbot import progress as prog
+    chk("шкала: обновление awg2 и бота — да, прочее — нет",
+        prog.kind(("update", "install")) == "update" and prog.kind(("update", "install", "force")) == "update"
+        and prog.kind(("bot", "update")) == "bot" and prog.kind(("server", "install")) == "")
+    chk("шкала: этап по журналу и следующий", prog.reached("bot", "→ Скачиваю код бота\n→ Зависимости Python...") == (30, 75)
+        and prog.reached("update", "") == (0, 10) and prog.reached("update", "√ Установлено: v1") == (92, 100))
+    pct, steps = 0.0, []
+    for _ in range(60):
+        pct = prog.creep(pct, 30, 75)
+        steps.append(pct)
+    chk("шкала: к следующему этапу понемногу, не дальше него и не назад",
+        steps[0] >= 30 and all(b >= a for a, b in zip(steps, steps[1:])) and max(steps) <= 74 and steps[-1] > 70, steps[-3:])
+    chk("шкала текстом", prog.bar(50) == "▓▓▓▓▓▓░░░░░░ 50%" and prog.bar(100).startswith("▓" * 12), prog.bar(50))
+
+    print("Случайное имя клиента")
+    from awgbot.sections import clients as clmod
+    names = {clmod.rand_name({"alice"}) for _ in range(50)}
+    chk("случайное имя — 6 букв и цифра, разные", all(re.fullmatch(r"[a-z]{6}[0-9]", n) for n in names) and len(names) > 45,
+        sorted(names)[:5])
+    text, buttons = screen(await press("cl:addrnd"))
+    chk("«🎲 Случайное имя» в боте — новое имя по форме и выбор срока",
+        re.search(r"<b>➕ [a-z]{6}[0-9]</b>", text) is not None and "Срок действия" in text, text)
+    await press("cl")
+
     print("Лимит трафика и трафик по дням")
     text, buttons = screen(await press("cl:lim:alice"))
     chk("экран лимита: готовые размеры, свой, период", "Лимит трафика: alice" in text and "без лимита" in text
@@ -1396,6 +1426,21 @@ async def run():
             chk("скрипт панели отдаётся", r.status == 200 and "runJob" in await r.text(), r.status)
         async with http.get(base + "/icons.js") as r:
             chk("иконки панели отдаются", r.status == 200 and "const ICONS" in await r.text(), r.status)
+        async with http.get(base + "/") as r:
+            page, hd = await r.text(), r.headers
+        m = re.search(r'src="app\.js\?v=([0-9a-f]{16})"', page)
+        chk("страница Mini App: сжата gzip, скрипты — с отпечатком версии, сама — со сверкой (ETag)",
+            hd.get("Content-Encoding") == "gzip" and m is not None and re.search(r'src="icons\.js\?v=[0-9a-f]{16}"', page)
+            and hd.get("Cache-Control") == "no-cache" and hd.get("ETag"), dict(hd))
+        async with http.get(base + "/", headers={"If-None-Match": hd.get("ETag", "")}) as r:
+            chk("повторное открытие страницы — 304 без тела", r.status == 304 and not await r.read(), r.status)
+        async with http.get(base + f"/app.js?v={m.group(1) if m else ''}") as r:
+            chk("app.js с отпечатком — сжат и хранится браузером до новой версии", r.status == 200
+                and r.headers.get("Content-Encoding") == "gzip" and "immutable" in r.headers.get("Cache-Control", ""),
+                dict(r.headers))
+        async with http.get(base + "/app.js?v=0123456789abcdef") as r:
+            chk("чужой отпечаток — со сверкой, не «навсегда»", r.headers.get("Cache-Control") == "no-cache",
+                dict(r.headers))
         # Встроенный браузер Telegram Desktop для Windows без WebView2 — Edge 18:
         # ES2017 и ни шагу дальше, иначе панель не запускается вовсе
         legacy = []
@@ -1417,6 +1462,90 @@ async def run():
         chk("шрифты: только .woff2 из своего каталога", not bad, bad)
         async with http.get(base + "/panel.py") as r:
             chk("кроме страницы, скрипта, иконок и шрифтов — ничего", r.status == 404, r.status)
+        print("Ссылка на конфиг на 5 минут")
+        from awgbot import share as shmod
+        st, d = await post("/api/client/share")
+        chk("ссылку без подписи Telegram не создать", st == 401, [st, d])
+        st, d = await api_("/api/client/share", {"name": "alice"})
+        surl = d.get("url") or ""
+        tok = surl.rsplit("/", 1)[-1]
+        chk("ссылка: адрес панели без пути, 192 бита, id для отзыва, 5 минут",
+            st == 200 and re.fullmatch(rf"https://127\.0\.0\.1:{ports[0]}/s/[A-Za-z0-9_-]{{32}}", surl) is not None
+            and re.fullmatch(r"[0-9a-f]{12}", d.get("id") or "") and 290 <= d["exp"] - time.time() <= 300, d)
+        raw = open(shmod._file()).read()
+        chk("на диске — только отпечаток ссылки, права 600", tok and tok not in raw and len(json.loads(raw)) >= 1
+            and oct(os.stat(shmod._file()).st_mode & 0o777) == "0o600", raw[:200])
+        async with http.get(base + f"/s/{tok}") as r:
+            page, hd = await r.text(), r.headers
+        chk("страница по ссылке: оболочка без конфига (предпросмотр мессенджеров его не получит), без кэша, "
+            "не индексируется, не во фрейм, строгий CSP",
+            r.status == 200 and "PrivateKey" not in page and "Показать QR и конфиг" in page
+            and hd.get("Cache-Control") == "no-store" and "noindex" in hd.get("X-Robots-Tag", "")
+            and hd.get("X-Frame-Options") == "DENY" and "default-src 'none'" in hd.get("Content-Security-Policy", "")
+            and "frame-ancestors 'none'" in hd.get("Content-Security-Policy", "") and hd.get("Referrer-Policy") == "no-referrer",
+            [r.status, dict(hd)])
+        async with http.post(base + f"/s/{tok}/data", json={}) as r:
+            sd = await r.json(content_type=None)
+        chk("по кнопке — конфиг, QR и имя файла", r.status == 200 and "PrivateKey" in (sd.get("text") or "")
+            and sd.get("file") == "alice.conf" and (sd.get("qr") is None or len(sd["qr"]) > 100), [r.status, str(sd)[:200]])
+        async with http.post(base + f"/s/{tok}/file") as r:
+            body_ = await r.text()
+            cd = r.headers.get("Content-Disposition", "")
+        chk("файл — alice.conf, вложением", r.status == 200 and cd == 'attachment; filename="alice.conf"'
+            and body_ == sd.get("text"), [r.status, cd])
+        async with http.get(base + "/s.js") as r:
+            chk("скрипт страницы ссылки отдаётся", r.status == 200 and "Скопировать" in await r.text(), r.status)
+        async with http.get(base + "/s/" + "A" * 32) as r:
+            chk("чужая ссылка — «недействительна», 404", r.status == 404 and "недействительна" in await r.text(), r.status)
+        st, d2 = await api_("/api/client/share/revoke", {"id": d.get("id")})
+        async with http.post(base + f"/s/{tok}/data", json={}) as r:
+            chk("«Отозвать» — ссылка больше не отдаёт конфиг", st == 200 and d2.get("ok") is True and r.status == 404,
+                [st, d2, r.status])
+        # Истекла: 5 минут прошли
+        st, d = await api_("/api/client/share", {"name": "alice"})
+        tok = d["url"].rsplit("/", 1)[-1]
+        recs = json.loads(open(shmod._file()).read())
+        for v in recs.values():
+            v["exp"] = int(time.time()) - 1
+        with open(shmod._file(), "w") as f:
+            json.dump(recs, f)
+        async with http.get(base + f"/s/{tok}") as r:
+            chk("через 5 минут — недействительна", r.status == 404, r.status)
+        # Под тем же именем уже другой клиент (ключ не совпадает) — ничего
+        st, d = await api_("/api/client/share", {"name": "alice"})
+        tok = d["url"].rsplit("/", 1)[-1]
+        recs = json.loads(open(shmod._file()).read())
+        for v in recs.values():
+            v["pub"] = "OTHERKEY="
+        with open(shmod._file(), "w") as f:
+            json.dump(recs, f)
+        async with http.post(base + f"/s/{tok}/file") as r:
+            chk("клиент с тем же именем, но другим ключом — конфиг не отдаётся", r.status == 404, r.status)
+        st, d = await api_("/api/client/share", {"name": "nobody"})
+        chk("ссылка на несуществующего клиента — отказ", st == 404, [st, d])
+        async with http.post(base + "/api/client/share", json={"name": "alice"},
+                             headers={"Authorization": "tma " + init_data(111), "Host": "evil.example/x"}) as r:
+            chk("подставной Host в адрес ссылки не попадает", r.status == 400, r.status)
+        shmod._fails.clear()
+        codes = []
+        for i in range(shmod.FAIL_MAX + 1):
+            async with http.get(base + "/s/" + f"{i:032d}") as r:
+                codes.append(r.status)
+        shmod._fails.clear()
+        chk("перебор ссылок с одного адреса — 429", codes[:shmod.FAIL_MAX] == [404] * shmod.FAIL_MAX and codes[-1] == 429,
+            codes[-3:])
+
+        text, buttons = screen(await press("cl:shr:alice"))
+        m2 = re.search(r"<code>(https://[^<]+)/s/([A-Za-z0-9_-]{32})</code>", text)
+        chk("бот: «🔗 Ссылка 5 мин» — адрес Mini App, срок и «Отозвать»",
+            m2 is not None and m2.group(1) + "/" == webapp.SERVER.url and "Действует 5 минут" in text
+            and any(d.startswith("cl:shx:alice|") for _, d in buttons), [text, buttons])
+        rid = next((d for _, d in buttons if d.startswith("cl:shx:")), "|").split("|")[1]
+        sent = await press(f"cl:shx:alice|{rid}")
+        async with http.get(base + f"/s/{m2.group(2) if m2 else 'x'}") as r:
+            chk("бот: «Отозвать» гасит ссылку", "Ссылка отозвана" in alerts(sent) and r.status == 404, [alerts(sent), r.status])
+
+
         st, body = await api_("/api/call", {"args": ["status"]})
         chk("панель: общий вызов awg2 api", st == 200 and body["ok"] and body["data"].get("version"), [st, str(body)[:200]])
         # Неверные типы в теле — отказ или игнор, а не 500 с трейсом

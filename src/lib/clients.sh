@@ -249,10 +249,12 @@ _client_mimicry() {
 
 do_add_client() {
   server_exists || { err "Сервер не создан"; return 1; }
-  local name addr ip expire base
+  local name addr ip expire base rnd
   while true; do
-    read_line name "${C}  Имя клиента (латиница, цифры, _ -): ${N}"
-    [[ -z "$name" ]] && return 0
+    rnd=$(rand_client_name) || rnd=""
+    read_line name "${C}  Имя клиента (латиница, цифры, _ -)${rnd:+; Enter — случайное ${rnd}}; 0 — отмена: ${N}"
+    [[ "$name" == 0 ]] && return 0
+    [[ -z "$name" ]] && { [[ -n "$rnd" ]] || return 0; name="$rnd"; }
     _name_free "$name" && break
     valid_client_name "$name" && warn "Клиент $name уже есть" || warn "Имя: латиница, цифры, _ и -, до 32 символов"
   done

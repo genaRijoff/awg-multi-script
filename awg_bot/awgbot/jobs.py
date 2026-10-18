@@ -19,7 +19,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup
 
-from . import api, store, ui
+from . import api, progress, store, ui
 
 log = logging.getLogger("awgbot.jobs")
 
@@ -61,10 +61,11 @@ async def start(target: ui.Target, title: str, *args: Any, stdin: str | bytes | 
         msg = await ui.show_new(chat.bot, chat.chat.id, text)  # type: ignore[arg-type]
     ui.busy.add((msg.chat.id, msg.message_id))
     ok_buttons = [list(b) for b in ok_buttons or []]
+    bar = progress.kind(args)
     store.job_add(job_id, {"chat": msg.chat.id, "msg": msg.message_id, "title": title,
-                           "back": back_to, "started": int(time.time()), "ok_buttons": ok_buttons})
+                           "back": back_to, "started": int(time.time()), "ok_buttons": ok_buttons, "bar": bar})
     _spawn(_follow(msg.bot, job_id, msg.chat.id, msg.message_id, title, back_to, done,
-                   ok_buttons=ok_buttons))
+                   ok_buttons=ok_buttons, bar=bar))
 
 
 def resume(bot: Bot) -> int:
@@ -74,7 +75,8 @@ def resume(bot: Bot) -> int:
         try:
             _spawn(_follow(bot, job_id, int(info["chat"]), int(info["msg"]),
                            str(info.get("title") or "Задача"), str(info.get("back") or "main"), None,
-                           int(info.get("started") or time.time()), info.get("ok_buttons") or []))
+                           int(info.get("started") or time.time()), info.get("ok_buttons") or [],
+                           str(info.get("bar") or "")))
         except (KeyError, TypeError, ValueError):
             store.job_done(job_id)
     return len(pending)
@@ -124,13 +126,14 @@ async def _deliver(bot: Bot, chat_id: int, msg_id: int, body: str, markup: Inlin
 
 
 async def _follow(bot: Bot, job_id: str, chat_id: int, msg_id: int, title: str, back_to: str,
-                  done: Done | None, started: int | None = None, ok_buttons: list | None = None) -> None:
+                  done: Done | None, started: int | None = None, ok_buttons: list | None = None,
+                  bar: str = "") -> None:
     """Слежение за задачей. Любая неожиданная ошибка (сеть, админ заблокировал
     бота…) не должна молча убить задачу в фоне: экран чата снимается с ui.busy,
     а сама задача остаётся в jobs.json — resume() после перезапуска доследит её
     и доставит итог (awg2 хранит задачу три дня, дальше она станет «lost»)."""
     try:
-        await _follow_inner(bot, job_id, chat_id, msg_id, title, back_to, done, started, ok_buttons)
+        await _follow_inner(bot, job_id, chat_id, msg_id, title, back_to, done, started, ok_buttons, bar)
     except asyncio.CancelledError:
         raise
     except Exception:                                          # noqa: BLE001
@@ -139,9 +142,9 @@ async def _follow(bot: Bot, job_id: str, chat_id: int, msg_id: int, title: str, 
 
 
 async def _follow_inner(bot: Bot, job_id: str, chat_id: int, msg_id: int, title: str, back_to: str,
-                        done: Done | None, started: int | None, ok_buttons: list | None) -> None:
+                        done: Done | None, started: int | None, ok_buttons: list | None, bar: str = "") -> None:
     started = started or int(time.time())
-    offset, text, shown, last_edit, errors = 0, "", "", 0.0, 0
+    offset, text, shown, last_edit, errors, pct = 0, "", "", 0.0, 0, 0.0
     head = f"<b>{ui.esc(title)}</b>"
     while True:
         await asyncio.sleep(POLL)
@@ -159,10 +162,13 @@ async def _follow_inner(bot: Bot, job_id: str, chat_id: int, msg_id: int, title:
         offset = int(st.get("offset") or offset)
         text = (text + (st.get("log") or ""))[-LOG_KEEP:]
         elapsed = ui.fmt_dur(int(time.time()) - started)
+        if bar:
+            pct = progress.creep(pct, *progress.reached(bar, text))
         if st.get("state") == "running":
             if time.monotonic() - last_edit < EDIT_EVERY:
                 continue
-            body = f"⏳ {head} · {elapsed}\n" + (ui.pre(_tail(text), 3500) or "<i>идёт…</i>")
+            body = (f"⏳ {head} · {elapsed}\n" + (f"<code>{progress.bar(pct)}</code>\n" if bar else "")
+                    + (ui.pre(_tail(text), 3500) or "<i>идёт…</i>"))
             if body != shown and await _edit(bot, chat_id, msg_id, body):
                 shown, last_edit = body, time.monotonic()
             continue
@@ -172,9 +178,11 @@ async def _follow_inner(bot: Bot, job_id: str, chat_id: int, msg_id: int, title:
             body = (f"⚠️ {head}\nЗадача прервана: awg2 остановлен или сервер перезагружен.\n"
                     + ui.pre(_tail(text, 15), 2500))
         elif st.get("ok"):
-            body = f"✅ {head} · {elapsed}\n" + ui.pre(_tail(text, 20), 3000)
+            body = (f"✅ {head} · {elapsed}\n" + (f"<code>{progress.bar(100)}</code>\n" if bar else "")
+                    + ui.pre(_tail(text, 20), 3000))
         else:
             body = (f"❌ {head}\n{ui.esc(st.get('error') or 'ошибка')}\n"
+                    + (f"<code>{progress.bar(pct)}</code> — остановилось здесь\n" if bar else "")
                     + ui.pre(_tail(text, 20), 3000))
         extra = [tuple(b) for b in ok_buttons or []] if st.get("ok") else []
         markup = ui.kb(extra, ui.back(back_to))

@@ -47,7 +47,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from . import __version__, api, panel
+from . import __version__, api, assets, panel, share
 
 log = logging.getLogger("awgbot.web")
 
@@ -390,6 +390,8 @@ class WebPanel:
         self.deny_logged = 0.0
         self.access = Access()
         self.notify = Notifier()
+        self.assets = assets.Assets(index_fix=lambda h: h.replace(INDEX_TG, '<script src="web.js"></script>'))
+        self._prefetch: set[asyncio.Task] = set()
         self.ctx: ssl.SSLContext | None = None
         self.cert_kind = ""
         self._mtime = 0.0
@@ -427,6 +429,8 @@ class WebPanel:
     @staticmethod
     async def headers(request: web.Request, resp: web.StreamResponse) -> None:
         resp.headers["Server"] = "awg"
+        if share.is_share_path(request.path):
+            return                      # у ссылок на конфиг свои заголовки, строже
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["Referrer-Policy"] = "no-referrer"
@@ -438,16 +442,21 @@ class WebPanel:
 
     # ── страницы ──
     async def index(self, request: web.Request) -> web.Response:
-        html = (STATIC / "index.html").read_text(encoding="utf-8")
-        html = html.replace(INDEX_TG, '<script src="web.js"></script>')
-        return web.Response(text=html, content_type="text/html")
+        # Вошедший открыл панель: сводку и клиентов awg2 начинает собирать уже
+        # сейчас, пока браузер грузит скрипты, — экран получит их из кэша. Только
+        # для живой сессии: чужим открытие страницы не стоит ни одного вызова awg2
+        if self.sessions.get(request.cookies.get(COOKIE, ""), touch=False):
+            for args in (("status",), ("clients", "list"), ("server", "info")):
+                self._prefetch.add(t := asyncio.create_task(api.call(*args)))
+                t.add_done_callback(self._prefetch.discard)
+        return self.assets.response(request, "index.html")
 
     async def web_js(self, request: web.Request) -> web.Response:
         cfg = {"base": self.base, "version": __version__}
         return web.Response(text=f"window.AWG_WEB = {json.dumps(cfg)};\n", content_type="application/javascript")
 
-    async def static(self, request: web.Request) -> web.FileResponse:
-        return web.FileResponse(STATIC / request.match_info["file"])
+    async def static(self, request: web.Request) -> web.Response:
+        return self.assets.response(request, request.match_info["file"])
 
     async def font(self, request: web.Request) -> web.StreamResponse:
         """Шрифт оформления «Карточки» (IBM Plex, OFL): имя — только из списка
@@ -633,6 +642,9 @@ class WebPanel:
         async def to_base(request: web.Request) -> web.StreamResponse:
             raise web.HTTPFound(self.base)
         app.router.add_get(self.base.rstrip("/"), to_base)
+        # Ссылки на конфиг — в корне, не под секретным путём: путь панели в них не попадает.
+        # Доступ по адресам (guard_mw) действует и на них: панель «только через VPN» их не отдаст
+        share.setup(app)
         app.add_subapp(self.base.rstrip("/"), sub)
         return app
 

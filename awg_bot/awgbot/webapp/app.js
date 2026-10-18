@@ -1237,6 +1237,21 @@ const tidy = (l) => {
   return " ".repeat(Math.max(0, lead - 2)) + l.trim().replace(/ {3,}/g, "  ");
 };
 
+// ── Шкала долгих задач обновления ─────────────────────────
+// Этапы — строки из журнала awg2 и установщика бота; доля — сколько обычно
+// пройдено к этому месту. Тот же список — в progress.py бота.
+const JOB_STAGES = {
+  "update install": [[/Канал:/, 10], [/Через зеркало/, 20], [/Прежняя версия|Уже последняя/, 75], [/Установлено:/, 92]],
+  "bot update": [[/Установщик бота|Найден локальный код/, 5], [/Скачиваю код бота|Код бота:/, 15], [/Зависимости Python/, 30],
+    [/Код и зависимости:/, 75], [/Веб-панель перезапущена/, 85], [/Бот перезапущен/, 92]],
+};
+// [пройдено, следующий этап] по журналу
+function jobReached(stages, text) {
+  let got = 0, next = stages.length ? stages[0][1] : 100;
+  stages.forEach(([re, p], i) => { if (re.test(text)) { got = Math.max(got, p); next = i + 1 < stages.length ? stages[i + 1][1] : 100; } });
+  return [got, next];
+}
+
 // ── Задача с живым журналом ────────────────────────────────
 // Долгое (массовое создание, установка, сборка) идёт задачей awg2: журнал —
 // по ходу, итог — на том же экране. done(data) рисует кнопки итога;
@@ -1247,11 +1262,21 @@ const tidy = (l) => {
 async function runJob(ctx, title, args, done, opts = {}) {
   const started = Date.now(), name = plainTitle(title);
   const state = pill("идёт", "accent");
-  const head = h("h1", {}, name, state), time = h("div", { class: "muted small mono" }), log = h("pre", {}, "запускаю…");
-  const finish = (ok, text) => { state.className = "pill " + (ok ? "ok" : "bad"); state.textContent = text; };
+  // Состояние и время — строкой под заголовком: в самом заголовке метка не вставала вровень
+  const time = h("span", { class: "jt" }), log = h("pre", {}, "запускаю…");
+  // Шкала — у обновлений awg2 и бота: этапы из журнала, между ними — понемногу к следующему
+  const stages = JOB_STAGES[args.slice(0, 2).join(" ")];
+  const barIn = h("i"), bar = stages ? h("div", { class: "jbar", role: "progressbar", "aria-valuemin": "0", "aria-valuemax": "100" }, barIn) : null;
+  let pct = 0;
+  const setBar = (p, cls) => {
+    if (!bar) return;
+    pct = p; barIn.style.width = Math.round(p) + "%"; bar.setAttribute("aria-valuenow", String(Math.round(p)));
+    if (cls) bar.classList.add(cls);
+  };
+  const finish = (ok, text) => { state.className = "pill " + (ok ? "ok" : "bad"); state.textContent = text; setBar(ok ? 100 : pct, ok ? "ok" : "bad"); };
   const foot = h("div");
   const backBtn = (ok) => h("button", { class: "btn-block", onclick: () => (opts.onBack || render)(ok) }, "◀️ Назад");
-  ctx.put(head, time, log, foot);
+  ctx.put(h("h1", {}, name), h("div", { class: "jobhead", "data-name": "job" }, state, bar, time), log, foot);
   let id;
   try {
     id = (await post("/api/job", { args, stdin: opts.stdin })).data.id;
@@ -1293,7 +1318,12 @@ async function runJob(ctx, title, args, done, opts = {}) {
       log.textContent = text.split("\n").filter((l) => !/^[\s━─═—–-]*$/.test(l)).map(tidy).slice(-300).join("\n") || "идёт…";
       log.scrollTop = log.scrollHeight;
     }
-    if (live) time.textContent = fmtDur((Date.now() - started) / 1000);
+    if (stages && st.state === "running") {
+      const [got, next] = jobReached(stages, text);
+      const p = Math.max(pct, got);
+      setBar(p < next - 1 ? Math.min(p + (next - p) * 0.08, next - 1) : p);
+    } else if (stages && st.state === "done" && st.ok) setBar(100);
+    if (live) time.textContent = (bar ? Math.round(pct) + "% · " : "") + fmtDur((Date.now() - started) / 1000);
     if (st.state === "running") continue;
     const ok = st.state === "done" && st.ok;
     if (!live) {
@@ -1944,12 +1974,30 @@ function setStatus(d, gen) {
   favRefresh();
 }
 
+// Вторичное на главной (график за 14 дней, события, клиенты Phobos) экран не
+// держит: сводку и клиентов рисуем, как только пришли, а это ждём не дольше
+// HOME_EXTRA_WAIT — опоздавшее дорисуется само, тем, что пришло (без нового запроса).
+// Каждый заход на главную берёт свежее; идущий запрос не повторяется
+const HOME_EXTRA_WAIT = 250;
+let homeExtra = null, homeExtraNext = null;
+function homeExtraLoad() {
+  if (homeExtraNext) { const x = homeExtraNext; homeExtraNext = null; return x; }
+  if (homeExtra && !homeExtra.v) return homeExtra;
+  const p = Promise.all([call("traffic", "daily", "all", 14).catch(() => null), callR(["log", "expire", "80"]).catch(() => null),
+    call("wgobf", "clients").catch(() => null)]);
+  const x = homeExtra = { p, v: null };
+  p.then((v) => { x.v = v; });
+  return x;
+}
+
 route(/^\/$/, async (ctx) => {
   let clErr = null;
   const gen = chanGen;
-  const [me, d, cl, traffic, evlog, wob] = await Promise.all([post("/api/me"), post("/api/status"), post("/api/clients").catch((e) => { clErr = e; return null; }),
-    call("traffic", "daily", "all", 14).catch(() => null), callR(["log", "expire", "80"]).catch(() => null),
-    call("wgobf", "clients").catch(() => null)]);
+  const ex = homeExtraLoad();
+  const [me, d, cl] = await Promise.all([post("/api/me"), post("/api/status"), post("/api/clients").catch((e) => { clErr = e; return null; })]);
+  const extra = ex.v || await Promise.race([ex.p, new Promise((ok) => setTimeout(() => ok(null), HOME_EXTRA_WAIT))]);
+  if (!extra) ex.p.then(() => { if (ctx.live() && curPath() === "/") { homeExtraNext = ex; render(); } });
+  const [traffic, evlog, wob] = extra || [null, null, null];
   S.me = me;
   setStatus(d, gen);
   if (cl) { S.clients = cl; if (!S.sort) S.sort = cl.sort || "activity"; }
@@ -2695,8 +2743,44 @@ route(/^\/client\/([^/]+)\/qr$/, async (ctx, name) => {
     h("div", { class: "muted small", style: "text-align:center;margin:6px 0 10px" }, "AmneziaVPN / AmneziaWG → добавить → QR или файл"),
     confBtns(name),
     copyBtn("Скопировать конфиг", d.text),
+    shareBox(name),
     h("pre", { class: "small" }, d.text));
 });
+
+// Ссылка на конфиг на 5 минут: по ней — QR, текст и файл .conf. Адрес — тот, по
+// которому открыта панель (без секретного пути веб-панели)
+function shareBox(name) {
+  const box = h("div", { "data-name": "share" });
+  const idle = () => box.replaceChildren(h("button", { class: "btn-block", onclick: (ev) => busy(ev.currentTarget, make) },
+    "🔗 Ссылка на 5 минут"));
+  let timer = 0;
+  async function make() {
+    const d = await post("/api/client/share", { name });
+    haptic();
+    const left = h("span", {}), field = h("input", { readonly: "", value: d.url, "aria-label": "Ссылка на конфиг" });
+    field.onfocus = () => field.select();
+    const tick = () => {
+      if (!box.isConnected) return clearInterval(timer);
+      const s = Math.max(0, Math.round(d.exp - Date.now() / 1000));
+      left.textContent = s ? `действует ещё ${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}` : "срок истёк";
+      if (!s) { clearInterval(timer); idle(); }
+    };
+    clearInterval(timer); timer = setInterval(tick, 1000); tick();
+    box.replaceChildren(h("div", { class: "card" },
+      h("div", { class: "eyebrow" }, "ссылка на конфиг · ", left), field,
+      h("div", { class: "even2", style: "margin-top:8px" },
+        copyBtn("Скопировать", d.url, ""),
+        !WEB && tg && tg.openTelegramLink
+          ? h("button", { onclick: () => tg.openTelegramLink("https://t.me/share/url?url=" + encodeURIComponent(d.url)) }, "✈️ Переслать")
+          : null),
+      h("button", { class: "btn-danger btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
+        await post("/api/client/share/revoke", { id: d.id }); clearInterval(timer); haptic(); toast("Ссылка отозвана"); idle();
+      }) }, "🚫 Отозвать"),
+      hint("По ссылке — QR, текст и файл .conf, 5 минут. Это доступ к VPN: отправляй только тому, кому конфиг предназначен.")));
+  }
+  idle();
+  return box;
+}
 
 route(/^\/client\/([^/]+)\/rename$/, async (ctx, name) => {
   const input = h("input", { value: name, maxlength: 32, autocapitalize: "off", autocomplete: "off" });
@@ -2846,6 +2930,18 @@ route(/^\/client\/([^/]+)\/mimicry$/, async (ctx, name) => {
 });
 
 // ── Новый клиент ──────────────────────────────────────────
+// Случайное имя: 6 букв и цифра (qtrbka7), криптостойко, не из занятых
+function randName(taken) {
+  const pick = (abc) => { const b = new Uint32Array(1); let x;
+    do { crypto.getRandomValues(b); x = b[0]; } while (x >= 4294967296 - 4294967296 % abc.length);
+    return abc[x % abc.length]; };
+  for (;;) {
+    let n = "";
+    for (let i = 0; i < 6; i++) n += pick("abcdefghijklmnopqrstuvwxyz");
+    n += pick("0123456789");
+    if (!taken.has(n)) return n;
+  }
+}
 function expireField() {
   const sel = h("select", {}, EXPIRES.map(([v, l]) => h("option", { value: v }, l)), h("option", { value: "date" }, "📅 До даты…"));
   const date = h("input", { type: "datetime-local", style: "display:none;margin-top:8px" });
@@ -2862,7 +2958,7 @@ function expireField() {
 route(/^\/add$/, async (ctx) => {
   const d = await loadClients();
   const taken = new Set(d.rows.map((c) => c.name));
-  const free = () => { let n = 1; while (taken.has("client" + n)) n++; return "client" + n; };
+  const free = () => randName(taken);
   const name = h("input", { placeholder: "anna_phone", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
   const exp = expireField();
   let spec = "server";
@@ -4343,7 +4439,7 @@ route(/^\/wgobf$/, async (ctx) => {
 route(/^\/wgobf\/add$/, async (ctx) => {
   const rows = (await call("wgobf", "clients")) || [];
   const taken = new Set(rows.map((c) => c.name));
-  const free = () => { let n = 1; while (taken.has("client" + n)) n++; return "client" + n; };
+  const free = () => randName(taken);
   const name = h("input", { placeholder: "keenetic_home", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
   ctx.put(title("Новый клиент"), hint("Клиент WG + обфускатор — комплект со ссылкой для Keenetic и конфигами."),
     h("label", {}, "Имя — латиница, цифры, _ и -, до 32"),

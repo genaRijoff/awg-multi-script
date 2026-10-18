@@ -199,12 +199,13 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
 
   await step("не запустилась — причина на экране, а не вечная «Загрузка…»", async () => {
     const p2 = await ctx.newPage();
-    await p2.route(/\/app\.js$/, (r) => r.abort());
+    await p2.route(/\/app\.js(\?|$)/, (r) => r.abort());
     await p2.goto(base, { waitUntil: "domcontentloaded" });
     await p2.waitForSelector(".boot-fail >> text=не загрузился app.js", { timeout: 5000 });
+    if (/\?v=/.test(await p2.textContent(".boot-fail"))) throw new Error("в причине — отпечаток версии из адреса скрипта");
     if (!await p2.locator(".boot-fail button:has-text('Повторить')").count()) throw new Error("нет кнопки «Повторить»");
-    await p2.unroute(/\/app\.js$/);
-    await p2.route(/\/app\.js$/, async (r) => { const res = await r.fetch(); r.fulfill({ response: res, body: "window.x = ;" }); });
+    await p2.unroute(/\/app\.js(\?|$)/);
+    await p2.route(/\/app\.js(\?|$)/, async (r) => { const res = await r.fetch(); r.fulfill({ response: res, body: "window.x = ;" }); });
     await p2.reload({ waitUntil: "domcontentloaded" });
     await p2.waitForSelector(".boot-fail >> text=/SyntaxError|Unexpected/", { timeout: 5000 });
     await p2.close();
@@ -400,6 +401,29 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(".kv >> text=без ограничения");
   });
   await step("QR", async () => { await page.click("text=Конфиг и QR"); await page.waitForSelector("img.qr"); await shot("04-qr"); });
+  await step("ссылка на 5 минут: создаётся, открывается без входа (QR, текст, файл), отзывается", async () => {
+    await page.click("[data-name=share] button:has-text('Ссылка на 5 минут')");
+    await page.waitForSelector("[data-name=share] input");
+    const link = await page.inputValue("[data-name=share] input");
+    if (!new RegExp("^https://127\\.0\\.0\\.1:" + port + "/s/[A-Za-z0-9_-]{32}$").test(link)) throw new Error("ссылка: " + link);
+    await page.waitForSelector("[data-name=share] >> text=/действует ещё [45]:\\d\\d/");
+    await shot("04b-share");
+    // Получатель: без Telegram и без входа
+    const p2 = await ctx.newPage();
+    await p2.goto(link);
+    if (await p2.locator("text=PrivateKey").count()) throw new Error("конфиг на странице до нажатия");
+    await p2.click("#show");
+    await p2.waitForSelector("#box:not([hidden])");
+    if (!await p2.locator("#qr[src^='data:image/png']").count() && !await p2.locator("#noqr:not([hidden])").count()) throw new Error("ни QR, ни пояснения");
+    if (!/PrivateKey/.test(await p2.textContent("#text"))) throw new Error("нет текста конфига");
+    if (await p2.textContent("#fname") !== "alice.conf") throw new Error("имя файла: " + await p2.textContent("#fname"));
+    await p2.screenshot({ path: `${out}/04c-share-page.png`, fullPage: true });
+    await page.click("[data-name=share] button:has-text('Отозвать')");
+    await page.waitForSelector(".toast >> text=Ссылка отозвана");
+    await p2.reload();
+    await p2.waitForSelector("text=Ссылка недействительна");
+    await p2.close();
+  });
   await step("в чат (одна кнопка, без ZIP — он только в веб-панели)", async () => {
     if (await page.$(".confbtns") || await page.$("button:has-text('ZIP')")) throw new Error("в Mini App кнопка ZIP");
     await page.click("text=Отправить файл в чат"); await page.waitForSelector(".toast >> text=Файл и QR");
@@ -428,6 +452,15 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/add", "input");
     // Кнопка со случайным именем — одна иконка: подпись для чтения с экрана и всплывающая нужны
     if (await page.locator("button[aria-label='Случайное имя'][title='Случайное имя']").count() !== 1) throw new Error("кнопка «🎲» без подписи");
+    // Случайное имя — 6 букв и цифра, каждый раз новое
+    const seen = new Set();
+    for (let i = 0; i < 5; i++) {
+      await page.click("button[aria-label='Случайное имя']");
+      const v = await page.inputValue("input");
+      if (!/^[a-z]{6}[0-9]$/.test(v)) throw new Error("случайное имя не по форме: " + v);
+      seen.add(v);
+    }
+    if (seen.size < 4) throw new Error("случайные имена повторяются: " + [...seen]);
     await page.fill("input", "carol");
     await page.selectOption("select", "+1d");
     await shot("06-add");
@@ -853,12 +886,12 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.route(/\/api\/job\/status$/, (r) => r.abort());
     try {
       await page.click("text=Домены мимикрии: мир");
-      await page.waitForSelector("h1 .pill:has-text('нет связи')", { timeout: 20000 });
+      await page.waitForSelector(".jobhead .pill:has-text('нет связи')", { timeout: 20000 });
       await page.waitForSelector("text=задача могла продолжиться на сервере");
       await page.waitForSelector("button:has-text('Назад')");
     } finally { await page.unroute(/\/api\/job\/status$/); await page.evaluate(() => { delete window.AWG_JOB_LOST_MS; }); }
     await page.click("button:has-text('Повторить проверку')");
-    await page.waitForFunction(() => /готово|ошибка/.test((document.querySelector("#app h1 .pill") || {}).textContent || ""),
+    await page.waitForFunction(() => /готово|ошибка/.test((document.querySelector("#app .jobhead .pill") || {}).textContent || ""),
       null, { timeout: 90000 });
   });
   await step("задача: ушли с экрана — итог подсказкой", async () => {
@@ -867,7 +900,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.route(/\/api\/job\/status$/, async (r) => { await new Promise((ok) => setTimeout(ok, 2500)); r.continue().catch(() => {}); });
     try {
       await page.click("text=Домены мимикрии: мир");
-      await page.waitForSelector("h1 .pill:has-text('идёт')");
+      await page.waitForSelector(".jobhead .pill:has-text('идёт')");
       await page.evaluate(() => { location.hash = "/server"; });
       await page.waitForSelector("text=Endpoint");
       await page.waitForSelector(".toast >> text=/Домены мимикрии \\(мир\\): (готово|ошибка)/", { timeout: 90000 });
@@ -921,7 +954,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   });
   await step("восстановление", async () => {
     await page.click("button:has-text('Восстановить')");
-    await page.waitForSelector("h1:has-text('Восстановление из бэкапа') .pill.ok", { timeout: 90000 });
+    await page.waitForSelector("h1:has-text('Восстановление из бэкапа') + .jobhead .pill.ok", { timeout: 90000 });
     await shot("46-restored");
   });
   await step("не бэкап — понятная ошибка", async () => {
@@ -947,6 +980,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(".chlog li >> text=со второй строкой");
     if (await page.locator(".chlog-v >> text=v1.1.1").count()) throw new Error("в списке изменений — уже установленная версия");
     await shot("48-update-available");
+  });
+  await step("обновление: шкала по этапам журнала, в конце — 100% и зелёная", async () => {
+    // Задача подставная: настоящее обновление заменило бы awg2 стенда
+    const ver = await page.evaluate(() => S.version);
+    const steps = [["running", "→ Канал: стабильный\n"], ["running", "→ Прежняя версия: /usr/local/bin/awg2.bak\n"],
+      ["done", "√ Установлено: " + ver + "\n"]];
+    let i = 0;
+    await page.route("**/api/job", (r) => r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: { id: "fake1" } }) }));
+    await page.route("**/api/job/status", (r) => {
+      const [state, log] = steps[Math.min(i, steps.length - 1)]; i++;
+      r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data:
+        { state, log, offset: i, ok: state === "done", data: { version: ver } } }) });
+    });
+    try {
+      await page.click("button:has-text('Обновить до v9.9.9')");
+      await page.waitForSelector(".jobhead .jbar");
+      await page.waitForFunction(() => +document.querySelector(".jbar").getAttribute("aria-valuenow") >= 75, null, { timeout: 15000 });
+      await page.waitForSelector(".jobhead .jbar.ok[aria-valuenow='100']", { timeout: 15000 });
+      await page.waitForSelector(".jobhead .jt >> text=/^100% · /");
+      await shot("48a-update-bar");
+    } finally {
+      // Подмена задач — только для этого шага: иначе следующие задачи получили бы её ответы
+      await page.unroute("**/api/job"); await page.unroute("**/api/job/status");
+    }
+    const r = await page.evaluate(() => [jobReached(JOB_STAGES["bot update"], "Скачиваю код бота\nЗависимости Python..."),
+      jobReached(JOB_STAGES["bot update"], "")]);
+    if (JSON.stringify(r) !== "[[30,75],[0,5]]") throw new Error("этапы обновления бота: " + JSON.stringify(r));
+    await nav("/update", "text=Канал");
   });
   await step("стрелка ↑ у версии в шапке", async () => {
     await page.waitForSelector(".top .lockup text >> text=↑");
@@ -1274,7 +1335,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot/app", "text=Сервер панели");
     await shot("56-app");
     await page.click("button:has-text('На IP')");
-    await page.waitForSelector("h1:has-text('Сертификат на IP') .pill.ok", { timeout: 60000 });
+    await page.waitForSelector("h1:has-text('Сертификат на IP') + .jobhead .pill.ok", { timeout: 60000 });
     // Сервер Mini App перезапускается через секунду после выпуска — дальше идём, когда он снова на месте
     await page.waitForTimeout(3000);
   });

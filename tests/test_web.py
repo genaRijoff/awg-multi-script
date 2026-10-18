@@ -8,6 +8,7 @@ cookie сессии, CSRF, заголовки, скачивание файлов
 
 Запуск:  python3 tests/test_web.py [путь/к/dist/awg2.sh]   (python с aiogram)
 """
+import gzip
 import http.cookiejar
 import io
 import json
@@ -117,6 +118,20 @@ try:
     st = [c.req(BASE + p)[0] for p in ("fonts/nope.woff2", "fonts/OFL.txt", "fonts/..%2fapp.js", "fonts/plex-sans-latin-400.woff")]
     chk("шрифты: только существующие .woff2 из каталога шрифтов", st == [404, 404, 404, 404], st)
     chk("остальное по-прежнему без кэша", c.req(BASE + "web.js")[1].get("Cache-Control") == "no-store")
+    st, hd, gz = c.req(BASE, headers={"Accept-Encoding": "gzip"})
+    page = gzip.decompress(gz) if hd.get("Content-Encoding") == "gzip" else gz
+    m = re.search(rb'src="app\.js\?v=([0-9a-f]{16})"', page)
+    chk("страница: сжата gzip, скрипты — с отпечатком версии, сама — со сверкой (ETag)",
+        st == 200 and hd.get("Content-Encoding") == "gzip" and m is not None and b'src="web.js"' in page
+        and hd.get("Cache-Control") == "no-cache" and hd.get("ETag"), [st, hd])
+    chk("повторное открытие — 304 без тела", c.req(BASE, headers={"If-None-Match": hd.get("ETag", "")})[0] == 304)
+    st, hd, gz = c.req(BASE + "app.js?v=" + (m.group(1).decode() if m else ""), headers={"Accept-Encoding": "gzip"})
+    chk("app.js с отпечатком: сжат (в 3+ раза меньше), хранится браузером до новой версии",
+        st == 200 and hd.get("Content-Encoding") == "gzip" and "immutable" in hd.get("Cache-Control", "")
+        and len(gz) * 3 < len(gzip.decompress(gz)) and b"runJob" in gzip.decompress(gz), [st, hd])
+    st, hd, raw = c.req(BASE + "app.js")
+    chk("без отпечатка и без gzip у браузера — несжатый, со сверкой", st == 200 and "Content-Encoding" not in hd
+        and hd.get("Cache-Control") == "no-cache" and b"runJob" in raw, [st, hd])
 
     print("Без входа")
     for path in ("api/me", "api/status", "api/call", "api/clients", "api/download", "api/web/account", "api/backup/upload"):
@@ -180,6 +195,27 @@ try:
     chk("«в чат» в веб-панели — понятный отказ, без падения", st == 409 and "Telegram-бот" in d.get("error", ""), [st, d])
     st, d = c.api("api/download", {"what": "conf", "name": "../../etc/passwd"})
     chk("имя клиента с путём — отказ", st == 400, [st, d])
+
+    print("Ссылка на конфиг")
+    st, d = c.api("api/client/share", {"name": "alice"})
+    surl = d.get("url") or ""
+    path = surl.split(str(PORT), 1)[-1]
+    chk("ссылка из веб-панели: её адрес, без секретного пути панели",
+        st == 200 and surl.startswith(f"https://127.0.0.1:{PORT}/s/") and BASE.strip("/") not in surl
+        and re.fullmatch(r"/s/[A-Za-z0-9_-]{32}", path) is not None, d)
+    st, hd, page = c.req(path)
+    chk("страница ссылки отдаётся веб-панелью, со своими строгими заголовками",
+        st == 200 and b"PrivateKey" not in page and "default-src 'none'" in hd.get("Content-Security-Policy", "")
+        and hd.get("Cache-Control") == "no-store", [st, hd])
+    st, hd, data = c.req(path + "/file", b"", raw=True, method="POST", headers={"Origin": f"https://127.0.0.1:{PORT}"})
+    chk("файл по ссылке — alice.conf", st == 200 and b"[Interface]" in data
+        and hd.get("Content-Disposition") == 'attachment; filename="alice.conf"', [st, hd])
+    st, hd, data = c.req(path + "/file", b"", raw=True, method="POST", headers={"Origin": "https://evil.example"})
+    chk("POST по ссылке с чужого сайта — отказ (как у всей панели)", st == 403, st)
+    st, d2 = c.api("api/client/share/revoke", {"id": d.get("id")})
+    chk("отзыв из веб-панели", st == 200 and d2.get("ok") is True and c.req(path)[0] == 404, [st, d2])
+    st, d = Client().api("api/client/share", {"name": "alice"})
+    chk("без входа ссылку не создать", st == 401, [st, d])
 
     print("Доступ: по адресам и только через VPN")
     nets_file = os.path.join(ROOT, "..", "web", "access.nets")
