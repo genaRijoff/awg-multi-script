@@ -18,7 +18,7 @@
   };
   window.addEventListener("error", (e) => {
     const t = e.target;
-    if (t && t !== window && t.tagName === "SCRIPT") fail("не загрузился " + String(t.src || "скрипт").split("/").pop());
+    if (t && t !== window && t.tagName === "SCRIPT") fail("не загрузился " + String(t.src || "скрипт").split("/").pop().split("?")[0]);
     else fail((e.message || "ошибка") + (e.filename ? " (" + e.filename.split("/").pop() + ":" + e.lineno + ":" + e.colno + ")" : ""));
   }, true);
   window.addEventListener("unhandledrejection", (e) => fail(String((e.reason && e.reason.message) || e.reason)));

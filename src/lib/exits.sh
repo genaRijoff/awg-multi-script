@@ -284,13 +284,13 @@ _exits_node_line() {  # нода → строка статуса
   fi
 }
 
-exits_list() {
+exits_list() {  # [fast] — без проверки выхода в интернет через ноды
   local nodes=() n ip sample
   mapfile -t nodes < <(exits_nodes)
   (( ${#nodes[@]} )) || { info "Нод нет"; return 0; }
   for n in "${nodes[@]}"; do
     echo -e "  ${W}$n${N}  $(_exits_node_line "$n")"
-    if ip link show "awg-exit-$n" &>/dev/null; then
+    if [[ "${1:-}" != fast ]] && ip link show "awg-exit-$n" &>/dev/null; then
       ip=$(iface_egress_ip "awg-exit-$n" 5)
       if [[ -n "$ip" ]]; then echo -e "      выход в интернет: ${G}$ip${N}"; else echo -e "      ${R}выхода в интернет нет${N}"; fi
     fi

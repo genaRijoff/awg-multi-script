@@ -32,7 +32,7 @@ from aiogram.exceptions import TelegramAPIError
 from aiogram.types import MenuButtonDefault, MenuButtonWebApp, WebAppInfo
 from aiohttp import web
 
-from . import __version__, access, api, panel
+from . import __version__, access, api, assets, panel, share
 from .config import CONF_PATH, _read_file
 
 log = logging.getLogger("awgbot.webapp")
@@ -44,6 +44,7 @@ DEFAULT_PORT = 8443
 MAX_AGE = 24 * 3600         # initData старше суток не принимаем
 WATCH_EVERY = 60            # проверка обновлённого сертификата
 MENU_TEXT = "Панель"        # кнопка «Меню» у админов
+ASSETS = assets.Assets()    # страница и скрипты: сжатие, кэш с отпечатком версии
 
 
 # ── Подпись Telegram ──────────────────────────────────────
@@ -153,6 +154,7 @@ class MiniApp:
             app.router.add_post("/api/me", self._me)
             app.router.add_post("/api/status", self._status)
             panel.setup(app, self._user)
+            share.setup(app)
             self.runner = web.AppRunner(app, access_log=None)
             await self.runner.setup()
             await web.TCPSite(self.runner, "0.0.0.0", port, ssl_context=self.ctx).start()
@@ -233,6 +235,8 @@ class MiniApp:
         """Как у веб-панели, но рамку не запрещаем: Telegram Web открывает Mini App
         во фрейме; скрипт Telegram — с telegram.org."""
         resp.headers["Server"] = "awg"
+        if share.is_share_path(request.path):
+            return                      # у ссылок на конфиг свои, строже: без фрейма и без кэша
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["Referrer-Policy"] = "no-referrer"
         resp.headers["Content-Security-Policy"] = (
@@ -242,9 +246,7 @@ class MiniApp:
 
     @staticmethod
     async def _index(request: web.Request) -> web.StreamResponse:
-        resp = web.FileResponse(STATIC / "index.html")
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
+        return ASSETS.response(request, "index.html")
 
     @staticmethod
     async def _font(request: web.Request) -> web.StreamResponse:
@@ -259,9 +261,7 @@ class MiniApp:
 
     @staticmethod
     async def _static(request: web.Request) -> web.StreamResponse:
-        resp = web.FileResponse(STATIC / request.path.lstrip("/"))
-        resp.headers["Cache-Control"] = "no-store"
-        return resp
+        return ASSETS.response(request, request.path.lstrip("/"))
 
     async def _me(self, request: web.Request) -> web.Response:
         user = self._user(request)

@@ -74,6 +74,9 @@ _api_ts() {
 _api_status() {
   local n=0
   os_detect
+  # Адрес сервера — здесь, в этой оболочке: внутри $(…) ниже кэш public_ip_cached
+  # не сохраняется, и без этого адрес узнавался дважды (ip и endpoint)
+  public_ip_cached >/dev/null
   update_check_async || true
   upstream_refresh_async || true
   country_refresh_async || true
@@ -604,7 +607,10 @@ _api_exits() {
       { _kv up:b "$(_b exits_is_up)"; _kv mode "$(exits_state_get mode)"
         _kv balancer "$(exits_state_get balancer)"; _kv single "$(exits_state_get single_exit)"
         _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto)"; } | api_obj
-      exits_status; exits_list ;;
+      # Проверка выхода в интернет через каждую ноду (до 5 с на ноду) — только по
+      # «exits status check», для экрана exit-нод: список клиентов, обзор и туннели
+      # зовут status на каждом открытии и ждать её не должны
+      exits_status; exits_list "$([[ "${1:-}" == check ]] || echo fast)" ;;
     add)
       [[ -n "${1:-}" ]] || { _api_usage "exits add ИМЯ < конфиг"; return; }
       _api_stdin
@@ -624,7 +630,7 @@ _api_exits() {
       # all / none без второго аргумента — все клиенты; с ним — клиент с таким именем
       [[ "${1:-}" == all || "${1:-}" == none || -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА | all | none"; return; }
       exits_client "$1" "${2:-}" ;;
-    *) _api_usage "exits status|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
+    *) _api_usage "exits status [check]|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
   esac
 }
 

@@ -6,13 +6,15 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import secrets
+import string
 import time
 
 from aiogram import Bot, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 
-from .. import api, ask, media, store, ui
+from .. import api, ask, media, share, store, ui, webapp
 from ..ui import esc
 
 router = Router()
@@ -332,6 +334,7 @@ async def card(target: ui.Target, name: str) -> None:
     mon = store.monitored(name)
     await ui.render(target, card_text(c, route), ui.kb(
         ("📄 Конфиг и QR", act.data("conf", name)),
+        ("🔗 Ссылка 5 мин", act.data("shr", name)),
         ("✏️ Переименовать", act.data("ren", name)),
         ("⏳ Срок действия", act.data("exp", name)),
         ("📶 Лимит трафика", act.data("lim", name)),
@@ -573,6 +576,44 @@ async def _exdate(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
         await ask.retry(msg, state, ctx, r.message)
         return
     await card(msg, ctx["name"])
+
+
+# ── Ссылка на конфиг на 5 минут ───────────────────────────
+async def share_base() -> str:
+    """Чей адрес в ссылке: Mini App, а без неё — веб-панель, если она открыта всем
+    (панель «только через VPN» человеку без VPN ссылку не отдаст)."""
+    if webapp.SERVER.running and webapp.SERVER.url:
+        return webapp.SERVER.url
+    w = await api.data("web", "status", default={}) or {}
+    if w.get("active") and w.get("access") == "all" and w.get("url"):
+        return str(w["url"])
+    return ""
+
+
+@act("shr")
+async def _share(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    c = await client(name)
+    if c is None or not c.get("pub"):
+        await card(cb, name)
+        return
+    base = await share_base()
+    if not base:
+        await ui.render(cb, "<b>🔗 Ссылка на конфиг</b>\nСсылку отдаёт Mini App или веб-панель с доступом для всех — "
+                            "сейчас ни одна из них не работает. Включи Mini App: Бот → 📱 Mini App.",
+                        ui.kb(ui.back(act.data("v", name))))
+        return
+    token, rid, exp = share.create(name, c["pub"], f"tg:{cb.from_user.id}")
+    await ui.render(cb, f"<b>🔗 Ссылка на конфиг {esc(name)}</b>\n<code>{esc(share.url_for(base, token))}</code>\n\n"
+                        f"Действует 5 минут — до {time.strftime('%H:%M:%S', time.localtime(exp))}. По ней: QR, текст "
+                        "и файл .conf.\nСсылка — это доступ к VPN: отправляй только тому, кому конфиг предназначен.",
+                    ui.kb(("🚫 Отозвать", act.data("shx", f"{name}|{rid}")), ui.back(act.data("v", name))))
+
+
+@act("shx")
+async def _share_revoke(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    name, _, rid = arg.partition("|")
+    await cb.answer("Ссылка отозвана" if share.revoke(rid) else "Ссылка уже не действует")
+    await card(cb, name)
 
 
 # ── Лимит трафика ─────────────────────────────────────────
@@ -890,13 +931,17 @@ async def _add_expire(target: ui.Target, state: FSMContext, name: str) -> None:
     await ui.render(target, f"<b>➕ {esc(name)}</b>\nСрок действия:", expire_kb("ne", "", False, "cl"))
 
 
+def rand_name(taken: set[str]) -> str:
+    """Случайное имя — 6 букв и цифра (qtrbka7), криптостойко, не из занятых."""
+    while True:
+        n = "".join(secrets.choice(string.ascii_lowercase) for _ in range(6)) + secrets.choice(string.digits)
+        if n not in taken:
+            return n
+
+
 @act("addrnd")
 async def _add_rnd(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
-    taken = {c["name"] for c in await clients() or []}
-    n = 1
-    while f"client{n}" in taken:
-        n += 1
-    await _add_expire(cb, state, f"client{n}")
+    await _add_expire(cb, state, rand_name({c["name"] for c in await clients() or []}))
 
 
 @ask.on("cl_add")

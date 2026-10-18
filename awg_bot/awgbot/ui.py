@@ -70,6 +70,7 @@ def _page(text: str) -> bool:
 
 
 SUPPORT_URL = "https://t.me/awgToolza/156/157"
+CHANNEL_URL = "https://t.me/awgToolza"
 
 # Цвет кнопки (Bot API: style): зелёная — только «Поддержать 💚», остальные
 # обычные — красные, синие и зелёные разделы и действия рябили в глазах.

@@ -20,7 +20,7 @@ from typing import Any, Callable
 from aiogram.types import BufferedInputFile, FSInputFile
 from aiohttp import web
 
-from . import __version__, access, admins, alerts, api, icons, media, store
+from . import __version__, access, admins, alerts, api, icons, media, share, store
 from .sections import backup as bk
 from .sections import botself
 from .sections import clients as cls
@@ -217,6 +217,27 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         png = media.qr_png(text)
         return web.json_response({"ok": True, "text": text, "file": os.path.basename(r.data.get("file") or ""),
                                   "png": base64.b64encode(png).decode() if png else None})
+
+    # Ссылка на конфиг на 5 минут: адрес — тот, по которому админ сам открыл
+    # панель (Mini App или веб-панель), без секретного пути
+    @route("/api/client/share")
+    async def _share(request: web.Request, user: dict, body: dict) -> web.Response:
+        name = _name(body)
+        r = await api.call("clients", "list")
+        rows = r.data if r.ok and isinstance(r.data, list) else []
+        pub = next((c.get("pub") for c in rows if c.get("name") == name), None)
+        if not pub:
+            return web.json_response({"error": f"Клиента {name} нет"}, status=404)
+        if not share.host_ok(request.host):
+            return web.json_response({"error": "Адрес сервера не распознан"}, status=400)
+        by = f"web:{user.get('first_name', '')}" if user.get("web") else f"tg:{user.get('id')}"
+        token, rid, exp = share.create(name, pub, by)
+        return web.json_response({"ok": True, "url": f"https://{request.host}/s/{token}", "id": rid,
+                                  "exp": exp, "ttl": share.TTL})
+
+    @route("/api/client/share/revoke")
+    async def _share_revoke(request: web.Request, user: dict, body: dict) -> web.Response:
+        return web.json_response({"ok": share.revoke(str(body.get("id") or "")[:16])})
 
     @route("/api/client/add")
     async def _add(request: web.Request, user: dict, body: dict) -> web.Response:
