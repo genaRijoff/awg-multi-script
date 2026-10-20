@@ -207,6 +207,15 @@ try:
     chk("страница ссылки отдаётся веб-панелью, со своими строгими заголовками",
         st == 200 and b"PrivateKey" not in page and "default-src 'none'" in hd.get("Content-Security-Policy", "")
         and hd.get("Cache-Control") == "no-store", [st, hd])
+    # При no-referrer браузер шлёт форму «Скачать» с Origin: null — панель отвечает 403;
+    # same-origin: Origin свой, а чужим адресам (Telegram, «Поддержать») referrer не уходит
+    chk("страница ссылки: Referrer-Policy same-origin (форма «Скачать» — со своим Origin)",
+        hd.get("Referrer-Policy") == "same-origin", hd.get("Referrer-Policy"))
+    for what, h in (("чужой Origin", {"Origin": "https://evil.example"}), ("Origin: null", {"Origin": "null"}),
+                    ("без Origin, Sec-Fetch-Site: cross-site", {"Sec-Fetch-Site": "cross-site"})):
+        codes = [c.req(path + p, b"{}", raw=True, method="POST", headers=dict(h, **{"Content-Type": "application/json"}))[0]
+                 for p in ("/data", "/file")]
+        chk(f"ссылка: POST /data и /file, {what} — 403", codes == [403, 403], codes)
     st, hd, data = c.req(path + "/file", b"", raw=True, method="POST", headers={"Origin": f"https://127.0.0.1:{PORT}"})
     chk("файл по ссылке — alice.conf", st == 200 and b"[Interface]" in data
         and hd.get("Content-Disposition") == 'attachment; filename="alice.conf"', [st, hd])
@@ -214,6 +223,10 @@ try:
     chk("POST по ссылке с чужого сайта — отказ (как у всей панели)", st == 403, st)
     st, d2 = c.api("api/client/share/revoke", {"id": d.get("id")})
     chk("отзыв из веб-панели", st == 200 and d2.get("ok") is True and c.req(path)[0] == 404, [st, d2])
+    codes = [c.req(path + p, b"{}", raw=True, method="POST",
+                   headers={"Origin": f"https://127.0.0.1:{PORT}", "Content-Type": "application/json"})[0]
+             for p in ("/data", "/file")]
+    chk("после отзыва: POST /data и /file со своим Origin — 404", codes == [404, 404], codes)
     st, d = Client().api("api/client/share", {"name": "alice"})
     chk("без входа ссылку не создать", st == 401, [st, d])
 

@@ -1,5 +1,5 @@
 // web_drive.js — веб-панель в Chromium: вход, обзор (ПК и телефон), лента и нижняя панель, клиенты
-// с карточкой справа (ПК), скачивание, аккаунт, выход.
+// с карточкой справа (ПК), скачивание, ссылка на конфиг, аккаунт, выход.
 // Запускает test_web.py: node web_drive.js ПОРТ ПУТЬ ЛОГИН ПАРОЛЬ КАТАЛОГ_СКРИНШОТОВ
 const { chromium } = require("playwright");
 const [port, base, user, password, out] = process.argv.slice(2);
@@ -196,6 +196,49 @@ const say = (ok, label) => console.log(`${ok ? "OK" : "FAIL"} ${label}`);
       if (!/^[\w-]+\.zip$/.test(dz.suggestedFilename())) throw new Error(dz.suggestedFilename());
       const zb = require("fs").readFileSync(await dz.path());
       if (zb.readUInt32LE(0) !== 0x04034b50 || !zb.includes(Buffer.from(dl.suggestedFilename()))) throw new Error("в ZIP нет " + dl.suggestedFilename());
+    });
+    await step("ссылка на конфиг: QR, «Скачать» — alice.conf (форма со своим Origin), чужим адресам ни запроса, ни referrer; отзыв", async () => {
+      const call = (path, body) => page.evaluate(async ([p, b]) => (await fetch(p, { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) })).json(), [base + path, body]);
+      const d = await call("api/client/share", { name: "alice" });
+      if (!/^https:\/\/127\.0\.0\.1:\d+\/s\/[\w-]{32}$/.test(d.url || "")) throw new Error("ссылка не создана");
+      let revoked = false;
+      try {
+        const sp = await ctx.newPage(), sent = [];
+        sp.on("request", (r) => sent.push(r));
+        try {
+          await sp.goto(d.url);
+          await sp.click("#show");
+          await sp.waitForSelector("#box:not([hidden])");
+          if (!/^data:image\/png;base64,/.test(await sp.getAttribute("#qr", "src") || "")) throw new Error("нет QR");
+          const [dl] = await Promise.all([sp.waitForEvent("download"), sp.click("form button")]);
+          if (dl.suggestedFilename() !== "alice.conf") throw new Error(dl.suggestedFilename());
+          if (!require("fs").readFileSync(await dl.path(), "utf8").startsWith("[Interface]")) throw new Error("в файле не конфиг");
+          const post = sent.find((r) => r.method() === "POST" && r.url().endsWith("/file"));
+          const origin = post && (await post.allHeaders()).origin;
+          if (origin !== `https://127.0.0.1:${port}`) throw new Error("Origin формы «Скачать»: " + origin);
+          const ext = sent.filter((r) => !/^(https:\/\/127\.0\.0\.1:\d+\/|data:)/.test(r.url()));
+          if (ext.length) throw new Error("внешний запрос со страницы ссылки: " + ext[0].url());
+          // Переход по внешней ссылке шапки без rel и target: запрос перехвачен и не уходит; referrer в нём быть не должно
+          let hdr = null;
+          await sp.route(/^https?:\/\/(?!127\.0\.0\.1[:/])/, async (r) => { hdr = await r.request().allHeaders(); await r.abort(); });
+          await sp.evaluate(() => { const a = document.querySelector(".top a"); a.removeAttribute("target"); a.removeAttribute("rel"); a.click(); });
+          for (let i = 0; i < 20 && !hdr; i++) await sp.waitForTimeout(100);
+          if (!hdr) throw new Error("переход по внешней ссылке не перехвачен");
+          if (hdr.referer) throw new Error("на внешний адрес ушёл Referer");
+        } finally { await sp.close(); }
+        revoked = (await call("api/client/share/revoke", { id: d.id })).ok === true;
+        if (!revoked) throw new Error("ссылка не отозвана");
+        const gp = await ctx.newPage();
+        try {
+          const resp = await gp.goto(d.url);
+          if (resp.status() !== 404) throw new Error("после отзыва — " + resp.status());
+          await gp.waitForSelector("text=Ссылка недействительна");
+        } finally { await gp.close(); }
+      } finally {
+        // Шаг упал раньше — ссылку всё равно отзываем: не оставлять действующую до конца 5 минут
+        if (!revoked) await call("api/client/share/revoke", { id: d.id }).catch(() => {});
+      }
     });
     await step("сессия кончилась при возврате на открытый экран — форма входа нажимается, в снимок не попадает", async () => {
       await page.goto(u + "#/clients");
