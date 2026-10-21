@@ -1478,11 +1478,11 @@ async def run():
         async with http.get(base + f"/s/{tok}") as r:
             page, hd = await r.text(), r.headers
         chk("страница по ссылке: оболочка без конфига (предпросмотр мессенджеров его не получит), без кэша, "
-            "не индексируется, не во фрейм, строгий CSP",
+            "не индексируется, не во фрейм, строгий CSP, referrer — только своему адресу",
             r.status == 200 and "PrivateKey" not in page and "Показать QR и конфиг" in page
             and hd.get("Cache-Control") == "no-store" and "noindex" in hd.get("X-Robots-Tag", "")
             and hd.get("X-Frame-Options") == "DENY" and "default-src 'none'" in hd.get("Content-Security-Policy", "")
-            and "frame-ancestors 'none'" in hd.get("Content-Security-Policy", "") and hd.get("Referrer-Policy") == "no-referrer",
+            and "frame-ancestors 'none'" in hd.get("Content-Security-Policy", "") and hd.get("Referrer-Policy") == "same-origin",
             [r.status, dict(hd)])
         chk("в шапке страницы ссылки — «Telegram» со значком слева и «Поддержать» справа, в новой вкладке, без referrer",
             'href="https://t.me/awgToolza" target="_blank" rel="noopener noreferrer"' in page

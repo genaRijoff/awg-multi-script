@@ -12,7 +12,7 @@
     клиент удалён или под его именем уже другой — ссылка не отдаёт ничего;
   • по GET — только страница-оболочка, конфиг — по POST с неё: предпросмотр
     ссылок (Telegram, мессенджеры) и кэши конфиг не получают;
-  • без кэша, не индексируется, без referrer, во фрейм не встраивается;
+  • без кэша, не индексируется, без referrer на чужие адреса, во фрейм не встраивается;
   • неверные ссылки не стоят вызова awg2 и ограничены по частоте с адреса;
   • в журнал — кто создал и для кого, без самой ссылки.
 """
@@ -316,8 +316,12 @@ async def page(request: web.Request) -> web.Response:
         _fail(ip)
         return _resp(GONE.replace("{top}", TOP), 404)
     left = max(0, int(rec["exp"] - time.time()))
+    # Форма «Скачать» — обычный POST: при no-referrer браузер шлёт её с Origin: null,
+    # и веб-панель отвечает 403 «чужой сайт». same-origin — Origin свой; на чужие
+    # адреса (Telegram, «Поддержать») ни Referer, ни ссылка по-прежнему не уходят
     return _resp(PAGE.replace("{top}", TOP).replace("{exp}", str(int(rec["exp"]))).replace("{token}", token)
-                 .replace("{left}", f"Ссылка действует ещё {left // 60}:{left % 60:02d}"))
+                 .replace("{left}", f"Ссылка действует ещё {left // 60}:{left % 60:02d}"),
+                 extra={"Referrer-Policy": "same-origin"})
 
 
 async def _payload(request: web.Request) -> tuple[str, str] | web.Response:
