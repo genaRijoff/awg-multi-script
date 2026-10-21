@@ -943,9 +943,15 @@ AllowedIPs = 127.0.0.2/32
 # speed=12x
 PublicKey = P5=
 AllowedIPs = 10.9.0.6/32 junk
+
+[Peer]
+# s6
+# speed=²
+PublicKey = P6=
+AllowedIPs = 10.9.0.7/32
 EOC
 py speed-plan "$f" 127.0.0.2/32""")
-chk("план скорости: своя скорость, замедленный — меньшее из двух, IPv6, без заблокированных и мусора",
+chk("план скорости: своя скорость, замедленный — меньшее из двух, IPv6, без заблокированных и мусора (и «²»)",
     out.splitlines() == ["10.9.0.2/32\t20", "fd00::2/128\t20", "10.9.0.3/32\t2"], repr(out))
 r = api("client", "speed", "alice", "20")
 reset_calls()

@@ -216,8 +216,11 @@ client_limit_mode() {  # имя block|Мбит/с
 # «20 Мбит/с», «🐢 1 Мбит/с — лимит исчерпан» для меню.
 speed_fmt() {  # speed limit_slow slowed_by
   local sp="$1" slow="$2" by="$3"
+  # Метки из конфига: не число bash в (( )) вычислил бы как выражение
+  [[ -z "$sp" || "$sp" =~ ^[0-9]{1,5}$ ]] || { echo "метка повреждена — не ограничивается"; return 0; }
+  [[ "$slow" =~ ^[0-9]{1,5}$ ]] || slow=""
   if [[ "$by" == traffic && -n "$slow" ]]; then
-    if [[ -n "$sp" ]] && (( sp < slow )); then echo "$sp Мбит/с"; else echo "🐢 $slow Мбит/с — лимит исчерпан"; fi
+    if [[ -n "$sp" ]] && (( 10#$sp < 10#$slow )); then echo "$sp Мбит/с"; else echo "🐢 $slow Мбит/с — лимит исчерпан"; fi
   elif [[ -n "$sp" ]]; then echo "$sp Мбит/с"
   fi
 }
