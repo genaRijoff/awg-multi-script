@@ -541,7 +541,7 @@ python3 tests/test_cps.py         # генератор I1-I5
 python3 tests/test_bot.py         # бот на живом диспетчере против awg2 api (нужен aiogram)
 python3 tests/test_panel.py       # панель Mini App в Chromium (нужны aiogram и Playwright для node)
 python3 tests/test_web.py         # веб-панель: вход, защита, файлы, вид в Chromium
-python3 tests/test_admins.py && python3 tests/test_net.py
+python3 tests/test_admins.py && python3 tests/test_net.py && python3 tests/test_meta_menu.py
 ```
 
 ---

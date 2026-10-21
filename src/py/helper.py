@@ -675,8 +675,10 @@ PERIOD_WORD = {"month": "за месяц", "total": "всего"}
 
 
 def _mbit(value):
-    """Метка скорости (Мбит/с) → число; не число или 0 — 0 (без ограничения)."""
-    return int(value) if (value or "").isdigit() and 0 < int(value) <= SPEED_MAX else 0
+    """Метка скорости (Мбит/с) → число; не число или 0 — 0 (без ограничения).
+    isascii: «²» тоже isdigit(), а int() на нём падает — и весь план скорости с ним"""
+    v = value or ""
+    return int(v) if v.isascii() and v.isdigit() and 0 < int(v) <= SPEED_MAX else 0
 
 
 SPEED_MAX = 10000
