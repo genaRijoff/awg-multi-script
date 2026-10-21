@@ -448,7 +448,13 @@ def cmd_expire_set(conf, name, ts):
     write_atomic(conf, head + "".join(peers))
 
 
-def cmd_expire_clear(conf, name, suspend):
+def cmd_expire_clear(conf, name, suspend, db="", transfer=""):
+    """Снять срок. Печатает, что держит клиента дальше: traffic — лимит
+    исчерпан (заблокирован), slow — лимит исчерпан (замедлен), meta —
+    повреждена другая метка; пусто — свободен. db и transfer — база трафика
+    и снимок счётчиков: исчерпавший лимит не получает адрес даже на время
+    до прохода таймера."""
+    lock = _traffic_lock(db) if db else None
     head, peers = split_peers(read(conf))
     i = find_peer(peers, name=name)
     if i < 0:
@@ -460,19 +466,43 @@ def cmd_expire_clear(conf, name, suspend):
         write_atomic(conf, head + "".join(peers))
         print("traffic")
         return
-    orig = peer_meta(b, "orig_ips")
-    if orig and peer_field(b, "AllowedIPs") == suspend:
-        b = re.sub(r"^([ \t]*AllowedIPs\s*=\s*).+$", lambda m: m.group(1) + orig, b, count=1, flags=re.M | re.I)
-    b = set_meta(set_meta(set_meta(b, "expires", ""), "orig_ips", ""), "blocked_by", "")
+    if peer_meta(b, "blocked_by") == "meta":
+        # Повреждённый срок уходит вместе со сроком; блокировка снимается,
+        # только если других повреждённых меток нет
+        b = set_meta(b, "expires", "")
+        b = _meta_guard(b, suspend, peer_field(b, "AllowedIPs"), int(time.time()), name)[0]
+    else:
+        b = set_meta(_unblock(b, suspend), "expires", "")
+    held = "meta" if peer_meta(b, "blocked_by") == "meta" else ""
+    if not held and db:
+        b, held = _limit_hold(b, suspend, Traffic(db), transfer)
     peers[i] = b
     write_atomic(conf, head + "".join(peers))
-    print(orig)
+    del lock
+    print(held)
+
+
+def _limit_hold(b, suspend, t, transfer=""):
+    """Только что разблокированный — сверка с лимитом: исчерпан — снова блок
+    за трафик или, в режиме «замедлять», замедление. → (блок, traffic|slow|"")."""
+    limit, period = parse_limit(peer_meta(b, "limit"))
+    aip, pub = peer_field(b, "AllowedIPs"), peer_field(b, "PublicKey")
+    if not limit or aip == suspend or not pub:
+        return b, ""
+    if transfer:
+        t.apply(_read_transfer(transfer), "")       # только в памяти: базу ведёт таймер
+    if t.used(pub, period) < limit:
+        return b, ""
+    if _mbit(peer_meta(b, "limit_slow")):
+        return set_meta(b, "slowed_by", "traffic"), "slow"
+    return _block(b, suspend, aip, "traffic"), "traffic"
 
 
 def cmd_expire_check(conf, suspend, state_dir):
     """Блокирует истёкших (AllowedIPs → suspend, исходный адрес в orig_ips)
     и предупреждает за час до срока. Печатает события построчно:
-    CHANGED; EXPIRED<TAB>имя<TAB>адрес; WARN1H<TAB>имя<TAB>минут."""
+    CHANGED; EXPIRED<TAB>имя<TAB>адрес; WARN1H<TAB>имя<TAB>минут;
+    META<TAB>имя<TAB>адрес|-<TAB>метки (снимает такую блокировку traffic-tick)."""
     try:
         text = read(conf)
     except OSError:
@@ -481,11 +511,18 @@ def cmd_expire_check(conf, suspend, state_dir):
     head, peers = split_peers(text)
     events, changed = [], False
     for i, b in enumerate(peers):
-        exp, pub, aip = peer_meta(b, "expires"), peer_field(b, "PublicKey"), peer_field(b, "AllowedIPs")
-        if not (exp.isdigit() and pub and aip):
+        pub, aip = peer_field(b, "PublicKey"), peer_field(b, "AllowedIPs")
+        if not (pub and aip):
             continue
-        exp = int(exp)
         name = peer_name(b) or pub[:8]
+        peers[i], aip, ev = _meta_guard(b, suspend, aip, now, name, release=False)
+        if ev:
+            b = peers[i]
+            changed = True
+            events.append(ev)
+        exp = meta_int(peer_meta(b, "expires"))
+        if peer_meta(b, "blocked_by") == "meta" or exp is None or exp is BAD:
+            continue
         if now >= exp and aip != suspend:
             if not peer_meta(b, "orig_ips"):
                 b = set_meta(b, "orig_ips", aip)
@@ -543,9 +580,14 @@ def parse_size(text):
 
 
 def parse_limit(value):
-    """Метка «БАЙТ/период» → (байт, период) или (0, "")."""
-    m = re.match(r"^(\d+)/(month|total)$", value or "")
-    return (int(m.group(1)), m.group(2)) if m else (0, "")
+    """Метка «БАЙТ/период» → (байт, период) или (0, "") — нет лимита или
+    метка повреждена (это отличает limit_bad)."""
+    m = re.fullmatch(r"([0-9]{1,16})/(month|total)", (value or "").strip())
+    return (int(m.group(1)), m.group(2)) if m and int(m.group(1)) else (0, "")
+
+
+def limit_bad(value):
+    return bool((value or "").strip()) and not parse_limit(value)[0]
 
 
 def _read_transfer(path):
@@ -563,7 +605,8 @@ def _read_transfer(path):
 class Traffic:
     """База трафика: {"v", "ifindex", "saved", "last": {pub: [rx, tx]},
     "total": {pub: n}, "days": {"ГГГГ-ММ-ДД": {pub: [rx, tx]}},
-    "reset": {pub: {"p": период, "b": байт}}, "warned": {pub: "период:лимит"}}."""
+    "reset": {pub: {"p": период, "b": байт}}, "warned": {pub: "период:лимит"},
+    "badmeta": {pub: "метки"}} — badmeta: о чём уже предупредили."""
 
     def __init__(self, path):
         self.path = path
@@ -575,7 +618,7 @@ class Traffic:
         if not isinstance(data, dict):
             data = {}
         self.d = {k: data.get(k) if isinstance(data.get(k), dict) else {}
-                  for k in ("last", "total", "days", "reset", "warned")}
+                  for k in ("last", "total", "days", "reset", "warned", "badmeta")}
         self.ifindex = str(data.get("ifindex") or "")
         self.saved = int(data.get("saved") or 0)
 
@@ -646,7 +689,7 @@ class Traffic:
         cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400 * DAYS_KEEP))
         self.d["days"] = {k: v for k, v in self.d["days"].items() if k >= cutoff and v}
         if alive is not None:
-            for k in ("last", "total", "reset", "warned"):
+            for k in ("last", "total", "reset", "warned", "badmeta"):
                 self.d[k] = {p: v for p, v in self.d[k].items() if p in alive}
         self.saved = int(time.time())
         data = dict(self.d, v=1, ifindex=self.ifindex, saved=self.saved)
@@ -684,12 +727,80 @@ def _mbit(value):
 SPEED_MAX = 10000
 
 
+# ── Повреждённые метки ──
+# Числовые метки — только цифры ASCII: isdigit() пропускает «²» и «①», а int()
+# на них падает — вместе с проходом таймера по всем клиентам. Метку портят
+# руками или подменённым бэкапом (восстанавливать может и приглашённый админ).
+BAD = object()
+META_HARD = ("expires", "limit")       # без них неизвестно, можно ли пускать клиента
+
+
+def meta_int(value):
+    """«123» (пробелы по краям можно) → 123; пусто → None; иначе BAD."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    return int(v) if re.fullmatch(r"[0-9]{1,15}", v) else BAD
+
+
+def bad_meta(b):
+    """Повреждённые метки клиента: expires, limit, limit_slow, speed."""
+    out = [k for k in ("expires",) if meta_int(peer_meta(b, k)) is BAD]
+    if limit_bad(peer_meta(b, "limit")):
+        out.append("limit")
+    # Скорость и режим лимита — по правилу _mbit: только цифры ASCII, до SPEED_MAX; иначе
+    # _mbit молча дал бы «без ограничения», а предупреждения бы не было
+    for k in ("limit_slow", "speed"):
+        v = peer_meta(b, k)
+        if v and not (v.isascii() and v.isdigit() and int(v) <= SPEED_MAX):
+            out.append(k)
+    return out
+
+
+def _meta_guard(b, suspend, aip, now, name, release=True):
+    """Срок или лимит повреждён — неизвестно, истёк ли он и исчерпан ли
+    лимит, а «бессрочный без лимита» — не то, что задумано: клиент
+    блокируется своей причиной «# blocked_by=meta». Её не снимают ни новый
+    месяц, ни продление, ни смена режима — только исправленная метка; тогда
+    состояние считается заново (истёкший остаётся заблокирован сроком).
+    → (блок, AllowedIPs, событие или ""). Пустых полей в событиях нет — «-»:
+    read с IFS=таб схлопнул бы их. release=False — только блокировать:
+    expire-check снимать не должен — исчерпавшего лимит traffic-tick
+    заблокировал бы снова, но уже после того, как awg0 его пропустил."""
+    hard = [k for k in bad_meta(b) if k in META_HARD]
+    by = peer_meta(b, "blocked_by")
+    if hard:
+        if aip != suspend:
+            return _block(b, suspend, aip, "meta"), suspend, "META\t%s\t%s\t%s" % (name, aip, ", ".join(hard))
+        if by != "meta":
+            return set_meta(b, "blocked_by", "meta"), aip, "META\t%s\t-\t%s" % (name, ", ".join(hard))
+        return b, aip, ""
+    if by != "meta" or not release:
+        return b, aip, ""
+    exp = meta_int(peer_meta(b, "expires"))
+    if exp is not None and now >= exp:
+        return set_meta(b, "blocked_by", ""), aip, "UNMETA\t%s\texpire" % name
+    b = _unblock(b, suspend)
+    return b, peer_field(b, "AllowedIPs"), "UNMETA\t%s\t-" % name
+
+
+def cmd_meta_check(conf):
+    """Клиенты с повреждёнными метками: «имя<TAB>метки» — для восстановления."""
+    _, peers = split_peers(read(conf))
+    for b in peers:
+        bad = bad_meta(b)
+        if bad and peer_field(b, "PublicKey"):
+            print("%s\t%s" % (peer_name(b) or peer_field(b, "PublicKey")[:8], ", ".join(bad)))
+
+
 def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
     """Проход таймера: прирост трафика в базу и проверка лимитов. События:
     CHANGED; LIMIT<TAB>имя<TAB>адрес<TAB>текст; WARN90<TAB>имя<TAB>текст;
     UNLIMIT<TAB>имя<TAB>текст; SLOW<TAB>имя<TAB>Мбит/с<TAB>текст;
     UNSLOW<TAB>имя<TAB>текст. Мягкий лимит («# limit_slow=N»): исчерпавший
-    не блокируется, а замедляется до N Мбит/с («# slowed_by=traffic»)."""
+    не блокируется, а замедляется до N Мбит/с («# slowed_by=traffic»).
+    Повреждённые метки: META и UNMETA — как в expire-check; BADMETA<TAB>имя
+    <TAB>метки — скорость или режим лимита не действуют (один раз)."""
     lock = _traffic_lock(db)
     try:
         text = read(conf)
@@ -699,19 +810,37 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
     t.apply(_read_transfer(transfer), ifindex)
     now = int(time.time())
     head, peers = split_peers(text)
-    events, changed, alive = [], False, set()
+    events, changed, alive, dirty = [], False, set(), False
     for i, b in enumerate(peers):
         pub, aip = peer_field(b, "PublicKey"), peer_field(b, "AllowedIPs")
         if not (pub and aip):
             continue
         alive.add(pub)
         name = peer_name(b) or pub[:8]
+        peers[i], aip, ev = _meta_guard(b, suspend, aip, now, name)
+        if ev:
+            b = peers[i]
+            changed = True
+            events.append(ev)
+        # Повреждённые скорость и режим лимита не блокируют: скорость не
+        # ограничивается, исчерпавший лимит блокируется — об этом одно
+        # предупреждение, пока набор повреждённых меток тот же
+        soft = ", ".join(k for k in bad_meta(b) if k not in META_HARD)
+        if t.d["badmeta"].get(pub, "") != soft:
+            dirty = True
+            if soft:
+                t.d["badmeta"][pub] = soft
+                events.append("BADMETA\t%s\t%s" % (name, soft))
+            else:
+                t.d["badmeta"].pop(pub, None)
+        if peer_meta(b, "blocked_by") == "meta":
+            continue
         limit, period = parse_limit(peer_meta(b, "limit"))
         slow = _mbit(peer_meta(b, "limit_slow"))
         by_traffic = peer_meta(b, "blocked_by") == "traffic"
         slowed = peer_meta(b, "slowed_by") == "traffic"
-        exp = peer_meta(b, "expires")
-        expired = exp.isdigit() and now >= int(exp)
+        exp = meta_int(peer_meta(b, "expires"))
+        expired = isinstance(exp, int) and now >= exp
         used = t.used(pub, period) if limit else 0
         word = "%s из %s %s" % (fmt_bytes(used), fmt_bytes(limit), PERIOD_WORD.get(period, "")) if limit else ""
         over = bool(limit) and used >= limit
@@ -727,16 +856,21 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
                     events.append("UNLIMIT\t%s\t%s" % (name, word or "лимит снят"))
             changed = True
             b, aip = peers[i], peer_field(peers[i], "AllowedIPs")
+        # Заблокированный сроком: метка замедления ведётся и дальше — после
+        # продления сразу действует положенная скорость, — но сообщений о
+        # скорости заблокированного нет: «снова полная скорость» было бы неправдой
+        blocked = aip == suspend
         if slowed and not (over and slow):
             peers[i] = b = set_meta(b, "slowed_by", "")
             changed = True
-            if not over:
+            if not over and not blocked:
                 events.append("UNSLOW\t%s\t%s" % (name, word or "лимит снят"))
         if over and slow:
             if not slowed:
                 peers[i] = set_meta(b, "slowed_by", "traffic")
                 changed = True
-                events.append("SLOW\t%s\t%d\t%s" % (name, slow, word))
+                if not blocked:
+                    events.append("SLOW\t%s\t%d\t%s" % (name, slow, word))
         elif over and aip != suspend:
             peers[i] = _block(b, suspend, aip, "traffic")
             changed = True
@@ -750,7 +884,7 @@ def cmd_traffic_tick(conf, suspend, db, transfer, ifindex="", force_save="0"):
         write_atomic(conf, head + "".join(peers))
         print("CHANGED")
     day_changed = time.strftime("%Y-%m-%d", time.localtime(t.saved)) != time.strftime("%Y-%m-%d")
-    if events or changed or day_changed or force_save == "1" or now - t.saved >= TRAFFIC_SAVE_EVERY:
+    if events or changed or dirty or day_changed or force_save == "1" or now - t.saved >= TRAFFIC_SAVE_EVERY:
         t.save(alive)
     del lock
     for e in events:
@@ -837,6 +971,8 @@ def cmd_limit_reset(conf, db, name, transfer="", ifindex=""):
     if i < 0:
         die("клиент %s не найден" % name, 2)
     limit, period = parse_limit(peer_meta(peers[i], "limit"))
+    if limit_bad(peer_meta(peers[i], "limit")):
+        die("метка лимита у %s повреждена — задай лимит заново" % name)
     if not limit:
         die("у клиента %s нет лимита" % name)
     t = Traffic(db)
@@ -1915,7 +2051,7 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
         name = peer_name(b)
         orig = peer_meta(b, "orig_ips")
         ip = _first_ip(orig or peer_field(b, "AllowedIPs"))
-        exp = peer_meta(b, "expires")
+        exp = meta_int(peer_meta(b, "expires"))
         s = stats.get(pub) or ["", "", "", "", "0", "0", "0"]
         hs = int(s[4]) if s[4].isdigit() else 0
         path = ""
@@ -1926,7 +2062,7 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
                 break
         row = {
             "name": name, "ip": ip, "pub": pub,
-            "expires": int(exp) if exp.isdigit() else None, "blocked": bool(orig),
+            "expires": exp if exp is not BAD else None, "blocked": bool(orig),
             "mimicry": peer_meta(b, "mimicry") or "none",
             "handshake": hs, "ago": now - hs if hs else None,
             "online": bool(hs) and now - hs < 180,
@@ -1939,7 +2075,9 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
                    blocked_by=(by or "expire") if orig else None,
                    speed=_mbit(peer_meta(b, "speed")) or None,
                    limit_slow=_mbit(peer_meta(b, "limit_slow")) or None,
-                   slowed=peer_meta(b, "slowed_by") == "traffic",
+                   # Заблокированный не «замедлен»: метку таймер держит до продления
+                   slowed=peer_meta(b, "slowed_by") == "traffic" and not orig,
+                   bad_meta=bad_meta(b),
                    used=traffic.used(pub, period) if traffic and limit else None,
                    month=traffic.raw_used(pub, "month") if traffic else None,
                    today=sum((traffic.d["days"].get(today) or {}).get(pub) or [0, 0]) if traffic else None)
@@ -2329,7 +2467,7 @@ COMMANDS = {
     "peer-rename": cmd_peer_rename, "peers-clear": cmd_peers_clear,
     "params-replace": cmd_params_replace, "keepalive-set": cmd_keepalive_set, "params-check": cmd_params_check,
     "i-replace": cmd_i_replace,
-    "expire-set": cmd_expire_set, "expire-clear": cmd_expire_clear,
+    "expire-set": cmd_expire_set, "expire-clear": cmd_expire_clear, "meta-check": cmd_meta_check,
     "expire-check": cmd_expire_check,
     "traffic-tick": cmd_traffic_tick, "traffic-daily": cmd_traffic_daily, "traffic-now": cmd_traffic_now,
     "traffic-rows": cmd_traffic_rows, "traffic-report": cmd_traffic_report,

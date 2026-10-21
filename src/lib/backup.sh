@@ -265,7 +265,7 @@ _restore_hooks() {  # конфиг [разрешённые команды…]
 }
 
 do_restore() {
-  local list=() i c src name opts=()
+  local list=() i c src name opts=() bad
   mapfile -t list < <(_restore_list)
   (( ${#list[@]} )) || { err "Бэкапов нет в $BACKUP_DIR"; return 1; }
   for i in "${!list[@]}"; do
@@ -277,6 +277,8 @@ do_restore() {
   (( c )) || return 0
   src="${list[$((c - 1))]}"
   _restore_prepare "$src" || return 1
+  bad=$(py meta-check "$RESTORE_SRC/awg0.conf" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
+  [[ -n "$bad" ]] && warn "В бэкапе у клиентов повреждены метки: $bad — срок или лимит: клиент будет заблокирован до исправления"
   read_confirm "${R}  Текущий сервер будет заменён. Продолжить? (введи yes): ${N}" || return 0
   [[ -d "$RESTORE_SRC/wgobf/etc" ]] && ask_yes "  В бэкапе есть WG + обфускатор — восстановить? [Y/n]: " y && opts+=(wgobf)
   [[ -f "$RESTORE_SRC/tunnels.tar.gz" ]] \
@@ -286,7 +288,7 @@ do_restore() {
 
 # backup_restore БЭКАП [wgobf] [tunnels] — сервер и клиенты всегда, остальное по флагам.
 backup_restore() {
-  local src="$1" label="${1##*/}" port f
+  local src="$1" label="${1##*/}" port f bad
   shift
   command -v awg-quick &>/dev/null || { err "Нет awg-quick — сначала установи компоненты (Сервер → Установить компоненты)"; return 1; }
   _restore_prepare "$src" || return 1
@@ -299,6 +301,10 @@ backup_restore() {
   conf_uplink_sync force || true
   client_files_sync_suffix
   ok "Сервер и клиенты: $(client_files | wc -l) кл."
+  # Повреждённые метки клиентов (бэкап правили руками или подменили): срок и
+  # лимит — таймер блокирует до исправления, скорость и режим лимита не действуют
+  bad=$(py meta-check "$SERVER_CONF" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
+  [[ -n "$bad" ]] && warn "У клиентов повреждены метки: $bad. Срок или лимит — клиент заблокирован, пока не задать их заново; скорость — не ограничивается"
   _restore_warp "$src"
   for f in "$@"; do
     case "$f" in

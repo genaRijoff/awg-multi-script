@@ -293,6 +293,11 @@ const limitText = (c) => `${fmtBytes(c.used)} из ${fmtBytes(c.limit)} ${PERIOD
 // Скорость клиента: своя или замедление по лимиту (действует меньшая); пусто — без ограничения
 const speedNow = (c) => (c.slowed && c.limit_slow && !(c.speed && c.speed < c.limit_slow) ? c.limit_slow : c.speed || 0);
 const speedText = (c) => (!speedNow(c) ? "" : speedNow(c) === c.speed ? `${c.speed} Мбит/с` : `🐢 ${c.limit_slow} Мбит/с — лимит исчерпан`);
+// Повреждённые метки (bad_meta из awg2): срок и лимит — клиент заблокирован, скорость и режим лимита не действуют
+const badMeta = (c, k) => Array.isArray(c.bad_meta) && c.bad_meta.includes(k);
+const BAD_META = { expires: "срок", limit: "лимит", limit_slow: "режим лимита", speed: "скорость" };
+const badMetaText = (c) => (Array.isArray(c.bad_meta) && c.bad_meta.length
+  ? "повреждена метка: " + c.bad_meta.map((k) => BAD_META[k] || k).join(", ") : "");
 const SPEEDS = [5, 10, 20, 50, 100];
 const SLOW_MODES = [["block", "🚫 Блокировать"], ["1", "🐢 1 Мбит/с"], ["2", "🐢 2 Мбит/с"], ["5", "🐢 5 Мбит/с"]];
 
@@ -1865,6 +1870,9 @@ const EV_KIND = {
   unlimit: ["circle-check", "var(--ok)", (n, x) => [`${n} разблокирован`, x]],
   expired: ["hourglass", "var(--red)", (n, x) => [`${n}: срок истёк`, x]],
   warn1h: ["clock", "var(--amber)", (n, x) => [`${n}: срок истекает через час`, x]],
+  meta: ["shield-off", "var(--red)", (n, x) => [`${n} заблокирован`, x]],
+  unmeta: ["circle-check", "var(--ok)", (n, x) => [`${n}: метки исправлены`, x]],
+  badmeta: ["triangle-alert", "var(--amber)", (n, x) => [`${n}: метка не действует`, x]],
   watchdog: ["refresh-cw", "var(--blue)", (n, x) => ["Таймер сроков и лимитов перезапущен", [n, x].filter(Boolean).join(" ")]],
 };
 function parseEvents(log) {
@@ -2024,7 +2032,8 @@ route(/^\/$/, async (ctx) => {
   const eyebrow = now.toLocaleDateString("ru-RU", { weekday: "long", day: "numeric", month: "long" }) + " · "
     + now.toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" });
   const online = rows.filter((c) => c.online).length, byLimit = rows.filter((c) => c.blocked && c.blocked_by === "traffic").length;
-  const byExp = rows.filter((c) => c.blocked && c.blocked_by !== "traffic").length;
+  const byExp = rows.filter((c) => c.blocked && c.blocked_by === "expire").length;
+  const byMeta = rows.filter((c) => c.blocked && c.blocked_by === "meta").length;
   const today = rows.reduce((a, c) => a + (c.today || 0), 0), month = rows.reduce((a, c) => a + (c.month || 0), 0);
   const foot = h("div", { class: "foot" }, WEB ? `${me.name} · веб-панель · ${me.bot}` : `${me.name} · ${me.owner ? "владелец" : "админ"} · бот ${me.bot}`);
   // Список клиентов не пришёл — не «Клиентов пока нет» и «Лимитов нет», а честно и с повтором
@@ -2115,7 +2124,8 @@ route(/^\/$/, async (ctx) => {
       setPref("routes-pane", i ? "w" : "awg"); rhLink.replaceChildren(rlink(i)); })) : routesIn;
   const subText = () => [`${rows.filter((c) => c.online).length} из ${rows.length} ${plural(rows.length, "клиента", "клиентов", "клиентов")} в сети`,
     byLimit ? `${byLimit} ${plural(byLimit, "заблокирован", "заблокированы", "заблокированы")} по лимиту` : null,
-    byExp ? `${byExp} с истёкшим сроком` : null, wrows.length ? `обфускатор: ${won} из ${wrows.length} в сети` : null,
+    byExp ? `${byExp} с истёкшим сроком` : null,
+    byMeta ? `${byMeta} ${plural(byMeta, "заблокирован", "заблокированы", "заблокированы")}: повреждена метка` : null, wrows.length ? `обфускатор: ${won} из ${wrows.length} в сети` : null,
     alerts.length ? "есть замечания" : "сервер без замечаний"].filter(Boolean).join(" · ");
   const sub = h("span", {}, subText()), kOnline = h("span", {}, String(online));
 
@@ -2200,7 +2210,7 @@ route(/^\/$/, async (ctx) => {
 const FILTERS = [["all", "Все"], ["online", "Онлайн"], ["blocked", "Заблок."], ["mon", "Мониторинг"]];
 const EXPIRES = [["", "♾ Бессрочно"], ["+1h", "1 час"], ["+1d", "1 день"], ["+7d", "7 дней"], ["+30d", "30 дней"]];
 
-const blockedWord = (c) => (c.blocked_by === "traffic" ? "лимит исчерпан" : "срок истёк");
+const blockedWord = (c) => (c.blocked_by === "traffic" ? "лимит исчерпан" : c.blocked_by === "meta" ? "метка повреждена" : "срок истёк");
 function seen(c) {
   if (c.blocked) return blockedWord(c);
   if (c.online) return "онлайн";
@@ -2247,6 +2257,7 @@ function clientTags(c) {
   return [
     c.mimicry && c.mimicry !== "none" ? tag(c.mimicry, "accent", "drama") : tag("без I1-I5"),
     expLive(c) ? tag(expShort(c.expires), left < 3 * 86400 ? "warn" : "", "hourglass") : null,
+    badMetaText(c) ? tag(badMetaText(c), "bad", "triangle-alert") : null,
     c.limit ? tag(`лимит ${Math.min(999, Math.round(c.used * 100 / c.limit))}%`, c.used >= c.limit * 0.9 ? "warn" : "", "gauge") : null,
     speedNow(c) ? tag(`${speedNow(c)} Мбит/с`, speedNow(c) !== c.speed ? "warn" : "", speedNow(c) !== c.speed ? "timer" : "zap") : null,
     routeTag(c, (S.clients && S.clients.route) || {}),
@@ -2443,13 +2454,14 @@ const CLIENTS_RE = route(/^\/clients$/, async (ctx) => {
     return h("tr", { class: sel ? "sel" : null, "data-name": c.name, onclick: () => open(c) },
       S.select ? h("td", {}, mark(c)) : null,
       h("td", {}, h("div", { class: "who" }, ava(c), h("div", { style: "min-width:0" }, h("b", {}, c.name, c.mon ? " 🔔" : ""),
-        h("span", { class: "note" }, [c.ip, c.note].filter(Boolean).join(" · "))))),
+        h("span", { class: "note" }, [c.ip, c.note].filter(Boolean).join(" · ")),
+        badMetaText(c) ? h("span", { class: "note", style: "color:var(--red)" }, "⚠ " + badMetaText(c)) : null))),
       h("td", {}, statusPill(c)),
       h("td", { class: "num" }, c.today != null ? `${fmtBytes(c.today)} сегодня` : "—", h("br"),
         h("span", { class: "muted" }, `↓ ${fmtBytes(c.rx)} · ↑ ${fmtBytes(c.tx)}`)),
       h("td", {}, c.limit ? h("div", { class: "lim", title: limitText(c) }, ringSvg(pct, 26, 4), pct + "%") : h("span", { class: "muted" }, "—")),
       h("td", { class: "num", style: expActive && left < 3 * 86400 ? "color:var(--amber)" : null },
-        expActive ? expShort(c.expires) : c.expires ? "истёк" : "∞"),
+        expActive ? expShort(c.expires) : badMeta(c, "expires") ? "метка повреждена" : c.expires ? "истёк" : "∞"),
       h("td", {}, routeChip(c, mdl), c.mimicry && c.mimicry !== "none" ? h("div", { class: "muted small mono" }, c.mimicry) : null),
       h("td", {}, S.select ? null : h("div", { class: "ops" },
         op("qr-code", "Конфиг и QR", () => go(`/client/${enc}/qr`)),
@@ -2518,9 +2530,10 @@ const CLIENTS_RE = route(/^\/clients$/, async (ctx) => {
       chips: [c.mimicry && c.mimicry !== "none" ? kchip(c.mimicry, "acc", "drama") : kchip("без I1-I5"),
         expLive(c) ? kchip(expShort(c.expires), left < 3 * 86400 ? "warn" : "", "hourglass") : null,
         c.limit ? kchip(`лимит ${pct}%`, c.used >= c.limit * 0.9 ? "warn" : "", "gauge") : null,
+        badMetaText(c) ? kchip(badMetaText(c), "bad", "triangle-alert") : null,
         kroute(c), c.mon ? kchip("мониторинг", "", "bell") : null],
       kv: [["Рукопожатие", c.handshake ? fmtDur(c.ago) + " назад" : "не было"], ["Сегодня", fmtBytes(c.today || 0)],
-        ["Срок", expLive(c) && left > 0 ? "ещё " + expShort(c.expires) : c.expires ? "истёк" : "бессрочно"],
+        ["Срок", expLive(c) && left > 0 ? "ещё " + expShort(c.expires) : badMeta(c, "expires") ? "метка повреждена" : c.expires ? "истёк" : "бессрочно"],
         c.limit ? ["Лимит", `${pct}% · ${fmtBytes(c.used)} из ${fmtBytes(c.limit)}`] : null,
         v === "grid" ? ["Принято", "↓ " + fmtBytes(c.rx)] : null, v === "grid" ? ["Отдано", "↑ " + fmtBytes(c.tx)] : null,
         c.note ? ["Заметка", c.note] : null],
@@ -2694,7 +2707,7 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       [fmtBytes(c.rx), "Принято ↓", "от клиента"],
       [fmtBytes(c.tx), "Отдано ↑", "клиенту"],
       [c.handshake ? fmtDur(c.ago) : "—", "Рукопожатие", c.handshake ? (c.online ? "назад · онлайн" : "назад") : "не было"],
-      [c.expires ? expShort(c.expires) : "∞", "Срок", c.expires ? fmtTime(c.expires) : "бессрочно"],
+      [c.expires ? expShort(c.expires) : badMeta(c, "expires") ? "⚠" : "∞", "Срок", c.expires ? fmtTime(c.expires) : badMeta(c, "expires") ? "метка повреждена" : "бессрочно"],
     ])),
     area("info", h("div", { class: "card" },
       kv("IP", h("span", { class: "mono" }, c.ip)),
@@ -2703,9 +2716,11 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       c.note ? kv("Заметка", c.note) : null), routeCard()),
     area("traf", h("div", { class: "card" },
       kv("За месяц", fmtBytes(c.month)), kv("Сегодня", fmtBytes(c.today)),
-      kv("Лимит", c.limit ? limitText(c) + (c.limit_slow ? ` · исчерпал — 🐢 до ${c.limit_slow} Мбит/с` : "") : "нет"),
+      kv("Лимит", badMeta(c, "limit") ? "метка повреждена — клиент заблокирован, задай лимит заново"
+        : (c.limit ? limitText(c) : "нет") + (badMeta(c, "limit_slow") ? " · режим: метка повреждена — при исчерпании блокировка"
+          : c.limit && c.limit_slow ? ` · исчерпал — 🐢 до ${c.limit_slow} Мбит/с` : "")),
       c.limit ? meter(c.used, c.limit) : null,
-      kv("Скорость", speedText(c) || "без ограничения"), chartBox)),
+      kv("Скорость", badMeta(c, "speed") ? "метка повреждена — не ограничивается, задай заново" : speedText(c) || "без ограничения"), chartBox)),
     // Сообщает Telegram-бот: в веб-панели без бота присылать некому — так и говорим
     area("mon", switchRow("Мониторинг активности", noBot() ? "уведомления присылает Telegram-бот — он не установлен"
       : "уведомления в чат, когда клиент пропал и вернулся", c.mon, async (on) => {
@@ -2841,6 +2856,7 @@ route(/^\/client\/([^/]+)\/limit$/, async (ctx, name) => {
   ctx.put(title("📶 Лимит · " + name),
     h("label", {}, "Размер: 50G, 500MB, 1.5T; число без буквы — гигабайты"), input, seg,
     h("label", {}, "Исчерпал лимит"), modes,
+    badMeta(c, "limit_slow") ? hint("Метка режима повреждена: сейчас при исчерпании — блокировка. Выбери режим заново.") : null,
     hint("«Блокировать» — клиент отключается, как истёкший; «замедлять» — остаётся на связи на малой скорости. "
       + "«В месяц» — счётчик обнуляется 1-го числа, и всё снимается само; «всего» — считается с этой минуты, без сброса."),
     enterTo(h("button", { class: "btn-primary btn-block", onclick: (ev) => busy(ev.currentTarget, async () => {
