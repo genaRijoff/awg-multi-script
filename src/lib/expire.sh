@@ -51,6 +51,31 @@ _traffic_snapshot() {  # → путь к снимку в stdout
   printf '%s\n' "$tr"
 }
 
+# Повреждённые метки (события expire-check и traffic-tick): срок или лимит —
+# клиент заблокирован, пока метку не задать заново. Строки журнала — как
+# у ленты событий панели: «событие: имя (подробности)», заголовок даёт панель.
+_expire_meta_event() {  # META|UNMETA имя адрес|expire|- метки
+  if [[ "$1" == META ]]; then
+    echo "$(date '+%F %T') meta: $2 (повреждена метка $4)" >> "$EXPIRE_LOG"
+    [[ "$3" != - ]] && command -v conntrack >/dev/null && conntrack -D -s "${3%%/*}" >/dev/null 2>&1
+    _expire_notify "🚫 Клиент <b>$(_expire_esc "$2")</b> заблокирован: повреждена метка $4 в конфиге сервера. Задай срок или лимит заново — блокировка снимется сама."
+  elif [[ "$3" == expire ]]; then
+    echo "$(date '+%F %T') unmeta: $2 (срок истёк — остаётся заблокирован)" >> "$EXPIRE_LOG"
+    _expire_notify "🚫 Клиент <b>$(_expire_esc "$2")</b>: метки исправлены, но срок действия истёк — остаётся заблокирован."
+  else
+    echo "$(date '+%F %T') unmeta: $2 (разблокирован)" >> "$EXPIRE_LOG"
+    _expire_notify "✅ Клиент <b>$(_expire_esc "$2")</b> разблокирован: метки исправлены."
+  fi
+}
+
+# Повреждённые скорость и режим лимита не блокируют — что вместо них.
+_expire_soft_word() {  # «limit_slow, speed»
+  local w=""
+  [[ "$1" == *limit_slow* ]] && w="исчерпавший лимит блокируется, а не замедляется"
+  [[ "$1" == *speed* ]] && w="${w:+$w; }скорость не ограничивается"
+  echo "$w"
+}
+
 traffic_tick() {  # [1 — записать базу сейчас]
   local out ev name arg text tr ifx=""
   [[ -f "$SERVER_CONF" ]] || return 0
@@ -79,6 +104,10 @@ traffic_tick() {  # [1 — записать базу сейчас]
       UNSLOW)
         echo "$(date '+%F %T') unslow: $name ($arg)" >> "$EXPIRE_LOG"
         _expire_notify "✅ Клиент <b>$(_expire_esc "$name")</b> — снова полная скорость: трафик в пределах лимита — ${arg}." ;;
+      META | UNMETA) _expire_meta_event "$ev" "$name" "$arg" "$text" ;;
+      BADMETA)
+        echo "$(date '+%F %T') badmeta: $name (повреждена метка $arg — $(_expire_soft_word "$arg"))" >> "$EXPIRE_LOG"
+        _expire_notify "⚠️ У клиента <b>$(_expire_esc "$name")</b> повреждена метка $arg в конфиге сервера: $(_expire_soft_word "$arg"). Задай заново." ;;
     esac
   done <<< "$out"
   # Замедление по лимиту и своя скорость клиентов — в tc
@@ -93,7 +122,7 @@ traffic_tick() {  # [1 — записать базу сейчас]
 # сроки и лимиты ждут её не дольше EXPIRE_LOCK_MAX, дальше проход идёт без замка.
 EXPIRE_LOCK_MAX=120
 expire_check_run() {
-  local out ev name arg busy="$EXPIRE_STATE_DIR/lock_busy"
+  local out ev name arg text busy="$EXPIRE_STATE_DIR/lock_busy"
   local EXPIRE_DEFER=1 EXPIRE_QUEUE=()
   [[ -f "$SERVER_CONF" ]] || return 0
   mkdir -p "$STATE_DIR" "$EXPIRE_STATE_DIR"
@@ -108,9 +137,10 @@ expire_check_run() {
     fi
   fi
   out=$(py expire-check "$SERVER_CONF" "$EXPIRE_SUSPEND_IP" "$EXPIRE_STATE_DIR" 2>>"$EXPIRE_LOG") || out=""
-  while IFS=$'\t' read -r ev name arg; do
+  while IFS=$'\t' read -r ev name arg text; do
     case "$ev" in
       CHANGED) _expire_sync ;;
+      META | UNMETA) _expire_meta_event "$ev" "$name" "$arg" "$text" ;;
       EXPIRED)
         echo "$(date '+%F %T') expired: $name (было $arg)" >> "$EXPIRE_LOG"
         command -v conntrack >/dev/null && conntrack -D -s "${arg%%/*}" >/dev/null 2>&1
@@ -268,11 +298,11 @@ do_expire_menu() {
     while IFS='|' read -r name lim per used month _ by; do
       [[ -n "$name" && "$lim" != 0 ]] && tl[x$name]="$lim/$per|$used|$by"
     done < <(traffic_rows)
-    while IFS='|' read -r name pub _ exp orig _ _ _ sp slow sby; do
-      [[ -n "$exp" || -n "${tl[x$name]:-}" || -n "$sp" ]] || continue
+    while IFS='|' read -r name pub _ exp orig _ _ by sp slow sby; do
+      [[ -n "$exp" || -n "${tl[x$name]:-}" || -n "$sp" || "$by" == meta ]] || continue
       n=$((n + 1))
-      by="${tl[x$name]:-}"; by="${by##*|}"
-      if [[ -n "$orig" && "$by" == traffic ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован: исчерпан лимит${N}"
+      if [[ -n "$orig" && "$by" == meta ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован: повреждена метка срока или лимита — задай заново${N}"
+      elif [[ -n "$orig" && "$by" == traffic ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован: исчерпан лимит${N}"
       elif [[ -n "$orig" ]]; then echo -e "  ${R}🚫 ${name}${N} ${D}— заблокирован, $(expire_fmt "$exp")${N}"
       elif [[ -n "$exp" ]]; then echo -e "  ${Y}⏰ ${name}${N} ${D}— $(expire_fmt "$exp")${N}"
       else echo -e "  ${C}📶 ${name}${N}"; fi
@@ -280,7 +310,7 @@ do_expire_menu() {
         IFS='|' read -r lim used _ <<< "${tl[x$name]}"
         echo -e "     ${D}трафик: $(limit_fmt "$lim" "$used")${slow:+, исчерпал — замедлять до $slow Мбит/с}${N}"
       fi
-      sp=$(speed_fmt "$sp" "$slow" "$sby")
+      sp=$(speed_fmt "$sp" "$slow" "$([[ -z "$orig" ]] && echo "$sby")")
       [[ -n "$sp" ]] && echo -e "     ${D}скорость: $sp${N}"
     done < <(clients_psv)
     (( n )) || echo -e "  ${D}Сроков, лимитов и ограничений скорости нет${N}"
@@ -317,7 +347,7 @@ do_expire_menu() {
       5) _pick_client || continue
          client_limit_reset "${CHOSEN%%$'\t'*}" || true ;;
       6) do_traffic_days || true; pause ;;
-      7) mapfile -t rows < <(clients_tsv | awk -F'\t' '$5 != "" && $8 != "traffic" {print $1}')
+      7) mapfile -t rows < <(clients_tsv | awk -F'\t' '$5 != "" && $8 == "" {print $1}')
          (( ${#rows[@]} )) || { info "Клиентов с истёкшим сроком нет"; continue; }
          warn "Будут удалены навсегда: ${rows[*]}"
          read_confirm "${R}  Подтверди (введи yes): ${N}" && clients_purge_blocked ;;
