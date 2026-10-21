@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.40"
+VERSION="v1.2.41"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -4119,8 +4119,11 @@ expire_remove() {
 }
 
 expire_fmt() {  # unix-время → «31.12.2026 23:59 (через 3д 4ч)»
-  local ts="$1" d abs s="" when
-  d=$(( ts - $(date +%s) )); abs=${d#-}
+  local ts="${1// /}" d abs s="" when
+  # Метка из конфига: не число bash в $(( )) вычислил бы как выражение — с
+  # подстановкой команд в индексе массива
+  [[ "$ts" =~ ^[0-9]{1,15}$ ]] || { echo "метка срока повреждена"; return 0; }
+  d=$(( 10#$ts - $(date +%s) )); abs=${d#-}
   (( abs >= 86400 )) && s+="$((abs / 86400))д "
   (( abs % 86400 >= 3600 )) && s+="$((abs % 86400 / 3600))ч "
   (( abs < 86400 )) && s+="$((abs % 3600 / 60))м"
@@ -4461,8 +4464,11 @@ client_limit_mode() {  # имя block|Мбит/с
 # «20 Мбит/с», «🐢 1 Мбит/с — лимит исчерпан» для меню.
 speed_fmt() {  # speed limit_slow slowed_by
   local sp="$1" slow="$2" by="$3"
+  # Метки из конфига: не число bash в (( )) вычислил бы как выражение
+  [[ -z "$sp" || "$sp" =~ ^[0-9]{1,5}$ ]] || { echo "метка повреждена — не ограничивается"; return 0; }
+  [[ "$slow" =~ ^[0-9]{1,5}$ ]] || slow=""
   if [[ "$by" == traffic && -n "$slow" ]]; then
-    if [[ -n "$sp" ]] && (( sp < slow )); then echo "$sp Мбит/с"; else echo "🐢 $slow Мбит/с — лимит исчерпан"; fi
+    if [[ -n "$sp" ]] && (( 10#$sp < 10#$slow )); then echo "$sp Мбит/с"; else echo "🐢 $slow Мбит/с — лимит исчерпан"; fi
   elif [[ -n "$sp" ]]; then echo "$sp Мбит/с"
   fi
 }
@@ -14449,7 +14455,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=f27d5c0db43f32a9
+_PY_HELPER_SUM=cbca518d7b459202
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -15128,8 +15134,10 @@ PERIOD_WORD = {"month": "за месяц", "total": "всего"}
 
 
 def _mbit(value):
-    """Метка скорости (Мбит/с) → число; не число или 0 — 0 (без ограничения)."""
-    return int(value) if (value or "").isdigit() and 0 < int(value) <= SPEED_MAX else 0
+    """Метка скорости (Мбит/с) → число; не число или 0 — 0 (без ограничения).
+    isascii: «²» тоже isdigit(), а int() на нём падает — и весь план скорости с ним"""
+    v = value or ""
+    return int(v) if v.isascii() and v.isdigit() and 0 < int(v) <= SPEED_MAX else 0
 
 
 SPEED_MAX = 10000
@@ -16823,5 +16831,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=b891490317dccdb1
+_BUILD_SUM=8167224d54366adf
 main "$@"
