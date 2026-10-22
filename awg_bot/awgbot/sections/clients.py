@@ -67,9 +67,13 @@ def sort_rows(rows: list[dict], mode: str) -> list[dict]:
                                        -(c.get("handshake") or 0), c["name"].lower()))
 
 
+BLOCKED_WORD = {"traffic": "заблокирован: исчерпан лимит трафика",
+                "meta": "заблокирован: повреждена метка срока или лимита"}
+
+
 def seen(c: dict) -> str:
     if c.get("blocked"):
-        return "заблокирован: исчерпан лимит трафика" if c.get("blocked_by") == "traffic" else "заблокирован: срок истёк"
+        return BLOCKED_WORD.get(c.get("blocked_by"), "заблокирован: срок истёк")
     if c.get("online"):
         return f"онлайн ({ui.fmt_dur(c.get('ago'))} назад)"
     if c.get("handshake"):
@@ -212,8 +216,9 @@ async def _export(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
 
 def expired_block(c: dict) -> bool:
     """Заблокирован сроком: такие и удаляет «Истёкшие». Заблокированные за
-    трафик остаются — они разблокируются сами в новом месяце."""
-    return bool(c.get("blocked")) and c.get("blocked_by") != "traffic"
+    трафик остаются — они разблокируются сами в новом месяце, за повреждённые
+    метки (meta) — после исправления метки."""
+    return bool(c.get("blocked")) and c.get("blocked_by") == "expire"
 
 
 @act("purge")

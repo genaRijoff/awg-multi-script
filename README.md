@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v1.2.41-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v1.2.42-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -542,6 +542,7 @@ python3 tests/test_bot.py         # бот на живом диспетчере 
 python3 tests/test_panel.py       # панель Mini App в Chromium (нужны aiogram и Playwright для node)
 python3 tests/test_web.py         # веб-панель: вход, защита, файлы, вид в Chromium
 python3 tests/test_admins.py && python3 tests/test_net.py && python3 tests/test_meta_menu.py
+python3 tests/test_regress_f2f3.py
 ```
 
 ---
@@ -569,6 +570,6 @@ python3 tests/test_admins.py && python3 tests/test_net.py && python3 tests/test_
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v1.2.41** · MIT License
+**AWG Toolza v1.2.42** · MIT License
 
 </div>
