@@ -343,7 +343,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -357,7 +357,7 @@ _api_client() {
       client_rename "$name" "$1" ;;
     conf)
       f=$(client_file "$name")
-      [[ -f "$f" ]] || { err "Нет конфига клиента $name"; return 1; }
+      [[ -f "$f" ]] || { client_no_conf "$name"; return 1; }
       { _kv name "$name"; _kv file "$f"; _kv size:n "$(stat -c %s "$f")"; _kv text:f "$f"; } | api_obj ;;
     mimicry)
       [[ -n "${1:-}" ]] || { _api_usage "client mimicry ИМЯ none|server|профиль[:уровень[:домен[:бюджет]]]"; return; }
@@ -378,7 +378,11 @@ _api_client() {
     speed)
       [[ -n "${1:-}" ]] || { _api_usage "client speed ИМЯ Мбит/с|off"; return; }
       client_speed_set "$name" "$1" ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed ИМЯ ..." ;;
+    reissue)
+      client_reissue "$name" || return 1
+      f=$(client_file "$name")
+      { _kv name "$name"; _kv file "$f"; _kv text:f "$f"; } | api_obj ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..." ;;
   esac
 }
 
@@ -909,6 +913,23 @@ _api_antiscan() {
   esac
 }
 
+# ── Перенос из Amnezia (Docker) ───────────────────────────
+_api_amnezia() {
+  local a="${1:-status}" c running=0
+  case "$a" in
+    status)
+      c=$(amnezia_container) || c=""
+      [[ -n "$c" ]] && amnezia_running "$c" && running=1
+      { _kv container "$c"; _kv running:b "$running"; _kv migrated:b "$(_b amnezia_migrated)"
+        _kv server:b "$(_b server_exists)"; } | api_obj ;;
+    scan) amnezia_scan_json > "$API_DATA" ;;
+    migrate) amnezia_migrate ;;
+    revert) amnezia_revert ;;
+    remove) amnezia_remove ;;
+    *) _api_usage "amnezia status|scan|migrate|revert|remove" ;;
+  esac
+}
+
 _api_uninstall() {
   local o
   for o in "$@"; do [[ "$o" =~ ^(bot|wgobf|web|self)$ ]] || { _api_usage "uninstall [bot] [wgobf] [web] [self]"; return; }; done
@@ -1022,7 +1043,8 @@ _api_readonly() {
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
     "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
-    "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status") return 0 ;;
+    "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
+    "amnezia scan") return 0 ;;
   esac
   return 1
 }
@@ -1067,12 +1089,13 @@ api_dispatch() {
     cert) _api_cert "$@" ;;
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
+    amnezia) _api_amnezia "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac

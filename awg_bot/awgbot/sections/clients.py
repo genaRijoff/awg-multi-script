@@ -324,8 +324,11 @@ def card_text(c: dict, route: dict) -> str:
         f"Скорость: {speed_text(c)}" if speed_text(c) else "",
         f"Адрес клиента: <code>{esc(c['endpoint'].rsplit(':', 1)[0])}</code>" if c.get("endpoint") else "",
         f"Срок: {ui.fmt_expire(c.get('expires'))}",
-        f"Мимикрия: {esc(c['mimicry']) if c.get('mimicry') not in (None, '', 'none') else 'без I1-I5'}",
+        f"Мимикрия: {esc(c['mimicry']) if c.get('mimicry') not in (None, '', 'none') else 'без I1-I5'}"
+        if not c.get("amnezia") else "",
         f"Маршрут: {route_of(c, route)}",
+        ("🐳 Перенесён из Amnezia" + (f" («{esc(c['amnezia'])}»)" if c["amnezia"] != name else "")
+         + " — конфиг есть только у самого клиента, в Тулзе его можно перевыпустить") if c.get("amnezia") else "",
         f"Заметка: {esc(note)}" if note else "",
         f"Мониторинг: {'🔔 вкл' if store.monitored(name) else '🔕 выкл'}",
     ]))
@@ -337,15 +340,17 @@ async def card(target: ui.Target, name: str) -> None:
         await ui.render(target, f"Клиента <b>{esc(name)}</b> нет.", ui.kb(ui.back("cl")))
         return
     mon = store.monitored(name)
+    imported = bool(c.get("amnezia"))
     await ui.render(target, card_text(c, route), ui.kb(
-        ("📄 Конфиг и QR", act.data("conf", name)),
-        ("🔗 Ссылка 5 мин", act.data("shr", name)),
+        ("📄 Конфиг и QR", act.data("conf", name)) if not imported else None,
+        ("🔗 Ссылка 5 мин", act.data("shr", name)) if not imported else None,
+        ("🔁 Перевыпустить конфиг", act.data("rei", name)) if imported else None,
         ("✏️ Переименовать", act.data("ren", name)),
         ("⏳ Срок действия", act.data("exp", name)),
         ("📶 Лимит трафика", act.data("lim", name)),
         ("🚀 Скорость", act.data("spd", name)),
         ("📊 Трафик по дням", act.data("tday", name)),
-        ("🎭 Мимикрия", act.data("mim", name)),
+        ("🎭 Мимикрия", act.data("mim", name)) if not imported else None,
         ("🌐 Маршрут", act.data("tun", name)) if route["kind"] in ("warp", "xray", "exits") else None,
         ("📝 Заметка", act.data("note", name)),
         ("🔕 Мониторинг" if mon else "🔔 Мониторинг", act.data("mon", name)),
@@ -362,6 +367,25 @@ async def _view(cb: CallbackQuery, state: FSMContext, name: str) -> None:
 async def _conf(cb: CallbackQuery, state: FSMContext, name: str) -> None:
     await cb.answer()
     await send_config(cb.bot, ui.chat_of(cb).chat.id, name)  # type: ignore[arg-type]
+
+
+@act("rei")
+async def _reissue(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    await ui.confirm(cb, f"<b>🔁 Перевыпустить конфиг {esc(name)}</b>\n\nКлиенту — новый ключ и новый конфиг с QR. "
+                         "Адрес, сроки, лимиты и маршрут остаются, а прежний конфиг (из Amnezia) перестанет "
+                         "подключаться — отправь клиенту новый.",
+                     ("🔁 Перевыпустить", act.data("reiok", name)), act.data("v", name))
+
+
+@act("reiok")
+async def _reissue_ok(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    r = await api.call("client", "reissue", name)
+    if not r.ok:
+        await ui.render(cb, ui.fail(r, "Перевыпуск конфига"), ui.kb(ui.back(act.data("v", name))))
+        return
+    await cb.answer(f"Новый конфиг: {name}")
+    await send_config(cb.bot, ui.chat_of(cb).chat.id, name)  # type: ignore[arg-type]
+    await card(cb, name)
 
 
 @act("mon")
@@ -598,7 +622,7 @@ async def share_base() -> str:
 @act("shr")
 async def _share(cb: CallbackQuery, state: FSMContext, name: str) -> None:
     c = await client(name)
-    if c is None or not c.get("pub"):
+    if c is None or not c.get("pub") or c.get("amnezia"):
         await card(cb, name)
         return
     base = await share_base()

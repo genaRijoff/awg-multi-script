@@ -601,6 +601,57 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await shot("23-module");
   });
   await step("журнал", async () => { await nav("/log/manager", "pre"); });
+  await step("перенос из Amnezia: пункт в «Сервере», предпросмотр клиентов, перенос задачей; перенесённый клиент — перевыпуск", async () => {
+    const AMZ = { container: "amnezia-awg2", running: true, migrated: false, proto: "3.1", port: 51888, net: "10.8.1.0/24",
+      clients: [{ name: "Petr", orig: "Пётр <b>x</b>", ip: "10.8.1.1" }, { name: "cat", orig: "cat", ip: "10.8.1.2" }],
+      errors: [], warnings: ["не переносится: PostUp"], blockers: [] };
+    const jobs = [];
+    const fake = async (r) => {
+      const body = r.request().postData() || "";
+      if (body.includes('"amnezia","status"') || body.includes('"amnezia","scan"')) {
+        return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: AMZ }) });
+      }
+      return r.continue();
+    };
+    const job = (r) => { jobs.push(r.request().postData() || ""); return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: false, error: "тест: без задачи" }) }); };
+    const imp = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      (d.rows || []).forEach((c) => { if (c.name === "alice") c.amnezia = "Алиса"; });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/job", job);
+    try {
+      await nav("/server", "text=Перенос из Amnezia");
+      await nav("/server/amnezia", "text=Перенести");
+      const txt = await page.textContent("#app");
+      if (!txt.includes("Пётр <b>x</b>") || !txt.includes("AWG 3.1") || !txt.includes("51888/udp") || !txt.includes("не переносится: PostUp"))
+        throw new Error("предпросмотр: " + txt.slice(0, 400));
+      if (await page.locator("#app b >> text=x").count()) throw new Error("исходное имя выведено как HTML");
+      await page.click("button:has-text('🚚 Перенести')");
+      await page.waitForTimeout(300);
+      if (!jobs.some((b) => b.includes('"amnezia","migrate"'))) throw new Error("перенос не ушёл задачей: " + jobs.join(" | "));
+      AMZ.migrated = true;
+      await nav("/server/amnezia", "text=Вернуть Amnezia");
+      await page.waitForSelector("text=Удалить контейнер");
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/job", job);
+    }
+    await page.route("**/api/clients", imp);
+    try {
+      await page.evaluate(() => { S.clients = null; });
+      await nav("/client/alice", "text=Перевыпустить конфиг");
+      if (await page.locator("#app button:has-text('Конфиг и QR')").count()) throw new Error("у перенесённого — «Конфиг и QR»");
+      if (await page.locator("#app button:has-text('Мимикрия')").count()) throw new Error("у перенесённого — «Мимикрия»");
+      await page.waitForSelector("text=«Алиса» · конфиг есть только у клиента");
+      await nav("/client/alice/qr", "text=Перенесён из Amnezia");
+      await page.waitForSelector("#app button:has-text('Перевыпустить конфиг')");
+    } finally {
+      await page.unroute("**/api/clients", imp);
+      await page.evaluate(() => { S.clients = null; });
+    }
+  });
   await step("антисканер: выключен, три списка, исключения, «Включить»", async () => {
     await nav("/server/antiscan", "text=Сети госорганов");
     const n = await page.locator(".card.list .item .check").count();
@@ -1488,7 +1539,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await step("все экраны: ничего не уходит под нижнюю панель и плашку действий, нет прокрутки вбок", async () => {
       const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
         + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
-        + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/antiscan /server/create /server/endpoint /server/module "
+        + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/amnezia /server/antiscan /server/create /server/endpoint /server/module "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
         + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");

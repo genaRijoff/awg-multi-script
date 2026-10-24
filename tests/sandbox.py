@@ -164,6 +164,8 @@ WARP_STATE="$WARP_DIR/state"; WARP_CONF="{ROOT}/etc/wireguard/warp0.conf"; WARP_
 USQUE_DIR="{ROOT}/etc/usque"; USQUE_CONF="$USQUE_DIR/config.json"
 ANTISCAN_DIR="$STATE_DIR/antiscan"; ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf"; ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"
 ANTISCAN_LOG="{ROOT}/antiscan.log"
+AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
+AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"
 # Веб-панель: стенд (web_stand.py) передаёт свои конфиг и список адресов
 WEB_CONF="${{AWG_WEB_CONF:-{ROOT}/etc/awg-web.conf}}"; WEB_DIR="{ROOT}/etc/awg-web"; WEB_LOG="{ROOT}/awg-web.log"
 WEB_NETS_FILE="${{AWG_WEB_NETS:-$WEB_DIR/access.nets}}"

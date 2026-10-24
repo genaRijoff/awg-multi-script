@@ -3,6 +3,7 @@ endpoint, сброс и перезагрузка — пункты меню «С�
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 from aiogram import Bot, Router
@@ -11,7 +12,7 @@ from aiogram.types import CallbackQuery, Message
 
 from .. import api, ask, jobs, ui
 from ..ui import esc
-from . import clients
+from . import amnezia, clients
 
 router = Router()
 act = ui.Actions(router, "srv")
@@ -30,7 +31,7 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
 
 
 async def screen(target: ui.Target) -> None:
-    r = await api.call("server", "info")
+    r, amz = await asyncio.gather(api.call("server", "info"), amnezia.found())
     if not r.ok or not isinstance(r.data, dict):
         await ui.render(target, ui.fail(r, "Сервер"), ui.kb(ui.back()))
         return
@@ -66,6 +67,7 @@ async def screen(target: ui.Target) -> None:
         ("🌍 Endpoint", act.data("ep")) if exists else None,
         ("🛠 Починить", act.data("repair")),
         ("🛡 Антисканер", "as"),
+        ("🐳 Перенос из Amnezia", "amz") if amz else None,
         ("♻️ Перезагрузка", act.data("reboot")),
         ("⚠️ Сбросить", act.data("reset")) if exists else None,
         ui.back()))

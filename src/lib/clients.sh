@@ -97,9 +97,45 @@ client_rename() {  # старое новое
   ok "Переименован: $old → $new"
 }
 
+# Нет файла конфига — почему: перенесённый из Amnezia хранит его только у себя.
+client_no_conf() {  # имя
+  if server_exists && [[ -n "$(py meta-get "$SERVER_CONF" "$1" amnezia 2>/dev/null)" ]]; then
+    err "Конфиг клиента $1 есть только у него самого: клиент перенесён из Amnezia. Нужен новый — «Перевыпустить конфиг»"
+  else
+    err "Нет конфига клиента $1"
+  fi
+  return 1
+}
+
+# Перевыпуск: новый ключ клиенту, адрес, сроки, лимиты, скорость и маршруты —
+# прежние. Старый конфиг перестаёт работать. Для перенесённых из Amnezia —
+# способ получить конфиг и QR в Тулзе.
+client_reissue() {  # имя
+  local name="$1" old priv pub psk addr
+  old=$(client_pub "$name")
+  [[ -n "$old" ]] || { err "Клиента $name нет"; return 1; }
+  priv=$(awg genkey) && pub=$(awg pubkey <<< "$priv") && psk=$(awg genpsk) || return 1
+  addr=$(py peer-rekey "$SERVER_CONF" "$old" "$pub" "$psk") || return 1
+  addr="${addr%%,*}"
+  if iface_up; then
+    awg set "$AWG_IF" peer "$old" remove 2>/dev/null
+    awg set "$AWG_IF" peer "$pub" preshared-key <(printf '%s\n' "$psk") \
+      allowed-ips "$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {print $3; exit}')" \
+      || warn "Ядро не приняло новый ключ — перезапусти awg0"
+  fi
+  [[ -f "$TRAFFIC_DB" ]] && { py traffic-rekey "$TRAFFIC_DB" "$old" "$pub" || warn "Счётчики трафика начнутся заново"; }
+  rm -f "$EXPIRE_STATE_DIR/warn1h_${old//[^A-Za-z0-9]/_}"
+  mimicry_from_spec server || return 1
+  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "1.1.1.1, 1.0.0.1" "$(conf_iface_get MTU)" || return 1
+  peer_meta_set "$name" mimicry "$(mimicry_tag)" || true
+  log_info "клиент перевыпущен: $name"
+  ok "Новый конфиг $name: $(client_file "$name")"
+  warn "Старый конфиг $name больше не подключится"
+}
+
 # Мимикрия выданного клиента: меняются только его I1-I5 — сервер их не видит.
 client_set_mimicry() {  # имя строка
-  [[ -f "$(client_file "$1")" ]] || { err "Нет конфига клиента $1"; return 1; }
+  [[ -f "$(client_file "$1")" ]] || { client_no_conf "$1"; return 1; }
   mimicry_from_spec "$2" && _client_write_mimicry "$1"
 }
 
@@ -434,6 +470,14 @@ _pick_client_file() {  # → путь в CHOSEN
   CHOSEN="${files[$((c - 1))]}"
 }
 
+do_reissue_client() {
+  local name
+  _pick_client || return 0
+  name="${CHOSEN%%$'\t'*}"
+  ask_yes "  Новый ключ для $name: старый конфиг перестанет работать. Продолжить? [y/N]: " n || return 0
+  client_reissue "$name" && share_config "$(client_file "$name")" qr
+}
+
 do_show_client()    { _pick_client_file && share_config "$CHOSEN"; }
 do_show_client_qr() { _pick_client_file && share_config "$CHOSEN" qr; }
 
@@ -515,14 +559,16 @@ do_clients_menu() {
     echo -e "  ${C}8)${N} Экспорт всех (zip)"
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"
+    echo -e "  ${C}11)${N} Перевыпустить конфиг ${D}— новый ключ; перенесённым из Amnezia — конфиг и QR${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
+    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
     case "$c" in
       1) do_add_client || true ;;     6) do_bulk_add || true ;;
       2) do_list_clients || true ;;   7) do_expire_menu || true ;;
       3) do_show_client || true ;;    8) do_export_clients || true ;;
       4) do_show_client_qr || true ;; 9) do_change_mimicry || true ;;
       5) do_rename_client || true ;;  10) do_delete_client || true ;;
+      11) do_reissue_client || true ;;
       0) return 0 ;;
     esac
     pause

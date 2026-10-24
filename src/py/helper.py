@@ -142,6 +142,14 @@ def cmd_peers(conf):
                          peer_meta(b, "speed"), peer_meta(b, "limit_slow"), peer_meta(b, "slowed_by")]))
 
 
+def cmd_meta_get(conf, name, key):
+    """Метка клиента по имени (пусто — нет метки или клиента)."""
+    _, peers = split_peers(read(conf))
+    i = find_peer(peers, name=name)
+    if i >= 0:
+        print(peer_meta(peers[i], key))
+
+
 def cmd_meta_set(conf, name, key, value):
     head, peers = split_peers(read(conf))
     i = find_peer(peers, name=name)
@@ -161,6 +169,42 @@ def cmd_peer_del(conf, pubkey):
     text = head + "".join(peers)
     write_atomic(conf, re.sub(r"\n{3,}", "\n\n", text))
     print(name)
+
+
+def cmd_peer_rekey(conf, pubkey, newpub, psk):
+    """Новый ключ клиенту (перевыпуск): PublicKey и PresharedKey заменяются,
+    метка «перенесён из Amnezia» снимается — конфиг теперь есть у Тулзы.
+    Печатает настоящий адрес клиента (у заблокированного — из orig_ips)."""
+    if not (_b64key(newpub) and _b64key(psk)):
+        die("ключ неверный")
+    head, peers = split_peers(read(conf))
+    i = find_peer(peers, pubkey=pubkey)
+    if i < 0:
+        die("пир не найден", 2)
+    b = re.sub(r"^([ \t]*PublicKey[ \t]*=[ \t]*).*$", lambda m: m.group(1) + newpub, peers[i], count=1, flags=re.M | re.I)
+    if re.search(r"^[ \t]*PresharedKey[ \t]*=", b, re.M | re.I):
+        b = re.sub(r"^([ \t]*PresharedKey[ \t]*=[ \t]*).*$", lambda m: m.group(1) + psk, b, count=1, flags=re.M | re.I)
+    else:
+        b = re.sub(r"^([ \t]*PublicKey[ \t]*=.*)$", lambda m: m.group(1) + "\nPresharedKey = " + psk, b, count=1,
+                   flags=re.M | re.I)
+    peers[i] = set_meta(b, "amnezia", "")
+    write_atomic(conf, head + "".join(peers))
+    print(peer_meta(peers[i], "orig_ips") or peer_field(peers[i], "AllowedIPs"))
+
+
+def cmd_traffic_rekey(db, old, new):
+    """Счётчики трафика и лимита клиента — на его новый ключ."""
+    lock = _traffic_lock(db)
+    t = Traffic(db)
+    for k in ("last", "total", "reset", "warned", "badmeta"):
+        if old in t.d[k]:
+            t.d[k][new] = t.d[k].pop(old)
+    for day in t.d["days"].values():
+        if isinstance(day, dict) and old in day:
+            day[new] = day.pop(old)
+    t.d["last"].pop(new, None)         # прежние показания ядра — у старого ключа
+    t.save()
+    del lock
 
 
 def cmd_peer_rename(conf, pubkey, new):
@@ -2068,6 +2112,8 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
             "online": bool(hs) and now - hs < 180,
             "rx": int(s[5]) if s[5].isdigit() else 0, "tx": int(s[6]) if s[6].isdigit() else 0,
             "endpoint": "" if s[2] in ("", "(none)") else s[2], "file": path,
+            # Перенесён из Amnezia: приватный ключ только у клиента — исходное имя
+            "amnezia": peer_meta(b, "amnezia") or None,
         }
         limit, period = parse_limit(peer_meta(b, "limit"))
         by = peer_meta(b, "blocked_by")
@@ -2462,11 +2508,305 @@ def cmd_web_hash():
     print("scrypt$%d$%d$%d$%s$%s" % (2 ** 14, 8, 1, base64.b64encode(salt).decode(), base64.b64encode(dk).decode()))
 
 
+# ── Перенос из Amnezia (Docker) ──
+# Файлы из контейнера Amnezia — недоверенные данные: контейнер мог быть
+# изменён, а его конфиг пойдёт в awg-quick под root. Берём только известные
+# ключи с проверенными значениями; команды (PostUp, PreUp…) и всё прочее
+# отбрасываются, о каждом пропуске — предупреждение.
+AMN_RANGE = r"[0-9]{1,10}(?:-[0-9]{1,10})?"
+AMN_KEYS = (
+    ("Jc", r"[0-9]{1,3}"), ("Jmin", r"[0-9]{1,4}"), ("Jmax", r"[0-9]{1,4}"),
+    ("S1", r"[0-9]{1,4}"), ("S2", r"[0-9]{1,4}"), ("S3", r"[0-9]{1,4}"), ("S4", r"[0-9]{1,2}"),
+    ("H1", AMN_RANGE), ("H2", AMN_RANGE), ("H3", AMN_RANGE), ("H4", AMN_RANGE),
+    ("HeaderProtectionKey", "key"), ("ContentPaddingAddition", AMN_RANGE),
+    ("RekeyAfterTime", AMN_RANGE), ("RekeyTimeout", AMN_RANGE), ("RejectAfterTime", AMN_RANGE),
+    ("KeepaliveTimeout", AMN_RANGE), ("MaxHandshakeAttempts", AMN_RANGE),
+    ("RandomTrailers", r"(?:on|off|true|false|0|1)"), ("DisableCookies", r"(?:on|off|true|false|0|1)"),
+)
+AMN_MTU = 1376              # как у клиентов Amnezia: новые клиенты Тулзы получат тот же MTU
+AMN_TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюяєіїґ", (
+    "a b v g d e e zh z i y k l m n o p r s t u f kh ts ch sh sch - y - e yu ya e i yi g").split()))
+
+
+def _b64key(v):
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", v or ""):
+        return False
+    try:
+        return len(base64.b64decode(v, validate=True)) == 32
+    except ValueError:
+        return False
+
+
+def _amn_value(key, rx, v):
+    if rx == "key":
+        return _b64key(v)
+    if not re.fullmatch(rx, v, re.I):
+        return False
+    # Диапазоны и числа — в uint32, «от» не больше «до»
+    nums = [int(x) for x in re.findall(r"[0-9]+", v)]
+    return all(n <= 0xFFFFFFFF for n in nums) and (len(nums) < 2 or nums[0] <= nums[1])
+
+
+def _amn_parse_conf(text):
+    """→ (interface {ключ: значение}, [peer {ключ: значение}], [непереносимые ключи])."""
+    iface, peers, cur, extra = {}, [], None, []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        sec = re.fullmatch(r"\[\s*(\w+)\s*\]", line)
+        if sec:
+            name = sec.group(1).lower()
+            if name == "interface":
+                cur = iface
+            elif name == "peer":
+                cur = {}
+                peers.append(cur)
+            else:
+                cur = None
+                extra.append("[%s]" % sec.group(1)[:20])
+            continue
+        m = re.fullmatch(r"([A-Za-z0-9]{1,40})\s*=\s*(.*?)", line)
+        if not m or cur is None:
+            extra.append(line[:20])
+            continue
+        k = m.group(1)
+        if k in cur:
+            extra.append(k)          # повтор ключа: берём первое значение
+            continue
+        cur[k] = m.group(2)
+    return iface, peers, extra
+
+
+def _amn_names(table_text):
+    """clientsTable → {публичный ключ: имя}."""
+    out = {}
+    try:
+        data = json.loads(table_text) if table_text.strip() else []
+    except ValueError:
+        return out, ["таблица клиентов не JSON — имена не перенесены"]
+    if not isinstance(data, list):
+        return out, ["таблица клиентов не список — имена не перенесены"]
+    for row in data[:5000]:
+        if not isinstance(row, dict):
+            continue
+        pub, ud = row.get("clientId"), row.get("userData")
+        name = ud.get("clientName") if isinstance(ud, dict) else None
+        if isinstance(pub, str) and _b64key(pub) and isinstance(name, str):
+            out.setdefault(pub, name)
+    return out, []
+
+
+def _amn_label(orig):
+    """Исходное имя для метки: без управляющих символов, переводов строк и «=»."""
+    s = "".join(ch for ch in orig if ch.isprintable() and ch not in "\r\n=")
+    return re.sub(r"\s+", " ", s).strip()[:64]
+
+
+def _amn_slug(orig):
+    out = []
+    for ch in orig:
+        t = AMN_TRANSLIT.get(ch.lower())
+        if t is None:
+            out.append(ch)
+        elif t != "-":
+            out.append(t.capitalize() if ch.isupper() else t)
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", "".join(out)).strip("_-")
+    return re.sub(r"_+", "_", s)[:32].strip("_-")
+
+
+def amnezia_model(conf_text, table_text, host_port=""):
+    """Проверенная модель сервера Amnezia: {iface, peers, ...}, ошибки, предупреждения."""
+    import ipaddress
+    errors, warns = [], []
+    iface, peers, extra = _amn_parse_conf(conf_text)
+    if extra:
+        warns.append("не переносится: " + ", ".join(sorted(set(extra)))[:300])
+    priv = iface.get("PrivateKey", "")
+    if not _b64key(priv):
+        errors.append("нет ключа сервера (PrivateKey) или он повреждён")
+    port = iface.get("ListenPort", "")
+    if not (re.fullmatch(r"[0-9]{1,5}", port) and 1 <= int(port) <= 65535):
+        errors.append("порт сервера (ListenPort) не задан или неверный")
+        port = ""
+    if re.fullmatch(r"[0-9]{1,5}", host_port or "") and 1 <= int(host_port) <= 65535 and host_port != port:
+        warns.append("порт контейнера %s проброшен наружу как %s — сервер будет слушать %s" % (port, host_port, host_port))
+        port = host_port
+    net = addr = None
+    for a in [x.strip() for x in iface.get("Address", "").split(",") if x.strip()]:
+        try:
+            itf = ipaddress.ip_interface(a)
+        except ValueError:
+            continue
+        if itf.version == 4 and 16 <= itf.network.prefixlen <= 30 and itf.network.is_private:
+            net, addr = itf.network, a
+            break
+        warns.append("адрес %s не переносится" % a[:45])
+    if net is None:
+        errors.append("нет адреса сервера IPv4 в частной подсети (/16–/30)")
+    params, mtu = [], AMN_MTU
+    for k, rx in AMN_KEYS:
+        if k in iface:
+            v = iface[k].strip()
+            if _amn_value(k, rx, v):
+                params.append((k, v))
+            else:
+                errors.append("параметр %s: неверное значение" % k)
+    m = iface.get("MTU", "")
+    if m:
+        if re.fullmatch(r"[0-9]{3,4}", m) and 576 <= int(m) <= 9000:
+            mtu = int(m)
+        else:
+            warns.append("MTU сервера неверный — будет %d" % AMN_MTU)
+    known = {"PrivateKey", "ListenPort", "Address", "MTU"} | {k for k, _ in AMN_KEYS}
+    dropped = sorted(k for k in iface if k not in known)
+    if dropped:
+        warns.append("не переносится из [Interface]: " + ", ".join(dropped)[:200])
+    keys = dict(params)
+    if "RandomTrailers" in keys or "DisableCookies" in keys:
+        proto = "3.1"
+    elif "HeaderProtectionKey" in keys:
+        proto = "3.0"
+    else:
+        proto = "2.0"
+    names, w = _amn_names(table_text)
+    warns += w
+    out, seen_pub, seen_ip, used = [], set(), set(), set()
+    for i, p in enumerate(peers):
+        pub, psk = p.get("PublicKey", ""), p.get("PresharedKey", "")
+        if not _b64key(pub) or pub in seen_pub:
+            warns.append("пир %d пропущен: нет ключа, ключ повреждён или повторяется" % (i + 1))
+            continue
+        if psk and not _b64key(psk):
+            warns.append("пир %d пропущен: PresharedKey повреждён" % (i + 1))
+            continue
+        ips = []
+        for a in [x.strip() for x in p.get("AllowedIPs", "").split(",") if x.strip()]:
+            try:
+                n = ipaddress.ip_network(a, strict=True)
+            except ValueError:
+                n = None
+            if n is not None and n.version == 4 and n.prefixlen == 32 and net is not None \
+                    and n.network_address in net and str(n) not in seen_ip \
+                    and str(n.network_address) != str(addr).split("/")[0]:
+                ips.append(str(n))
+        if not ips:
+            warns.append("пир %d пропущен: нет своего адреса /32 в подсети сервера" % (i + 1))
+            continue
+        seen_pub.add(pub)
+        seen_ip.update(ips)
+        orig = _amn_label(names.get(pub, ""))
+        name = _amn_slug(orig) or "amnezia_" + ips[0].split("/")[0].rsplit(".", 1)[1]
+        base, n = name, 2
+        while name.lower() in used:
+            sfx = "_%d" % n
+            name, n = base[:32 - len(sfx)] + sfx, n + 1
+        used.add(name.lower())
+        out.append({"name": name, "orig": orig, "ip": ips[0].split("/")[0], "pub": pub, "psk": psk,
+                    "allowed": ", ".join(ips)})
+    if not out and not errors:
+        warns.append("клиентов не найдено — перенесётся пустой сервер")
+    model = {"proto": proto, "port": int(port) if port else 0, "net": str(net) if net else "",
+             "address": addr or "", "mtu": mtu, "params": params, "priv": priv, "peers": out}
+    return model, errors, warns
+
+
+def _amn_load(dir_):
+    conf = ""
+    for n in ("awg0.conf", "wg0.conf"):
+        f = os.path.join(dir_, n)
+        if os.path.isfile(f):
+            conf = read(f)
+            break
+    table = os.path.join(dir_, "clientsTable")
+    port = os.path.join(dir_, "host_port")
+    return amnezia_model(conf, read(table) if os.path.isfile(table) else "",
+                         read(port).strip() if os.path.isfile(port) else "")
+
+
+def cmd_amnezia_scan(dir_, container="", running="0", blockers="", notes=""):
+    """Сводка для меню, бота и панели — без ключей. blockers — что мешает
+    переносу (server, components, proto) — считает awg2; notes=dns — рядом
+    работает контейнер AmneziaDNS."""
+    m, errors, warns = _amn_load(dir_)
+    if notes == "dns":
+        warns.append("рядом работает AmneziaDNS (amnezia-dns) — переносом не трогается; клиенты с DNS 172.29.172.254 "
+                     "ходят через него и дальше, пока контейнер работает")
+    print(json.dumps({"container": container, "running": running == "1", "migrated": False,
+                      "proto": m["proto"], "port": m["port"], "net": m["net"], "address": m["address"],
+                      "mtu": m["mtu"], "clients": [{"name": p["name"], "orig": p["orig"], "ip": p["ip"]}
+                                                    for p in m["peers"]],
+                      "errors": errors, "warnings": warns,
+                      "blockers": [b for b in blockers.split(",") if b]}, ensure_ascii=False))
+
+
+AMN_BLOCK = {"server": "сервер Тулзы уже создан — перенос только на сервер без своего awg0",
+             "components": "сначала установи компоненты (Сервер → Установить компоненты)",
+             "proto": "модуль ядра не умеет эту версию AWG — обнови модуль"}
+
+
+def cmd_amnezia_show():
+    """Сводка amnezia-scan (stdin) — текстом для меню awg2."""
+    d = json.loads(sys.stdin.read() or "{}")
+    print("  Контейнер : %s (%s)" % (d.get("container") or "—", "работает" if d.get("running") else "остановлен"))
+    print("  AWG %s, порт %s/udp, подсеть %s, клиентов: %d" % (d.get("proto"), d.get("port"), d.get("net"),
+                                                              len(d.get("clients") or [])))
+    for c in (d.get("clients") or [])[:60]:
+        orig = c.get("orig") or ""
+        print("    %-15s %s%s" % (c.get("ip"), c.get("name"), "  ← " + orig if orig and orig != c.get("name") else ""))
+    for w in d.get("warnings") or []:
+        print("  ⚠ " + w)
+    for e in d.get("errors") or []:
+        print("  ✖ " + e)
+    for b in d.get("blockers") or []:
+        print("  ✖ " + AMN_BLOCK.get(b, b))
+    print("  Конфиги клиентов останутся прежними. Приватных ключей клиентов на сервере нет —")
+    print("  для перенесённых Тулза не покажет конфиг и QR, а перевыпустит их по просьбе.")
+
+
+def cmd_amnezia_conf(dir_, part):
+    """Конфиг сервера Тулзы: part=iface — шапка и [Interface], peers — клиенты."""
+    m, errors, _ = _amn_load(dir_)
+    if errors:
+        die("; ".join(errors))
+    if part == "iface":
+        print("# AWG_PROFILE=lite")
+        print("# AmneziaWG Toolza — AWG %s server config (перенесён из Amnezia)" % m["proto"])
+        print("# Region: world")
+        print("# AWG_PROTO=%s" % m["proto"])
+        print("# AWG_OBF_LEVEL=1")
+        print("# AWG_MIMICRY=none")
+        print("# AWG_IMPORTED=amnezia")
+        print("[Interface]")
+        print("PrivateKey = %s" % m["priv"])
+        print("Address = %s" % m["address"])
+        print("ListenPort = %d" % m["port"])
+        print("MTU = %d" % m["mtu"])
+        for k, v in m["params"]:
+            print("%s = %s" % (k, v))
+    elif part == "peers":
+        for p in m["peers"]:
+            print("\n[Peer]\n# %s" % p["name"])
+            if p["orig"] and p["orig"] != p["name"]:
+                print("# amnezia=%s" % p["orig"])
+            else:
+                print("# amnezia=%s" % p["name"])
+            print("PublicKey = %s" % p["pub"])
+            if p["psk"]:
+                print("PresharedKey = %s" % p["psk"])
+            print("AllowedIPs = %s" % p["allowed"])
+    elif part == "net":
+        print(m["net"])
+    else:
+        die("часть: iface|peers|net")
+
+
 COMMANDS = {
     "peers": cmd_peers, "meta-set": cmd_meta_set, "peer-del": cmd_peer_del,
-    "peer-rename": cmd_peer_rename, "peers-clear": cmd_peers_clear,
+    "peer-rename": cmd_peer_rename, "peer-rekey": cmd_peer_rekey, "meta-get": cmd_meta_get, "traffic-rekey": cmd_traffic_rekey, "peers-clear": cmd_peers_clear,
     "params-replace": cmd_params_replace, "keepalive-set": cmd_keepalive_set, "params-check": cmd_params_check,
     "i-replace": cmd_i_replace,
+    "amnezia-scan": cmd_amnezia_scan, "amnezia-conf": cmd_amnezia_conf, "amnezia-show": cmd_amnezia_show,
     "expire-set": cmd_expire_set, "expire-clear": cmd_expire_clear, "meta-check": cmd_meta_check,
     "expire-check": cmd_expire_check,
     "traffic-tick": cmd_traffic_tick, "traffic-daily": cmd_traffic_daily, "traffic-now": cmd_traffic_now,

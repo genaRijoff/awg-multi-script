@@ -2255,7 +2255,7 @@ function routeTag(c, r) {
 function clientTags(c) {
   const left = c.expires ? c.expires - Date.now() / 1000 : 0;
   return [
-    c.mimicry && c.mimicry !== "none" ? tag(c.mimicry, "accent", "drama") : tag("без I1-I5"),
+    c.amnezia ? tag("из Amnezia", "", "package") : c.mimicry && c.mimicry !== "none" ? tag(c.mimicry, "accent", "drama") : tag("без I1-I5"),
     expLive(c) ? tag(expShort(c.expires), left < 3 * 86400 ? "warn" : "", "hourglass") : null,
     badMetaText(c) ? tag(badMetaText(c), "bad", "triangle-alert") : null,
     c.limit ? tag(`лимит ${Math.min(999, Math.round(c.used * 100 / c.limit))}%`, c.used >= c.limit * 0.9 ? "warn" : "", "gauge") : null,
@@ -2712,7 +2712,8 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
     area("info", h("div", { class: "card" },
       kv("IP", h("span", { class: "mono" }, c.ip)),
       c.endpoint ? kv("Адрес клиента", h("span", { class: "mono" }, c.endpoint.replace(/:\d+$/, ""))) : null,
-      kv("Мимикрия", h("span", { class: "mono" }, !c.mimicry || c.mimicry === "none" ? "без I1-I5" : c.mimicry)),
+      c.amnezia ? kv("Из Amnezia", (c.amnezia !== name ? `«${c.amnezia}» · ` : "") + "конфиг есть только у клиента")
+        : kv("Мимикрия", h("span", { class: "mono" }, !c.mimicry || c.mimicry === "none" ? "без I1-I5" : c.mimicry)),
       c.note ? kv("Заметка", c.note) : null), routeCard()),
     area("traf", h("div", { class: "card" },
       kv("За месяц", fmtBytes(c.month)), kv("Сегодня", fmtBytes(c.today)),
@@ -2729,12 +2730,13 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
         : "🔔 Бот сообщит, когда клиент пропадёт и вернётся", 3500);
     })),
     area("acts", h("div", { class: "actions" },
-      h("button", { class: "btn-primary", onclick: () => go(`/client/${enc}/qr`) }, icon("qr-code"), "Конфиг и QR"),
+      c.amnezia ? h("button", { class: "btn-primary", onclick: (ev) => reissue(ev.currentTarget, name) }, "🔁 Перевыпустить конфиг")
+        : h("button", { class: "btn-primary", onclick: () => go(`/client/${enc}/qr`) }, icon("qr-code"), "Конфиг и QR"),
       h("button", { onclick: () => go(`/client/${enc}/rename`) }, "✏️ Имя"),
       h("button", { onclick: (ev) => setExpire(ev.currentTarget) }, "⏳ Срок"),
       h("button", { onclick: (ev) => setLimit(ev.currentTarget) }, "📶 Лимит"),
       h("button", { onclick: (ev) => setSpeed(ev.currentTarget) }, "🚀 Скорость"),
-      h("button", { onclick: () => go(`/client/${enc}/mimicry`) }, "🎭 Мимикрия"),
+      c.amnezia ? null : h("button", { onclick: () => go(`/client/${enc}/mimicry`) }, "🎭 Мимикрия"),
       h("button", { onclick: () => go(`/client/${enc}/note`) }, "📝 Заметка"))),
     // После удаления — шаг назад к списку, а не второй список поверх первого
     area("del", h("button", { class: "btn-danger btn-block", onclick: (ev) => removeClients(ev.currentTarget, [name],
@@ -2753,7 +2755,24 @@ const confBtns = (name, primary = true) => {
     h("button", { onclick: (ev) => busy(ev.currentTarget, () => deliver({ what: "conf_zip", name })) }, "🗜 Скачать ZIP"));
 };
 
+// Перенесён из Amnezia: приватный ключ только у клиента — конфиг Тулза перевыпускает
+// (новый ключ; прежний конфиг перестаёт подключаться)
+function reissue(btn, name) {
+  return quickAsk(btn, `Перевыпустить конфиг ${name}? Клиенту — новый ключ и QR; адрес, сроки, лимиты и маршрут остаются, `
+    + "а прежний конфиг перестанет подключаться — отправь клиенту новый.", "Новый конфиг готов", ["client", "reissue", name],
+  () => { S.clients = null; replace(`/client/${encodeURIComponent(name)}/qr`); });
+}
+
 route(/^\/client\/([^/]+)\/qr$/, async (ctx, name) => {
+  const c = await loadClients().then(() => byName(name)).catch(() => null);
+  if (c && c.amnezia) {
+    return ctx.put(title("📄 " + name),
+      h("div", { class: "card" }, h("b", {}, "🐳 Перенесён из Amnezia"),
+        h("div", { class: "muted small", style: "margin-top:6px" }, "Конфиг этого клиента есть только у него самого: "
+          + "приватного ключа на сервере нет. Он подключается со своим прежним конфигом. Новое устройство или потерянный "
+          + "конфиг — перевыпусти: новый ключ и QR, прежний конфиг перестанет работать.")),
+      h("button", { class: "btn-primary btn-block", onclick: (ev) => reissue(ev.currentTarget, name) }, "🔁 Перевыпустить конфиг"));
+  }
   const d = await post("/api/client/qr", { name });
   ctx.put(
     title("📄 " + name),
@@ -3055,7 +3074,8 @@ const DNS = [["Cloudflare", "1.1.1.1, 1.0.0.1"], ["Google", "8.8.8.8, 8.8.4.4"],
   ["Quad9", "9.9.9.9, 149.112.112.112"], ["Яндекс", "77.88.8.8, 77.88.8.1"]];
 
 route(/^\/server$/, async (ctx) => {
-  const r = await callR(["server", "info"]);
+  const [r, amz] = await Promise.all([callR(["server", "info"]), call("amnezia", "status").catch(() => null)]);
+  const amzOn = !!(amz && (amz.container || amz.migrated));
   // Подсказка о переходе на 3.1 — не предупреждение: сервер на 2.0 — обычный выбор,
   // а переход — в «Протоколе»; в карточке — только то, что правда требует внимания
   const d = r.data || {};
@@ -3078,12 +3098,19 @@ route(/^\/server$/, async (ctx) => {
       [d.net || "—", "Подсеть", "адреса клиентов"],
       [(d.mimicry || "none"), "Мимикрия", d.mimicry_domain || (d.mimicry && d.mimicry !== "none" ? "пакеты I1-I5" : "без I1-I5")],
     ]) : null,
-    !d.exists ? btn("✨ Создать сервер", () => go("/server/create"), "btn-block" + (d.installed ? " btn-primary" : "")) : null,
+    // Сервер Amnezia на этом VPS: перенос лучше создания — клиенты остаются со своими конфигами
+    !d.exists && amz && amz.container && !amz.migrated ? ecard({ name: "Найден сервер Amnezia", attrs: { "data-name": "amnezia" },
+      right: pill(amz.running ? "работает" : "остановлен", amz.running ? "ok" : "warn"),
+      lines: ["Перенеси его в Тулзу — клиенты останутся со своими конфигами, перевыдавать не нужно"],
+      acts: [act("package", "Перенос", () => go("/server/amnezia"))] }) : null,
+    !d.exists ? btn("✨ Создать сервер", () => go("/server/create"), "btn-block" + (d.installed && !(amz && amz.container) ? " btn-primary" : "")) : null,
     h("h2", {}, "Обслуживание"),
     h("div", { class: "card list" },
       d.exists ? menuItem("🎛 Параметры AWG", "Jc, S1-S4, H1-H4 вручную", () => go("/server/params")) : null,
       menuItem("🧩 Модуль ядра", "версии, обновление, откат", () => go("/server/module")),
       menuItem("🛡 Антисканер", "сети сканеров РКН и госорганов — не до портов сервера", () => go("/server/antiscan")),
+      amzOn ? menuItem("🐳 Перенос из Amnezia", amz.migrated ? "сделан — вернуть или удалить контейнер"
+        : "сервер из Docker-контейнера, клиенты без перевыдачи", () => go("/server/amnezia")) : null,
       menuItem(d.installed ? "📦 Компоненты" : "📦 Установить компоненты", "пакеты, модуль, amneziawg-tools",
         () => jobAsk(ctx, "Пакеты, заголовки ядра, сборка модуля AmneziaWG и amneziawg-tools из исходников. Обычно 5-15 минут. "
           + "Если ядру нет заголовков, поставится свежее ядро — тогда понадобится перезагрузка.", "Установка компонентов", ["server", "install"])),
@@ -3149,6 +3176,49 @@ route(/^\/server\/antiscan$/, async (ctx) => {
     h("div", { class: "main" }, h("div", { class: "title mono wrap" }, a)), h("div", { class: "side bad" }, icon("x"))))) : null,
     h("div", { class: "row", style: "gap:8px;margin-top:8px" }, ip, enterTo(add, ip)),
     hint("Клиенты VPN, которые подключаются из этих сетей, тоже не подключатся — для них есть исключения."));
+});
+
+// Перенос из Amnezia (Docker): сервер AWG из контейнера приложения AmneziaVPN — в awg0
+// Тулзы с теми же ключами и параметрами. Читает и переносит awg2, здесь — экран
+const AMZ_BLOCK = { server: "Сервер Тулзы уже создан — перенос только на сервер без своего awg0 (Сбросить сервер).",
+  components: "Сначала установи компоненты.", proto: "Модуль ядра не умеет эту версию AWG — обнови модуль." };
+route(/^\/server\/amnezia$/, async (ctx) => {
+  const d = (await call("amnezia", "scan")) || {};
+  if (d.migrated) {
+    return ctx.put(title("🐳 Перенос из Amnezia"),
+      h("div", { class: "card" }, kv("Статус", h("span", { class: "ok" }, "● перенос сделан")),
+        kv("Контейнер", h("span", { class: "mono" }, (d.container || "") + " — остановлен, не удалён"))),
+      hint("«Вернуть Amnezia» снимает awg0 Тулзы (перед этим — бэкап) и запускает контейнер. Клиенты, созданные в Тулзе "
+        + "после переноса, в Amnezia не попадут. Когда всё работает — контейнер можно удалить."),
+      h("div", { class: "actions" },
+        btn("↩️ Вернуть Amnezia", () => jobAsk(ctx, "Вернуть Amnezia? awg0 Тулзы будет снят, контейнер запустится снова.",
+          "Возврат Amnezia", ["amnezia", "revert"])),
+        btn("🗑 Удалить контейнер", (b) => quickAsk(b, "Удалить контейнер Amnezia навсегда? Вернуть Amnezia будет нельзя. "
+          + "Сервер и клиенты в Тулзе остаются.", "Контейнер удалён", ["amnezia", "remove"], () => replace("/server")))));
+  }
+  if (!d.container) return ctx.put(title("🐳 Перенос из Amnezia"), h("div", { class: "empty" }, "Контейнер Amnezia на сервере не найден"));
+  if (d.error) return ctx.put(title("🐳 Перенос из Amnezia"), h("div", { class: "card bad" }, "❌ " + d.error));
+  const cl = d.clients || [], blockers = d.blockers || [], errors = d.errors || [];
+  const ok = !blockers.length && !errors.length;
+  ctx.put(title("🐳 Перенос из Amnezia"),
+    h("div", { class: "card" },
+      kv("Контейнер", h("span", {}, h("span", { class: "mono" }, d.container), " · ", d.running ? "работает" : "остановлен")),
+      kv("Протокол", "AWG " + (d.proto || "?")), kv("Порт", d.port + "/udp"), kv("Подсеть", h("span", { class: "mono" }, d.net || "")),
+      kv("Клиентов", String(cl.length))),
+    [...(d.warnings || []).map((w) => h("div", { class: "small warn" }, "▲ " + w)),
+      ...errors.map((e) => h("div", { class: "small bad" }, "✖ " + e)),
+      ...blockers.map((b) => h("div", { class: "small bad" }, "✖ " + (AMZ_BLOCK[b] || b)))],
+    cl.length ? [h("h2", {}, "Клиенты"), h("div", { class: "card list" }, cl.map((c) => h("div", { class: "item" },
+      h("div", { class: "main" }, h("div", { class: "title" }, c.name),
+        h("div", { class: "sub mono" }, c.ip + (c.orig && c.orig !== c.name ? " · " + c.orig : ""))))))] : null,
+    hint("Ключи, порт и параметры — те же: клиенты подключаются со своими конфигами, перевыдавать не нужно. "
+      + "Приватных ключей клиентов на сервере нет — конфиг и QR им Тулза перевыпустит по просьбе. Приложение AmneziaVPN "
+      + "после переноса этим сервером не управляет (как клиент — работает)."),
+    ok ? btn("🚚 Перенести", () => jobAsk(ctx, "Перенести? Контейнер будет остановлен (не удалён), awg0 Тулзы поднимется с теми же "
+      + "ключами и портом. Клиенты на пару секунд потеряют связь и переподключатся сами. Не поднимется — Amnezia вернётся "
+      + "автоматически.", "Перенос из Amnezia", ["amnezia", "migrate"]), "btn-primary btn-block")
+      : blockers.includes("components") ? btn("📦 Установить компоненты", () => jobAsk(ctx, "Установить компоненты? Обычно 5-15 минут.",
+        "Установка компонентов", ["server", "install"]), "btn-block") : null);
 });
 
 // Создание сервера — те же вопросы, что задают меню awg2 и бот, одной формой
