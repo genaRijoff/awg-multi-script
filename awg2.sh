@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.45"
+VERSION="v1.2.46"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -399,7 +399,8 @@ MOD_LOG="/var/log/awg-mod-update.log"
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"
-COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000»: страна сервера (флаг в шапке панели)
+COUNTRY_CACHE="$STATE_DIR/country"     # «NL 1791500000 2 NL=4,DE=1»: страна сервера по геосервисам (флаг в шапке панели)
+COUNTRY_MANUAL="$STATE_DIR/country_manual"   # страна, выбранная вручную, — главнее геосервисов
 UPSTREAM_TTL=21600
 
 # ── Обновление скрипта ────────────────────────────────────
@@ -945,31 +946,139 @@ public_ip_cached() {
   echo "$_PUBLIC_IP"
 }
 
-# Страна сервера — флаг в шапке панели. Код страны IP сервера по геобазе
-# Cloudflare (cdn-cgi/trace, строка «loc=»): без ключей и своих баз. В кэше
-# на сутки (не узнали — повтор через час), обновляется в фоне: статус сеть не ждёт.
-server_country() { awk 'NR == 1 && $1 ~ /^[A-Z][A-Z]$/ {print $1}' "$COUNTRY_CACHE" 2>/dev/null || true; }
+# Страна сервера — флаг в шапке панели. Одному геосервису верить нельзя: по
+# адресам хостеров базы расходятся (сервер в Нидерландах «оказывается» в
+# Германии, у другого сервиса страна вовсе не определилась). Поэтому спрашиваем
+# несколько независимых сервисов разом и берём страну, на которой сошлись
+# большинство; при равенстве — тот, кто выше в списке. Все отвечают про один и
+# тот же адрес сервера (Cloudflare — про адрес, с которого пришёл запрос).
+# В кэше на сутки (не узнали — повтор через час), обновляется в фоне: статус
+# сеть не ждёт. Формат кэша: «КОД время версия голоса» — «NL 1791500000 2 NL=4,DE=1».
+#
+# «имя|URL с {IP}|URL без адреса» (пусто — без адреса не спрашиваем)
+COUNTRY_SOURCES=(
+  "cloudflare|https://cloudflare.com/cdn-cgi/trace|https://cloudflare.com/cdn-cgi/trace"
+  "ipinfo|https://ipinfo.io/{IP}/country|https://ipinfo.io/country"
+  "ipapi|https://ipapi.co/{IP}/country/|https://ipapi.co/country/"
+  "countryis|https://api.country.is/{IP}|https://api.country.is/"
+  "geojs|https://get.geojs.io/v1/ip/country/{IP}.json|https://get.geojs.io/v1/ip/country.json"
+  "ipwhois|https://ipwho.is/{IP}?fields=country_code|"
+  "ifconfig|https://ifconfig.co/country-iso|https://ifconfig.co/country-iso"
+)
+
+# Страна по геосервисам (кэш) и выбранная вручную. Флаг — по ручной, если она есть:
+# геобазы бывают дружно неправы (сервер в Вене, а адрес «нидерландский»).
+country_auto() { awk 'NR == 1 && $1 ~ /^[A-Z][A-Z]$/ {print $1}' "$COUNTRY_CACHE" 2>/dev/null || true; }
+country_manual() { awk 'NR == 1 && $1 ~ /^[A-Z][A-Z]$/ {print $1}' "$COUNTRY_MANUAL" 2>/dev/null || true; }
+country_is_manual() { [[ -n "$(country_manual)" ]]; }
+server_country() {
+  local c
+  c=$(country_manual)
+  [[ -n "$c" ]] && { echo "$c"; return 0; }
+  country_auto
+}
+# Голоса последней проверки: «NL=4,DE=1» (или пусто)
+country_votes() {
+  local v
+  v=$(awk 'NR == 1 {print $4}' "$COUNTRY_CACHE" 2>/dev/null)
+  [[ "$v" =~ ^[A-Z]{2}=[0-9]+(,[A-Z]{2}=[0-9]+)*$ ]] && echo "$v"
+  return 0
+}
+
+# Страна вручную: код из двух латинских букв или auto — снова по геосервисам.
+country_set() {  # КОД|auto
+  local c="${1^^}" a
+  if [[ "$c" == AUTO ]]; then
+    rm -f "$COUNTRY_MANUAL"
+    a=$(country_auto)
+    log_info "страна сервера: снова по геосервисам (${a:-не определена})"
+    ok "Страна сервера — по геосервисам: ${a:-пока не определена}"
+    return 0
+  fi
+  [[ "$c" =~ ^[A-Z]{2}$ ]] || { err "Код страны — две латинские буквы (AT, NL, DE) или auto"; return 1; }
+  printf '%s\n' "$c" | write_file "$COUNTRY_MANUAL" 644 || return 1
+  log_info "страна сервера: $c (вручную)"
+  ok "Страна сервера: $c (вручную)"
+}
+
+# Тело ответа сервиса → двухбуквенный код страны или пусто. Понимает «loc=NL»
+# (Cloudflare), простой текст «NL» и JSON с полем country / country_code.
+# Ошибки сервисов («Too many requests», страница HTML), XX, EU и прочие
+# «не страна» отбрасываются.
+country_parse() {
+  local body c
+  body=$(head -c 4000 | tr -d '\r')
+  c=$(sed -n 's/^loc=\([A-Za-z][A-Za-z]\)$/\1/p; s/.*"country[_a-z]*"[[:space:]]*:[[:space:]]*"\([A-Za-z][A-Za-z]\)".*/\1/p' <<< "$body" | head -1)
+  [[ -n "$c" ]] || c=$(tr -d '[:space:]' <<< "$body")
+  c=${c^^}
+  [[ "$c" == UK ]] && c=GB
+  [[ "$c" =~ ^[A-Z]{2}$ && ! "$c" =~ ^(XX|ZZ|EU|AP|AA|QM|QZ)$ ]] && echo "$c"
+  return 0
+}
+
+# Голосование: коды по одному в строке, по порядку источников → «КОД<tab>голосов»
+# победителя. Побеждает страна с наибольшим числом голосов; при равенстве — та,
+# что встретилась раньше (выше в списке источников). Нет ни одного кода — пусто.
+country_vote() {
+  awk '{ n[$1]++; if (!($1 in first)) first[$1] = NR }
+       END { best = ""
+             for (c in n) if (best == "" || n[c] > n[best] || (n[c] == n[best] && first[c] < first[best])) best = c
+             if (best != "") printf "%s\t%d\n", best, n[best] }'
+}
 
 country_refresh() {
-  local loc="" ts
+  local ip="" src name u1 u2 url d i=0 body code winner cnt ts prev tally
+  local -a codes=() pids=()
   command -v curl &>/dev/null || return 0
-  loc=$(curl -s --max-time 6 https://cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p' | head -1 || true)
-  ts=$(date +%s)
-  if ! [[ "$loc" =~ ^[A-Z]{2}$ && "$loc" != XX ]]; then
-    # Не ответили: прежняя страна остаётся (флаг не пропадает на час из-за одного сбоя),
-    # метка сдвинута так, чтобы повтор был через час, а не через сутки
-    loc=$(server_country); ts=$(( ts - 86400 + 3600 ))
-    [[ -n "$loc" ]] || { loc="-"; ts=$(date +%s); }
+  ip=$(public_ip_cached 2>/dev/null || true)
+  valid_ip "$ip" && ! ip_is_private "$ip" || ip=""
+  d=$(mktemp -d /tmp/awg2.country.XXXXXX) || return 0
+  # Все сервисы — одновременно: ждём самого медленного, а не сумму
+  for src in "${COUNTRY_SOURCES[@]}"; do
+    IFS='|' read -r name u1 u2 <<< "$src"
+    if [[ -n "$ip" ]]; then url="${u1//\{IP\}/$ip}"; else url="$u2"; fi
+    [[ -n "$url" ]] || continue
+    ( curl -4 -fsS --max-time 6 -A awg2-toolza "$url" 2>/dev/null | head -c 4000 > "$d/$(printf '%02d' "$i").$name" ) &
+    pids+=("$!"); i=$((i + 1))
+  done
+  # Только свои запросы: чужие фоновые задачи (обновление кэшей) не ждём
+  (( ${#pids[@]} )) && wait "${pids[@]}" 2>/dev/null
+  # Ответы — по порядку источников (имена файлов начинаются с номера)
+  for body in "$d"/*; do
+    [[ -f "$body" ]] || continue
+    code=$(country_parse < "$body")
+    [[ -n "$code" ]] && codes+=("$code")
+  done
+  [[ "$d" == /tmp/awg2.country.* ]] && rm -rf "$d"
+  ts=$(date +%s); prev=$(country_auto); winner=""
+  if (( ${#codes[@]} )); then
+    IFS=$'\t' read -r winner cnt < <(printf '%s\n' "${codes[@]}" | country_vote)
+    tally=$(printf '%s\n' "${codes[@]}" | sort | uniq -c | sort -k1,1nr -k2 | awk '{printf "%s%s=%s", s, $2, $1; s=","}')
+    # Два и больше ответа, а двух одинаковых нет: «большинства» нет — прежняя
+    # страна не перебивается случайным ответом одного сервиса
+    if (( ${#codes[@]} > 1 && cnt < 2 )) && [[ -n "$prev" ]]; then winner=""; fi
   fi
-  printf '%s %s\n' "$loc" "$ts" | write_file "$COUNTRY_CACHE" 644
+  if [[ "$winner" =~ ^[A-Z]{2}$ ]]; then
+    # Кто за кого — в журнал (при смене страны) и в кэш: видно, если сервисы расходятся
+    [[ "$winner" == "$prev" ]] || log_info "страна сервера: $winner (голоса: $tally)"
+    printf '%s %s 2 %s\n' "$winner" "$ts" "$tally" | write_file "$COUNTRY_CACHE" 644
+    return 0
+  fi
+  # Не ответили (или не сошлись): прежняя страна остаётся (флаг не пропадает на
+  # час из-за одного сбоя), метка сдвинута так, чтобы повтор был через час
+  winner="$prev"; ts=$(( ts - 86400 + 3600 ))
+  [[ -n "$winner" ]] || { winner="-"; ts=$(date +%s); }
+  printf '%s %s 2\n' "$winner" "$ts" | write_file "$COUNTRY_CACHE" 644
 }
 
 country_refresh_async() {
-  local cc="" ts=0 ttl=86400
+  local cc="" ts=0 ver="" ttl=86400
   [[ -n "${AWG_NO_UPDATE_CHECK:-}" ]] && return 0
-  read -r cc ts 2>/dev/null < "$COUNTRY_CACHE" || true
+  read -r cc ts ver _ 2>/dev/null < "$COUNTRY_CACHE" || true
   [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
   [[ "$cc" =~ ^[A-Z]{2}$ ]] || ttl=3600
+  # Кэш прежнего формата (один сервис, без голосования) — пересчитать сразу
+  [[ "$ver" == 2 ]] || ttl=0
   (( $(date +%s) - ts < ttl )) && return 0
   ( country_refresh ) </dev/null >/dev/null 2>&1 3>&- 4>&- 8>&- &
   disown 2>/dev/null || true
@@ -11952,6 +12061,7 @@ _api_status() {
     _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"
     _kv channel "$UPDATE_CHANNEL"; _kv update "$(update_available || true)"
     _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"; _kv country "$(server_country)"
+    _kv country_auto "$(country_auto)"; _kv country_manual:b "$(_b country_is_manual)"; _kv country_votes "$(country_votes)"
     _kv uptime:n "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     _kv os "$OS_LABEL"; _kv kernel "$(uname -r)"
     _kv components.installed:b "$(_b command -v awg)"
@@ -12785,6 +12895,20 @@ _api_antiscan() {
 }
 
 # ── Перенос из Amnezia (Docker) ───────────────────────────
+# Страна сервера (флаг в шапке панели): вручную или снова по геосервисам;
+# refresh — спросить геосервисы сейчас, не дожидаясь суток
+_api_country() {
+  local a="${1:-}"
+  case "$a" in
+    set) [[ -n "${2:-}" ]] || { _api_usage "country set КОД|auto"; return; }
+         country_set "$2" ;;
+    refresh) country_refresh
+             { _kv country "$(server_country)"; _kv country_auto "$(country_auto)"; _kv votes "$(country_votes)"; } | api_obj
+             info "По геосервисам: $(country_auto || true) ($(country_votes || true))" ;;
+    *) _api_usage "country set КОД|auto | refresh" ;;
+  esac
+}
+
 _api_amnezia() {
   local a="${1:-status}" c running=0
   case "$a" in
@@ -12961,12 +13085,13 @@ api_dispatch() {
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
     amnezia) _api_amnezia "$@" ;;
+    country) _api_country "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -17876,5 +18001,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=8047496349d2d123
+_BUILD_SUM=1a0d66072445a774
 main "$@"
