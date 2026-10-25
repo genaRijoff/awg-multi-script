@@ -230,7 +230,9 @@ do_amnezia_menu() {
     py amnezia-show <<< "$j" && break
     amnezia_blockers | grep -qx components || { warn "Перенос пока невозможен — см. ✖ выше"; return 0; }
     read_confirm "${Y}  Установить компоненты сейчас? (введи yes): ${N}" || return 0
-    do_install || return 1
+    INSTALL_NEXT="Сервер → Перенос из Amnezia" do_install || return 1
+    # нужна перезагрузка, а её отложили — переносить на старом модуле бессмысленно
+    j=$(reboot_reason); [[ -z "$j" || "$j" == *modprobe* ]] || return 0
     echo ""
   done
   read_confirm "${Y}  Перенести? Контейнер будет остановлен (введи yes): ${N}" || return 0

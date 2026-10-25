@@ -130,10 +130,10 @@ do_install() {
     if [[ "$why" == *"перезагрузка модуля"* ]]; then
       mod_reload || true
     elif (( ! AUTO_MODE )) && ask_yes "  Перезагрузить сервер сейчас? [Y/n]: " y; then
-      ok "Перезагружаюсь. После — sudo awg2 → Сервер → Создать сервер"
+      ok "Перезагружаюсь. После — sudo awg2 → ${INSTALL_NEXT:-Сервер → Создать сервер}"
       sleep 2; reboot
     fi
-  else
+  elif [[ -z "${INSTALL_NEXT:-}" ]]; then   # из переноса Amnezia — сводка идёт сразу следом
     info "Следующий шаг: Сервер → Создать сервер"
   fi
 }

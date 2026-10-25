@@ -167,13 +167,18 @@ d = scan()
 chk("рядом AmneziaDNS — предупреждение, что он остаётся", any("AmneziaDNS" in w for w in d.get("warnings", [])), d.get("warnings"))
 
 print("\nМеню: не хватает компонентов")
-NOCOMP = PRE + "amnezia_blockers() { [[ -e $STATE_DIR/comp_ok ]] || echo components; }; amnezia_migrate() { echo MIGRATE; }; "
+NOCOMP = (PRE + "amnezia_blockers() { [[ -e $STATE_DIR/comp_ok ]] || echo components; }; amnezia_migrate() { echo MIGRATE; }; "
+          "reboot_reason() { [[ -e $STATE_DIR/need_reboot ]] && echo 'новое ядро 9.9 — нужна перезагрузка'; return 0; }; ")
 rc, out, err = bash(NOCOMP + "do_install() { echo INSTALL; }; do_amnezia_menu", stdin="no\n")
 chk("блокер — без «yes» на перенос: отказ от установки — выход", "установи компоненты" in out
     and "INSTALL" not in out and "MIGRATE" not in out, out + err)
 rc, out, err = bash(NOCOMP + 'do_install() { echo INSTALL; touch "$STATE_DIR/comp_ok"; }; do_amnezia_menu', stdin="yes\nyes\n")
 chk("после установки — снова сводка и перенос", out.count("INSTALL") == 1 and out.endswith("MIGRATE\n"), out + err)
 bash('rm -f "$STATE_DIR/comp_ok"')
+rc, out, err = bash(NOCOMP + 'do_install() { echo INSTALL; touch "$STATE_DIR/comp_ok" "$STATE_DIR/need_reboot"; }; do_amnezia_menu',
+                    stdin="yes\nyes\n")
+chk("после установки нужна перезагрузка, а её отложили — перенос не начинается", "INSTALL" in out and "MIGRATE" not in out, out + err)
+bash('rm -f "$STATE_DIR/comp_ok" "$STATE_DIR/need_reboot"')
 
 print("\nНедоверенный конфиг")
 reset()
