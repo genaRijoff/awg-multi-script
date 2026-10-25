@@ -2339,6 +2339,28 @@ function kcard({ state = "", cls = "", name, iface, chips, right, kv, view = "fu
     view === "list" ? null : extra || null,
     acts && acts.length ? h("div", { class: "kc-a" }, acts) : null);
 }
+// Пустые клетки после плотной укладки (grid-auto-flow: dense) на cols колонок;
+// items — [ширина, высота] в клетках, по порядку
+function gridHoles(items, cols) {
+  const g = [];
+  const free = (r, c, w, ht) => {
+    for (let y = r; y < r + ht; y++) for (let x = c; x < c + w; x++) if (g[y] && g[y][x]) return false;
+    return true;
+  };
+  let rows = 0, used = 0;
+  items.forEach(([w0, ht]) => {
+    const w = Math.min(w0, cols);
+    for (let r = 0; ; r++) {
+      for (let c = 0; c + w <= cols; c++) {
+        if (!free(r, c, w, ht)) continue;
+        for (let y = r; y < r + ht; y++) { g[y] = g[y] || []; for (let x = c; x < c + w; x++) g[y][x] = 1; }
+        rows = Math.max(rows, r + ht); used += w * ht;
+        return;
+      }
+    }
+  });
+  return rows * cols - used;
+}
 // Трафик карточки: принято, отдано, всего — счётчики интерфейса, с его запуска
 // (после перезапуска туннеля — снова с нуля)
 const kTraffic = (rx, tx) => h("div", { class: "kc-tr", title: "С запуска интерфейса" },
@@ -3695,18 +3717,20 @@ async function tunnelsCards(ctx) {
         : outs.map((o) => [`${o.tag} ${o.proto} ${o.sec} ${o.net} ${o.host}`, () => outCard(o)]);
     const vis = items.filter(([t]) => !q || t.toLowerCase().indexOf(q) >= 0);
     const empty = (text, btn) => h("div", { class: "kempty" }, h("div", {}, text), btn || null);
-    const cards = vis.map((it) => it[1]());
-    // Работающий — слева, остальные справа по два: высокие (со строками и трафиком)
-    // парой с высокими, низкие с низкими, лишняя в группе — во всю ширину.
-    // В строчном виде карточки одной высоты — раскладка не нужна.
-    const big = tab === "tun" && view !== "list" ? cards.filter((c, i) => vis[i][2] === 0) : [];
+    let cards = vis.map((it) => it[1]());
+    // Высокие карточки (строки, трафик) — на две строки сетки, низкие заполняют
+    // место рядом с ними; осталась одна пустая клетка — последняя низкая во всю
+    // ширину двух колонок. В строчном виде карточки одной высоты — не нужно.
     const tall = (c) => !!c.querySelector(".kc-kv, .kc-tr");
-    const pairs = (list) => list.map((c, i) => { if (i === list.length - 1 && i % 2 === 0) c.classList.add("kwide"); return c; });
-    const rest = cards.filter((c) => big.indexOf(c) < 0);
+    const mas = tab === "tun" && view !== "list" && cards.some(tall) && !cards.every(tall);
+    if (mas) {
+      cards = cards.filter(tall).concat(cards.filter((c) => !tall(c)));
+      cards.forEach((c) => { if (tall(c)) c.classList.add("ktall"); });
+      const dims = cards.map((c) => [1, tall(c) ? 2 : 1]), last = cards[cards.length - 1];
+      [2, 3].forEach((n) => { if (gridHoles(dims.slice(0, -1).concat([[2, 1]]), n) < gridHoles(dims, n)) last.classList.add("kw" + n); });
+    }
     listBox.replaceChildren(...[
-      big.length && rest.length ? h("div", { class: "klist ksplit" }, h("div", { class: "kbig" }, big),
-        h("div", { class: "ksmall" }, pairs(rest.filter(tall)), pairs(rest.filter((c) => !tall(c)))))
-      : cards.length ? h("div", { class: "klist" }, cards)
+      cards.length ? h("div", { class: "klist" + (mas ? " kmas" : "") }, cards)
         : q ? empty("Ничего не нашлось")
           : tab === "nodes" ? empty("Нод нет — клиенты могут выходить в интернет через другие AWG/WG-серверы",
             h("button", { class: "btn-primary", onclick: () => go("/tunnels/exits/add") }, icon("plus"), "Добавить ноду"))
