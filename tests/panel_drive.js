@@ -600,6 +600,61 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click("summary"); await page.waitForSelector("details[open] pre");
     await shot("23-module");
   });
+  await step("страна сервера: окно «О сервере» → выбор вручную, поиск, «Автоматически»", async () => {
+    const sent = [];
+    const fake = async (r) => {
+      const body = r.request().postData() || "";
+      if (body.includes('"country"')) { sent.push(body); return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: {} }) }); }
+      return r.continue();
+    };
+    const st = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      Object.assign(d, { country: "NL", country_auto: "NL", country_manual: false, country_votes: "NL=4,DE=2" });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/status", st);
+    try {
+      await nav("/", "h1");
+      await page.evaluate(() => refreshStatus());
+      await page.evaluate(() => serverInfo(null));
+      await page.waitForSelector("[data-name=server-info] [data-name=country]");
+      await page.click("[data-name=server-info] [data-name=country]");
+      await page.waitForSelector("[data-name=country-pick]");
+      const txt = await page.textContent("[data-name=country-pick]");
+      if (!txt.includes("По геосервисам: Нидерланды") || !txt.includes("NL × 4")) throw new Error("сводка геосервисов: " + txt.slice(0, 200));
+      if (!(await page.locator("[data-name=country-pick] .cpi.on[data-cc=auto]").count())) throw new Error("не отмечено «Автоматически»");
+      await page.fill("[data-name=country-pick] input", "авст");
+      const vis = await page.locator("[data-name=country-pick] .cpi").evaluateAll((els) => els.map((e) => e.dataset.cc));
+      if (vis.join(",") !== "AT,AU") throw new Error("поиск «авст»: " + vis.join(","));
+      await page.click("[data-name=country-pick] .cpi[data-cc=AT]");
+      await page.waitForTimeout(300);
+      if (!sent.some((b) => b.includes('"country","set","AT"'))) throw new Error("выбор не ушёл в awg2: " + sent.join(" | "));
+      if (await page.locator("[data-name=country-pick]").count()) throw new Error("окно выбора не закрылось");
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/status", st);
+    }
+  });
+  await step("ссылка на конфиг: «Открыть» — ссылка в новой вкладке", async () => {
+    const opened = [];
+    await page.exposeFunction("__opened", (u) => opened.push(u)).catch(() => {});
+    await page.evaluate(() => { window.open = (u) => { window.__opened(u); return null; };
+      if (window.Telegram && window.Telegram.WebApp) window.Telegram.WebApp.openLink = (u) => window.__opened(u); });
+    const fake = (r) => r.fulfill({ contentType: "application/json",
+      body: JSON.stringify({ ok: true, url: "https://198.51.100.7:8443/s/test-token", id: "abc123", exp: Math.round(Date.now() / 1000) + 300 }) });
+    await page.route("**/api/client/share", fake);
+    try {
+      await nav("/client/alice/qr", "text=Ссылка на 5 минут");
+      await page.click("button:has-text('Ссылка на 5 минут')");
+      await page.waitForSelector("[data-name=share-open]");
+      await page.click("[data-name=share-open]");
+      await page.waitForTimeout(200);
+      if (opened[0] !== "https://198.51.100.7:8443/s/test-token") throw new Error("открыто: " + JSON.stringify(opened));
+    } finally {
+      await page.unroute("**/api/client/share", fake);
+    }
+  });
   await step("журнал", async () => { await nav("/log/manager", "pre"); });
   await step("перенос из Amnezia: пункт в «Сервере», предпросмотр клиентов, перенос задачей; перенесённый клиент — перевыпуск", async () => {
     const AMZ = { container: "amnezia-awg2", running: true, migrated: false, proto: "3.1", port: 51888, net: "10.8.1.0/24",

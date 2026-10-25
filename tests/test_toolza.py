@@ -1827,16 +1827,17 @@ chk("api status: uptime — секунды работы системы", isinsta
 print("Страна сервера — флаг в шапке панели")
 rc, out, _ = bash('curl() { printf "fl=1\\nip=203.0.113.10\\nloc=NL\\nwarp=off\\n"; }; country_refresh; cat "$COUNTRY_CACHE"; server_country')
 o = out.split()
-chk("страна — из cloudflare cdn-cgi/trace (loc=), в кэш со временем", len(o) == 3 and o[0] == "NL" and o[1].isdigit() and o[2] == "NL", out)
+chk("страна — из ответов сервисов (loc=NL у всех), в кэш со временем, версией формата и голосами",
+    len(o) == 5 and o[0] == "NL" and o[1].isdigit() and o[2] == "2" and o[3].startswith("NL=") and o[4] == "NL", out)
 r = api("status")
 chk("api status: country — код страны из кэша", (r.get("data") or {}).get("country") == "NL", r.get("data"))
 rc, out, _ = bash('rm -f "$COUNTRY_CACHE"; curl() { return 28; }; country_refresh; cat "$COUNTRY_CACHE"; echo "[$(server_country)]"')
-chk("Cloudflare не ответил — пометка «-», страна пустая (флага нет)", out.split()[0] == "-" and out.strip().endswith("[]"), out)
+chk("ни один сервис не ответил — пометка «-», страна пустая (флага нет)", out.split()[0] == "-" and out.strip().endswith("[]"), out)
 # Один сбой не стирает уже известную страну (флаг не пропадает на час); метка такая, что повтор — через час
 rc, out, _ = bash('echo "NL $(( $(date +%s) - 90000 ))" > "$COUNTRY_CACHE"; curl() { return 28; }; country_refresh; '
-                  'read -r cc ts < "$COUNTRY_CACHE"; echo "$cc $(( $(date +%s) - ts )) [$(server_country)]"')
+                  'read -r cc ts _ < "$COUNTRY_CACHE"; echo "$cc $(( $(date +%s) - ts )) [$(server_country)]"')
 o = out.split()
-chk("Cloudflare не ответил, а страна уже известна — остаётся, повтор через час (не через сутки)",
+chk("сервисы не ответили, а страна уже известна — остаётся, повтор через час (не через сутки)",
     len(o) == 3 and o[0] == "NL" and o[2] == "[NL]" and o[1].isdigit() and 82700 <= int(o[1]) <= 82900, out)
 rc, out, _ = bash('rm -f "$COUNTRY_CACHE"; curl() { printf "loc=XX\\n"; }; country_refresh; echo "[$(server_country)]"; '
                   'printf "<b>\\n" > "$COUNTRY_CACHE"; echo "[$(server_country)]"')
@@ -1846,14 +1847,101 @@ for cache, age, want, what in (("NL", 3600, False, "узнали час наза
                                ("NL", 90000, True, "узнали больше суток назад — спрашивает"),
                                ("-", 600, False, "не узнали 10 мин назад — ждёт"),
                                ("-", 3700, True, "не узнали больше часа назад — спрашивает снова")):
-    rc, out, _ = bash(CR + f'echo "{cache} $(( $(date +%s) - {age} ))" > "$COUNTRY_CACHE"; country_refresh_async; sleep 0.3; '
+    rc, out, _ = bash(CR + f'echo "{cache} $(( $(date +%s) - {age} )) 2" > "$COUNTRY_CACHE"; country_refresh_async; sleep 0.3; '
                       '[[ -e "$STATE_DIR/cr" ]] && echo ASK || echo SKIP')
     chk(f"страна: {what}", out.strip().endswith("ASK" if want else "SKIP"), out)
+rc, out, _ = bash(CR + 'echo "NL $(( $(date +%s) - 3600 ))" > "$COUNTRY_CACHE"; country_refresh_async; sleep 0.3; '
+                  '[[ -e "$STATE_DIR/cr" ]] && echo ASK || echo SKIP')
+chk("страна: кэш прежнего формата (один сервис) — пересчитывается сразу, а не через сутки", out.strip().endswith("ASK"), out)
 rc, out, err = bash(CR + 'rm -f "$COUNTRY_CACHE"; country_refresh_async; sleep 0.3; [[ -e "$STATE_DIR/cr" ]] && echo ASK || echo SKIP')
 chk("страна: кэша ещё нет — спрашивает, без ошибок в stderr", out.strip().endswith("ASK") and not err.strip(), [out, err])
 rc, out, _ = bash('AWG_NO_UPDATE_CHECK=1; country_refresh() { touch "$STATE_DIR/cr"; }; rm -f "$STATE_DIR/cr" "$COUNTRY_CACHE"; '
                   'country_refresh_async; sleep 0.3; [[ -e "$STATE_DIR/cr" ]] && echo ASK || echo SKIP')
 chk("страна: в тестах и без сети (AWG_NO_UPDATE_CHECK) — не спрашивает", out.strip().endswith("SKIP"), out)
+
+print("Страна сервера — несколько сервисов, побеждает большинство")
+import shlex
+
+
+def cstub(**ans):
+    """curl, отвечающий по имени сервиса: текст — ответ, None — сбой, нет ключа — сбой."""
+    arms = []
+    for key, pat in (("cloudflare", "*cloudflare*"), ("ipinfo", "*ipinfo*"), ("ipapi", "*ipapi*"), ("countryis", "*country.is*"),
+                     ("geojs", "*geojs*"), ("ipwhois", "*ipwho.is*"), ("ifconfig", "*ifconfig*")):
+        body = ans.get(key)
+        arms.append(f"{pat}) " + ("return 22" if body is None else f"printf '%s\\n' {shlex.quote(body)}") + " ;;")
+    return ('curl() { local u="${@: -1}"; echo "$u" >> "$STATE_DIR/curl-urls"; ' + ans.get("_pre", "") + 'case "$u" in '
+            + " ".join(arms) + " *) return 22 ;; esac; }; ")
+
+
+CRF = 'rm -f "$COUNTRY_CACHE" "$STATE_DIR/curl-urls"; country_refresh; cat "$COUNTRY_CACHE"'
+# Хостер из Нидерландов, база Cloudflare и ещё одного сервиса говорят «Германия»
+rc, out, _ = bash(cstub(cloudflare="fl=1\nloc=DE\nwarp=off", ipinfo="NL", ipapi="NL", countryis='{"ip":"203.0.113.10","country":"NL"}',
+                        geojs='[{"name":"Netherlands","country":"NL"}]', ipwhois='{"country_code":"DE"}') + CRF)
+chk("DE у двух сервисов, NL у четырёх — берётся большинство (NL), голоса в кэше", out.split()[0] == "NL" and out.split()[3] == "NL=4,DE=2", out)
+# Равенство: побеждает тот, кто встретился раньше (Cloudflare — первый в списке)
+rc, out, _ = bash(cstub(cloudflare="loc=DE", ipinfo="NL", ipapi="NL", countryis='{"country":"DE"}') + CRF)
+chk("два против двух — выше в списке (Cloudflare): DE", out.split()[0] == "DE", out)
+rc, out, _ = bash(cstub(ipinfo="NL", ipapi="DE", countryis='{"country":"DE"}', geojs='[{"country":"NL"}]') + CRF)
+chk("два против двух без Cloudflare — тот, кто встретился раньше: NL", out.split()[0] == "NL", out)
+# Один ответ — берётся он (лучше, чем без флага)
+rc, out, _ = bash(cstub(ipinfo="AT") + CRF)
+chk("ответил один сервис — страна от него", out.split()[0] == "AT", out)
+# Все разные: большинства нет — известная страна не меняется, а неизвестная берётся по порядку
+rc, out, _ = bash(cstub(cloudflare="loc=DE", ipinfo="NL", ipapi="FR") + 'echo "AT $(( $(date +%s) - 90000 )) 2" > "$COUNTRY_CACHE"; country_refresh; '
+                  'read -r cc ts _ < "$COUNTRY_CACHE"; echo "$cc $(( $(date +%s) - ts ))"')
+o = out.split()
+chk("все сервисы разошлись — прежняя страна остаётся, повтор через час", o[0] == "AT" and 82700 <= int(o[1]) <= 82900, out)
+rc, out, _ = bash(cstub(cloudflare="loc=DE", ipinfo="NL", ipapi="FR") + CRF)
+chk("все разошлись, страны ещё нет — берётся по порядку списка (Cloudflare)", out.split()[0] == "DE", out)
+# Мусор и «не страна» не считаются голосами
+rc, out, _ = bash(cstub(cloudflare="loc=XX", ipinfo="Too many requests", ipapi="<html><body>429</body></html>", countryis='{"error":"rate limit"}',
+                        geojs='[{"name":"Austria","country":"AT"}]', ipwhois='{"success":false,"country_code":"EU"}', ifconfig="at") + CRF)
+chk("XX, EU, ошибки и HTML — не голоса; остальные (AT, at) — страна AT", out.split()[0] == "AT" and out.split()[3] == "AT=2", out)
+rc, out, _ = bash(cstub(ipinfo="UK", ipapi="GB") + CRF)
+chk("UK и GB — одна страна (GB)", out.split()[0] == "GB" and out.split()[3] == "GB=2", out)
+# Все спрашивают про один адрес сервера; без адреса — запросы без него, сервис «только по адресу» пропускается
+rc, out, _ = bash(cstub(ipinfo="NL", ipapi="NL") + CRF + '; cat "$STATE_DIR/curl-urls"')
+chk("в запросы подставлен адрес сервера", "https://ipinfo.io/203.0.113.10/country" in out and "https://ipwho.is/203.0.113.10?fields=country_code" in out
+    and "{IP}" not in out and "https://cloudflare.com/cdn-cgi/trace" in out, out)
+rc, out, _ = bash("public_ip_cached() { :; }; " + cstub(ipinfo="NL", ipapi="NL") + CRF + '; cat "$STATE_DIR/curl-urls"')
+chk("адрес сервера неизвестен — запросы без него, ipwho.is пропущен", "https://ipinfo.io/country" in out and "ipwho.is" not in out
+    and "{IP}" not in out and out.split()[0] == "NL", out)
+# Сервисы опрашиваются одновременно: семь по секунде — не семь секунд
+rc, out, _ = bash(cstub(cloudflare="loc=NL", ipinfo="NL", ipapi="NL", countryis='{"country":"NL"}', geojs='[{"country":"NL"}]',
+                        ipwhois='{"country_code":"NL"}', ifconfig="NL", _pre="sleep 1; ")
+                  + 't0=$(date +%s%N); ' + CRF + '; echo "ms=$(( ($(date +%s%N) - t0) / 1000000 ))"')
+ms = int(out.split("ms=")[-1])
+chk("семь сервисов по секунде отвечают одновременно (<3 с)", out.split()[0] == "NL" and ms < 3000, [out, ms])
+# Смена страны — в журнал, с голосами
+rc, out, _ = bash(cstub(cloudflare="loc=DE", ipinfo="NL", ipapi="NL") + 'echo "DE $(date +%s) 2" > "$COUNTRY_CACHE"; country_refresh; '
+                  'grep -h "страна сервера" "$LOG_FILE" "$AWG_LOG" 2>/dev/null | tail -1; cat "$COUNTRY_CACHE"')
+chk("страна сменилась (DE → NL) — кэш обновлён", "NL " in out.split("\n")[-2] + " ", out)
+# Временный каталог ответов за собой убирается
+rc, out, _ = bash(cstub(ipinfo="NL", ipapi="NL") + CRF + '; ls -d /tmp/awg2.country.* 2>/dev/null | wc -l')
+chk("временные файлы ответов убраны", out.strip().endswith("0"), out)
+
+print("Страна сервера вручную — главнее геосервисов")
+bash('rm -f "$COUNTRY_MANUAL"; echo "NL $(date +%s) 2 NL=4,DE=2" > "$COUNTRY_CACHE"')
+r = api("status")
+d = r.get("data") or {}
+chk("api status: страна по геосервисам, не вручную, голоса", d.get("country") == "NL" and d.get("country_auto") == "NL"
+    and d.get("country_manual") is False and d.get("country_votes") == "NL=4,DE=2", d)
+r = api("country", "set", "at")
+d = (api("status").get("data") or {})
+chk("country set at — флаг AT (регистр не важен), геосервисы помнятся отдельно",
+    r.get("ok") and d.get("country") == "AT" and d.get("country_manual") is True and d.get("country_auto") == "NL", [r, d])
+rc, out, _ = bash('echo "DE $(date +%s) 2 DE=5" > "$COUNTRY_CACHE"; server_country')
+chk("ручная страна не перебивается новой проверкой геосервисов", out.strip() == "AT", out)
+for bad in ("A1", "AUT", "a-", "../x"):
+    r = api("country", "set", bad)
+    chk(f"country set {bad!r} — отказ, ручная страна прежняя", not r.get("ok") and (api("status").get("data") or {}).get("country") == "AT", r)
+r = api("country", "set", "auto")
+d = (api("status").get("data") or {})
+chk("country set auto — снова по геосервисам", r.get("ok") and d.get("country") == "DE" and d.get("country_manual") is False, [r, d])
+r = api("country")
+chk("api country без команды — подсказка, rc 2", not r.get("ok") and r.get("_rc") == 2, r)
+bash('rm -f "$COUNTRY_MANUAL" "$COUNTRY_CACHE"')
 
 print("Домен мимикрии по региону")
 STUBSCAN = 'scan_domains() { shift; SCAN_OK=("$@"); }; '

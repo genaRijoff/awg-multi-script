@@ -85,6 +85,7 @@ _api_status() {
     _kv version "$VERSION_SHOW"; _kv api:n "$API_VERSION"
     _kv channel "$UPDATE_CHANNEL"; _kv update "$(update_available || true)"
     _kv host "$(hostname)"; _kv ip "$(public_ip_cached)"; _kv country "$(server_country)"
+    _kv country_auto "$(country_auto)"; _kv country_manual:b "$(_b country_is_manual)"; _kv country_votes "$(country_votes)"
     _kv uptime:n "$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
     _kv os "$OS_LABEL"; _kv kernel "$(uname -r)"
     _kv components.installed:b "$(_b command -v awg)"
@@ -918,6 +919,20 @@ _api_antiscan() {
 }
 
 # ── Перенос из Amnezia (Docker) ───────────────────────────
+# Страна сервера (флаг в шапке панели): вручную или снова по геосервисам;
+# refresh — спросить геосервисы сейчас, не дожидаясь суток
+_api_country() {
+  local a="${1:-}"
+  case "$a" in
+    set) [[ -n "${2:-}" ]] || { _api_usage "country set КОД|auto"; return; }
+         country_set "$2" ;;
+    refresh) country_refresh
+             { _kv country "$(server_country)"; _kv country_auto "$(country_auto)"; _kv votes "$(country_votes)"; } | api_obj
+             info "По геосервисам: $(country_auto || true) ($(country_votes || true))" ;;
+    *) _api_usage "country set КОД|auto | refresh" ;;
+  esac
+}
+
 _api_amnezia() {
   local a="${1:-status}" c running=0
   case "$a" in
@@ -1094,12 +1109,13 @@ api_dispatch() {
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
     amnezia) _api_amnezia "$@" ;;
+    country) _api_country "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
