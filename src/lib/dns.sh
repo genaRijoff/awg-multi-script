@@ -16,6 +16,20 @@ DNS_PRESETS=(
   "cisco-doh|Только Cisco OpenDNS"
   "google|Только Google"
 )
+# Подсказка к «Вручную»: только DoH по IPv4 — других этот dnscrypt-proxy не берёт
+# (dnscrypt_servers = false, ipv6_servers = false)
+DNS_POPULAR=(
+  "cloudflare|Cloudflare 1.1.1.1"
+  "google|Google 8.8.8.8"
+  "quad9-doh-ip4-port443-nofilter-pri|Quad9 без фильтра"
+  "adguard-dns-doh|AdGuard — режет рекламу и трекеры"
+  "adguard-dns-unfiltered-doh|AdGuard без фильтра"
+  "mullvad-doh|Mullvad"
+  "controld-uncensored|Control D без фильтра"
+  "dns.sb|DNS.SB"
+  "yandex|Яндекс 77.88.8.1"
+  "cloudflare-family|Cloudflare Family — без вредоносных и 18+"
+)
 
 dns_installed() { command -v dnscrypt-proxy &>/dev/null && [[ -f "$DNS_PROXY_STATE" ]]; }
 dns_running()   { unit_active "$DNS_UNIT" || unit_active "$DNS_SOCKET"; }
@@ -202,6 +216,8 @@ dns_install() {  # [force] — включить поверх стороннег�
   _dns_write_conf
   systemctl daemon-reload
   systemctl enable "$DNS_SOCKET" "$DNS_UNIT" &>/dev/null || true
+  # после череды падений systemd не даёт запустить службу («start request repeated too quickly»)
+  systemctl reset-failed "$DNS_UNIT" &>/dev/null || true
   systemctl restart "$DNS_SOCKET" "$DNS_UNIT" &>/dev/null || true
   info "Жду, пока загрузятся резолверы..."
   if ! _dns_wait_ready; then
@@ -227,6 +243,8 @@ dns_install() {  # [force] — включить поверх стороннег�
 
 dns_restart() {
   dns_installed || { err "Шифрованный DNS не настроен"; return 1; }
+  # после череды падений systemd не даёт запустить службу («start request repeated too quickly»)
+  systemctl reset-failed "$DNS_UNIT" &>/dev/null || true
   systemctl restart "$DNS_SOCKET" "$DNS_UNIT" &>/dev/null || true
   iface_up && dns_rules_up
   if _dns_wait_ready; then ok "dnscrypt-proxy перезапущен и отвечает"
@@ -258,7 +276,9 @@ dns_change_upstream() {
   if (( c <= ${#DNS_PRESETS[@]} )); then
     names="${DNS_PRESETS[$((c - 1))]%%|*}"
   else
-    echo -e "  ${D}Список: https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/public-resolvers.md${N}"
+    echo -e "  ${D}Популярные (DoH):${N}"
+    for i in "${DNS_POPULAR[@]}"; do printf "    ${C}%-36s${N} ${D}%s${N}\n" "${i%%|*}" "${i#*|}"; done
+    echo -e "  ${D}Весь список: https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/public-resolvers.md${N}"
     read_line manual "${C}  Резолверы через запятую: ${N}"
     [[ -n "$manual" ]] || return 0
     names="$manual"
@@ -266,22 +286,39 @@ dns_change_upstream() {
   dns_set_upstream "$names"
 }
 
-# Резолверы dnscrypt-proxy по именам из public-resolvers.md (через пробел или запятую).
+# Резолверы dnscrypt-proxy по именам из public-resolvers.md (через пробел или
+# запятую). Не поднялся с новыми — возвращаются прежние.
 dns_set_upstream() {
-  _dns_upstream_write "$1" || return 1
-  ok "Резолверы: ${1//,/ }"
-  dns_restart || info "Проверь имена резолверов: journalctl -u $DNS_UNIT -n 20"
+  local names="${1//,/ }" old
+  _dns_upstream_check "$names" || return 1
+  old=$(sed -n 's/^server_names[[:space:]]*=[[:space:]]*//p' "$DNS_PROXY_CONF" 2>/dev/null | head -1)
+  _dns_upstream_write "$names" || return 1
+  if dns_restart; then ok "Резолверы: $names"; return 0; fi
+  if [[ "$old" =~ ^\[[A-Za-z0-9._\ \',-]*\]$ ]]; then
+    sed -i "s|^server_names[[:space:]]*=.*|server_names = $old|" "$DNS_PROXY_CONF"
+    warn "С новыми резолверами dnscrypt-proxy не поднялся — вернул прежние: $(tr -d "[]'" <<< "$old")"
+    dns_restart || true
+  fi
+  return 1
+}
+
+# Имена — в кэше списка, DoH, IPv4: иначе dnscrypt-proxy их молча отбросит и,
+# не найдя ни одного, упадёт. Списка ещё нет — проверит сам перезапуск.
+_dns_upstream_check() {
+  local out
+  [[ -s "$DNS_RESOLVERS_MD" && "$1" =~ ^[A-Za-z0-9._\ -]+$ ]] || return 0   # формат проверит запись
+  out=$(py dns-check "$DNS_RESOLVERS_MD" $1) && return 0
+  while IFS= read -r out; do err "$out"; done <<< "$out"
+  return 1
 }
 
 _dns_upstream_write() {  # имена — в конфиг, без перезапуска
-  local names="${1//,/ }" nofilter=true toml="" n
+  local names="${1//,/ }" toml="" n
   [[ -f "$DNS_PROXY_CONF" ]] || { err "Шифрованный DNS не настроен"; return 1; }
-  [[ "$names" =~ ^[A-Za-z0-9_\ -]+$ && -n "${names// /}" ]] || { err "Допустимы латиница, цифры, дефис и запятая"; return 1; }
-  # Фильтрующий резолвер при require_nofilter=true dnscrypt-proxy молча
-  # отбрасывает — и остаётся без серверов вообще.
-  [[ " $names " == *safe* || " $names " == *filter* || " $names " == *family* || " $names " == *adguard* ]] && nofilter=false
+  [[ "$names" =~ ^[A-Za-z0-9._\ -]+$ && -n "${names// /}" ]] || { err "Допустимы латиница, цифры, точка, дефис и запятая"; return 1; }
+  # require_* при явном server_names dnscrypt-proxy не смотрит — только протокол и IPv4/IPv6
   for n in $names; do toml+="${toml:+, }'$n'"; done
-  sed -i "s|^server_names[[:space:]]*=.*|server_names = [$toml]|; s|^require_nofilter[[:space:]]*=.*|require_nofilter = $nofilter|" "$DNS_PROXY_CONF"
+  sed -i "s|^server_names[[:space:]]*=.*|server_names = [$toml]|" "$DNS_PROXY_CONF"
 }
 
 dns_remove() {

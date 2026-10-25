@@ -911,6 +911,19 @@
   /* Карточка: рамка по состоянию — бирюзовая работает, серая выключено, пунктир не настроено */
   .klist { display: grid; gap: 12px; margin-bottom: 12px; }
   @media (min-width: 900px) { .klist { grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); align-items: start; } }
+  /* Работающий туннель (высокая карточка) — слева, остальные — справа по два в ряд:
+     высокие парой с высокими, низкие с низкими, лишняя — во всю ширину. Без дыр
+     рядом с высокой карточкой и без пустоты внутри растянутой соседки */
+  .kbig, .ksmall { display: grid; gap: 12px; align-content: start; min-width: 0; }
+  @media (min-width: 900px) {
+    .klist.ksplit { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .klist.kpair { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (min-width: 1400px) {
+    .klist.ksplit { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); }
+    .ksmall { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .ksmall > .kwide { grid-column: 1 / -1; }
+  }
   .kcard { position: relative; background: var(--panel); border: 1.5px solid var(--line2); border-radius: var(--rb); padding: 13px 16px 4px; min-width: 0;
            container-type: inline-size; }
   .kcard.on { border-color: var(--ok); } .kcard.warn { border-color: var(--amber); } .kcard.bad { border-color: var(--red); }

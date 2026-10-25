@@ -628,12 +628,17 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       if (!txt.includes("Пётр <b>x</b>") || !txt.includes("AWG 3.1") || !txt.includes("51888/udp") || !txt.includes("не переносится: PostUp"))
         throw new Error("предпросмотр: " + txt.slice(0, 400));
       if (await page.locator("#app b >> text=x").count()) throw new Error("исходное имя выведено как HTML");
-      await page.click("button:has-text('🚚 Перенести')");
+      await page.click("#app button:has-text('Перенести')");
       await page.waitForTimeout(300);
       if (!jobs.some((b) => b.includes('"amnezia","migrate"'))) throw new Error("перенос не ушёл задачей: " + jobs.join(" | "));
       AMZ.migrated = true;
       await nav("/server/amnezia", "text=Вернуть Amnezia");
       await page.waitForSelector("text=Удалить контейнер");
+      await nav("/server", "text=Перенос из Amnezia");
+      if (await page.locator(".item:has-text('Перенос из Amnezia') .ibox").count() !== 1
+        || (await page.textContent(".item:has-text('Перенос из Amnezia') .title")).includes("🐳"))
+        throw new Error("пункт «Перенос из Amnezia» — без значка, как у соседних");
+      await shot("23b-server-amnezia");
     } finally {
       await page.unroute("**/api/call", fake);
       await page.unroute("**/api/job", job);
@@ -797,6 +802,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector("text=Правил нет");
   });
   await step("DNS", async () => { await nav("/tunnels/dns", "text=Включить"); await shot("39-dns"); });
+  await step("DNS: свои резолверы — отмечено «Вручную», подсказка популярных добавляет и убирает имя", async () => {
+    const D = { installed: true, running: true, intercept: true, upstream: "adguard-dns-doh dns.sb",
+      presets: [{ names: "cloudflare google cisco-doh", label: "Cloudflare + Google + Cisco" }, { names: "cloudflare", label: "Только Cloudflare" }],
+      popular: [{ name: "cloudflare", label: "Cloudflare 1.1.1.1" }, { name: "quad9-doh-ip4-port443-nofilter-pri", label: "Quad9 без фильтра" },
+        { name: "dns.sb", label: "DNS.SB" }] };
+    const fake = (r) => ((r.request().postData() || "").includes('"dns","status"')
+      ? r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: D }) }) : r.continue());
+    await page.route("**/api/call", fake);
+    try {
+      await nav("/tunnels/dns", "text=Вручную");
+      const manual = page.locator(".item:has-text('Вручную')");
+      if (!(await manual.locator(".radio.on").count()) || !(await manual.textContent()).includes("adguard-dns-doh dns.sb"))
+        throw new Error("свои резолверы — без отметки «Вручную»: " + (await manual.textContent()));
+      if (await page.locator(".item:not(:has-text('Вручную')) .radio.on").count()) throw new Error("отмечен и пресет");
+      await nav("/tunnels/dns/manual", "text=Популярные резолверы");
+      const input = page.locator("#app input");
+      if ((await input.inputValue()) !== "adguard-dns-doh, dns.sb") throw new Error("поле: " + (await input.inputValue()));
+      await page.click("summary:has-text('Популярные')");
+      if (!(await page.locator(".item:has-text('dns.sb') .check.on").count())) throw new Error("dns.sb из поля — без отметки");
+      await page.click(".item:has-text('quad9-doh-ip4-port443-nofilter-pri')");
+      await page.click(".item:has-text('dns.sb')");
+      if ((await input.inputValue()) !== "adguard-dns-doh, quad9-doh-ip4-port443-nofilter-pri")
+        throw new Error("после нажатий: " + (await input.inputValue()));
+      await shot("39b-dns-manual");
+    } finally {
+      await page.unroute("**/api/call", fake);
+    }
+  });
   await step("всё напрямую", async () => {
     await nav("/tunnels", ".kcard");
     await page.click("text=Всё напрямую");

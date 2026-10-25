@@ -320,6 +320,7 @@ const EMOJI_ICON = {
   "🔐": "lock-keyhole", "🧪": "flask-conical", "🖥": "server", "🛡": "shield", "📁": "folder", "🗜": "file-archive",
   "◀": "arrow-left", "✅": "circle-check", "❌": "circle-x", "✖": "x", "🔃": "arrow-down-up", "📂": "folder",
   "👮": "user", "🎨": "palette", "📶": "gauge", "🚀": "zap", "🐢": "timer", "🚫": "circle-x", "📊": "chart-column", "📈": "chart-column", "🕒": "clock", "🎛": "sliders-horizontal", "↩": "undo-2", "💬": "message-square-text", "📱": "smartphone", "🔗": "share-2", "🙋": "user-plus", "🧯": "eraser",
+  "🐳": "arrow-left-right", "🚚": "arrow-left-right",
 };
 // \p{…} старый движок не знает (вся панель падала на этой строке) — там
 // эмодзи узнаётся по суррогатной паре или блоку символов
@@ -3102,7 +3103,7 @@ route(/^\/server$/, async (ctx) => {
     !d.exists && amz && amz.container && !amz.migrated ? ecard({ name: "Найден сервер Amnezia", attrs: { "data-name": "amnezia" },
       right: pill(amz.running ? "работает" : "остановлен", amz.running ? "ok" : "warn"),
       lines: ["Перенеси его в Тулзу — клиенты останутся со своими конфигами, перевыдавать не нужно"],
-      acts: [act("package", "Перенос", () => go("/server/amnezia"))] }) : null,
+      acts: [act("arrow-left-right", "Перенос", () => go("/server/amnezia"))] }) : null,
     !d.exists ? btn("✨ Создать сервер", () => go("/server/create"), "btn-block" + (d.installed && !(amz && amz.container) ? " btn-primary" : "")) : null,
     h("h2", {}, "Обслуживание"),
     h("div", { class: "card list" },
@@ -3689,20 +3690,30 @@ async function tunnelsCards(ctx) {
   function drawList() {
     // Карточка — [текст для поиска, построитель]: ищем по имени, интерфейсу, протоколу, адресу
     const rank = (k) => (d[k] === "up" ? 0 : has(k) || (k === "exits" && nodes.length) ? 1 : 2);
-    const items = tab === "tun" ? keys.slice().sort((a, b) => rank(a) - rank(b)).map((k) => [`${TUN_NAME[k]} ${k}`, () => engine(k)])
+    const items = tab === "tun" ? keys.slice().sort((a, b) => rank(a) - rank(b)).map((k) => [`${TUN_NAME[k]} ${k}`, () => engine(k), rank(k)])
       : tab === "nodes" ? nodes.map((n) => [`${n.name} awg-exit-${n.name} ${n.proto} ${n.endpoint || ""}`, () => nodeCard(n)])
         : outs.map((o) => [`${o.tag} ${o.proto} ${o.sec} ${o.net} ${o.host}`, () => outCard(o)]);
     const vis = items.filter(([t]) => !q || t.toLowerCase().indexOf(q) >= 0);
     const empty = (text, btn) => h("div", { class: "kempty" }, h("div", {}, text), btn || null);
+    const cards = vis.map((it) => it[1]());
+    // Работающий — слева, остальные справа по два: высокие (со строками и трафиком)
+    // парой с высокими, низкие с низкими, лишняя в группе — во всю ширину.
+    // В строчном виде карточки одной высоты — раскладка не нужна.
+    const big = tab === "tun" && view !== "list" ? cards.filter((c, i) => vis[i][2] === 0) : [];
+    const tall = (c) => !!c.querySelector(".kc-kv, .kc-tr");
+    const pairs = (list) => list.map((c, i) => { if (i === list.length - 1 && i % 2 === 0) c.classList.add("kwide"); return c; });
+    const rest = cards.filter((c) => big.indexOf(c) < 0);
     listBox.replaceChildren(...[
-      vis.length ? h("div", { class: "klist" }, vis.map(([, mk]) => mk()))
+      big.length && rest.length ? h("div", { class: "klist ksplit" }, h("div", { class: "kbig" }, big),
+        h("div", { class: "ksmall" }, pairs(rest.filter(tall)), pairs(rest.filter((c) => !tall(c)))))
+      : cards.length ? h("div", { class: "klist" }, cards)
         : q ? empty("Ничего не нашлось")
           : tab === "nodes" ? empty("Нод нет — клиенты могут выходить в интернет через другие AWG/WG-серверы",
             h("button", { class: "btn-primary", onclick: () => go("/tunnels/exits/add") }, icon("plus"), "Добавить ноду"))
             : !has("xray") ? empty("Xray не установлен — выходы VLESS, VMess, Trojan, Shadowsocks, Hysteria2",
               h("button", { class: "btn-primary", onclick: () => runJob(ctx, "Установка Xray", ["xray", "install"]) }, icon("package"), "Установить Xray"))
               : empty("Выходов нет — добавь ссылкой", h("button", { class: "btn-primary", onclick: () => go("/tunnels/xray/add") }, icon("plus"), "Добавить выход")),
-      tab === "tun" && !q ? [h("div", { class: "ksec" }, h("h2", {}, "Ещё")), h("div", { class: "klist" }, extraCards()),
+      tab === "tun" && !q ? [h("div", { class: "ksec" }, h("h2", {}, "Ещё")), h("div", { class: "klist kpair" }, extraCards()),
         hint("Одновременно работает один туннель: включишь другой — текущий выключится.")] : null,
       tab === "xray" && outs.length > 1 && !q ? hint(X.per_client ? "Клиенту можно закрепить свой выход: Клиенты → клиент → Маршрут."
         : "Свой выход клиенту — только с inbound tun в самом Xray: обнови Xray.") : null].flat(Infinity).filter(Boolean));
@@ -4082,6 +4093,7 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
   const d = r.data || {}, inst = d.installed;
   const norm = (s) => (s || "").split(/[\s,]+/).filter(Boolean).join(" ");
   const cur = norm(d.upstream);
+  const manual = !!cur && !(d.presets || []).some((p) => norm(p.names) === cur);
   async function off(b) {
     const v = await sheet("Выключить шифрованный DNS? Клиенты вернутся к DNS из своих конфигов.",
       [{ label: "⏹ Выключить", value: "off" }, { label: "🗑 Удалить совсем, с dnscrypt-proxy", value: "purge", cls: "bad" }]);
@@ -4094,8 +4106,9 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
         (norm(p.names) === cur ? null : quick(null, "Резолверы изменены", ["dns", "upstream", p.names])) },
       h("div", { class: "radio" + (norm(p.names) === cur ? " on" : "") }),
       h("div", { class: "main" }, h("div", { class: "title" }, p.label), h("div", { class: "sub" }, p.names)))),
-      h("div", { class: "item", onclick: () => go("/tunnels/dns/manual") }, h("div", { class: "radio" }),
-        h("div", { class: "main" }, h("div", { class: "title" }, "✏️ Вручную…"), h("div", { class: "sub" }, "имена из public-resolvers"))))] : null,
+      h("div", { class: "item", onclick: () => go("/tunnels/dns/manual") }, h("div", { class: "radio" + (manual ? " on" : "") }),
+        h("div", { class: "main" }, h("div", { class: "title" }, "✏️ Вручную…"),
+          h("div", { class: "sub" }, manual ? cur : "имена из public-resolvers"))))] : null,
     h("div", { class: "actions", style: "margin-top:8px" },
       !inst ? btn("▶️ Включить", () => runJob(ctx, "Шифрованный DNS", ["dns", "install"]), "btn-primary") : null,
       !inst ? btn("⚠️ Принудительно", () => jobAsk(ctx, "Если на сервере работает свой DNS (Pi-hole, Unbound, bind), "
@@ -4108,12 +4121,30 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
 
 route(/^\/tunnels\/dns\/manual$/, async (ctx) => {
   const d = (await call("dns", "status")) || {};
-  const names = h("input", { value: d.upstream || "", placeholder: "cloudflare, google", autocapitalize: "off", autocomplete: "off" });
+  const names = h("input", { value: (d.upstream || "").split(/[\s,]+/).filter(Boolean).join(", "), placeholder: "cloudflare, google",
+    autocapitalize: "off", autocomplete: "off" });
+  const picked = () => names.value.split(/[\s,]+/).filter(Boolean);
+  // Популярные — отметкой: нажатие добавляет имя в поле или убирает его
+  const pop = (d.popular || []).map((p) => {
+    const mark = h("div", { class: "check" });
+    const sync = () => { const on = picked().includes(p.name); mark.className = "check" + (on ? " on" : ""); mark.replaceChildren(...(on ? [icon("check")] : [])); };
+    sync();
+    return { sync, row: h("div", { class: "item", onclick: () => {
+      const l = picked(), i = l.indexOf(p.name);
+      if (i >= 0) l.splice(i, 1); else l.push(p.name);
+      names.value = l.join(", ");
+      pop.forEach((x) => x.sync());
+    } }, mark, h("div", { class: "main" }, h("div", { class: "title mono wrap" }, p.name), h("div", { class: "sub" }, p.label))) };
+  });
+  names.addEventListener("input", () => pop.forEach((x) => x.sync()));
   ctx.put(title("✏️ Резолверы"),
-    h("label", {}, "Имена через запятую — из списка public-resolvers (github.com/DNSCrypt/dnscrypt-resolvers)"), names,
+    h("label", {}, "Имена через запятую — из списка public-resolvers (github.com/DNSCrypt/dnscrypt-resolvers). Подходят только DoH."), names,
+    pop.length ? h("details", { class: "card list", style: "margin-top:10px" },
+      h("summary", { style: "padding:12px 14px" }, "Популярные резолверы (DoH) — " + pop.length), pop.map((x) => x.row)) : null,
     btn("Сохранить", (b) => {
-      const v = names.value.trim();
-      if (!/^[A-Za-z0-9_, -]+$/.test(v)) return fail(new Error("Допустимы латиница, цифры, дефис и запятая"));
+      const v = picked().join(",");
+      if (!v) return fail(new Error("Укажи хотя бы одно имя"));
+      if (!/^[A-Za-z0-9._,-]+$/.test(v)) return fail(new Error("Допустимы латиница, цифры, точка, дефис и запятая"));
       return quick(b, "Резолверы изменены", ["dns", "upstream", v], () => back());
     }, "btn-primary btn-block"));
 });

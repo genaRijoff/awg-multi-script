@@ -782,16 +782,21 @@ async def _dns_set(cb: CallbackQuery, state: FSMContext, idx: str) -> None:
 
 @dns("manual")
 async def _dns_manual(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    d = await api.data("dns", "status", default={}) or {}
+    pop = [p for p in d.get("popular") or [] if isinstance(p, dict)]
+    tip = ("\n\n<b>Популярные (DoH)</b> — нажми на имя, чтобы скопировать:\n<blockquote expandable>"
+           + "\n".join(f"<code>{esc(p.get('name', ''))}</code> — {esc(p.get('label', ''))}" for p in pop)
+           + "</blockquote>") if pop else ""
     await ask.ask(cb, state, "dns_names", "Имена резолверов через запятую — из списка "
                                           "<a href=\"https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/"
-                                          "public-resolvers.md\">public-resolvers</a>.", "dns")
+                                          "public-resolvers.md\">public-resolvers</a>. Подходят только DoH." + tip, "dns")
 
 
 @ask.on("dns_names")
 async def _dns_names(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not re.fullmatch(r"[A-Za-z0-9_, -]+", v):
-        await ask.retry(msg, state, ctx, "Допустимы латиница, цифры, дефис и запятая")
+    if not re.fullmatch(r"[A-Za-z0-9._, -]+", v):
+        await ask.retry(msg, state, ctx, "Допустимы латиница, цифры, точка, дефис и запятая")
         return
     await quick(msg, "Резолверы", "dns", "dns", "upstream", v)
 

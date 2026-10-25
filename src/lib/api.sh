@@ -671,6 +671,7 @@ _api_dns() {
         _kv intercept:b "$(_b dns_rules_ok)"
         _kv upstream "$(sed -n 's/^server_names[[:space:]]*=[[:space:]]*//p' "$DNS_PROXY_CONF" 2>/dev/null | tr -d "[]'\"" | head -1)"
         _kv presets:j "$(for i in "${DNS_PRESETS[@]}"; do printf '%s\t%s\n' "${i%%|*}" "${i#*|}"; done | py json-rows names label)"
+        _kv popular:j "$(for i in "${DNS_POPULAR[@]}"; do printf '%s\t%s\n' "${i%%|*}" "${i#*|}"; done | py json-rows name label)"
       } | api_obj
       dns_status ;;
     install) dns_install "${1:-}" ;;

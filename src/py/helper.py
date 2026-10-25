@@ -6,6 +6,7 @@
 с целевым и os.replace: обрыв на середине не оставляет битый конфиг.
 """
 import base64
+import difflib
 import importlib
 import json
 import os
@@ -2033,6 +2034,68 @@ def cmd_json_kv():
     print(json.dumps(out, ensure_ascii=False))
 
 
+DNS_PROTO = {1: "DNSCrypt", 3: "DoT", 4: "DoQ", 5: "ODoH", 0x81: "релей DNSCrypt", 0x85: "релей ODoH"}
+
+
+def _dns_stamps(path):
+    """public-resolvers.md → {имя: [(протокол, адрес), ...]} по штампам sdns://."""
+    out, name = {}, None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read(8 << 20)
+    for line in text.splitlines():
+        if line.startswith("## "):
+            name = line[3:].strip()
+            continue
+        line = line.strip()
+        if not (name and line.startswith("sdns://")):
+            continue
+        try:
+            b = base64.urlsafe_b64decode(line[7:] + "=" * (-len(line[7:]) % 4))
+        except ValueError:          # и binascii.Error
+            continue
+        if not b:
+            continue
+        addr = ""
+        if b[0] in (1, 2, 3, 4) and len(b) > 9:
+            addr = b[10:10 + b[9]].decode("ascii", "replace")
+        out.setdefault(name, []).append((b[0], addr))
+    return out
+
+
+def cmd_dns_check(path, *names):
+    """Имена резолверов, которые dnscrypt-proxy Тулзы (только DoH, только IPv4)
+    отбросит, — с причиной и подсказкой. Код 1, если такие есть."""
+    st = _dns_stamps(path)
+    usable = sorted(n for n, v in st.items() if any(p == 2 and not a.startswith("[") for p, a in v))
+    ok = set(usable)
+
+    def alt(n, *cand):
+        for c in cand:
+            if c in ok:
+                return c
+        m = difflib.get_close_matches(n, usable, 1, 0.75)
+        return m[0] if m else ""
+
+    bad = []
+    for n in names:
+        if n in ok:
+            continue
+        v = st.get(n)
+        if not v:
+            a = alt(n, n + "-doh")
+            bad.append("«%s» нет в списке public-resolvers%s" % (n, " — может, %s?" % a if a else ""))
+        elif all(p != 2 for p, _ in v):
+            a = alt(n, n + "-doh", n.replace("dnscrypt", "doh"))
+            bad.append("«%s» — это %s, а шифрованный DNS Тулзы ходит только по DoH%s"
+                       % (n, DNS_PROTO.get(v[0][0], "не DoH"), ": возьми %s" % a if a else ""))
+        else:
+            a = alt(n, n.replace("-ipv6", ""))
+            bad.append("«%s» — только IPv6, а к резолверам сервер ходит по IPv4%s" % (n, ": возьми %s" % a if a else ""))
+    if bad:
+        print("\n".join(bad))
+        sys.exit(1)
+
+
 def cmd_json_rows(*cols):
     """Строки TSV → список объектов по колонкам «имя[:тип]»."""
     spec = [_split_key(c) for c in cols]
@@ -2829,7 +2892,7 @@ COMMANDS = {
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
-    "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "json-list": cmd_json_list,
+    "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,
     "clients-json": cmd_clients_json, "api-envelope": cmd_api_envelope,
     "api-job-status": cmd_api_job_status, "api-jobs": cmd_api_jobs,
     "tg-targets": cmd_tg_targets,
