@@ -45,11 +45,11 @@ tunnel_cli() {  # туннель действие
   esac
 }
 
-_on_interrupt() {
+_on_interrupt() {  # INT|TERM
   _cleanup_tmp
   echo ""
   warn "Прервано"
-  exit 130
+  _die_by_signal "$1"
 }
 
 main() {
@@ -61,7 +61,8 @@ main() {
   (( EUID == 0 )) || { echo "awg2: нужен root — sudo awg2" >&2; exit 1; }
   log_init
   trap _cleanup_tmp EXIT
-  trap _on_interrupt INT TERM
+  trap '_on_interrupt INT' INT
+  trap '_on_interrupt TERM' TERM
   # Машинный интерфейс бота: весь вывод — внутри одного JSON-ответа
   [[ "${1:-}" == api ]] && { shift; api_main "$@"; exit; }
   update_channel_init
