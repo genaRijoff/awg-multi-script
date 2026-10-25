@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.43"
+VERSION="v1.2.44"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -481,6 +481,7 @@ CASCADE_TAG="awg-cascade"
 CASCADE_SCRIPT="/usr/local/bin/awg-cascade-apply.sh"
 CASCADE_LOG="/var/log/awg-cascade.log"
 CASCADE_UFW_BACKUP="$CASCADE_DIR/ufw-backup/ufw.default.original"
+UFW_DEFAULTS="/etc/default/ufw"   # политики UFW (DEFAULT_FORWARD_POLICY)
 
 XRAY_DIR="/etc/xray"
 XRAY_CONF="$XRAY_DIR/config.json"
@@ -794,11 +795,36 @@ ipt_del_grep() {
 }
 
 # ── UFW ───────────────────────────────────────────────────
-ufw_active() { command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -qiE '^Status:[[:space:]]*active'; }
+# LC_ALL=C: ufw переводит вывод («Состояние: активен») — на русской локали
+# Тулза считала бы его выключенным и не открывала бы ни один порт.
+ufw_active() { command -v ufw &>/dev/null && LC_ALL=C ufw status 2>/dev/null | grep -qiE '^Status:[[:space:]]*active'; }
 
 ufw_allow() {  # порт/протокол комментарий
   ufw_active || return 0
-  ufw allow "$1" comment "$2" >/dev/null 2>&1
+  LC_ALL=C ufw allow "$1" comment "$2" >/dev/null 2>&1
+}
+
+# Есть ли в UFW правило на порт ($1 — порт/протокол, как пишет ufw status)
+ufw_port_open() {
+  ufw_active || return 1
+  LC_ALL=C ufw status 2>/dev/null | grep -qE "^$1[[:space:]]+ALLOW"
+}
+
+# Открыть порт службы с сообщением; UFW выключен — молча ничего.
+ufw_open() {  # порт/протокол комментарий
+  ufw_active || return 0
+  ufw_allow "$1" "$2" && ok "UFW: открыт $1"
+}
+
+# Политика FORWARD в UFW: DROP оставит клиентов VPN без интернета, если
+# правил ACCEPT туннеля в цепочке не окажется (ufw с MANAGE_BUILTINS=yes,
+# iptables -F) — для серверов с VPN ставим ACCEPT, как делает сам wg-quick.
+ufw_forward_accept() {
+  ufw_active || return 0
+  grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null || return 0
+  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' "$UFW_DEFAULTS"
+  LC_ALL=C ufw reload &>/dev/null || true
+  info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
 }
 
 # Снять правила UFW с комментарием ровно $1. ufw_delete_matching ищет подстроку —
@@ -807,12 +833,12 @@ ufw_delete_comment() {
   command -v ufw &>/dev/null || return 0
   local n guard=0
   while (( guard++ < 64 )); do
-    n=$(ufw status numbered 2>/dev/null | awk -v c="$1" '{
+    n=$(LC_ALL=C ufw status numbered 2>/dev/null | awk -v c="$1" '{
           s = $0; sub(/[ \t]+$/, "", s); i = index(s, "# ")
           if (i && substr(s, i + 2) == c && match(s, /^\[ *[0-9]+ *\]/)) {
             n = substr(s, 2, RLENGTH - 2); gsub(/ /, "", n); print n; exit } }')
     [[ -n "$n" ]] || break
-    ufw --force delete "$n" >/dev/null 2>&1 || break
+    LC_ALL=C ufw --force delete "$n" >/dev/null 2>&1 || break
   done
 }
 
@@ -821,9 +847,9 @@ ufw_delete_matching() {
   command -v ufw &>/dev/null || return 0
   local n guard=0
   while (( guard++ < 64 )); do
-    n=$(ufw status numbered 2>/dev/null | grep -F -- "$1" | head -1 | grep -oE '^\[ *[0-9]+ *\]' | tr -d '[] ')
+    n=$(LC_ALL=C ufw status numbered 2>/dev/null | grep -F -- "$1" | head -1 | grep -oE '^\[ *[0-9]+ *\]' | tr -d '[] ')
     [[ -n "$n" ]] || break
-    ufw --force delete "$n" >/dev/null 2>&1 || break
+    LC_ALL=C ufw --force delete "$n" >/dev/null 2>&1 || break
   done
 }
 
@@ -2714,14 +2740,8 @@ server_write() {
 server_start_new() {
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   awg_up_diag || return 1
-  if ufw_active; then
-    ufw_allow "$S_PORT/udp" AmneziaWG && ok "UFW: открыт $S_PORT/udp"
-    if grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw 2>/dev/null; then
-      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-      ufw reload &>/dev/null || true
-      info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
-    fi
-  fi
+  ufw_open "$S_PORT/udp" AmneziaWG
+  ufw_forward_accept
   setup_autostart
   expire_install
   web_vpn_changed
@@ -3045,6 +3065,35 @@ REPAIR_ISSUES=0 REPAIR_FIXED=0
 _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
+# Файрвол: при включённом UFW порты awg0 и обфускатора открыты (UFW могли
+# включить уже после установки, или на русской локали Тулза его не видела),
+# политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
+# ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
+_repair_firewall() {
+  local p
+  if ufw_active; then
+    if server_exists; then
+      p=$(server_port)
+      if ufw_port_open "$p/udp"; then ok "UFW: порт AWG $p/udp открыт"
+      else _issue "UFW включён, а порт AWG $p/udp закрыт"; ufw_allow "$p/udp" AmneziaWG && _fixed "UFW: открыт $p/udp"; fi
+    fi
+    if wgobf_installed; then
+      p=$(wgobf_get PORT)
+      if ufw_port_open "$p/udp"; then ok "UFW: порт обфускатора $p/udp открыт"
+      else _issue "UFW включён, а порт обфускатора $p/udp закрыт"; ufw_allow "$p/udp" "$WGOBF_TAG" && _fixed "UFW: открыт $p/udp"; fi
+    fi
+    if { server_exists || wgobf_installed; } && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
+      _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
+      ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
+    fi
+  fi
+  if wgobf_installed && ip link show "$WGOBF_IF" &>/dev/null \
+     && ! iptables -C FORWARD -i "$WGOBF_IF" -j ACCEPT -m comment --comment "$WGOBF_TAG" 2>/dev/null; then
+    _issue "Нет правил файрвола $WGOBF_IF (NAT, FORWARD) — обфускатор без выхода в интернет"
+    wgobf_fw_run up && _fixed "Правила $WGOBF_IF восстановлены"
+  fi
+}
+
 do_repair() {
   local bad conf_n live_n dev net perm rc old
   REPAIR_ISSUES=0 REPAIR_FIXED=0
@@ -3069,6 +3118,7 @@ do_repair() {
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
   else _issue "Нет автозагрузки модуля"; mod_autoload && _fixed "Автозагрузка настроена"; fi
 
+  _repair_firewall
   server_exists || { err "Сервер не создан"; return 1; }
   if [[ -z "$(conf_marker AWG_OBF_LEVEL)" ]]; then
     # Бот по этой метке решает, сколько пакетов I1-I5 выдать клиенту
@@ -6142,7 +6192,7 @@ cascade_uninstall() {
   # Прежние версии меняли политику FORWARD в UFW. Если AWG-сервера нет,
   # вернуть её было бы некому — возвращаем здесь.
   if [[ -f "$CASCADE_UFW_BACKUP" ]] && ! server_exists; then
-    cp -a "$CASCADE_UFW_BACKUP" /etc/default/ufw
+    cp -a "$CASCADE_UFW_BACKUP" "$UFW_DEFAULTS"
     ufw_active && ufw reload &>/dev/null
   fi
   rm -rf "$CASCADE_DIR"
@@ -8368,7 +8418,8 @@ EOF
     _wgobf_teardown keep
     return 1
   fi
-  ufw_allow "$port/udp" "$WGOBF_TAG"
+  ufw_open "$port/udp" "$WGOBF_TAG"
+  ufw_forward_accept
   web_vpn_changed
   ok "WG + обфускатор запущен: вход $ep:$port/udp, подсеть $net"
   log_info "wgobf: установлен (порт $port, wg $wg_port, сеть $net, маскировка $mask)"
@@ -8448,7 +8499,8 @@ wgobf_restore() {
   port=$(wgobf_get PORT)
   udp_listening "$port" && warn "UDP $port сейчас занят — обфускатор может не подняться"
   wgobf_restart || { err "WG + обфускатор восстановлен, но не запустился"; return 1; }
-  ufw_allow "$port/udp" "$WGOBF_TAG"
+  ufw_open "$port/udp" "$WGOBF_TAG"
+  ufw_forward_accept
   ok "WG + обфускатор восстановлен"
 }
 
@@ -8464,6 +8516,10 @@ wgobf_status() {
   echo -e "  Без обфускатора: $([[ "$(wgobf_get ALLOW_CLEAN)" == 1 ]] && echo -e "${Y}да${N}" || echo нет)"
   echo -e "  Подсеть        : $(wgobf_get NET), MTU $(wgobf_get MTU), WireGuard на $(wgobf_get WG_PORT) ${D}(снаружи закрыт)${N}"
   echo -e "  Клиентов       : $(wgobf_clients | grep -c . || true)"
+  if ufw_active; then
+    if ufw_port_open "$(wgobf_get PORT)/udp"; then echo -e "  UFW            : ${G}● порт открыт${N}"
+    else echo -e "  UFW            : ${R}▲ порт $(wgobf_get PORT)/udp закрыт${N} ${D}— Сервер → Проверить и починить${N}"; fi
+  fi
 }
 
 wgobf_settings() {
@@ -12503,6 +12559,8 @@ _api_wgobf() {
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
+          # off — UFW выключен; closed — включён, а порт обфускатора не открыт
+          _kv ufw "$(if ! ufw_active; then echo off; elif ufw_port_open "$(wgobf_get PORT)/udp"; then echo open; else echo closed; fi)"
           # Выход для всех и новых клиентов и туннели на выбор: none | off | up,
           # свои выходы Xray (если Xray их умеет) и exit-ноды
           _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
@@ -17815,5 +17873,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=c546e2082e250ae3
+_BUILD_SUM=cd9f33f747a11717
 main "$@"
