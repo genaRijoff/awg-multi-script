@@ -2883,6 +2883,79 @@ chk("списка ещё нет — имя проверит перезапуск
 rc, out, _ = bash('popular() { for i in "${DNS_POPULAR[@]}"; do echo "${i%%|*}"; done; }; popular')
 chk("подсказка «Популярные» — 10 имён", len(out.split()) == 10 and "adguard-dns-doh" in out.split(), out)
 
+print("\n── UFW: русская локаль, порты awg0 и обфускатора, политика FORWARD, починка ──")
+UFWR = os.path.join(TMP, "ufw-active-rules")
+UFWD = os.path.join(ROOT, "etc/default/ufw")
+os.makedirs(os.path.dirname(UFWD), exist_ok=True)
+open(UFWR, "w").close()
+# ufw как на русской локали: статус переведён; правила — в файле, allow/delete его правят
+UFWS = r"""ufw() { echo "ufw $*" >> "$CALLS"
+  case "$1" in
+    status)
+      if [[ "${LC_ALL:-}" == C ]]; then echo "Status: active"; else echo "Состояние: активен"; fi
+      if [[ "${2:-}" == numbered ]]; then awk '{printf "[%2d] %s\n", NR, $0}' "@R@"; else cat "@R@"; fi ;;
+    allow) grep -qF -- "$2 " "@R@" || printf '%-26s ALLOW IN    Anywhere                   # %s\n' "$2" "$4" >> "@R@" ;;
+    --force) sed -i "${3}d" "@R@" ;;
+  esac
+  return 0
+}
+""".replace("@R@", UFWR)
+WOV = (f'WGOBF_DIR="{TMP}/wgobf-ufw"; WGOBF_STATE="$WGOBF_DIR/state"; WGOBF_OBF_CONF="$WGOBF_DIR/obfuscator.conf"; '
+       f'WGOBF_WG_CONF="$WGOBF_DIR/wgobf0.conf"; WGOBF_CLIENTS="$WGOBF_DIR/clients"; WGOBF_LIB="$WGOBF_DIR/lib"; '
+       'WGOBF_BIN="$WGOBF_LIB/wg-obfuscator"; WGOBF_FW="$WGOBF_LIB/wgobf-fw.sh"; '
+       '_wgobf_prepare() { :; }; wgobf_restart() { :; }; web_vpn_changed() { :; }; ')
+
+
+def ufw_defaults(policy):
+    with open(UFWD, "w") as f:
+        f.write(f'IPV6=yes\nDEFAULT_INPUT_POLICY="DROP"\nDEFAULT_FORWARD_POLICY="{policy}"\nMANAGE_BUILTINS=no\n')
+
+
+def ufw_rules():
+    with open(UFWR) as f:
+        return f.read()
+
+
+rc, out, _ = bash(UFWS + 'LC_ALL= ufw status | head -1; ufw_active && echo ACTIVE')
+chk("ufw на русской локали («Состояние: активен») — Тулза видит, что он включён",
+    out.startswith("Состояние: активен") and "ACTIVE" in out, out)
+ufw_defaults("DROP")
+reset_calls()
+rc, out, err = bash(UFWS + WOV + "wgobf_install_opts endpoint=203.0.113.10 port=40555 masking=STUN client= 2>&1")
+chk("установка обфускатора при включённом UFW — порт открыт с меткой, FORWARD=ACCEPT, об этом сказано",
+    rc == 0 and "40555/udp" in ufw_rules() and "# awg-wgobf" in ufw_rules() and "UFW: открыт 40555/udp" in out
+    and 'DEFAULT_FORWARD_POLICY="ACCEPT"' in open(UFWD).read() and "ufw reload" in calls(), [out[-500:], err[-300:], ufw_rules()])
+rc, out, _ = bash(UFWS + WOV + f'API_DATA="{TMP}/api-wgobf.json"; _api_wgobf status >/dev/null 2>&1; cat "$API_DATA"')
+try:
+    chk("api wgobf status: ufw=open", json.loads(out).get("ufw") == "open", out[-300:])
+except ValueError:
+    chk("api wgobf status: ufw=open", False, out[-300:])
+# UFW включили после установки (правил на порты нет, FORWARD снова DROP), правила wgobf0 снесены
+open(UFWR, "w").close()
+ufw_defaults("DROP")
+links_saved = open(LINKS).read()
+with open(LINKS, "a") as f:
+    f.write("wgobf0\n")
+reset_calls()
+rc, out, _ = bash(UFWS + WOV + "AUTO_MODE=1; do_repair 2>&1")
+aport = bash("server_port")[1].strip()
+chk("«Проверить и починить»: открывает порты AWG и обфускатора, FORWARD=ACCEPT, возвращает правила wgobf0",
+    f"UFW: открыт {aport}/udp" in out and "UFW: открыт 40555/udp" in out and "DEFAULT_FORWARD_POLICY=ACCEPT" in out
+    and "Правила wgobf0 восстановлены" in out and "-I FORWARD 1 -i wgobf0 -j ACCEPT" in calls()
+    and f"{aport}/udp" in ufw_rules() and "40555/udp" in ufw_rules(), out[-900:])
+rc, out, _ = bash(UFWS + WOV + 'iptables() { for a in "$@"; do [[ "$a" == -C ]] && return 0; done; command iptables "$@"; }; '
+                  "AUTO_MODE=1; do_repair 2>&1")
+chk("всё открыто и правила на месте — замечаний по файрволу нет",
+    "порт обфускатора 40555/udp открыт" in out and f"порт AWG {aport}/udp открыт" in out
+    and "закрыт" not in out and "Нет правил файрвола" not in out and "FORWARD — DROP" not in out, out[-900:])
+rc, out, _ = bash(UFWS + WOV + "wgobf_status 2>&1")
+chk("статус обфускатора — строка UFW: порт открыт", "UFW" in out and "порт открыт" in out, out)
+rc, out, _ = bash(UFWS + WOV + "_wgobf_teardown drop 2>&1; echo rc=$?")
+chk("удаление обфускатора снимает его правило UFW, чужие остаются",
+    "rc=0" in out and "40555/udp" not in ufw_rules() and f"{aport}/udp" in ufw_rules(), [out[-300:], ufw_rules()])
+open(LINKS, "w").write(links_saved)
+shutil.rmtree(os.path.join(TMP, "wgobf-ufw"), ignore_errors=True)
+
 print("\n── Ctrl+C: выход от сигнала — в «awg2.sh; awg-bot-install.sh» вторая команда не запускается ──")
 rc, out, _ = bash("trap '_on_interrupt INT' INT; kill -INT $$; sleep 1; echo AFTER")
 chk("Ctrl+C в меню — «Прервано» и смерть от SIGINT, а не exit 130", rc == -2 and "Прервано" in out and "AFTER" not in out, (rc, out))

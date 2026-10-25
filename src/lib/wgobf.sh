@@ -810,7 +810,8 @@ EOF
     _wgobf_teardown keep
     return 1
   fi
-  ufw_allow "$port/udp" "$WGOBF_TAG"
+  ufw_open "$port/udp" "$WGOBF_TAG"
+  ufw_forward_accept
   web_vpn_changed
   ok "WG + обфускатор запущен: вход $ep:$port/udp, подсеть $net"
   log_info "wgobf: установлен (порт $port, wg $wg_port, сеть $net, маскировка $mask)"
@@ -890,7 +891,8 @@ wgobf_restore() {
   port=$(wgobf_get PORT)
   udp_listening "$port" && warn "UDP $port сейчас занят — обфускатор может не подняться"
   wgobf_restart || { err "WG + обфускатор восстановлен, но не запустился"; return 1; }
-  ufw_allow "$port/udp" "$WGOBF_TAG"
+  ufw_open "$port/udp" "$WGOBF_TAG"
+  ufw_forward_accept
   ok "WG + обфускатор восстановлен"
 }
 
@@ -906,6 +908,10 @@ wgobf_status() {
   echo -e "  Без обфускатора: $([[ "$(wgobf_get ALLOW_CLEAN)" == 1 ]] && echo -e "${Y}да${N}" || echo нет)"
   echo -e "  Подсеть        : $(wgobf_get NET), MTU $(wgobf_get MTU), WireGuard на $(wgobf_get WG_PORT) ${D}(снаружи закрыт)${N}"
   echo -e "  Клиентов       : $(wgobf_clients | grep -c . || true)"
+  if ufw_active; then
+    if ufw_port_open "$(wgobf_get PORT)/udp"; then echo -e "  UFW            : ${G}● порт открыт${N}"
+    else echo -e "  UFW            : ${R}▲ порт $(wgobf_get PORT)/udp закрыт${N} ${D}— Сервер → Проверить и починить${N}"; fi
+  fi
 }
 
 wgobf_settings() {

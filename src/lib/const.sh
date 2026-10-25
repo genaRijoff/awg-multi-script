@@ -110,6 +110,7 @@ CASCADE_TAG="awg-cascade"
 CASCADE_SCRIPT="/usr/local/bin/awg-cascade-apply.sh"
 CASCADE_LOG="/var/log/awg-cascade.log"
 CASCADE_UFW_BACKUP="$CASCADE_DIR/ufw-backup/ufw.default.original"
+UFW_DEFAULTS="/etc/default/ufw"   # политики UFW (DEFAULT_FORWARD_POLICY)
 
 XRAY_DIR="/etc/xray"
 XRAY_CONF="$XRAY_DIR/config.json"
