@@ -216,10 +216,13 @@ ufw_allow() {  # порт/протокол комментарий
   LC_ALL=C ufw allow "$1" comment "$2" >/dev/null 2>&1
 }
 
-# Есть ли в UFW правило на порт ($1 — порт/протокол, как пишет ufw status)
-ufw_port_open() {
-  ufw_active || return 1
-  LC_ALL=C ufw status 2>/dev/null | grep -qE "^$1[[:space:]]+ALLOW"
+# Порт в UFW одним вызовом ufw (он на Python — каждый вызов ~0,1-0,3 с):
+# off — UFW нет или выключен, open — разрешающее правило на порт есть, closed — нет
+ufw_port_state() {  # порт/протокол, как пишет ufw status: 51820/udp
+  local out
+  command -v ufw &>/dev/null && out=$(LC_ALL=C ufw status 2>/dev/null) \
+    && grep -qiE '^Status:[[:space:]]*active' <<< "$out" || { echo off; return 0; }
+  if grep -qE "^$1[[:space:]]+ALLOW" <<< "$out"; then echo open; else echo closed; fi
 }
 
 # Открыть порт службы с сообщением; UFW выключен — молча ничего.
@@ -234,7 +237,7 @@ ufw_open() {  # порт/протокол комментарий
 ufw_forward_accept() {
   ufw_active || return 0
   grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null || return 0
-  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' "$UFW_DEFAULTS"
+  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' "$UFW_DEFAULTS" || return 1
   LC_ALL=C ufw reload &>/dev/null || true
   info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
 }

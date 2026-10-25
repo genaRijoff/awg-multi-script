@@ -685,17 +685,18 @@ _api_dns() {
 }
 
 _api_wgobf() {
-  local a="${1:-}" name dir f dump now pub ip hs rx tx
+  local a="${1:-}" name dir f dump now pub ip hs rx tx u=""
   shift || true
   case "$a" in
     status)
+      wgobf_installed && u=$(ufw_port_state "$(wgobf_get PORT)/udp")
       { _kv installed:b "$(_b wgobf_installed)"; _kv running:b "$(_b wgobf_running)"
         _kv version "$WGOBF_VERSION"
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
           # off — UFW выключен; closed — включён, а порт обфускатора не открыт
-          _kv ufw "$(if ! ufw_active; then echo off; elif ufw_port_open "$(wgobf_get PORT)/udp"; then echo open; else echo closed; fi)"
+          _kv ufw "$u"
           # Выход для всех и новых клиентов и туннели на выбор: none | off | up,
           # свои выходы Xray (если Xray их умеет) и exit-ноды
           _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
@@ -705,7 +706,7 @@ _api_wgobf() {
           _kv exits "$(if [[ -z "$(exits_nodes)" ]]; then echo none; elif exits_is_up; then echo up; else echo off; fi)"
           _kv exit_nodes:j "$(exits_nodes | py json-list)"
         fi; } | api_obj
-      wgobf_installed && wgobf_status
+      wgobf_installed && wgobf_status "$u"
       return 0 ;;
     install) wgobf_install_opts "$@" ;;
     clients)
