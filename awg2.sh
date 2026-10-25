@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.42"
+VERSION="v1.2.43"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -197,11 +197,19 @@ _kill_tree() {
   kill -TERM "$1" 2>/dev/null
 }
 
+# Выходим «от сигнала», а не exit 130: иначе в `bash awg2.sh; bash awg-bot-install.sh`
+# оболочка считает Ctrl+C обработанным и запускает следующую команду.
+_die_by_signal() {  # INT|TERM
+  trap - "$1"
+  kill -"$1" $$
+  exit 130
+}
+
 _run_step_abort() {
   [[ -n "$_RUN_STEP_PID" ]] && _kill_tree "$_RUN_STEP_PID"
   printf '\r\033[K\n'
   warn "Прервано пользователем"
-  exit 130
+  _die_by_signal INT
 }
 
 run_step() {
@@ -460,6 +468,7 @@ DNS_PROXY_ADDR="127.0.2.1"
 DNS_PROXY_PORT=53
 DNS_PROXY_CONF="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
 DNS_PROXY_STATE="/etc/dnscrypt-proxy/awg.state"
+DNS_RESOLVERS_MD="/var/cache/dnscrypt-proxy/public-resolvers.md"   # кэш списка резолверов dnscrypt-proxy
 DNS_PROXY_BACKUP_CONF="/etc/dnscrypt-proxy/dnscrypt-proxy.toml.awg-backup"
 DNS_PERSIST_SCRIPT="/usr/local/bin/awg-dns-persist.sh"
 DNS_HEALTH_SCRIPT="/usr/local/bin/awg-dns-healthcheck.sh"
@@ -2508,10 +2517,10 @@ do_install() {
     if [[ "$why" == *"перезагрузка модуля"* ]]; then
       mod_reload || true
     elif (( ! AUTO_MODE )) && ask_yes "  Перезагрузить сервер сейчас? [Y/n]: " y; then
-      ok "Перезагружаюсь. После — sudo awg2 → Сервер → Создать сервер"
+      ok "Перезагружаюсь. После — sudo awg2 → ${INSTALL_NEXT:-Сервер → Создать сервер}"
       sleep 2; reboot
     fi
-  else
+  elif [[ -z "${INSTALL_NEXT:-}" ]]; then   # из переноса Amnezia — сводка идёт сразу следом
     info "Следующий шаг: Сервер → Создать сервер"
   fi
 }
@@ -2964,6 +2973,12 @@ server_create_opts() {
 
 do_create_server() {
   if ! server_create_ready; then return 1; fi
+  # Сервер Amnezia на этом VPS: перенос сохраняет клиентам их конфиги, новый сервер — нет
+  if amnezia_container &>/dev/null && ! amnezia_migrated; then
+    warn "На сервере есть Amnezia ($(amnezia_container)) — перенеси его: Сервер → Перенос из Amnezia."
+    info "Клиенты останутся со своими конфигами. Новый сервер — новые конфиги всем."
+    ask_yes "  Всё равно создать новый сервер? [y/N]: " n || return 0
+  fi
   if [[ -n "$REBOOT_WHY" ]]; then
     warn "$REBOOT_WHY"
     ask_yes "  Продолжить без перезагрузки? [y/N]: " n || return 0
@@ -3517,9 +3532,45 @@ client_rename() {  # старое новое
   ok "Переименован: $old → $new"
 }
 
+# Нет файла конфига — почему: перенесённый из Amnezia хранит его только у себя.
+client_no_conf() {  # имя
+  if server_exists && [[ -n "$(py meta-get "$SERVER_CONF" "$1" amnezia 2>/dev/null)" ]]; then
+    err "Конфиг клиента $1 есть только у него самого: клиент перенесён из Amnezia. Нужен новый — «Перевыпустить конфиг»"
+  else
+    err "Нет конфига клиента $1"
+  fi
+  return 1
+}
+
+# Перевыпуск: новый ключ клиенту, адрес, сроки, лимиты, скорость и маршруты —
+# прежние. Старый конфиг перестаёт работать. Для перенесённых из Amnezia —
+# способ получить конфиг и QR в Тулзе.
+client_reissue() {  # имя
+  local name="$1" old priv pub psk addr
+  old=$(client_pub "$name")
+  [[ -n "$old" ]] || { err "Клиента $name нет"; return 1; }
+  priv=$(awg genkey) && pub=$(awg pubkey <<< "$priv") && psk=$(awg genpsk) || return 1
+  addr=$(py peer-rekey "$SERVER_CONF" "$old" "$pub" "$psk") || return 1
+  addr="${addr%%,*}"
+  if iface_up; then
+    awg set "$AWG_IF" peer "$old" remove 2>/dev/null
+    awg set "$AWG_IF" peer "$pub" preshared-key <(printf '%s\n' "$psk") \
+      allowed-ips "$(clients_tsv | awk -F'\t' -v k="$pub" '$2 == k {print $3; exit}')" \
+      || warn "Ядро не приняло новый ключ — перезапусти awg0"
+  fi
+  [[ -f "$TRAFFIC_DB" ]] && { py traffic-rekey "$TRAFFIC_DB" "$old" "$pub" || warn "Счётчики трафика начнутся заново"; }
+  rm -f "$EXPIRE_STATE_DIR/warn1h_${old//[^A-Za-z0-9]/_}"
+  mimicry_from_spec server || return 1
+  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "1.1.1.1, 1.0.0.1" "$(conf_iface_get MTU)" || return 1
+  peer_meta_set "$name" mimicry "$(mimicry_tag)" || true
+  log_info "клиент перевыпущен: $name"
+  ok "Новый конфиг $name: $(client_file "$name")"
+  warn "Старый конфиг $name больше не подключится"
+}
+
 # Мимикрия выданного клиента: меняются только его I1-I5 — сервер их не видит.
 client_set_mimicry() {  # имя строка
-  [[ -f "$(client_file "$1")" ]] || { err "Нет конфига клиента $1"; return 1; }
+  [[ -f "$(client_file "$1")" ]] || { client_no_conf "$1"; return 1; }
   mimicry_from_spec "$2" && _client_write_mimicry "$1"
 }
 
@@ -3854,6 +3905,14 @@ _pick_client_file() {  # → путь в CHOSEN
   CHOSEN="${files[$((c - 1))]}"
 }
 
+do_reissue_client() {
+  local name
+  _pick_client || return 0
+  name="${CHOSEN%%$'\t'*}"
+  ask_yes "  Новый ключ для $name: старый конфиг перестанет работать. Продолжить? [y/N]: " n || return 0
+  client_reissue "$name" && share_config "$(client_file "$name")" qr
+}
+
 do_show_client()    { _pick_client_file && share_config "$CHOSEN"; }
 do_show_client_qr() { _pick_client_file && share_config "$CHOSEN" qr; }
 
@@ -3935,14 +3994,16 @@ do_clients_menu() {
     echo -e "  ${C}8)${N} Экспорт всех (zip)"
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"
+    echo -e "  ${C}11)${N} Перевыпустить конфиг ${D}— новый ключ; перенесённым из Amnezia — конфиг и QR${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
+    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
     case "$c" in
       1) do_add_client || true ;;     6) do_bulk_add || true ;;
       2) do_list_clients || true ;;   7) do_expire_menu || true ;;
       3) do_show_client || true ;;    8) do_export_clients || true ;;
       4) do_show_client_qr || true ;; 9) do_change_mimicry || true ;;
       5) do_rename_client || true ;;  10) do_delete_client || true ;;
+      11) do_reissue_client || true ;;
       0) return 0 ;;
     esac
     pause
@@ -5482,6 +5543,20 @@ DNS_PRESETS=(
   "cisco-doh|Только Cisco OpenDNS"
   "google|Только Google"
 )
+# Подсказка к «Вручную»: только DoH по IPv4 — других этот dnscrypt-proxy не берёт
+# (dnscrypt_servers = false, ipv6_servers = false)
+DNS_POPULAR=(
+  "cloudflare|Cloudflare 1.1.1.1"
+  "google|Google 8.8.8.8"
+  "quad9-doh-ip4-port443-nofilter-pri|Quad9 без фильтра"
+  "adguard-dns-doh|AdGuard — режет рекламу и трекеры"
+  "adguard-dns-unfiltered-doh|AdGuard без фильтра"
+  "mullvad-doh|Mullvad"
+  "controld-uncensored|Control D без фильтра"
+  "dns.sb|DNS.SB"
+  "yandex|Яндекс 77.88.8.1"
+  "cloudflare-family|Cloudflare Family — без вредоносных и 18+"
+)
 
 dns_installed() { command -v dnscrypt-proxy &>/dev/null && [[ -f "$DNS_PROXY_STATE" ]]; }
 dns_running()   { unit_active "$DNS_UNIT" || unit_active "$DNS_SOCKET"; }
@@ -5668,6 +5743,8 @@ dns_install() {  # [force] — включить поверх стороннег�
   _dns_write_conf
   systemctl daemon-reload
   systemctl enable "$DNS_SOCKET" "$DNS_UNIT" &>/dev/null || true
+  # после череды падений systemd не даёт запустить службу («start request repeated too quickly»)
+  systemctl reset-failed "$DNS_UNIT" &>/dev/null || true
   systemctl restart "$DNS_SOCKET" "$DNS_UNIT" &>/dev/null || true
   info "Жду, пока загрузятся резолверы..."
   if ! _dns_wait_ready; then
@@ -5693,6 +5770,8 @@ dns_install() {  # [force] — включить поверх стороннег�
 
 dns_restart() {
   dns_installed || { err "Шифрованный DNS не настроен"; return 1; }
+  # после череды падений systemd не даёт запустить службу («start request repeated too quickly»)
+  systemctl reset-failed "$DNS_UNIT" &>/dev/null || true
   systemctl restart "$DNS_SOCKET" "$DNS_UNIT" &>/dev/null || true
   iface_up && dns_rules_up
   if _dns_wait_ready; then ok "dnscrypt-proxy перезапущен и отвечает"
@@ -5724,7 +5803,9 @@ dns_change_upstream() {
   if (( c <= ${#DNS_PRESETS[@]} )); then
     names="${DNS_PRESETS[$((c - 1))]%%|*}"
   else
-    echo -e "  ${D}Список: https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/public-resolvers.md${N}"
+    echo -e "  ${D}Популярные (DoH):${N}"
+    for i in "${DNS_POPULAR[@]}"; do printf "    ${C}%-36s${N} ${D}%s${N}\n" "${i%%|*}" "${i#*|}"; done
+    echo -e "  ${D}Весь список: https://github.com/DNSCrypt/dnscrypt-resolvers/blob/master/v3/public-resolvers.md${N}"
     read_line manual "${C}  Резолверы через запятую: ${N}"
     [[ -n "$manual" ]] || return 0
     names="$manual"
@@ -5732,22 +5813,39 @@ dns_change_upstream() {
   dns_set_upstream "$names"
 }
 
-# Резолверы dnscrypt-proxy по именам из public-resolvers.md (через пробел или запятую).
+# Резолверы dnscrypt-proxy по именам из public-resolvers.md (через пробел или
+# запятую). Не поднялся с новыми — возвращаются прежние.
 dns_set_upstream() {
-  _dns_upstream_write "$1" || return 1
-  ok "Резолверы: ${1//,/ }"
-  dns_restart || info "Проверь имена резолверов: journalctl -u $DNS_UNIT -n 20"
+  local names="${1//,/ }" old
+  _dns_upstream_check "$names" || return 1
+  old=$(sed -n 's/^server_names[[:space:]]*=[[:space:]]*//p' "$DNS_PROXY_CONF" 2>/dev/null | head -1)
+  _dns_upstream_write "$names" || return 1
+  if dns_restart; then ok "Резолверы: $names"; return 0; fi
+  if [[ "$old" =~ ^\[[A-Za-z0-9._\ \',-]*\]$ ]]; then
+    sed -i "s|^server_names[[:space:]]*=.*|server_names = $old|" "$DNS_PROXY_CONF"
+    warn "С новыми резолверами dnscrypt-proxy не поднялся — вернул прежние: $(tr -d "[]'" <<< "$old")"
+    dns_restart || true
+  fi
+  return 1
+}
+
+# Имена — в кэше списка, DoH, IPv4: иначе dnscrypt-proxy их молча отбросит и,
+# не найдя ни одного, упадёт. Списка ещё нет — проверит сам перезапуск.
+_dns_upstream_check() {
+  local out
+  [[ -s "$DNS_RESOLVERS_MD" && "$1" =~ ^[A-Za-z0-9._\ -]+$ ]] || return 0   # формат проверит запись
+  out=$(py dns-check "$DNS_RESOLVERS_MD" $1) && return 0
+  while IFS= read -r out; do err "$out"; done <<< "$out"
+  return 1
 }
 
 _dns_upstream_write() {  # имена — в конфиг, без перезапуска
-  local names="${1//,/ }" nofilter=true toml="" n
+  local names="${1//,/ }" toml="" n
   [[ -f "$DNS_PROXY_CONF" ]] || { err "Шифрованный DNS не настроен"; return 1; }
-  [[ "$names" =~ ^[A-Za-z0-9_\ -]+$ && -n "${names// /}" ]] || { err "Допустимы латиница, цифры, дефис и запятая"; return 1; }
-  # Фильтрующий резолвер при require_nofilter=true dnscrypt-proxy молча
-  # отбрасывает — и остаётся без серверов вообще.
-  [[ " $names " == *safe* || " $names " == *filter* || " $names " == *family* || " $names " == *adguard* ]] && nofilter=false
+  [[ "$names" =~ ^[A-Za-z0-9._\ -]+$ && -n "${names// /}" ]] || { err "Допустимы латиница, цифры, точка, дефис и запятая"; return 1; }
+  # require_* при явном server_names dnscrypt-proxy не смотрит — только протокол и IPv4/IPv6
   for n in $names; do toml+="${toml:+, }'$n'"; done
-  sed -i "s|^server_names[[:space:]]*=.*|server_names = [$toml]|; s|^require_nofilter[[:space:]]*=.*|require_nofilter = $nofilter|" "$DNS_PROXY_CONF"
+  sed -i "s|^server_names[[:space:]]*=.*|server_names = [$toml]|" "$DNS_PROXY_CONF"
 }
 
 dns_remove() {
@@ -8997,6 +9095,248 @@ backup_restore() {
   log_info "восстановление из $label"
 }
 
+# ═════ amnezia ═════
+# Перенос сервера из Amnezia (Docker): приложение AmneziaVPN ставит AWG в
+# контейнер amnezia-awg2 (AWG 2.0/3.1) или amnezia-awg (старый). Из него
+# берутся ключ сервера, порт, параметры, подсеть и пиры с PSK — awg0 Тулзы
+# поднимается ровно таким же, и конфиги клиентов работают без перевыдачи.
+#
+# Контейнер не удаляется, а останавливается: «Вернуть Amnezia» запускает его
+# снова. Всё, что пришло из контейнера, — недоверенные данные: разбор и
+# проверка — в helper (amnezia-scan / amnezia-conf), в awg0.conf попадают
+# только известные ключи с проверенными значениями.
+#
+# Приватных ключей клиентов на сервере нет — они только у самих клиентов.
+# Перенесённые помечены «# amnezia=исходное имя»: конфиг и QR для них Тулза
+# не покажет, а перевыпустит (новый ключ) по просьбе.
+
+AMNEZIA_SRC="/opt/amnezia/awg"
+AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
+AMNEZIA_MAX=1048576               # больше мегабайта в конфиге Amnezia не бывает
+
+# Имя контейнера Amnezia AWG: новый (amnezia-awg2) первым. Только эти имена —
+# в docker уходит проверенная строка.
+amnezia_container() {
+  local n
+  command -v docker &>/dev/null || return 1
+  n=$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -xE 'amnezia-awg2?' | sort -r | head -1)
+  [[ -n "$n" ]] && echo "$n"
+}
+
+amnezia_running() { [[ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" == true ]]; }
+
+amnezia_migrated() { [[ -f "$AMNEZIA_STATE_DIR/container" ]]; }
+
+# Файл из контейнера (и из остановленного): docker cp отдаёт tar, из него —
+# только содержимое в stdout, на диск tar ничего не распаковывает.
+_amnezia_cat() {  # контейнер файл
+  docker cp "$1:$AMNEZIA_SRC/$2" - 2>/dev/null | tar -xOf - 2>/dev/null | head -c "$AMNEZIA_MAX"
+}
+
+# Конфиг, таблица клиентов и внешний порт контейнера → каталог (700, файлы 600).
+amnezia_fetch() {  # контейнер каталог
+  local c="$1" d="$2" f got=""
+  [[ "$c" =~ ^amnezia-awg2?$ ]] || return 1
+  ( umask 077; mkdir -p "$d" ) || return 1
+  chmod 700 "$d"
+  for f in awg0.conf wg0.conf; do
+    if ( umask 077; _amnezia_cat "$c" "$f" > "$d/$f" ) && [[ -s "$d/$f" ]]; then got=1; break; fi
+    rm -f "$d/$f"
+  done
+  [[ -n "$got" ]] || { err "В контейнере $c нет конфига сервера ($AMNEZIA_SRC/awg0.conf)"; return 1; }
+  ( umask 077; _amnezia_cat "$c" clientsTable > "$d/clientsTable" ) || true
+  # Наружу порт может быть проброшен другим номером — клиенты знают внешний
+  ( umask 077
+    docker inspect -f '{{range $p, $b := .HostConfig.PortBindings}}{{$p}} {{range $b}}{{.HostPort}} {{end}}{{"\n"}}{{end}}' "$c" 2>/dev/null \
+      | awk '$1 ~ /\/udp$/ && $2 ~ /^[0-9]+$/ {print $2; exit}' > "$d/host_port" )
+  return 0
+}
+
+# Версия протокола по ключам конфига — для проверки модуля до переноса.
+_amnezia_proto() {  # каталог
+  local f
+  for f in "$1/awg0.conf" "$1/wg0.conf"; do
+    [[ -f "$f" ]] || continue
+    if grep -qE '^[[:space:]]*(RandomTrailers|DisableCookies)[[:space:]]*=' "$f"; then echo 3.1
+    elif grep -qE '^[[:space:]]*HeaderProtectionKey[[:space:]]*=' "$f"; then echo 3.0
+    else echo 2.0; fi
+    return 0
+  done
+  echo 2.0
+}
+
+# Что мешает переносу сейчас (по строке): server — свой сервер Тулзы уже
+# есть; components — нет awg/awg-quick; proto — модуль не умеет версию.
+amnezia_blockers() {  # [версия]
+  server_exists && echo server
+  { command -v awg && command -v awg-quick; } &>/dev/null || { echo components; return 0; }
+  local rc=0
+  if [[ "${1:-2.0}" == 3* ]]; then
+    proto_supported "$1" || rc=$?
+    (( rc == 1 )) && echo proto
+  fi
+  return 0
+}
+
+_amnezia_state_clear() {
+  [[ "$AMNEZIA_STATE_DIR" == */amnezia && -d "$AMNEZIA_STATE_DIR" ]] && rm -rf "$AMNEZIA_STATE_DIR"
+  return 0
+}
+
+# Контейнер — как был: автозапуск и запуск.
+_amnezia_back() {  # контейнер политика
+  docker update --restart="$2" "$1" >/dev/null 2>&1 || warn "Автозапуск контейнера $1 вернуть не удалось"
+  docker start "$1" >/dev/null 2>&1 || { err "Контейнер $1 не запустился — docker start $1"; return 1; }
+}
+
+# awg0 поднят и слушает нужный порт.
+_amnezia_up_ok() { iface_up && [[ "$(awg show "$AWG_IF" listen-port 2>/dev/null)" == "$1" ]]; }
+
+amnezia_migrate() {
+  local c d sum proto port net dev restart n b
+  c=$(amnezia_container) || { err "Контейнер Amnezia (amnezia-awg2 / amnezia-awg) не найден"; return 1; }
+  amnezia_migrated && { err "Перенос уже сделан. Вернуть Amnezia: Сервер → Перенос из Amnezia"; return 1; }
+  d="$AMNEZIA_STATE_DIR/orig"
+  info "Читаю конфиг из контейнера $c"
+  amnezia_fetch "$c" "$d" || { _amnezia_state_clear; return 1; }
+  proto=$(_amnezia_proto "$d")
+  b=$(amnezia_blockers "$proto")
+  case "$b" in
+    *server*) err "Сервер Тулзы уже создан — перенос только на сервер без своего awg0 (Сервер → Сбросить сервер)"; _amnezia_state_clear; return 1 ;;
+    *components*) err "Сначала установи компоненты: Сервер → Установить компоненты"; _amnezia_state_clear; return 1 ;;
+    *proto*) err "Модуль ядра не умеет AWG $proto — обнови модуль (Сервер → Модуль ядра и утилиты)"; _amnezia_state_clear; return 1 ;;
+  esac
+  # Конфиг проверяется до остановки контейнера: с ошибками ничего не трогаем
+  sum=$(py amnezia-conf "$d" iface) || { _amnezia_state_clear; return 1; }
+  port=$(sed -n 's/^ListenPort = //p' <<< "$sum")
+  net=$(py amnezia-conf "$d" net) && valid_cidr "$net" || { err "Подсеть сервера не определена"; _amnezia_state_clear; return 1; }
+  n=$(py amnezia-conf "$d" peers | grep -c '^\[Peer\]' || true)
+  dev=$(uplink_iface) || { err "Не найден интерфейс маршрута по умолчанию"; _amnezia_state_clear; return 1; }
+  restart=$(docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$c" 2>/dev/null)
+  [[ "$restart" =~ ^(no|always|unless-stopped|on-failure)$ ]] || restart=always
+  printf '%s\n' "$c" > "$AMNEZIA_STATE_DIR/container"
+  printf '%s\n' "$restart" > "$AMNEZIA_STATE_DIR/restart"
+  date +%s > "$AMNEZIA_STATE_DIR/migrated"
+  chmod 600 "$AMNEZIA_STATE_DIR/container" "$AMNEZIA_STATE_DIR/restart" "$AMNEZIA_STATE_DIR/migrated"
+  info "Останавливаю контейнер $c (не удаляю — его можно вернуть)"
+  docker update --restart=no "$c" >/dev/null 2>&1 || warn "Автозапуск контейнера выключить не удалось"
+  if ! docker stop -t 20 "$c" >/dev/null 2>&1; then
+    err "Контейнер $c не остановился"
+    _amnezia_back "$c" "$restart"; _amnezia_state_clear; return 1
+  fi
+  mkdir -p "$AWG_DIR" && chmod 700 "$AWG_DIR"
+  if ! { printf '%s\n\n' "$sum"; _postup_lines "$net" "$dev"; py amnezia-conf "$d" peers; } | write_file "$SERVER_CONF" 600; then
+    err "awg0.conf не записан"
+    rm -f "$SERVER_CONF"; _amnezia_back "$c" "$restart"; _amnezia_state_clear; return 1
+  fi
+  info "Поднимаю awg0: AWG $proto, порт $port, клиентов: $n"
+  # shellcheck disable=SC2034  # S_PORT читает server_start_new (UFW)
+  S_PORT="$port"
+  if ! server_start_new || ! _amnezia_up_ok "$port"; then
+    err "awg0 не поднялся — возвращаю Amnezia"
+    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+    systemctl disable awg-quick@awg0 &>/dev/null || true
+    rm -f "$SERVER_CONF"
+    _amnezia_back "$c" "$restart" && ok "Amnezia снова работает ($c)"
+    _amnezia_state_clear
+    return 1
+  fi
+  # Копия файлов контейнера (с ключом сервера) больше не нужна: ключ — в awg0.conf,
+  # для возврата есть сам контейнер
+  [[ "$d" == */amnezia/orig && -d "$d" ]] && rm -rf "$d"
+  log_info "перенос из Amnezia: $c → awg0, AWG $proto, порт $port, клиентов $n"
+  ok "Перенесено из Amnezia: клиентов $n, порт $port/udp, AWG $proto"
+  info "Конфиги клиентов прежние — переподключаться не нужно"
+  warn "Приложение AmneziaVPN больше не управляет этим сервером (как клиент работает как раньше)"
+  info "Контейнер $c остановлен, не удалён: Сервер → Перенос из Amnezia → Вернуть Amnezia"
+}
+
+amnezia_revert() {
+  local c restart
+  amnezia_migrated || { err "Переноса из Amnezia не было"; return 1; }
+  c=$(cat "$AMNEZIA_STATE_DIR/container"); restart=$(cat "$AMNEZIA_STATE_DIR/restart" 2>/dev/null)
+  [[ "$c" =~ ^amnezia-awg2?$ ]] || { err "Состояние переноса повреждено"; return 1; }
+  [[ "$restart" =~ ^(no|always|unless-stopped|on-failure)$ ]] || restart=always
+  docker inspect "$c" &>/dev/null || { err "Контейнера $c больше нет — вернуть Amnezia нельзя"; return 1; }
+  if server_exists; then
+    # Клиенты, созданные в Тулзе после переноса, остаются в бэкапе
+    backup_create >/dev/null 2>&1 && info "Бэкап сервера Тулзы — в $BACKUP_DIR"
+    awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
+    systemctl disable awg-quick@awg0 &>/dev/null || true
+    rm -f "$SERVER_CONF"
+  fi
+  _amnezia_back "$c" "$restart" || return 1
+  _amnezia_state_clear
+  log_info "перенос из Amnezia отменён: $c снова запущен"
+  ok "Amnezia снова работает ($c)"
+}
+
+# Контейнер больше не нужен: удалить его (данные Amnezia в нём — тоже).
+amnezia_remove() {
+  local c
+  amnezia_migrated || { err "Сначала перенос: удалять можно только перенесённый контейнер"; return 1; }
+  c=$(cat "$AMNEZIA_STATE_DIR/container")
+  [[ "$c" =~ ^amnezia-awg2?$ ]] || { err "Состояние переноса повреждено"; return 1; }
+  iface_up || { err "awg0 не работает — контейнер не удаляю, пока Тулза не подняла сервер"; return 1; }
+  if docker inspect "$c" &>/dev/null; then
+    docker rm -f "$c" >/dev/null 2>&1 || { err "Контейнер $c не удалён"; return 1; }
+  fi
+  _amnezia_state_clear
+  log_info "контейнер Amnezia удалён: $c"
+  ok "Контейнер $c удалён"
+}
+
+# Сводка для меню, бота и панели. Ключей в ней нет.
+amnezia_scan_json() {
+  local c d running=0 b
+  c=$(amnezia_container) || c=""
+  [[ -n "$c" ]] && amnezia_running "$c" && running=1
+  if [[ -z "$c" ]] || amnezia_migrated; then
+    { _kv container "$c"; _kv running:b "$running"; _kv migrated:b "$(_b amnezia_migrated)"; } | py json-kv
+    return 0
+  fi
+  mktmp d -d || return 1
+  if ! amnezia_fetch "$c" "$d/x" >/dev/null 2>&1; then
+    { _kv container "$c"; _kv running:b "$running"; _kv error "конфиг контейнера не прочитан"; } | py json-kv
+    return 0
+  fi
+  b=$(amnezia_blockers "$(_amnezia_proto "$d/x")" | paste -sd, -)
+  # AmneziaDNS — отдельный контейнер: переносом не трогается и работает дальше
+  py amnezia-scan "$d/x" "$c" "$running" "$b" \
+    "$(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx amnezia-dns && echo dns)"
+}
+
+do_amnezia_menu() {
+  local c j
+  c=$(amnezia_container) || c=""
+  hdr "Перенос из Amnezia (Docker)"
+  if amnezia_migrated; then
+    info "Перенос сделан: контейнер $(cat "$AMNEZIA_STATE_DIR/container") остановлен"
+    echo -e "  ${C}1)${N} Вернуть Amnezia ${D}— awg0 Тулзы снимается, контейнер запускается${N}"
+    echo -e "  ${C}2)${N} Удалить контейнер Amnezia"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice j "${C}  Выбор [0-2]: ${N}" 0 2 0
+    case "$j" in
+      1) read_confirm "${R}  Сервер Тулзы будет снят (бэкап сохранится). Продолжить? (введи yes): ${N}" && amnezia_revert ;;
+      2) read_confirm "${R}  Контейнер будет удалён навсегда. Продолжить? (введи yes): ${N}" && amnezia_remove ;;
+    esac
+    return 0
+  fi
+  [[ -n "$c" ]] || { info "Контейнер Amnezia (amnezia-awg2 / amnezia-awg) не найден"; return 0; }
+  while true; do
+    j=$(amnezia_scan_json) || return 1
+    py amnezia-show <<< "$j" && break
+    amnezia_blockers | grep -qx components || { warn "Перенос пока невозможен — см. ✖ выше"; return 0; }
+    read_confirm "${Y}  Установить компоненты сейчас? (введи yes): ${N}" || return 0
+    INSTALL_NEXT="Сервер → Перенос из Amnezia" do_install || return 1
+    # нужна перезагрузка, а её отложили — переносить на старом модуле бессмысленно
+    j=$(reboot_reason); [[ -z "$j" || "$j" == *modprobe* ]] || return 0
+    echo ""
+  done
+  read_confirm "${Y}  Перенести? Контейнер будет остановлен (введи yes): ${N}" || return 0
+  amnezia_migrate
+}
+
 # ═════ update ═════
 # Самообновление. Канал stable — основной репозиторий, beta — ранние сборки.
 # Выбор хранится в /var/lib/awg2/channel; AWG2_UPDATE_CHANNEL=beta — разовый
@@ -11383,8 +11723,9 @@ do_server_menu() {
     echo -e "  ${C}7)${N} Endpoint ${D}— ${ep:-IP сервера}${N}"
     echo -e "  ${Y}8)${N} Сбросить сервер"
     echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
+    echo -e "  ${C}10)${N} Перенос из Amnezia ${D}— сервер из Docker-контейнера, клиенты без перевыдачи${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
+    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -11395,6 +11736,7 @@ do_server_menu() {
       7) do_endpoint_menu || true ;;
       8) do_reset_server || true ;;
       9) do_antiscan_menu || true; continue ;;
+      10) do_amnezia_menu || true ;;
       0) return 0 ;;
     esac
     pause
@@ -11810,7 +12152,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -11824,7 +12166,7 @@ _api_client() {
       client_rename "$name" "$1" ;;
     conf)
       f=$(client_file "$name")
-      [[ -f "$f" ]] || { err "Нет конфига клиента $name"; return 1; }
+      [[ -f "$f" ]] || { client_no_conf "$name"; return 1; }
       { _kv name "$name"; _kv file "$f"; _kv size:n "$(stat -c %s "$f")"; _kv text:f "$f"; } | api_obj ;;
     mimicry)
       [[ -n "${1:-}" ]] || { _api_usage "client mimicry ИМЯ none|server|профиль[:уровень[:домен[:бюджет]]]"; return; }
@@ -11845,7 +12187,11 @@ _api_client() {
     speed)
       [[ -n "${1:-}" ]] || { _api_usage "client speed ИМЯ Мбит/с|off"; return; }
       client_speed_set "$name" "$1" ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed ИМЯ ..." ;;
+    reissue)
+      client_reissue "$name" || return 1
+      f=$(client_file "$name")
+      { _kv name "$name"; _kv file "$f"; _kv text:f "$f"; } | api_obj ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..." ;;
   esac
 }
 
@@ -12134,6 +12480,7 @@ _api_dns() {
         _kv intercept:b "$(_b dns_rules_ok)"
         _kv upstream "$(sed -n 's/^server_names[[:space:]]*=[[:space:]]*//p' "$DNS_PROXY_CONF" 2>/dev/null | tr -d "[]'\"" | head -1)"
         _kv presets:j "$(for i in "${DNS_PRESETS[@]}"; do printf '%s\t%s\n' "${i%%|*}" "${i#*|}"; done | py json-rows names label)"
+        _kv popular:j "$(for i in "${DNS_POPULAR[@]}"; do printf '%s\t%s\n' "${i%%|*}" "${i#*|}"; done | py json-rows name label)"
       } | api_obj
       dns_status ;;
     install) dns_install "${1:-}" ;;
@@ -12376,6 +12723,23 @@ _api_antiscan() {
   esac
 }
 
+# ── Перенос из Amnezia (Docker) ───────────────────────────
+_api_amnezia() {
+  local a="${1:-status}" c running=0
+  case "$a" in
+    status)
+      c=$(amnezia_container) || c=""
+      [[ -n "$c" ]] && amnezia_running "$c" && running=1
+      { _kv container "$c"; _kv running:b "$running"; _kv migrated:b "$(_b amnezia_migrated)"
+        _kv server:b "$(_b server_exists)"; } | api_obj ;;
+    scan) amnezia_scan_json > "$API_DATA" ;;
+    migrate) amnezia_migrate ;;
+    revert) amnezia_revert ;;
+    remove) amnezia_remove ;;
+    *) _api_usage "amnezia status|scan|migrate|revert|remove" ;;
+  esac
+}
+
 _api_uninstall() {
   local o
   for o in "$@"; do [[ "$o" =~ ^(bot|wgobf|web|self)$ ]] || { _api_usage "uninstall [bot] [wgobf] [web] [self]"; return; }; done
@@ -12489,7 +12853,8 @@ _api_readonly() {
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
     "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
-    "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status") return 0 ;;
+    "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
+    "amnezia scan") return 0 ;;
   esac
   return 1
 }
@@ -12534,12 +12899,13 @@ api_dispatch() {
     cert) _api_cert "$@" ;;
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
+    amnezia) _api_amnezia "$@" ;;
     uninstall) _api_uninstall "$@" ;;
     log) _api_log "$@" ;;
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -12650,11 +13016,11 @@ tunnel_cli() {  # туннель действие
   esac
 }
 
-_on_interrupt() {
+_on_interrupt() {  # INT|TERM
   _cleanup_tmp
   echo ""
   warn "Прервано"
-  exit 130
+  _die_by_signal "$1"
 }
 
 main() {
@@ -12666,7 +13032,8 @@ main() {
   (( EUID == 0 )) || { echo "awg2: нужен root — sudo awg2" >&2; exit 1; }
   log_init
   trap _cleanup_tmp EXIT
-  trap _on_interrupt INT TERM
+  trap '_on_interrupt INT' INT
+  trap '_on_interrupt TERM' TERM
   # Машинный интерфейс бота: весь вывод — внутри одного JSON-ответа
   [[ "${1:-}" == api ]] && { shift; api_main "$@"; exit; }
   update_channel_init
@@ -14529,7 +14896,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=69db2ef1613074e8
+_PY_HELPER_SUM=6cbfee4c1f8ac3b7
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -14539,6 +14906,7 @@ IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 с целевым и os.replace: обрыв на середине не оставляет битый конфиг.
 """
 import base64
+import difflib
 import importlib
 import json
 import os
@@ -14675,6 +15043,14 @@ def cmd_peers(conf):
                          peer_meta(b, "speed"), peer_meta(b, "limit_slow"), peer_meta(b, "slowed_by")]))
 
 
+def cmd_meta_get(conf, name, key):
+    """Метка клиента по имени (пусто — нет метки или клиента)."""
+    _, peers = split_peers(read(conf))
+    i = find_peer(peers, name=name)
+    if i >= 0:
+        print(peer_meta(peers[i], key))
+
+
 def cmd_meta_set(conf, name, key, value):
     head, peers = split_peers(read(conf))
     i = find_peer(peers, name=name)
@@ -14694,6 +15070,42 @@ def cmd_peer_del(conf, pubkey):
     text = head + "".join(peers)
     write_atomic(conf, re.sub(r"\n{3,}", "\n\n", text))
     print(name)
+
+
+def cmd_peer_rekey(conf, pubkey, newpub, psk):
+    """Новый ключ клиенту (перевыпуск): PublicKey и PresharedKey заменяются,
+    метка «перенесён из Amnezia» снимается — конфиг теперь есть у Тулзы.
+    Печатает настоящий адрес клиента (у заблокированного — из orig_ips)."""
+    if not (_b64key(newpub) and _b64key(psk)):
+        die("ключ неверный")
+    head, peers = split_peers(read(conf))
+    i = find_peer(peers, pubkey=pubkey)
+    if i < 0:
+        die("пир не найден", 2)
+    b = re.sub(r"^([ \t]*PublicKey[ \t]*=[ \t]*).*$", lambda m: m.group(1) + newpub, peers[i], count=1, flags=re.M | re.I)
+    if re.search(r"^[ \t]*PresharedKey[ \t]*=", b, re.M | re.I):
+        b = re.sub(r"^([ \t]*PresharedKey[ \t]*=[ \t]*).*$", lambda m: m.group(1) + psk, b, count=1, flags=re.M | re.I)
+    else:
+        b = re.sub(r"^([ \t]*PublicKey[ \t]*=.*)$", lambda m: m.group(1) + "\nPresharedKey = " + psk, b, count=1,
+                   flags=re.M | re.I)
+    peers[i] = set_meta(b, "amnezia", "")
+    write_atomic(conf, head + "".join(peers))
+    print(peer_meta(peers[i], "orig_ips") or peer_field(peers[i], "AllowedIPs"))
+
+
+def cmd_traffic_rekey(db, old, new):
+    """Счётчики трафика и лимита клиента — на его новый ключ."""
+    lock = _traffic_lock(db)
+    t = Traffic(db)
+    for k in ("last", "total", "reset", "warned", "badmeta"):
+        if old in t.d[k]:
+            t.d[k][new] = t.d[k].pop(old)
+    for day in t.d["days"].values():
+        if isinstance(day, dict) and old in day:
+            day[new] = day.pop(old)
+    t.d["last"].pop(new, None)         # прежние показания ядра — у старого ключа
+    t.save()
+    del lock
 
 
 def cmd_peer_rename(conf, pubkey, new):
@@ -16522,6 +16934,68 @@ def cmd_json_kv():
     print(json.dumps(out, ensure_ascii=False))
 
 
+DNS_PROTO = {1: "DNSCrypt", 3: "DoT", 4: "DoQ", 5: "ODoH", 0x81: "релей DNSCrypt", 0x85: "релей ODoH"}
+
+
+def _dns_stamps(path):
+    """public-resolvers.md → {имя: [(протокол, адрес), ...]} по штампам sdns://."""
+    out, name = {}, None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read(8 << 20)
+    for line in text.splitlines():
+        if line.startswith("## "):
+            name = line[3:].strip()
+            continue
+        line = line.strip()
+        if not (name and line.startswith("sdns://")):
+            continue
+        try:
+            b = base64.urlsafe_b64decode(line[7:] + "=" * (-len(line[7:]) % 4))
+        except ValueError:          # и binascii.Error
+            continue
+        if not b:
+            continue
+        addr = ""
+        if b[0] in (1, 2, 3, 4) and len(b) > 9:
+            addr = b[10:10 + b[9]].decode("ascii", "replace")
+        out.setdefault(name, []).append((b[0], addr))
+    return out
+
+
+def cmd_dns_check(path, *names):
+    """Имена резолверов, которые dnscrypt-proxy Тулзы (только DoH, только IPv4)
+    отбросит, — с причиной и подсказкой. Код 1, если такие есть."""
+    st = _dns_stamps(path)
+    usable = sorted(n for n, v in st.items() if any(p == 2 and not a.startswith("[") for p, a in v))
+    ok = set(usable)
+
+    def alt(n, *cand):
+        for c in cand:
+            if c in ok:
+                return c
+        m = difflib.get_close_matches(n, usable, 1, 0.75)
+        return m[0] if m else ""
+
+    bad = []
+    for n in names:
+        if n in ok:
+            continue
+        v = st.get(n)
+        if not v:
+            a = alt(n, n + "-doh")
+            bad.append("«%s» нет в списке public-resolvers%s" % (n, " — может, %s?" % a if a else ""))
+        elif all(p != 2 for p, _ in v):
+            a = alt(n, n + "-doh", n.replace("dnscrypt", "doh"))
+            bad.append("«%s» — это %s, а шифрованный DNS Тулзы ходит только по DoH%s"
+                       % (n, DNS_PROTO.get(v[0][0], "не DoH"), ": возьми %s" % a if a else ""))
+        else:
+            a = alt(n, n.replace("-ipv6", ""))
+            bad.append("«%s» — только IPv6, а к резолверам сервер ходит по IPv4%s" % (n, ": возьми %s" % a if a else ""))
+    if bad:
+        print("\n".join(bad))
+        sys.exit(1)
+
+
 def cmd_json_rows(*cols):
     """Строки TSV → список объектов по колонкам «имя[:тип]»."""
     spec = [_split_key(c) for c in cols]
@@ -16601,6 +17075,8 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
             "online": bool(hs) and now - hs < 180,
             "rx": int(s[5]) if s[5].isdigit() else 0, "tx": int(s[6]) if s[6].isdigit() else 0,
             "endpoint": "" if s[2] in ("", "(none)") else s[2], "file": path,
+            # Перенесён из Amnezia: приватный ключ только у клиента — исходное имя
+            "amnezia": peer_meta(b, "amnezia") or None,
         }
         limit, period = parse_limit(peer_meta(b, "limit"))
         by = peer_meta(b, "blocked_by")
@@ -16995,11 +17471,307 @@ def cmd_web_hash():
     print("scrypt$%d$%d$%d$%s$%s" % (2 ** 14, 8, 1, base64.b64encode(salt).decode(), base64.b64encode(dk).decode()))
 
 
+# ── Перенос из Amnezia (Docker) ──
+# Файлы из контейнера Amnezia — недоверенные данные: контейнер мог быть
+# изменён, а его конфиг пойдёт в awg-quick под root. Берём только известные
+# ключи с проверенными значениями; команды (PostUp, PreUp…) и всё прочее
+# отбрасываются, о каждом пропуске — предупреждение.
+AMN_RANGE = r"[0-9]{1,10}(?:-[0-9]{1,10})?"
+AMN_KEYS = (
+    ("Jc", r"[0-9]{1,3}"), ("Jmin", r"[0-9]{1,4}"), ("Jmax", r"[0-9]{1,4}"),
+    ("S1", r"[0-9]{1,4}"), ("S2", r"[0-9]{1,4}"), ("S3", r"[0-9]{1,4}"), ("S4", r"[0-9]{1,2}"),
+    ("H1", AMN_RANGE), ("H2", AMN_RANGE), ("H3", AMN_RANGE), ("H4", AMN_RANGE),
+    ("HeaderProtectionKey", "key"), ("ContentPaddingAddition", AMN_RANGE),
+    ("RekeyAfterTime", AMN_RANGE), ("RekeyTimeout", AMN_RANGE), ("RejectAfterTime", AMN_RANGE),
+    ("KeepaliveTimeout", AMN_RANGE), ("MaxHandshakeAttempts", AMN_RANGE),
+    ("RandomTrailers", r"(?:on|off|true|false|0|1)"), ("DisableCookies", r"(?:on|off|true|false|0|1)"),
+)
+AMN_MTU = 1376              # как у клиентов Amnezia: новые клиенты Тулзы получат тот же MTU
+AMN_TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюяєіїґ", (
+    "a b v g d e e zh z i y k l m n o p r s t u f kh ts ch sh sch - y - e yu ya e i yi g").split()))
+
+
+def _b64key(v):
+    if not re.fullmatch(r"[A-Za-z0-9+/]{43}=", v or ""):
+        return False
+    try:
+        return len(base64.b64decode(v, validate=True)) == 32
+    except ValueError:
+        return False
+
+
+def _amn_value(key, rx, v):
+    if rx == "key":
+        return _b64key(v)
+    if not re.fullmatch(rx, v, re.I):
+        return False
+    # Диапазоны и числа — в uint32, «от» не больше «до»
+    nums = [int(x) for x in re.findall(r"[0-9]+", v)]
+    return all(n <= 0xFFFFFFFF for n in nums) and (len(nums) < 2 or nums[0] <= nums[1])
+
+
+def _amn_parse_conf(text):
+    """→ (interface {ключ: значение}, [peer {ключ: значение}], [непереносимые ключи])."""
+    iface, peers, cur, extra = {}, [], None, []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        sec = re.fullmatch(r"\[\s*(\w+)\s*\]", line)
+        if sec:
+            name = sec.group(1).lower()
+            if name == "interface":
+                cur = iface
+            elif name == "peer":
+                cur = {}
+                peers.append(cur)
+            else:
+                cur = None
+                extra.append("[%s]" % sec.group(1)[:20])
+            continue
+        m = re.fullmatch(r"([A-Za-z0-9]{1,40})\s*=\s*(.*?)", line)
+        if not m or cur is None:
+            extra.append(line[:20])
+            continue
+        k = m.group(1)
+        if k in cur:
+            extra.append(k)          # повтор ключа: берём первое значение
+            continue
+        cur[k] = m.group(2)
+    return iface, peers, extra
+
+
+def _amn_names(table_text):
+    """clientsTable → {публичный ключ: имя}."""
+    out = {}
+    try:
+        data = json.loads(table_text) if table_text.strip() else []
+    except ValueError:
+        return out, ["таблица клиентов не JSON — имена не перенесены"]
+    if not isinstance(data, list):
+        return out, ["таблица клиентов не список — имена не перенесены"]
+    for row in data[:5000]:
+        if not isinstance(row, dict):
+            continue
+        pub, ud = row.get("clientId"), row.get("userData")
+        name = ud.get("clientName") if isinstance(ud, dict) else None
+        if isinstance(pub, str) and _b64key(pub) and isinstance(name, str):
+            out.setdefault(pub, name)
+    return out, []
+
+
+def _amn_label(orig):
+    """Исходное имя для метки: без управляющих символов, переводов строк и «=»."""
+    s = "".join(ch for ch in orig if ch.isprintable() and ch not in "\r\n=")
+    return re.sub(r"\s+", " ", s).strip()[:64]
+
+
+def _amn_slug(orig):
+    out = []
+    for ch in orig:
+        t = AMN_TRANSLIT.get(ch.lower())
+        if t is None:
+            out.append(ch)
+        elif t != "-":
+            out.append(t.capitalize() if ch.isupper() else t)
+    s = re.sub(r"[^A-Za-z0-9_-]+", "_", "".join(out)).strip("_-")
+    return re.sub(r"_+", "_", s)[:32].strip("_-")
+
+
+def amnezia_model(conf_text, table_text, host_port=""):
+    """Проверенная модель сервера Amnezia: {iface, peers, ...}, ошибки, предупреждения."""
+    import ipaddress
+    errors, warns = [], []
+    iface, peers, extra = _amn_parse_conf(conf_text)
+    if extra:
+        warns.append("не переносится: " + ", ".join(sorted(set(extra)))[:300])
+    priv = iface.get("PrivateKey", "")
+    if not _b64key(priv):
+        errors.append("нет ключа сервера (PrivateKey) или он повреждён")
+    port = iface.get("ListenPort", "")
+    if not (re.fullmatch(r"[0-9]{1,5}", port) and 1 <= int(port) <= 65535):
+        errors.append("порт сервера (ListenPort) не задан или неверный")
+        port = ""
+    if re.fullmatch(r"[0-9]{1,5}", host_port or "") and 1 <= int(host_port) <= 65535 and host_port != port:
+        warns.append("порт контейнера %s проброшен наружу как %s — сервер будет слушать %s" % (port, host_port, host_port))
+        port = host_port
+    net = addr = None
+    for a in [x.strip() for x in iface.get("Address", "").split(",") if x.strip()]:
+        try:
+            itf = ipaddress.ip_interface(a)
+        except ValueError:
+            continue
+        if itf.version == 4 and 16 <= itf.network.prefixlen <= 30 and itf.network.is_private:
+            net, addr = itf.network, a
+            break
+        warns.append("адрес %s не переносится" % a[:45])
+    if net is None:
+        errors.append("нет адреса сервера IPv4 в частной подсети (/16–/30)")
+    params, mtu = [], AMN_MTU
+    for k, rx in AMN_KEYS:
+        if k in iface:
+            v = iface[k].strip()
+            if _amn_value(k, rx, v):
+                params.append((k, v))
+            else:
+                errors.append("параметр %s: неверное значение" % k)
+    m = iface.get("MTU", "")
+    if m:
+        if re.fullmatch(r"[0-9]{3,4}", m) and 576 <= int(m) <= 9000:
+            mtu = int(m)
+        else:
+            warns.append("MTU сервера неверный — будет %d" % AMN_MTU)
+    known = {"PrivateKey", "ListenPort", "Address", "MTU"} | {k for k, _ in AMN_KEYS}
+    dropped = sorted(k for k in iface if k not in known)
+    if dropped:
+        warns.append("не переносится из [Interface]: " + ", ".join(dropped)[:200])
+    keys = dict(params)
+    if "RandomTrailers" in keys or "DisableCookies" in keys:
+        proto = "3.1"
+    elif "HeaderProtectionKey" in keys:
+        proto = "3.0"
+    else:
+        proto = "2.0"
+    names, w = _amn_names(table_text)
+    warns += w
+    out, seen_pub, seen_ip, used = [], set(), set(), set()
+    for i, p in enumerate(peers):
+        pub, psk = p.get("PublicKey", ""), p.get("PresharedKey", "")
+        if not _b64key(pub) or pub in seen_pub:
+            warns.append("пир %d пропущен: нет ключа, ключ повреждён или повторяется" % (i + 1))
+            continue
+        if psk and not _b64key(psk):
+            warns.append("пир %d пропущен: PresharedKey повреждён" % (i + 1))
+            continue
+        ips = []
+        for a in [x.strip() for x in p.get("AllowedIPs", "").split(",") if x.strip()]:
+            try:
+                n = ipaddress.ip_network(a, strict=True)
+            except ValueError:
+                n = None
+            if n is not None and n.version == 4 and n.prefixlen == 32 and net is not None \
+                    and n.network_address in net and str(n) not in seen_ip \
+                    and str(n.network_address) != str(addr).split("/")[0]:
+                ips.append(str(n))
+        if not ips:
+            warns.append("пир %d пропущен: нет своего адреса /32 в подсети сервера" % (i + 1))
+            continue
+        seen_pub.add(pub)
+        seen_ip.update(ips)
+        orig = _amn_label(names.get(pub, ""))
+        name = _amn_slug(orig) or "amnezia_" + ips[0].split("/")[0].rsplit(".", 1)[1]
+        base, n = name, 2
+        while name.lower() in used:
+            sfx = "_%d" % n
+            name, n = base[:32 - len(sfx)] + sfx, n + 1
+        used.add(name.lower())
+        out.append({"name": name, "orig": orig, "ip": ips[0].split("/")[0], "pub": pub, "psk": psk,
+                    "allowed": ", ".join(ips)})
+    if not out and not errors:
+        warns.append("клиентов не найдено — перенесётся пустой сервер")
+    model = {"proto": proto, "port": int(port) if port else 0, "net": str(net) if net else "",
+             "address": addr or "", "mtu": mtu, "params": params, "priv": priv, "peers": out}
+    return model, errors, warns
+
+
+def _amn_load(dir_):
+    conf = ""
+    for n in ("awg0.conf", "wg0.conf"):
+        f = os.path.join(dir_, n)
+        if os.path.isfile(f):
+            conf = read(f)
+            break
+    table = os.path.join(dir_, "clientsTable")
+    port = os.path.join(dir_, "host_port")
+    return amnezia_model(conf, read(table) if os.path.isfile(table) else "",
+                         read(port).strip() if os.path.isfile(port) else "")
+
+
+def cmd_amnezia_scan(dir_, container="", running="0", blockers="", notes=""):
+    """Сводка для меню, бота и панели — без ключей. blockers — что мешает
+    переносу (server, components, proto) — считает awg2; notes=dns — рядом
+    работает контейнер AmneziaDNS."""
+    m, errors, warns = _amn_load(dir_)
+    if notes == "dns":
+        warns.append("рядом работает AmneziaDNS (amnezia-dns) — переносом не трогается; клиенты с DNS 172.29.172.254 "
+                     "ходят через него и дальше, пока контейнер работает")
+    print(json.dumps({"container": container, "running": running == "1", "migrated": False,
+                      "proto": m["proto"], "port": m["port"], "net": m["net"], "address": m["address"],
+                      "mtu": m["mtu"], "clients": [{"name": p["name"], "orig": p["orig"], "ip": p["ip"]}
+                                                    for p in m["peers"]],
+                      "errors": errors, "warnings": warns,
+                      "blockers": [b for b in blockers.split(",") if b]}, ensure_ascii=False))
+
+
+AMN_BLOCK = {"server": "сервер Тулзы уже создан — перенос только на сервер без своего awg0",
+             "components": "сначала установи компоненты (Сервер → Установить компоненты)",
+             "proto": "модуль ядра не умеет эту версию AWG — обнови модуль"}
+
+
+def cmd_amnezia_show():
+    """Сводка amnezia-scan (stdin) — текстом для меню awg2."""
+    d = json.loads(sys.stdin.read() or "{}")
+    print("  Контейнер : %s (%s)" % (d.get("container") or "—", "работает" if d.get("running") else "остановлен"))
+    print("  AWG %s, порт %s/udp, подсеть %s, клиентов: %d" % (d.get("proto"), d.get("port"), d.get("net"),
+                                                              len(d.get("clients") or [])))
+    for c in (d.get("clients") or [])[:60]:
+        orig = c.get("orig") or ""
+        print("    %-15s %s%s" % (c.get("ip"), c.get("name"), "  ← " + orig if orig and orig != c.get("name") else ""))
+    for w in d.get("warnings") or []:
+        print("  ⚠ " + w)
+    for e in d.get("errors") or []:
+        print("  ✖ " + e)
+    for b in d.get("blockers") or []:
+        print("  ✖ " + AMN_BLOCK.get(b, b))
+    if d.get("errors") or d.get("blockers"):
+        sys.exit(1)                 # переносить нельзя — меню не спрашивает «yes»
+    print("  Конфиги клиентов останутся прежними. Приватных ключей клиентов на сервере нет —")
+    print("  для перенесённых Тулза не покажет конфиг и QR, а перевыпустит их по просьбе.")
+
+
+def cmd_amnezia_conf(dir_, part):
+    """Конфиг сервера Тулзы: part=iface — шапка и [Interface], peers — клиенты."""
+    m, errors, _ = _amn_load(dir_)
+    if errors:
+        die("; ".join(errors))
+    if part == "iface":
+        print("# AWG_PROFILE=lite")
+        print("# AmneziaWG Toolza — AWG %s server config (перенесён из Amnezia)" % m["proto"])
+        print("# Region: world")
+        print("# AWG_PROTO=%s" % m["proto"])
+        print("# AWG_OBF_LEVEL=1")
+        print("# AWG_MIMICRY=none")
+        print("# AWG_IMPORTED=amnezia")
+        print("[Interface]")
+        print("PrivateKey = %s" % m["priv"])
+        print("Address = %s" % m["address"])
+        print("ListenPort = %d" % m["port"])
+        print("MTU = %d" % m["mtu"])
+        for k, v in m["params"]:
+            print("%s = %s" % (k, v))
+    elif part == "peers":
+        for p in m["peers"]:
+            print("\n[Peer]\n# %s" % p["name"])
+            if p["orig"] and p["orig"] != p["name"]:
+                print("# amnezia=%s" % p["orig"])
+            else:
+                print("# amnezia=%s" % p["name"])
+            print("PublicKey = %s" % p["pub"])
+            if p["psk"]:
+                print("PresharedKey = %s" % p["psk"])
+            print("AllowedIPs = %s" % p["allowed"])
+    elif part == "net":
+        print(m["net"])
+    else:
+        die("часть: iface|peers|net")
+
+
 COMMANDS = {
     "peers": cmd_peers, "meta-set": cmd_meta_set, "peer-del": cmd_peer_del,
-    "peer-rename": cmd_peer_rename, "peers-clear": cmd_peers_clear,
+    "peer-rename": cmd_peer_rename, "peer-rekey": cmd_peer_rekey, "meta-get": cmd_meta_get, "traffic-rekey": cmd_traffic_rekey, "peers-clear": cmd_peers_clear,
     "params-replace": cmd_params_replace, "keepalive-set": cmd_keepalive_set, "params-check": cmd_params_check,
     "i-replace": cmd_i_replace,
+    "amnezia-scan": cmd_amnezia_scan, "amnezia-conf": cmd_amnezia_conf, "amnezia-show": cmd_amnezia_show,
     "expire-set": cmd_expire_set, "expire-clear": cmd_expire_clear, "meta-check": cmd_meta_check,
     "expire-check": cmd_expire_check,
     "traffic-tick": cmd_traffic_tick, "traffic-daily": cmd_traffic_daily, "traffic-now": cmd_traffic_now,
@@ -17020,7 +17792,7 @@ COMMANDS = {
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
-    "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "json-list": cmd_json_list,
+    "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,
     "clients-json": cmd_clients_json, "api-envelope": cmd_api_envelope,
     "api-job-status": cmd_api_job_status, "api-jobs": cmd_api_jobs,
     "tg-targets": cmd_tg_targets,
@@ -17043,5 +17815,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=d87fea42ed261d2c
+_BUILD_SUM=c546e2082e250ae3
 main "$@"
