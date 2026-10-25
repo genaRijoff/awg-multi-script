@@ -2760,6 +2760,8 @@ def cmd_amnezia_show():
         print("  ✖ " + e)
     for b in d.get("blockers") or []:
         print("  ✖ " + AMN_BLOCK.get(b, b))
+    if d.get("errors") or d.get("blockers"):
+        sys.exit(1)                 # переносить нельзя — меню не спрашивает «yes»
     print("  Конфиги клиентов останутся прежними. Приватных ключей клиентов на сервере нет —")
     print("  для перенесённых Тулза не покажет конфиг и QR, а перевыпустит их по просьбе.")
 

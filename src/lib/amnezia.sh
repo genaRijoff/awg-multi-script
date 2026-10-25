@@ -225,8 +225,14 @@ do_amnezia_menu() {
     return 0
   fi
   [[ -n "$c" ]] || { info "Контейнер Amnezia (amnezia-awg2 / amnezia-awg) не найден"; return 0; }
-  j=$(amnezia_scan_json) || return 1
-  py amnezia-show <<< "$j"
+  while true; do
+    j=$(amnezia_scan_json) || return 1
+    py amnezia-show <<< "$j" && break
+    amnezia_blockers | grep -qx components || { warn "Перенос пока невозможен — см. ✖ выше"; return 0; }
+    read_confirm "${Y}  Установить компоненты сейчас? (введи yes): ${N}" || return 0
+    do_install || return 1
+    echo ""
+  done
   read_confirm "${Y}  Перенести? Контейнер будет остановлен (введи yes): ${N}" || return 0
   amnezia_migrate
 }

