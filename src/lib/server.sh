@@ -327,14 +327,8 @@ server_write() {
 server_start_new() {
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   awg_up_diag || return 1
-  if ufw_active; then
-    ufw_allow "$S_PORT/udp" AmneziaWG && ok "UFW: открыт $S_PORT/udp"
-    if grep -q '^DEFAULT_FORWARD_POLICY="DROP"' /etc/default/ufw 2>/dev/null; then
-      sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-      ufw reload &>/dev/null || true
-      info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
-    fi
-  fi
+  ufw_open "$S_PORT/udp" AmneziaWG
+  ufw_forward_accept
   setup_autostart
   expire_install
   web_vpn_changed
@@ -658,6 +652,35 @@ REPAIR_ISSUES=0 REPAIR_FIXED=0
 _issue() { REPAIR_ISSUES=$((REPAIR_ISSUES + 1)); warn "$1"; }
 _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 
+# Файрвол: при включённом UFW порты awg0 и обфускатора открыты (UFW могли
+# включить уже после установки, или на русской локали Тулза его не видела),
+# политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
+# ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
+_repair_firewall() {
+  local p
+  if ufw_active; then
+    if server_exists; then
+      p=$(server_port)
+      if ufw_port_open "$p/udp"; then ok "UFW: порт AWG $p/udp открыт"
+      else _issue "UFW включён, а порт AWG $p/udp закрыт"; ufw_allow "$p/udp" AmneziaWG && _fixed "UFW: открыт $p/udp"; fi
+    fi
+    if wgobf_installed; then
+      p=$(wgobf_get PORT)
+      if ufw_port_open "$p/udp"; then ok "UFW: порт обфускатора $p/udp открыт"
+      else _issue "UFW включён, а порт обфускатора $p/udp закрыт"; ufw_allow "$p/udp" "$WGOBF_TAG" && _fixed "UFW: открыт $p/udp"; fi
+    fi
+    if { server_exists || wgobf_installed; } && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
+      _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
+      ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
+    fi
+  fi
+  if wgobf_installed && ip link show "$WGOBF_IF" &>/dev/null \
+     && ! iptables -C FORWARD -i "$WGOBF_IF" -j ACCEPT -m comment --comment "$WGOBF_TAG" 2>/dev/null; then
+    _issue "Нет правил файрвола $WGOBF_IF (NAT, FORWARD) — обфускатор без выхода в интернет"
+    wgobf_fw_run up && _fixed "Правила $WGOBF_IF восстановлены"
+  fi
+}
+
 do_repair() {
   local bad conf_n live_n dev net perm rc old
   REPAIR_ISSUES=0 REPAIR_FIXED=0
@@ -682,6 +705,7 @@ do_repair() {
   if grep -qs "^$MOD_NAME" "$MODULES_LOAD_FILE"; then ok "Автозагрузка модуля"
   else _issue "Нет автозагрузки модуля"; mod_autoload && _fixed "Автозагрузка настроена"; fi
 
+  _repair_firewall
   server_exists || { err "Сервер не создан"; return 1; }
   if [[ -z "$(conf_marker AWG_OBF_LEVEL)" ]]; then
     # Бот по этой метке решает, сколько пакетов I1-I5 выдать клиенту

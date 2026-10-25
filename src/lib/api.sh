@@ -694,6 +694,8 @@ _api_wgobf() {
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
+          # off — UFW выключен; closed — включён, а порт обфускатора не открыт
+          _kv ufw "$(if ! ufw_active; then echo off; elif ufw_port_open "$(wgobf_get PORT)/udp"; then echo open; else echo closed; fi)"
           # Выход для всех и новых клиентов и туннели на выбор: none | off | up,
           # свои выходы Xray (если Xray их умеет) и exit-ноды
           _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
