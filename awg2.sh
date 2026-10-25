@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.44"
+VERSION="v1.2.45"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -804,10 +804,13 @@ ufw_allow() {  # порт/протокол комментарий
   LC_ALL=C ufw allow "$1" comment "$2" >/dev/null 2>&1
 }
 
-# Есть ли в UFW правило на порт ($1 — порт/протокол, как пишет ufw status)
-ufw_port_open() {
-  ufw_active || return 1
-  LC_ALL=C ufw status 2>/dev/null | grep -qE "^$1[[:space:]]+ALLOW"
+# Порт в UFW одним вызовом ufw (он на Python — каждый вызов ~0,1-0,3 с):
+# off — UFW нет или выключен, open — разрешающее правило на порт есть, closed — нет
+ufw_port_state() {  # порт/протокол, как пишет ufw status: 51820/udp
+  local out
+  command -v ufw &>/dev/null && out=$(LC_ALL=C ufw status 2>/dev/null) \
+    && grep -qiE '^Status:[[:space:]]*active' <<< "$out" || { echo off; return 0; }
+  if grep -qE "^$1[[:space:]]+ALLOW" <<< "$out"; then echo open; else echo closed; fi
 }
 
 # Открыть порт службы с сообщением; UFW выключен — молча ничего.
@@ -822,7 +825,7 @@ ufw_open() {  # порт/протокол комментарий
 ufw_forward_accept() {
   ufw_active || return 0
   grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null || return 0
-  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' "$UFW_DEFAULTS"
+  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' "$UFW_DEFAULTS" || return 1
   LC_ALL=C ufw reload &>/dev/null || true
   info "UFW: DEFAULT_FORWARD_POLICY=ACCEPT (нужно для выхода клиентов в интернет)"
 }
@@ -3070,22 +3073,20 @@ _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 # политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
 # ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
 _repair_firewall() {
-  local p
-  if ufw_active; then
-    if server_exists; then
-      p=$(server_port)
-      if ufw_port_open "$p/udp"; then ok "UFW: порт AWG $p/udp открыт"
-      else _issue "UFW включён, а порт AWG $p/udp закрыт"; ufw_allow "$p/udp" AmneziaWG && _fixed "UFW: открыт $p/udp"; fi
-    fi
-    if wgobf_installed; then
-      p=$(wgobf_get PORT)
-      if ufw_port_open "$p/udp"; then ok "UFW: порт обфускатора $p/udp открыт"
-      else _issue "UFW включён, а порт обфускатора $p/udp закрыт"; ufw_allow "$p/udp" "$WGOBF_TAG" && _fixed "UFW: открыт $p/udp"; fi
-    fi
-    if { server_exists || wgobf_installed; } && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
-      _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
-      ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
-    fi
+  local p st on=0 what tag
+  for what in AWG обфускатора; do
+    if [[ "$what" == AWG ]]; then server_exists || continue; p=$(server_port); tag=AmneziaWG
+    else wgobf_installed || continue; p=$(wgobf_get PORT); tag="$WGOBF_TAG"; fi
+    st=$(ufw_port_state "$p/udp")
+    case "$st" in
+      open) on=1; ok "UFW: порт $what $p/udp открыт" ;;
+      closed) on=1; _issue "UFW включён, а порт $what $p/udp закрыт"
+              ufw_allow "$p/udp" "$tag" && _fixed "UFW: открыт $p/udp" ;;
+    esac
+  done
+  if (( on )) && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
+    _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
+    ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
   fi
   if wgobf_installed && ip link show "$WGOBF_IF" &>/dev/null \
      && ! iptables -C FORWARD -i "$WGOBF_IF" -j ACCEPT -m comment --comment "$WGOBF_TAG" 2>/dev/null; then
@@ -8505,8 +8506,8 @@ wgobf_restore() {
 }
 
 # ── Меню ──────────────────────────────────────────────────
-wgobf_status() {
-  local s
+wgobf_status() {  # [состояние порта в UFW — если уже узнано]
+  local s u="${1:-}"
   if ip link show "$WGOBF_IF" &>/dev/null; then s="${G}● поднят${N}"; else s="${R}○ лежит${N}"; fi
   echo -e "  $WGOBF_IF         : $s"
   if unit_active "$WGOBF_UNIT"; then s="${G}● работает${N}"; else s="${R}○ не работает${N}"; fi
@@ -8516,10 +8517,11 @@ wgobf_status() {
   echo -e "  Без обфускатора: $([[ "$(wgobf_get ALLOW_CLEAN)" == 1 ]] && echo -e "${Y}да${N}" || echo нет)"
   echo -e "  Подсеть        : $(wgobf_get NET), MTU $(wgobf_get MTU), WireGuard на $(wgobf_get WG_PORT) ${D}(снаружи закрыт)${N}"
   echo -e "  Клиентов       : $(wgobf_clients | grep -c . || true)"
-  if ufw_active; then
-    if ufw_port_open "$(wgobf_get PORT)/udp"; then echo -e "  UFW            : ${G}● порт открыт${N}"
-    else echo -e "  UFW            : ${R}▲ порт $(wgobf_get PORT)/udp закрыт${N} ${D}— Сервер → Проверить и починить${N}"; fi
-  fi
+  [[ -n "$u" ]] || u=$(ufw_port_state "$(wgobf_get PORT)/udp")
+  case "$u" in
+    open) echo -e "  UFW            : ${G}● порт открыт${N}" ;;
+    closed) echo -e "  UFW            : ${R}▲ порт $(wgobf_get PORT)/udp закрыт${N} ${D}— Сервер → Проверить и починить${N}" ;;
+  esac
 }
 
 wgobf_settings() {
@@ -12550,17 +12552,18 @@ _api_dns() {
 }
 
 _api_wgobf() {
-  local a="${1:-}" name dir f dump now pub ip hs rx tx
+  local a="${1:-}" name dir f dump now pub ip hs rx tx u=""
   shift || true
   case "$a" in
     status)
+      wgobf_installed && u=$(ufw_port_state "$(wgobf_get PORT)/udp")
       { _kv installed:b "$(_b wgobf_installed)"; _kv running:b "$(_b wgobf_running)"
         _kv version "$WGOBF_VERSION"
         if wgobf_installed; then
           _kv endpoint "$(wgobf_get ENDPOINT):$(wgobf_get PORT)"; _kv masking "$(wgobf_get MASKING)"
           _kv clean:b "$(wgobf_get ALLOW_CLEAN)"; _kv clients:n "$(wgobf_clients | grep -c . || true)"
           # off — UFW выключен; closed — включён, а порт обфускатора не открыт
-          _kv ufw "$(if ! ufw_active; then echo off; elif ufw_port_open "$(wgobf_get PORT)/udp"; then echo open; else echo closed; fi)"
+          _kv ufw "$u"
           # Выход для всех и новых клиентов и туннели на выбор: none | off | up,
           # свои выходы Xray (если Xray их умеет) и exit-ноды
           _kv route "$(r=$(wgobf_get ROUTE); echo "${r:-direct}")"
@@ -12570,7 +12573,7 @@ _api_wgobf() {
           _kv exits "$(if [[ -z "$(exits_nodes)" ]]; then echo none; elif exits_is_up; then echo up; else echo off; fi)"
           _kv exit_nodes:j "$(exits_nodes | py json-list)"
         fi; } | api_obj
-      wgobf_installed && wgobf_status
+      wgobf_installed && wgobf_status "$u"
       return 0 ;;
     install) wgobf_install_opts "$@" ;;
     clients)
@@ -17873,5 +17876,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=cd9f33f747a11717
+_BUILD_SUM=8047496349d2d123
 main "$@"
