@@ -626,7 +626,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       if (!(await page.locator("[data-name=country-pick] .cpi.on[data-cc=auto]").count())) throw new Error("не отмечено «Автоматически»");
       await page.fill("[data-name=country-pick] input", "авст");
       const vis = await page.locator("[data-name=country-pick] .cpi").evaluateAll((els) => els.map((e) => e.dataset.cc));
-      if (vis.join(",") !== "AT,AU") throw new Error("поиск «авст»: " + vis.join(","));
+      // По русскому названию: Австралия раньше Австрии
+      if (vis.join(",") !== "AU,AT") throw new Error("поиск «авст»: " + vis.join(","));
       await page.click("[data-name=country-pick] .cpi[data-cc=AT]");
       await page.waitForTimeout(300);
       if (!sent.some((b) => b.includes('"country","set","AT"'))) throw new Error("выбор не ушёл в awg2: " + sent.join(" | "));
