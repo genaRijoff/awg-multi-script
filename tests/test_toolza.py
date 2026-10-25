@@ -22,6 +22,7 @@ test_toolza.py — проверка собранного awg2 (dist/awg2.sh) б�
 import base64
 import hashlib
 import os
+import re
 import sys
 import time
 
@@ -2827,5 +2828,64 @@ for chan, age, want in (("beta", 1300, True), ("beta", 600, False), ("stable", 1
                       'unset AWG_NO_UPDATE_CHECK; update_check_async; sleep 0.3; [[ -e "$STATE_DIR/peeked" ]] && echo PEEK || echo SKIP')
     chk(f"{chan}: прошлой проверке {age // 60} мин — {'проверяет' if want else 'ещё рано'}",
         out.strip().endswith("PEEK" if want else "SKIP"), out)
+
+print("\n── Резолверы шифрованного DNS: только DoH по IPv4, откат, если не поднялся ──")
+
+
+def _stamp(proto, addr):
+    b = bytes([proto]) + (7).to_bytes(8, "little") + bytes([len(addr)]) + addr.encode() + b"\x00"
+    return "sdns://" + base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+RES_MD = os.path.join(ROOT, "var/cache/dnscrypt-proxy/public-resolvers.md")
+os.makedirs(os.path.dirname(RES_MD), exist_ok=True)
+with open(RES_MD, "w") as f:
+    f.write("# public-resolvers\n\n")
+    for name, proto, addr in (("cloudflare", 2, "1.0.0.1"), ("google", 2, "8.8.8.8"), ("adguard-dns", 1, "94.140.14.14:5443"),
+                              ("adguard-dns-doh", 2, "94.140.14.14"), ("dns.sb", 2, "185.222.222.222"),
+                              ("mullvad-doh-ipv6", 2, "[2a07:e340::2]"), ("mullvad-doh", 2, "194.242.2.2")):
+        f.write(f"## {name}\n\nописание\n\n{_stamp(proto, addr)}\n\n")
+DNSC = os.path.join(ROOT, "etc/dnscrypt-proxy/dnscrypt-proxy.toml")
+os.makedirs(os.path.dirname(DNSC), exist_ok=True)
+FAKE_RESTART = ('dns_restart() { echo restart >> "$STATE_DIR/dns_restarts"; '
+                '! grep -q "google" "$DNS_PROXY_CONF"; }; rm -f "$STATE_DIR/dns_restarts"; ')
+
+
+def dns_conf(names="'cloudflare'"):
+    with open(DNSC, "w") as f:
+        f.write(f"listen_addresses = []\nserver_names = [{names}]\nrequire_nofilter = true\ndoh_servers = true\n")
+
+
+def dns_names():
+    with open(DNSC) as f:
+        return re.search(r"^server_names = (.*)$", f.read(), re.M).group(1)
+
+
+dns_conf()
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream adguard-dns")
+chk("DNSCrypt-имя не записано, подсказка — DoH-вариант", rc != 0 and dns_names() == "['cloudflare']"
+    and "adguard-dns-doh" in out + err and "DoH" in out + err, out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream mullvad-doh-ipv6")
+chk("только IPv6 — не записано, подсказка — IPv4-вариант", rc != 0 and "mullvad-doh" in out + err
+    and dns_names() == "['cloudflare']", out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream adgaurd-dns-doh")
+chk("опечатка — «нет в списке» и похожее имя", rc != 0 and "нет в списке" in out + err and "adguard-dns-doh" in out + err, out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream 'dns.sb,adguard-dns-doh'")
+chk("имя с точкой и DoH-вариант — записаны", rc == 0 and dns_names() == "['dns.sb', 'adguard-dns-doh']", out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream 'cloudflare google'")
+chk("служба не поднялась — прежние резолверы вернулись", rc != 0 and dns_names() == "['dns.sb', 'adguard-dns-doh']"
+    and "вернул прежние" in out + err, out + err)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream 'cloud*'")
+chk("звёздочка и прочее — отказ до записи", rc != 0 and dns_names() == "['dns.sb', 'adguard-dns-doh']", out + err)
+os.remove(RES_MD)
+rc, out, err = bash(FAKE_RESTART + "dns_set_upstream mullvad-doh-ipv6")
+chk("списка ещё нет — имя проверит перезапуск", rc == 0 and dns_names() == "['mullvad-doh-ipv6']", out + err)
+rc, out, _ = bash('popular() { for i in "${DNS_POPULAR[@]}"; do echo "${i%%|*}"; done; }; popular')
+chk("подсказка «Популярные» — 10 имён", len(out.split()) == 10 and "adguard-dns-doh" in out.split(), out)
+
+print("\n── Ctrl+C: выход от сигнала — в «awg2.sh; awg-bot-install.sh» вторая команда не запускается ──")
+rc, out, _ = bash("trap '_on_interrupt INT' INT; kill -INT $$; sleep 1; echo AFTER")
+chk("Ctrl+C в меню — «Прервано» и смерть от SIGINT, а не exit 130", rc == -2 and "Прервано" in out and "AFTER" not in out, (rc, out))
+chk("TERM — смерть от SIGTERM", bash("trap '_on_interrupt TERM' TERM; kill -TERM $$; echo AFTER")[0] == -15)
 
 summary()

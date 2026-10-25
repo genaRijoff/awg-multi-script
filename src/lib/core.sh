@@ -183,11 +183,19 @@ _kill_tree() {
   kill -TERM "$1" 2>/dev/null
 }
 
+# Выходим «от сигнала», а не exit 130: иначе в `bash awg2.sh; bash awg-bot-install.sh`
+# оболочка считает Ctrl+C обработанным и запускает следующую команду.
+_die_by_signal() {  # INT|TERM
+  trap - "$1"
+  kill -"$1" $$
+  exit 130
+}
+
 _run_step_abort() {
   [[ -n "$_RUN_STEP_PID" ]] && _kill_tree "$_RUN_STEP_PID"
   printf '\r\033[K\n'
   warn "Прервано пользователем"
-  exit 130
+  _die_by_signal INT
 }
 
 run_step() {

@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v1.2.42-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v1.2.43-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -287,6 +287,28 @@ journalctl -u awg-bot -n 50 | grep 'Запасные адреса'
 
 ---
 
+## 🐳 Переход с Amnezia (Docker)
+
+Сервер поставлен приложением AmneziaVPN (контейнер `amnezia-awg2` или старый `amnezia-awg`)?
+**Сервер → Перенос из Amnezia** (в боте и панели — там же) переносит его в Тулзу
+**без перевыдачи конфигов**: ключ сервера, порт, подсеть, параметры AWG (2.0 и 3.1) и все
+клиенты с их PSK — те же, клиенты подключаются со своими конфигами из Amnezia.
+
+- Сначала — предпросмотр: протокол, порт, клиенты и их имена (кириллица и пробелы — латиницей,
+  исходное имя видно рядом). Ничего не меняется, пока не нажать «Перенести».
+- Нужны компоненты Тулзы (Сервер → Установить компоненты) и сервер без своего awg0.
+- Контейнер **останавливается, а не удаляется**: «Вернуть Amnezia» снимает awg0 Тулзы (перед
+  этим — бэкап) и запускает контейнер снова. awg0 не поднялся — Amnezia возвращается сама.
+  Когда всё работает, контейнер можно удалить там же.
+- Из конфига Amnezia берутся только известные параметры с проверкой; команды (`PostUp` и т.п.)
+  не переносятся — NAT ставит Тулза.
+- Приватных ключей клиентов на сервере нет — они только у клиентов. Перенесённым Тулза не покажет
+  конфиг и QR, а **перевыпустит** его по просьбе (новый ключ; адрес, сроки и лимиты — прежние,
+  старый конфиг перестаёт подключаться).
+- После переноса приложение AmneziaVPN этим сервером не управляет; как клиент работает как раньше.
+
+---
+
 ## WG + обфускатор (как Phobos)
 
 Пункт **WG + обфускатор** главного меню — второй сервер рядом с AWG: обычный WireGuard
@@ -542,7 +564,7 @@ python3 tests/test_bot.py         # бот на живом диспетчере 
 python3 tests/test_panel.py       # панель Mini App в Chromium (нужны aiogram и Playwright для node)
 python3 tests/test_web.py         # веб-панель: вход, защита, файлы, вид в Chromium
 python3 tests/test_admins.py && python3 tests/test_net.py && python3 tests/test_meta_menu.py
-python3 tests/test_regress_f2f3.py
+python3 tests/test_regress_f2f3.py && python3 tests/test_amnezia.py
 ```
 
 ---
@@ -570,6 +592,6 @@ python3 tests/test_regress_f2f3.py
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v1.2.42** · MIT License
+**AWG Toolza v1.2.43** · MIT License
 
 </div>

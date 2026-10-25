@@ -1979,6 +1979,83 @@ async def run():
     no_hourglass("антисканер")
     botapi.call = real_call_
 
+    print("Перенос из Amnezia")
+    AMZ = {"container": "amnezia-awg2", "running": True, "migrated": False, "proto": "3.1", "port": 51888,
+           "net": "10.8.1.0/24", "clients": [{"name": "Petr", "orig": "Пётр <b>", "ip": "10.8.1.1"},
+                                             {"name": "cat", "orig": "cat", "ip": "10.8.1.2"}],
+           "errors": [], "warnings": ["не переносится: PostUp"], "blockers": []}
+    amz_calls, amz_jobs = [], []
+    real_job_ = botapi.job_start
+
+    async def amz_call(*args, **kw):
+        if args[:1] != ("amnezia",):
+            return await real_call_(*args, **kw)
+        amz_calls.append(args[1:])
+        if args[1] in ("status", "scan"):
+            return botapi.Result(True, data=json.loads(json.dumps(AMZ)))
+        return botapi.Result(True, log="Контейнер amnezia-awg2 удалён")
+
+    async def amz_job(*args, **kw):
+        amz_jobs.append(args)
+        return botapi.Result(False, error="тест: задачу не запускаем")
+    botapi.call = amz_call
+    botapi.job_start = amz_job
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка переноса, когда найден контейнер", ("🐳 Перенос из Amnezia", "amz") in buttons, buttons)
+    text, buttons = screen(await press("amz"))
+    chk("экран переноса: протокол, порт, клиенты с исходными именами (экранированы), предупреждения",
+        "AWG 3.1 · порт 51888/udp" in text and "Petr ← Пётр &lt;b&gt;" in text and "cat ←" not in text
+        and "⚠️ не переносится: PostUp" in text and "Клиентов: 2" in text, text)
+    chk("кнопки: перенести, обновить, назад", ("🚚 Перенести", "amz:go") in buttons and ("◀️ Назад", "srv") in buttons, buttons)
+    text, buttons = screen(await press("amz:go"))
+    chk("перенос — с вопросом: контейнер остановится, вернётся сам при ошибке", "остановлен (не удалён)" in text
+        and "вернётся автоматически" in text and ("🚚 Перенести", "amz:gook") in buttons, text)
+    await press("amz:gook")
+    chk("перенос — задачей awg2 amnezia migrate", ("amnezia", "migrate") in amz_jobs, amz_jobs)
+    AMZ["blockers"] = ["components"]
+    text, buttons = screen(await press("amz"))
+    chk("нет компонентов — причина и кнопка установки вместо «Перенести»", "Сначала установи компоненты" in text
+        and ("📦 Компоненты", "srv:install") in buttons and not any(d == "amz:go" for _, d in buttons), buttons)
+    AMZ.update(migrated=True)
+    text, buttons = screen(await press("amz"))
+    chk("после переноса: вернуть или удалить контейнер", "Перенос сделан" in text and ("↩️ Вернуть Amnezia", "amz:rev") in buttons
+        and ("🗑 Удалить контейнер", "amz:rm") in buttons, buttons)
+    await press("amz:revok")
+    chk("возврат — задачей amnezia revert", ("amnezia", "revert") in amz_jobs, amz_jobs)
+    text, _ = screen(await press("amz:rmok"))
+    chk("удаление контейнера — awg2 amnezia remove", ("remove",) in amz_calls and "удалён" in text, [amz_calls[-2:], text])
+    AMZ.clear()
+    AMZ.update(container="", migrated=False)
+    text, buttons = screen(await press("srv"))
+    chk("контейнера нет — кнопки переноса нет", not any(d == "amz" for _, d in buttons), buttons)
+    botapi.job_start = real_job_
+
+    async def imp_call(*args, **kw):
+        r = await real_call_(*args, **kw)
+        if args[:2] == ("clients", "list") and r.ok and isinstance(r.data, list):
+            for c in r.data:
+                if c.get("name") == "alice":
+                    c["amnezia"] = "Алиса"
+        if args[:2] == ("client", "reissue"):
+            amz_calls.append(args)
+            return botapi.Result(False, error="тест: перевыпуск")
+        return r
+    botapi.call = imp_call
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("карточка перенесённого: пометка и исходное имя, «Перевыпустить» вместо конфига, ссылки и мимикрии",
+        "Перенесён из Amnezia («Алиса»)" in text and ("🔁 Перевыпустить конфиг", "cl:rei:alice") in buttons
+        and not any(d in ("cl:conf:alice", "cl:shr:alice", "cl:mim:alice") for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("cl:rei:alice"))
+    chk("перевыпуск — с вопросом: прежний конфиг перестанет подключаться", "перестанет" in text
+        and ("🔁 Перевыпустить", "cl:reiok:alice") in buttons, text)
+    text, _ = screen(await press("cl:reiok:alice"))
+    chk("перевыпуск — awg2 client reissue, ошибка — экраном", ("client", "reissue", "alice") in amz_calls
+        and "тест: перевыпуск" in text, text)
+    text, _ = screen(await press("cl:shr:alice"))
+    chk("ссылку на 5 минут перенесённому не создать — карточка", "Перенесён из Amnezia" in text, text)
+    no_hourglass("перенос из Amnezia")
+    botapi.call = real_call_
+
     print("Ширина экрана")
     short = ui.fit("<b>🛡 alice</b>", ui.kb(("📦 Комплект", "a"), ("🗑 Удалить", "b")))
     chk("короткий текст дополняется до ширины кнопок", short.startswith("<b>🛡 alice</b>")

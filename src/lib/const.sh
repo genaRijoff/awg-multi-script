@@ -97,6 +97,7 @@ DNS_PROXY_ADDR="127.0.2.1"
 DNS_PROXY_PORT=53
 DNS_PROXY_CONF="/etc/dnscrypt-proxy/dnscrypt-proxy.toml"
 DNS_PROXY_STATE="/etc/dnscrypt-proxy/awg.state"
+DNS_RESOLVERS_MD="/var/cache/dnscrypt-proxy/public-resolvers.md"   # кэш списка резолверов dnscrypt-proxy
 DNS_PROXY_BACKUP_CONF="/etc/dnscrypt-proxy/dnscrypt-proxy.toml.awg-backup"
 DNS_PERSIST_SCRIPT="/usr/local/bin/awg-dns-persist.sh"
 DNS_HEALTH_SCRIPT="/usr/local/bin/awg-dns-healthcheck.sh"

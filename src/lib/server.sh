@@ -130,10 +130,10 @@ do_install() {
     if [[ "$why" == *"перезагрузка модуля"* ]]; then
       mod_reload || true
     elif (( ! AUTO_MODE )) && ask_yes "  Перезагрузить сервер сейчас? [Y/n]: " y; then
-      ok "Перезагружаюсь. После — sudo awg2 → Сервер → Создать сервер"
+      ok "Перезагружаюсь. После — sudo awg2 → ${INSTALL_NEXT:-Сервер → Создать сервер}"
       sleep 2; reboot
     fi
-  else
+  elif [[ -z "${INSTALL_NEXT:-}" ]]; then   # из переноса Amnezia — сводка идёт сразу следом
     info "Следующий шаг: Сервер → Создать сервер"
   fi
 }
@@ -586,6 +586,12 @@ server_create_opts() {
 
 do_create_server() {
   if ! server_create_ready; then return 1; fi
+  # Сервер Amnezia на этом VPS: перенос сохраняет клиентам их конфиги, новый сервер — нет
+  if amnezia_container &>/dev/null && ! amnezia_migrated; then
+    warn "На сервере есть Amnezia ($(amnezia_container)) — перенеси его: Сервер → Перенос из Amnezia."
+    info "Клиенты останутся со своими конфигами. Новый сервер — новые конфиги всем."
+    ask_yes "  Всё равно создать новый сервер? [y/N]: " n || return 0
+  fi
   if [[ -n "$REBOOT_WHY" ]]; then
     warn "$REBOOT_WHY"
     ask_yes "  Продолжить без перезагрузки? [y/N]: " n || return 0

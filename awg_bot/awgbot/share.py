@@ -254,7 +254,7 @@ TG_ICON = ('<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" 
            'l.2-3.1 5.7-5.2c.3-.2 0-.4-.4-.1l-7 4.4-3-.9c-.7-.2-.7-.6.2-.8z"/></svg>')
 TOP = (f'<div class="top">'
        f'<a href="{ui.CHANNEL_URL}" target="_blank" rel="noopener noreferrer">{TG_ICON}Telegram</a>'
-       f'<a class="don" href="{ui.SUPPORT_URL}" target="_blank" rel="noopener noreferrer">💚 Поддержать</a></div>')
+       f'<a class="don" href="{ui.SUPPORT_URL}" target="_blank" rel="noopener noreferrer">💙 Поддержать</a></div>')
 
 JS = r"""(function () {
   var main = document.querySelector("main"), exp = +main.getAttribute("data-exp") * 1000;

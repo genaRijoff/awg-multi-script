@@ -30,11 +30,13 @@ from .sections import wgobf
 # Команды awg2 api, открытые панели; первое слово — раздел
 ALLOWED = {"status", "version", "server", "module", "clients", "client", "mimicry", "diag", "backup",
            "tunnels", "warp", "xray", "t2s", "exits", "cascade", "dns", "wgobf", "update", "log", "bot",
-           "cert", "uninstall", "traffic", "antiscan"}
+           "cert", "uninstall", "traffic", "antiscan", "amnezia"}
 # backup create auto — ротация автобэкапов: «auto 1» стёр бы все, кроме одного;
 # log web — журнал входов веб-панели (адреса, введённые логины), как раздел «Веб-панель» в боте
 OWNER_ONLY = (("uninstall",), ("bot", "uninstall"), ("bot", "webapp", "port"), ("cert", "issue"),
-              ("cert", "use"), ("cert", "remove"), ("backup", "create", "auto"), ("log", "web"))
+              ("cert", "use"), ("cert", "remove"), ("backup", "create", "auto"), ("log", "web"),
+              # Перенос из Amnezia подменяет сервер целиком — как и удаление Тулзы, только владельцу
+              ("amnezia", "migrate"), ("amnezia", "revert"), ("amnezia", "remove"))
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 MAX_ARGS, MAX_ARG = 32, 4000       # правка всех параметров 3.1 — 23 аргумента
 TIMEOUT_MAX = 900
@@ -225,9 +227,13 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         name = _name(body)
         r = await api.call("clients", "list")
         rows = r.data if r.ok and isinstance(r.data, list) else []
-        pub = next((c.get("pub") for c in rows if c.get("name") == name), None)
+        row = next((c for c in rows if c.get("name") == name), None)
+        pub = row.get("pub") if row else None
         if not pub:
             return web.json_response({"error": f"Клиента {name} нет"}, status=404)
+        if row.get("amnezia"):
+            return web.json_response({"error": f"Конфиг клиента {name} есть только у него самого: клиент перенесён "
+                                               "из Amnezia. Нужен новый — «Перевыпустить конфиг»"}, status=400)
         if not share.host_ok(request.host):
             return web.json_response({"error": "Адрес сервера не распознан"}, status=400)
         by = f"web:{user.get('first_name', '')}" if user.get("web") else f"tg:{user.get('id')}"

@@ -601,6 +601,62 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await shot("23-module");
   });
   await step("журнал", async () => { await nav("/log/manager", "pre"); });
+  await step("перенос из Amnezia: пункт в «Сервере», предпросмотр клиентов, перенос задачей; перенесённый клиент — перевыпуск", async () => {
+    const AMZ = { container: "amnezia-awg2", running: true, migrated: false, proto: "3.1", port: 51888, net: "10.8.1.0/24",
+      clients: [{ name: "Petr", orig: "Пётр <b>x</b>", ip: "10.8.1.1" }, { name: "cat", orig: "cat", ip: "10.8.1.2" }],
+      errors: [], warnings: ["не переносится: PostUp"], blockers: [] };
+    const jobs = [];
+    const fake = async (r) => {
+      const body = r.request().postData() || "";
+      if (body.includes('"amnezia","status"') || body.includes('"amnezia","scan"')) {
+        return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: AMZ }) });
+      }
+      return r.continue();
+    };
+    const job = (r) => { jobs.push(r.request().postData() || ""); return r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: false, error: "тест: без задачи" }) }); };
+    const imp = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      (d.rows || []).forEach((c) => { if (c.name === "alice") c.amnezia = "Алиса"; });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/job", job);
+    try {
+      await nav("/server", "text=Перенос из Amnezia");
+      await nav("/server/amnezia", "text=Перенести");
+      const txt = await page.textContent("#app");
+      if (!txt.includes("Пётр <b>x</b>") || !txt.includes("AWG 3.1") || !txt.includes("51888/udp") || !txt.includes("не переносится: PostUp"))
+        throw new Error("предпросмотр: " + txt.slice(0, 400));
+      if (await page.locator("#app b >> text=x").count()) throw new Error("исходное имя выведено как HTML");
+      await page.click("#app button:has-text('Перенести')");
+      await page.waitForTimeout(300);
+      if (!jobs.some((b) => b.includes('"amnezia","migrate"'))) throw new Error("перенос не ушёл задачей: " + jobs.join(" | "));
+      AMZ.migrated = true;
+      await nav("/server/amnezia", "text=Вернуть Amnezia");
+      await page.waitForSelector("text=Удалить контейнер");
+      await nav("/server", "text=Перенос из Amnezia");
+      if (await page.locator(".item:has-text('Перенос из Amnezia') .ibox").count() !== 1
+        || (await page.textContent(".item:has-text('Перенос из Amnezia') .title")).includes("🐳"))
+        throw new Error("пункт «Перенос из Amnezia» — без значка, как у соседних");
+      await shot("23b-server-amnezia");
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/job", job);
+    }
+    await page.route("**/api/clients", imp);
+    try {
+      await page.evaluate(() => { S.clients = null; });
+      await nav("/client/alice", "text=Перевыпустить конфиг");
+      if (await page.locator("#app button:has-text('Конфиг и QR')").count()) throw new Error("у перенесённого — «Конфиг и QR»");
+      if (await page.locator("#app button:has-text('Мимикрия')").count()) throw new Error("у перенесённого — «Мимикрия»");
+      await page.waitForSelector("text=«Алиса» · конфиг есть только у клиента");
+      await nav("/client/alice/qr", "text=Перенесён из Amnezia");
+      await page.waitForSelector("#app button:has-text('Перевыпустить конфиг')");
+    } finally {
+      await page.unroute("**/api/clients", imp);
+      await page.evaluate(() => { S.clients = null; });
+    }
+  });
   await step("антисканер: выключен, три списка, исключения, «Включить»", async () => {
     await nav("/server/antiscan", "text=Сети госорганов");
     const n = await page.locator(".card.list .item .check").count();
@@ -746,6 +802,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector("text=Правил нет");
   });
   await step("DNS", async () => { await nav("/tunnels/dns", "text=Включить"); await shot("39-dns"); });
+  await step("DNS: свои резолверы — отмечено «Вручную», подсказка популярных добавляет и убирает имя", async () => {
+    const D = { installed: true, running: true, intercept: true, upstream: "adguard-dns-doh dns.sb",
+      presets: [{ names: "cloudflare google cisco-doh", label: "Cloudflare + Google + Cisco" }, { names: "cloudflare", label: "Только Cloudflare" }],
+      popular: [{ name: "cloudflare", label: "Cloudflare 1.1.1.1" }, { name: "quad9-doh-ip4-port443-nofilter-pri", label: "Quad9 без фильтра" },
+        { name: "dns.sb", label: "DNS.SB" }] };
+    const fake = (r) => ((r.request().postData() || "").includes('"dns","status"')
+      ? r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: D }) }) : r.continue());
+    await page.route("**/api/call", fake);
+    try {
+      await nav("/tunnels/dns", "text=Вручную");
+      const manual = page.locator(".item:has-text('Вручную')");
+      if (!(await manual.locator(".radio.on").count()) || !(await manual.textContent()).includes("adguard-dns-doh dns.sb"))
+        throw new Error("свои резолверы — без отметки «Вручную»: " + (await manual.textContent()));
+      if (await page.locator(".item:not(:has-text('Вручную')) .radio.on").count()) throw new Error("отмечен и пресет");
+      await nav("/tunnels/dns/manual", "text=Популярные резолверы");
+      const input = page.locator("#app input");
+      if ((await input.inputValue()) !== "adguard-dns-doh, dns.sb") throw new Error("поле: " + (await input.inputValue()));
+      await page.click("summary:has-text('Популярные')");
+      if (!(await page.locator(".item:has-text('dns.sb') .check.on").count())) throw new Error("dns.sb из поля — без отметки");
+      await page.click(".item:has-text('quad9-doh-ip4-port443-nofilter-pri')");
+      await page.click(".item:has-text('dns.sb')");
+      if ((await input.inputValue()) !== "adguard-dns-doh, quad9-doh-ip4-port443-nofilter-pri")
+        throw new Error("после нажатий: " + (await input.inputValue()));
+      await shot("39b-dns-manual");
+    } finally {
+      await page.unroute("**/api/call", fake);
+    }
+  });
   await step("всё напрямую", async () => {
     await nav("/tunnels", ".kcard");
     await page.click("text=Всё напрямую");
@@ -1488,7 +1572,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await step("все экраны: ничего не уходит под нижнюю панель и плашку действий, нет прокрутки вбок", async () => {
       const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
         + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
-        + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/antiscan /server/create /server/endpoint /server/module "
+        + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/amnezia /server/antiscan /server/create /server/endpoint /server/module "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
         + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");
