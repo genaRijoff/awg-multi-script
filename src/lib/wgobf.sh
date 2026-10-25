@@ -897,8 +897,8 @@ wgobf_restore() {
 }
 
 # ── Меню ──────────────────────────────────────────────────
-wgobf_status() {
-  local s
+wgobf_status() {  # [состояние порта в UFW — если уже узнано]
+  local s u="${1:-}"
   if ip link show "$WGOBF_IF" &>/dev/null; then s="${G}● поднят${N}"; else s="${R}○ лежит${N}"; fi
   echo -e "  $WGOBF_IF         : $s"
   if unit_active "$WGOBF_UNIT"; then s="${G}● работает${N}"; else s="${R}○ не работает${N}"; fi
@@ -908,10 +908,11 @@ wgobf_status() {
   echo -e "  Без обфускатора: $([[ "$(wgobf_get ALLOW_CLEAN)" == 1 ]] && echo -e "${Y}да${N}" || echo нет)"
   echo -e "  Подсеть        : $(wgobf_get NET), MTU $(wgobf_get MTU), WireGuard на $(wgobf_get WG_PORT) ${D}(снаружи закрыт)${N}"
   echo -e "  Клиентов       : $(wgobf_clients | grep -c . || true)"
-  if ufw_active; then
-    if ufw_port_open "$(wgobf_get PORT)/udp"; then echo -e "  UFW            : ${G}● порт открыт${N}"
-    else echo -e "  UFW            : ${R}▲ порт $(wgobf_get PORT)/udp закрыт${N} ${D}— Сервер → Проверить и починить${N}"; fi
-  fi
+  [[ -n "$u" ]] || u=$(ufw_port_state "$(wgobf_get PORT)/udp")
+  case "$u" in
+    open) echo -e "  UFW            : ${G}● порт открыт${N}" ;;
+    closed) echo -e "  UFW            : ${R}▲ порт $(wgobf_get PORT)/udp закрыт${N} ${D}— Сервер → Проверить и починить${N}" ;;
+  esac
 }
 
 wgobf_settings() {

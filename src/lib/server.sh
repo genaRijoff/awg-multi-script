@@ -657,22 +657,20 @@ _fixed() { REPAIR_FIXED=$((REPAIR_FIXED + 1)); ok "$1"; }
 # политика FORWARD не режет клиентов; правила wgobf0 на месте — их сносит
 # ufw с MANAGE_BUILTINS=yes или iptables -F, и обфускатор остаётся без NAT.
 _repair_firewall() {
-  local p
-  if ufw_active; then
-    if server_exists; then
-      p=$(server_port)
-      if ufw_port_open "$p/udp"; then ok "UFW: порт AWG $p/udp открыт"
-      else _issue "UFW включён, а порт AWG $p/udp закрыт"; ufw_allow "$p/udp" AmneziaWG && _fixed "UFW: открыт $p/udp"; fi
-    fi
-    if wgobf_installed; then
-      p=$(wgobf_get PORT)
-      if ufw_port_open "$p/udp"; then ok "UFW: порт обфускатора $p/udp открыт"
-      else _issue "UFW включён, а порт обфускатора $p/udp закрыт"; ufw_allow "$p/udp" "$WGOBF_TAG" && _fixed "UFW: открыт $p/udp"; fi
-    fi
-    if { server_exists || wgobf_installed; } && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
-      _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
-      ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
-    fi
+  local p st on=0 what tag
+  for what in AWG обфускатора; do
+    if [[ "$what" == AWG ]]; then server_exists || continue; p=$(server_port); tag=AmneziaWG
+    else wgobf_installed || continue; p=$(wgobf_get PORT); tag="$WGOBF_TAG"; fi
+    st=$(ufw_port_state "$p/udp")
+    case "$st" in
+      open) on=1; ok "UFW: порт $what $p/udp открыт" ;;
+      closed) on=1; _issue "UFW включён, а порт $what $p/udp закрыт"
+              ufw_allow "$p/udp" "$tag" && _fixed "UFW: открыт $p/udp" ;;
+    esac
+  done
+  if (( on )) && grep -q '^DEFAULT_FORWARD_POLICY="DROP"' "$UFW_DEFAULTS" 2>/dev/null; then
+    _issue "UFW: политика FORWARD — DROP, клиенты VPN без правил туннеля останутся без интернета"
+    ufw_forward_accept >/dev/null && _fixed "UFW: DEFAULT_FORWARD_POLICY=ACCEPT"
   fi
   if wgobf_installed && ip link show "$WGOBF_IF" &>/dev/null \
      && ! iptables -C FORWARD -i "$WGOBF_IF" -j ACCEPT -m comment --comment "$WGOBF_TAG" 2>/dev/null; then

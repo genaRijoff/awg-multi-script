@@ -2925,11 +2925,14 @@ rc, out, err = bash(UFWS + WOV + "wgobf_install_opts endpoint=203.0.113.10 port=
 chk("установка обфускатора при включённом UFW — порт открыт с меткой, FORWARD=ACCEPT, об этом сказано",
     rc == 0 and "40555/udp" in ufw_rules() and "# awg-wgobf" in ufw_rules() and "UFW: открыт 40555/udp" in out
     and 'DEFAULT_FORWARD_POLICY="ACCEPT"' in open(UFWD).read() and "ufw reload" in calls(), [out[-500:], err[-300:], ufw_rules()])
+reset_calls()
 rc, out, _ = bash(UFWS + WOV + f'API_DATA="{TMP}/api-wgobf.json"; _api_wgobf status >/dev/null 2>&1; cat "$API_DATA"')
 try:
     chk("api wgobf status: ufw=open", json.loads(out).get("ufw") == "open", out[-300:])
 except ValueError:
     chk("api wgobf status: ufw=open", False, out[-300:])
+n = calls().count("ufw status")
+chk("api wgobf status — ufw запускается один раз (он медленный, на Python)", n == 1, n)
 # UFW включили после установки (правил на порты нет, FORWARD снова DROP), правила wgobf0 снесены
 open(UFWR, "w").close()
 ufw_defaults("DROP")
