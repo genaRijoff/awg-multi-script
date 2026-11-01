@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.46"
+VERSION="v1.2.47"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -890,6 +890,9 @@ valid_cidr() {
 # Без ведущих нулей: «0080» и «/08» — не восьмеричные числа и не ошибка
 # арифметики, а отказ; иначе такое значение легло бы в конфиги как есть.
 valid_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( $1 <= 65535 )); }
+# Порт AWG и обфускатора: 1024-65535 или 443 — там, где ждут QUIC (HTTP/3).
+# Остальные ниже 1024 — системные: 53 перехватывает DNS Тулзы, 123 — NTP и т.п.
+awg_port_ok() { valid_port "$1" && (( $1 >= 1024 || $1 == 443 )); }
 
 # Имя хоста (не IP): метки из букв, цифр и дефисов, минимум одна точка.
 valid_domain() {
@@ -2377,6 +2380,7 @@ choose_mimicry() {
     echo -e "  ${D}  Для одного I1 самый достоверный — QUIC (1).${N}"
   fi
   echo -e "  ${D}  На высоком порту естественны STUN, WebRTC, RTP; DNS/NTP/SSDP — нет.${N}"
+  echo -e "  ${D}  На порту 443 — QUIC (1) с одним I1.${N}"
   read_choice c "${C}  Выбор [0-9] (Enter = $def): ${N}" 0 9 "$def"
   (( c == 0 )) && return 1
   MIMICRY="${MIMICRY_PROFILES[$((c - 1))]}"
@@ -3002,14 +3006,14 @@ _choose_net() {
 _choose_port() {
   local v
   while true; do
-    read_line v "${C}  UDP-порт [Enter = случайный]: ${N}"
+    read_line v "${C}  UDP-порт: 443 или 1024-65535 [Enter = случайный]: ${N}"
     v="${v// /}"
     if [[ -z "$v" ]]; then S_PORT=$(random_free_udp_port) || return 1; return 0; fi
-    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1024 && v <= 65535 )); then
+    if awg_port_ok "$v"; then
       udp_port_busy "$v" && { warn "Порт $v занят"; continue; }
       S_PORT=$v; return 0
     fi
-    warn "Порт — число 1024-65535"
+    warn "Порт — 443 или число 1024-65535"
   done
 }
 
@@ -3076,7 +3080,7 @@ server_create_opts() {
       region) [[ "$v" =~ ^(world|ru)$ ]] || { err "region: world | ru"; return 1; }; S_REGION="$v" ;;
       dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }; MTU="$v" ;;
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; S_PORT="$v" ;;
       net) valid_cidr "$v" && [[ "${v#*/}" == 24 ]] || { err "net: сеть /24"; return 1; }
            v="${v%.*}.0/24"
@@ -8454,9 +8458,9 @@ wgobf_install() {
     done
   fi
   while true; do
-    read_line port "${C}  UDP-порт обфускатора (Enter — случайный): ${N}"
+    read_line port "${C}  UDP-порт обфускатора: 443 или 1024-65535 (Enter — случайный): ${N}"
     [[ -z "$port" ]] && break
-    valid_port "$port" && (( port >= 1024 )) || { warn "Порт 1024-65535"; continue; }
+    awg_port_ok "$port" || { warn "Порт — 443 или 1024-65535"; continue; }
     udp_port_busy "$port" && { warn "UDP $port занят (сокет, AWG или каскад)"; continue; }
     break
   done
@@ -8488,7 +8492,7 @@ wgobf_install_opts() {
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; port="$v" ;;
       masking) [[ "$v" =~ ^(STUN|NONE)$ ]] || { err "masking: STUN | NONE"; return 1; }; mask="$v" ;;
       clean) [[ "$v" =~ ^[01]$ ]] || { err "clean: 0 | 1"; return 1; }; clean="$v" ;;
@@ -18001,5 +18005,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=1a0d66072445a774
+_BUILD_SUM=76586f6a796decc1
 main "$@"
