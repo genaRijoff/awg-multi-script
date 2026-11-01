@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.47"
+VERSION="v1.2.48"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -13048,11 +13048,14 @@ _api_readonly() {
   return 1
 }
 
+# Блокировку не взять (нет каталога, файла или ждали дольше wait) — отказ:
+# без неё две меняющие команды пошли бы одновременно
 _api_lock() {
   local wait="${API_LOCK_WAIT:-20}" holder
-  mkdir -p "$STATE_DIR"
-  exec 8>>"$API_LOCK" || return 0
+  mkdir -p "$STATE_DIR" || { err "Не удалось создать каталог блокировки API"; return 73; }
+  exec 8>>"$API_LOCK" || { err "Не удалось открыть файл блокировки API"; return 73; }
   if ! flock -w "$wait" 8; then
+    exec 8>&-
     holder=$(cat "$API_LOCK.info" 2>/dev/null)
     err "Идёт другая операция${holder:+ ($holder)} — повтори, когда она закончится"
     return 75
@@ -18005,5 +18008,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=76586f6a796decc1
+_BUILD_SUM=c95ab7c4ea12bf98
 main "$@"
