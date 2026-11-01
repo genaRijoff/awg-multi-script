@@ -736,9 +736,9 @@ wgobf_install() {
     done
   fi
   while true; do
-    read_line port "${C}  UDP-порт обфускатора (Enter — случайный): ${N}"
+    read_line port "${C}  UDP-порт обфускатора: 443 или 1024-65535 (Enter — случайный): ${N}"
     [[ -z "$port" ]] && break
-    valid_port "$port" && (( port >= 1024 )) || { warn "Порт 1024-65535"; continue; }
+    awg_port_ok "$port" || { warn "Порт — 443 или 1024-65535"; continue; }
     udp_port_busy "$port" && { warn "UDP $port занят (сокет, AWG или каскад)"; continue; }
     break
   done
@@ -770,7 +770,7 @@ wgobf_install_opts() {
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; port="$v" ;;
       masking) [[ "$v" =~ ^(STUN|NONE)$ ]] || { err "masking: STUN | NONE"; return 1; }; mask="$v" ;;
       clean) [[ "$v" =~ ^[01]$ ]] || { err "clean: 0 | 1"; return 1; }; clean="$v" ;;

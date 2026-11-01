@@ -1551,6 +1551,8 @@ function enterTo(button, ...fields) {
   return button;
 }
 const validPort = (v, min = 1) => /^\d{1,5}$/.test(v) && +v >= min && +v <= 65535;
+// Порт AWG и обфускатора, как awg_port_ok в awg2: 1024-65535 или 443 — порт QUIC (HTTP/3)
+const awgPortOk = (v) => validPort(v) && (+v >= 1024 || +v === 443);
 
 // Строка меню раздела: иконка (из эмодзи в подписи), заголовок, пояснение, «›»
 function menuItem(label, sub, onclick) {
@@ -3394,7 +3396,7 @@ route(/^\/server\/create$/, async (ctx) => {
   const dnsIn = h("input", { placeholder: "1.1.1.1, 8.8.8.8", inputmode: "decimal" });
   const mtu = h("input", { type: "number", min: 1280, max: 1500 });
   const net = h("input", { placeholder: "случайная 10.x.y.0/24", autocapitalize: "off", autocomplete: "off" });
-  const port = h("input", { type: "number", min: 1024, max: 65535, placeholder: "случайный" });
+  const port = h("input", { type: "number", min: 443, max: 65535, placeholder: "случайный" });
   const ep = h("input", { placeholder: "vpn.example.com", autocapitalize: "off", autocomplete: "off" });
   const first = h("input", { placeholder: "случайное", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
 
@@ -3426,7 +3428,7 @@ route(/^\/server\/create$/, async (ctx) => {
       h("label", {}, `MTU — рекомендуется ${rec}`), mtu,
       h("label", {}, "Подсеть клиентов"), net,
       hint("Случайная — меньше шансов совпасть с домашней сетью клиента"),
-      h("label", {}, "UDP-порт"), port,
+      h("label", {}, "UDP-порт — 443 или 1024-65535"), port,
       h("label", {}, "Домен для конфигов (необязательно)"), ep,
       hint("С доменом сервер можно перенести без перевыдачи конфигов. A-запись должна указывать сюда"),
       h("label", {}, "Имя первого клиента"), first,
@@ -3452,8 +3454,8 @@ route(/^\/server\/create$/, async (ctx) => {
     }
     const p = port.value.trim();
     if (p) {
-      if (!validPort(p, 1024)) throw new Error("Порт — число 1024-65535");
-      a.push(`port=${p}`);
+      if (!awgPortOk(p)) throw new Error("Порт — 443 или число 1024-65535");
+      a.push(`port=${+p}`);
     }
     const e = ep.value.trim().toLowerCase();
     if (e) {
@@ -4626,7 +4628,7 @@ const sendWgobf = (b, name, what) => busy(b, () => deliver({ what, name },
 
 function wgobfInstall(ctx, d) {
   const f = { masking: "STUN", clean: false, dns: 0 };
-  const port = h("input", { type: "number", min: 1024, max: 65535, placeholder: "случайный" });
+  const port = h("input", { type: "number", min: 443, max: 65535, placeholder: "случайный" });
   const name = h("input", { placeholder: "client1", maxlength: 32, autocapitalize: "off", autocomplete: "off" });
   const box = h("div");
   const draw = () => box.replaceChildren(
@@ -4634,7 +4636,7 @@ function wgobfInstall(ctx, d) {
     segText([["STUN", "STUN · видеозвонок"], ["NONE", "NONE · только XOR"]], f.masking, (v) => { f.masking = v; draw(); }),
     h("label", {}, "DNS клиентов"),
     segText(WGOBF_DNS.map(([l], i) => [i, l]), f.dns, (v) => { f.dns = v; draw(); }),
-    h("label", {}, "UDP-порт обфускатора"), port,
+    h("label", {}, "UDP-порт обфускатора — 443 или 1024-65535"), port,
     h("label", {}, "Имя первого клиента"), name,
     h("div", { style: "margin-top:10px" }, switchRow("Чистый WG", "пускать и обычный WireGuard без обфускатора (iOS) — его DPI видит",
       f.clean, (on) => { f.clean = on; })));
@@ -4647,10 +4649,10 @@ function wgobfInstall(ctx, d) {
     box,
     btn("📦 Установить", () => {
       const p = port.value.trim(), n = name.value.trim() || "client1";
-      if (p && !validPort(p, 1024)) return fail(new Error("Порт — число 1024-65535"));
+      if (p && !awgPortOk(p)) return fail(new Error("Порт — 443 или число 1024-65535"));
       if (!/^[A-Za-z0-9_-]{1,32}$/.test(n)) return fail(new Error("Имя: латиница, цифры, _ и -, до 32"));
       const args = ["wgobf", "install", `masking=${f.masking}`, `clean=${f.clean ? 1 : 0}`, `client=${n}`,
-        `dns=${WGOBF_DNS[f.dns][1]}`, ...(p ? [`port=${p}`] : [])];
+        `dns=${WGOBF_DNS[f.dns][1]}`, ...(p ? [`port=${+p}`] : [])];
       return runJob(ctx, "Установка WG + обфускатор", args, () =>
         btn(`📄 Комплект ${n}`, () => go(`/wgobf/client/${encodeURIComponent(n)}`), "btn-primary btn-block"));
     }, "btn-primary btn-block"));

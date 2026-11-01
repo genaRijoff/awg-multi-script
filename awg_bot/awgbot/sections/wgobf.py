@@ -197,16 +197,16 @@ async def _install_opt(cb: CallbackQuery, state: FSMContext, key: str) -> None:
 
 @act("iport")
 async def _install_port(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
-    await ask.ask(cb, state, "wo_port", "UDP-порт обфускатора (1024-65535):", "wo")
+    await ask.ask(cb, state, "wo_port", "UDP-порт обфускатора: 443 или 1024-65535", "wo")
 
 
 @ask.on("wo_port")
 async def _install_port_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1024 <= int(v) <= 65535:
-        await ask.retry(msg, state, ctx, "Порт — число 1024-65535")
+    if not ui.awg_port_ok(v):
+        await ask.retry(msg, state, ctx, "Порт — 443 или число 1024-65535")
         return
-    o = dict((await state.get_data()).get("wgobf") or {}, port=v)
+    o = dict((await state.get_data()).get("wgobf") or {}, port=str(int(v)))
     await state.update_data(wgobf=o)
     await _install_screen(msg, state)
 

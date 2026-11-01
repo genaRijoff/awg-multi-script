@@ -3047,6 +3047,20 @@ chk("удаление обфускатора снимает его правил�
 open(LINKS, "w").write(links_saved)
 shutil.rmtree(os.path.join(TMP, "wgobf-ufw"), ignore_errors=True)
 
+print("\n── Порт AWG и обфускатора: 443 (QUIC) или 1024-65535 ──")
+rc, out, _ = bash('for p in 443 1024 51820 65535 80 53 123 1023 0 65536 0443 44x; do '
+                  'awg_port_ok "$p" && printf "+%s " "$p" || printf -- "-%s " "$p"; done')
+chk("443 и 1024-65535 — можно; 80, 53, 123, 1023, 0, 65536, 0443 и мусор — нет",
+    out.split() == ["+443", "+1024", "+51820", "+65535", "-80", "-53", "-123", "-1023", "-0", "-65536", "-0443", "-44x"], out)
+rc, out, _ = bash("server_create_ready() { return 0; }; server_create_opts port=80 2>&1; echo rc=$?")
+chk("api server create port=80 — отказ с подсказкой про 443", "port: 443 или 1024-65535" in out and "rc=1" in out, out[-300:])
+rc, out, _ = bash("server_create_ready() { return 0; }; udp_listening() { [[ $1 == 443 ]]; }; "
+                  "server_create_opts port=443 2>&1; echo rc=$?")
+chk("api server create port=443 — проходит проверку, занятый 443 (HTTP/3 у веб-сервера) — отказ",
+    "UDP 443 занят" in out and "rc=1" in out and "1024-65535" not in out, out[-300:])
+rc, out, _ = bash("wgobf_installed() { return 1; }; wgobf_install_opts port=1023 2>&1; echo rc=$?")
+chk("api wgobf install port=1023 — отказ с подсказкой про 443", "port: 443 или 1024-65535" in out and "rc=1" in out, out[-300:])
+
 print("\n── Ctrl+C: выход от сигнала — в «awg2.sh; awg-bot-install.sh» вторая команда не запускается ──")
 rc, out, _ = bash("trap '_on_interrupt INT' INT; kill -INT $$; sleep 1; echo AFTER")
 chk("Ctrl+C в меню — «Прервано» и смерть от SIGINT, а не exit 130", rc == -2 and "Прервано" in out and "AFTER" not in out, (rc, out))

@@ -540,9 +540,14 @@ async def run():
     chk("мастер: не /24 — повторный вопрос", "сеть /24" in text, text)
     text, buttons = screen(await say("10.66.1.7/24"))
     chk("мастер: после подсети — порт", "UDP-порт" in text, text)
-    await press("srv:w:port=")
+    text, _ = screen(await press("srv:w:port=ask"))
+    chk("мастер: вопрос про порт называет 443 (QUIC)", "443 или 1024-65535" in text, text)
+    text, _ = screen(await say("80"))
+    chk("мастер: порт 80 — повторный вопрос", "Порт — 443 или число 1024-65535" in text, text)
+    text, _ = screen(await say("443"))
+    chk("мастер: порт 443 принят — дальше адрес в конфигах", "Адрес в конфигах" in text, text)
     text, _ = screen(await press("srv:w:endpoint="))
-    chk("мастер: итог с подсетью", "Подсеть: 10.66.1.0/24" in text, text)
+    chk("мастер: итог с подсетью и портом 443", "Подсеть: 10.66.1.0/24" in text and "Порт: 443" in text, text)
     long_domain = "a" * 60 + ".example.com"
     await press("srv:epdom")
     text, buttons = screen(await say(long_domain))
@@ -2062,6 +2067,11 @@ async def run():
         and ui.width(short.replace("<b>", "").replace("</b>", "")) >= 2 * (ui.width("📦 Комплект") + 4), short)
     long_text = "<b>Заголовок</b>\n" + "очень длинная строка текста экрана"
     chk("длинный текст не трогается", ui.fit(long_text, ui.kb(("📦 Комплект", "a"))) == long_text)
+
+    print("Порт AWG и обфускатора")
+    chk("ui.awg_port_ok: 443 и 1024-65535 — да; 80, 1023, 65536, мусор — нет",
+        all(ui.awg_port_ok(v) for v in ("443", "1024", "51820", "65535"))
+        and not any(ui.awg_port_ok(v) for v in ("80", "53", "1023", "0", "65536", "", "44x", "١٠٢٤", "000443000")))
 
 
 asyncio.run(run())

@@ -656,6 +656,10 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       await page.unroute("**/api/client/share", fake);
     }
   });
+  await step("порт AWG и обфускатора: 443 (QUIC) или 1024-65535", async () => {
+    const r = await page.evaluate(() => ["443", "1024", "65535", "80", "1023", "65536", "44x"].map((v) => awgPortOk(v)));
+    if (r.join(",") !== "true,true,true,false,false,false,false") throw new Error(r.join(","));
+  });
   await step("журнал", async () => { await nav("/log/manager", "pre"); });
   await step("перенос из Amnezia: пункт в «Сервере», предпросмотр клиентов, перенос задачей; перенесённый клиент — перевыпуск", async () => {
     const AMZ = { container: "amnezia-awg2", running: true, migrated: false, proto: "3.1", port: 51888, net: "10.8.1.0/24",

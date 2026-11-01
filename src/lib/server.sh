@@ -477,14 +477,14 @@ _choose_net() {
 _choose_port() {
   local v
   while true; do
-    read_line v "${C}  UDP-порт [Enter = случайный]: ${N}"
+    read_line v "${C}  UDP-порт: 443 или 1024-65535 [Enter = случайный]: ${N}"
     v="${v// /}"
     if [[ -z "$v" ]]; then S_PORT=$(random_free_udp_port) || return 1; return 0; fi
-    if [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1024 && v <= 65535 )); then
+    if awg_port_ok "$v"; then
       udp_port_busy "$v" && { warn "Порт $v занят"; continue; }
       S_PORT=$v; return 0
     fi
-    warn "Порт — число 1024-65535"
+    warn "Порт — 443 или число 1024-65535"
   done
 }
 
@@ -551,7 +551,7 @@ server_create_opts() {
       region) [[ "$v" =~ ^(world|ru)$ ]] || { err "region: world | ru"; return 1; }; S_REGION="$v" ;;
       dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; S_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }; MTU="$v" ;;
-      port) valid_port "$v" && (( v >= 1024 )) || { err "port: 1024-65535"; return 1; }
+      port) awg_port_ok "$v" || { err "port: 443 или 1024-65535"; return 1; }
             udp_port_busy "$v" && { err "UDP $v занят"; return 1; }; S_PORT="$v" ;;
       net) valid_cidr "$v" && [[ "${v#*/}" == 24 ]] || { err "net: сеть /24"; return 1; }
            v="${v%.*}.0/24"
