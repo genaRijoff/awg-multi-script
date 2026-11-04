@@ -3963,6 +3963,8 @@ route(/^\/tunnels\/warp\/import$/, async (ctx) => {
   ctx.put(title("📥 Профиль WARP"),
     h("div", { class: "card small" }, "Зарегистрируй профиль там, где Cloudflare доступен (например, shell.cloud.google.com):",
       h("pre", { style: "margin:8px 0 0" }, "./wgcf register --accept-tos && ./wgcf generate")),
+    hint("Подойдёт и профиль с параметрами AmneziaWG (Jc, Jmin, Jmax): с российских серверов чистый WireGuard "
+      + "к Cloudflare часто режут, а с ними WARP поднимается через AmneziaWG."),
     h("label", {}, "wgcf-profile.conf"), fileField(ta), ta,
     btn("📥 Импортировать", (b) => {
       const text = ta.value.trim();

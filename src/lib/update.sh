@@ -283,7 +283,7 @@ helpers_refresh() {
   _mod_src_patch "$MOD_SRC_DIR"
   if [[ -f "$WARP_AUTOSTART_SCRIPT" ]]; then
     emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' \
-      WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_wg_bringup
+      WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup
   fi
   if [[ -f "$WARP_HEALTH_SCRIPT" ]]; then
     emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \

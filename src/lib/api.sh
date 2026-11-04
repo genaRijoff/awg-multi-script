@@ -514,7 +514,7 @@ _api_warp() {
         # Для карточки: интерфейс, адрес Cloudflare, рукопожатие (wg) и счётчики
         _kv iface "$WARP_IF"
         _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
-        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <(wg show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
+        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <("$(warp_tool)" show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
         _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
         _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
       warp_status ;;

@@ -181,7 +181,9 @@ async def _warp_import(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await ask.ask(cb, state, "warp_import",
                   "Зарегистрируй профиль там, где Cloudflare доступен (например, shell.cloud.google.com):\n"
                   "<code>./wgcf register --accept-tos &amp;&amp; ./wgcf generate</code>\n\n"
-                  "Пришли <code>wgcf-profile.conf</code> файлом или текстом.", "warp")
+                  "Пришли <code>wgcf-profile.conf</code> файлом или текстом.\n"
+                  "<i>Подойдёт и профиль с параметрами AmneziaWG (Jc, Jmin, Jmax): с российских серверов "
+                  "чистый WireGuard к Cloudflare часто режут, а с ними WARP поднимается через AmneziaWG.</i>", "warp")
 
 
 @ask.on("warp_import")
