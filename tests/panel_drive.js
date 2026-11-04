@@ -1365,7 +1365,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       await nav("/wgobf/client/" + from, "text=Ссылка для Keenetic");
       await page.click("button:has-text('Переименовать')");
       await page.waitForURL(new RegExp("#/wgobf/client/" + from + "/rename$"));
-      await page.fill("input", to);
+      await page.fill("[data-name=wgobf-rename-input]", to);
       await page.click("[data-name=wgobf-rename-save]");
       await page.waitForURL(new RegExp("#/wgobf/client/" + to + "$"));
       await page.waitForSelector("text=Ссылка для Keenetic");
@@ -1476,12 +1476,13 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot", "text=Уведомления");
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
-    if (await page.locator(".switch.on").count() !== 7) throw new Error("ждали 7 включённых уведомлений");
+    if (await page.locator(".switch.on").count() !== 8) throw new Error("ждали 8 включённых уведомлений");
+    await page.waitForSelector(".card.item:has-text('WARP упал и снова работает')");
     await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
-    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 6);
+    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 7);
     await nav("/bot/alerts", ".switch");
-    if (await page.locator(".switch.on").count() !== 6) throw new Error("выключенное уведомление не сохранилось");
+    if (await page.locator(".switch.on").count() !== 7) throw new Error("выключенное уведомление не сохранилось");
     await shot("52a-alerts");
   });
   await step("меню бота в чат", async () => {

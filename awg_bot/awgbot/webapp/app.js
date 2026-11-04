@@ -4777,7 +4777,7 @@ route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
 });
 
 route(/^\/wgobf\/client\/([^/]+)\/rename$/, async (ctx, name) => {
-  const input = h("input", { value: name, maxlength: 32, autocapitalize: "off", autocomplete: "off" });
+  const input = h("input", { value: name, maxlength: 32, autocapitalize: "off", autocomplete: "off", "data-name": "wgobf-rename-input" });
   ctx.put(title("✏️ Новое имя"), h("label", {}, "Латиница, цифры, _ и -, до 32"), input,
     enterTo(h("button", { class: "btn-primary btn-block", "data-name": "wgobf-rename-save", onclick: (ev) => busy(ev.currentTarget, async () => {
       const v = input.value.trim();
