@@ -895,6 +895,42 @@ async def run():
     await al.tick(BOT, st2)
     chk("сервер удалён, пока awg0 лежал, — без ложного «снова работает»",
         not any("снова работает" in t for t in said(mark)) and "down_sent" not in st2, [said(mark), st2])
+    # WARP: включён, а туннеля нет — две проверки подряд и кнопка «Включить»; вернулся — с простоем
+    warp = {"failed": True, "state": "off"}
+
+    async def warp_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"warp": warp["state"], "warp_failed": warp["failed"]}}
+        return await real_data(*args, **kw)
+    al.api.data = warp_status
+    st3 = {"boot": "boot-B"}
+
+    def warp_said(mark):
+        return [t for t in said(mark) if "WARP" in t]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("WARP упал: первая проверка — молчит", not warp_said(mark), warp_said(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    chk("WARP лежит две проверки — 🟠 с кнопкой «Включить WARP»", len(rep) == 1
+        and rep[0].reply_markup.inline_keyboard[0][0].callback_data == "warp:up", warp_said(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("пока WARP лежит — молчит", not warp_said(mark), warp_said(mark))
+    warp.update(failed=False, state="up")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st3)
+    chk("WARP снова работает — с простоем", any("WARP снова работает" in t and "Простой" in t for t in warp_said(mark))
+        and "warp_sent" not in st3, [warp_said(mark), st3])
+    # Выключили руками, пока лежал: это не «снова работает»
+    st4 = {"boot": "boot-B", "warp_down": 2, "warp_since": int(time.time()) - 60, "warp_sent": True}
+    warp.update(failed=False, state="off")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st4)
+    chk("WARP выключили руками, пока лежал, — без ложного «снова работает»",
+        not warp_said(mark) and "warp_sent" not in st4, [warp_said(mark), st4])
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",
@@ -1329,6 +1365,23 @@ async def run():
     chk("нет ответа по обфускатору — офлайн-клиент не даёт второго «офлайн»", not again and "wgobf:clus" in st,
         [again, st])
     os.remove(WG_DUMP)
+
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка клиента обфускатора: кнопка «Переименовать»", ("✏️ Переименовать", "wo:ren:clus") in buttons, buttons)
+    text, _ = screen(await press("wo:ren:clus"))
+    chk("переименование обфускатора: вопрос про новое имя", "Новое имя" in text and "clus" in text, text)
+    text, _ = screen(await say("bad name"))
+    chk("переименование: недопустимое имя — повторный вопрос", "латиница" in text, text)
+    text, _ = screen(await say("clus2"))
+    with open(os.path.join(ROOT, "etc/wireguard/wgobf0.conf")) as f:
+        wgc = f.read()
+    chk("переименование обфускатора: карточка с новым именем, мониторинг переехал, комплект — в новом каталоге",
+        "clus2" in text and "# client=clus2\n" in wgc and "# client=clus\n" not in wgc
+        and store.monitored("wgobf:clus2") and not store.monitored("wgobf:clus")
+        and os.path.isfile(os.path.join(ROOT, "root/wgobf/clus2/wg.conf")), [text, wgc, store.notes()])
+    await press("wo:ren:clus2")
+    text, _ = screen(await say("clus"))
+    chk("и обратно — карточка clus", "<b>🛡 clus</b>" in text and store.monitored("wgobf:clus"), text)
 
     text, buttons = screen(await press("wo:install"))
     chk("установка обфускатора: DNS по умолчанию Cloudflare", "DNS клиентов: Cloudflare" in text, text)

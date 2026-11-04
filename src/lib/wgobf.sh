@@ -667,6 +667,28 @@ wgobf_delete_client() {
   log_info "wgobf: удалён клиент $name"
 }
 
+# Имя — только комментарий над пиром: ключи, адрес и выход не меняются, wgobf0
+# не перезапускается. Комплект переезжает в каталог с новым именем.
+wgobf_rename_client() {  # старое новое
+  local old="$1" new="$2" bak
+  wgobf_clients | grep -qxF "$old" || { err "Клиента $old нет"; return 1; }
+  [[ "$new" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { err "Имя: латиница, цифры, _ и -, до 32 символов"; return 1; }
+  [[ "$new" != all ]] || { err "Имя all занято: так в команде выхода зовутся все клиенты"; return 1; }
+  [[ "$new" == "$old" ]] && return 0
+  wgobf_clients | grep -qxF "$new" && { err "Клиент $new уже есть"; return 1; }
+  [[ -e "$WGOBF_CLIENTS/$new" ]] && { err "Каталог $WGOBF_CLIENTS/$new уже есть"; return 1; }
+  mktmp bak || return 1
+  cp -a "$WGOBF_WG_CONF" "$bak"
+  awk -v o="# client=$old" -v n="# client=$new" '$0 == o {print n; next} {print}' "$bak" \
+    | write_file "$WGOBF_WG_CONF" 600 || { cp -a "$bak" "$WGOBF_WG_CONF"; return 1; }
+  if [[ -d "$WGOBF_CLIENTS/$old" ]]; then
+    mv "$WGOBF_CLIENTS/$old" "$WGOBF_CLIENTS/$new" \
+      && wgobf_write_bundle "$new" || warn "Комплект $new не пересобран — «Комплект клиента» соберёт его заново"
+  fi
+  log_info "wgobf: клиент переименован: $old → $new"
+  ok "Переименован: $old → $new"
+}
+
 wgobf_list_clients() {
   local names=() dump now i name pub ip hs
   mapfile -t names < <(wgobf_clients)
@@ -968,13 +990,14 @@ do_wgobf_menu() {
     echo -e "  ${C}2)${N} Список"
     echo -e "  ${C}3)${N} Комплект клиента"
     echo -e "  ${C}4)${N} Удалить клиента"
-    echo -e "  ${C}5)${N} Статус и журнал"
-    echo -e "  ${C}6)${N} Перезапустить"
-    echo -e "  ${C}7)${N} Настройки"
-    echo -e "  ${C}8)${N} Выход клиентов ${D}— $(_wgobf_route_label "$(wgobf_get ROUTE)")${N}"
-    echo -e "  ${R}9)${N} Удалить WG + обфускатор"
+    echo -e "  ${C}5)${N} Переименовать клиента"
+    echo -e "  ${C}6)${N} Статус и журнал"
+    echo -e "  ${C}7)${N} Перезапустить"
+    echo -e "  ${C}8)${N} Настройки"
+    echo -e "  ${C}9)${N} Выход клиентов ${D}— $(_wgobf_route_label "$(wgobf_get ROUTE)")${N}"
+    echo -e "  ${R}10)${N} Удалить WG + обфускатор"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-9]: ${N}" 0 9 0
+    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
     case "$c" in
       1) read_line name "${C}  Имя клиента: ${N}"
          name="${name// /}"
@@ -983,11 +1006,13 @@ do_wgobf_menu() {
       3) _wgobf_pick_client && { wgobf_show_bundle "$CHOSEN" || true; } ;;
       4) _wgobf_pick_client && read_confirm "${R}  Удалить клиента $CHOSEN? (введи yes): ${N}" \
            && { wgobf_delete_client "$CHOSEN" || true; } ;;
-      5) wgobf_status; journalctl -u "$WGOBF_UNIT" -n 12 --no-pager 2>/dev/null | sed 's/^/  /' || true ;;
-      6) wgobf_restart && ok "Перезапущено" || true ;;
-      7) wgobf_settings || true ;;
-      8) wgobf_route_menu || true ;;
-      9) wgobf_remove || true ;;
+      5) _wgobf_pick_client && read_line name "${C}  Новое имя для $CHOSEN: ${N}" && name="${name// /}" \
+           && [[ -n "$name" ]] && { wgobf_rename_client "$CHOSEN" "$name" || true; } ;;
+      6) wgobf_status; journalctl -u "$WGOBF_UNIT" -n 12 --no-pager 2>/dev/null | sed 's/^/  /' || true ;;
+      7) wgobf_restart && ok "Перезапущено" || true ;;
+      8) wgobf_settings || true ;;
+      9) wgobf_route_menu || true ;;
+      10) wgobf_remove || true ;;
       0) return 0 ;;
     esac
     pause
@@ -1000,14 +1025,16 @@ wgobf_cli() {
   wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
   case "$cmd" in
     add|del|bundle) [[ -n "$name" ]] || { err "Использование: awg2 --wgobf $cmd ИМЯ"; return 1; } ;;
+    rename) [[ -n "$name" && -n "${3:-}" ]] || { err "Использование: awg2 --wgobf rename СТАРОЕ НОВОЕ"; return 1; } ;;
   esac
   case "$cmd" in
     add) wgobf_add_client "$name" ;;
     del) wgobf_delete_client "$name" ;;
+    rename) wgobf_rename_client "$name" "${3:-}" ;;
     bundle) wgobf_clients | grep -qxF "$name" || { err "Клиента $name нет"; return 1; }
             wgobf_write_bundle "$name" && ok "$WGOBF_CLIENTS/$name" ;;
     rotate-key) wgobf_rotate_key ;;
     restart) wgobf_restart && ok "Перезапущено" ;;
-    *) err "Команда: add ИМЯ | del ИМЯ | bundle ИМЯ | rotate-key | restart"; return 1 ;;
+    *) err "Команда: add ИМЯ | del ИМЯ | rename СТАРОЕ НОВОЕ | bundle ИМЯ | rotate-key | restart"; return 1 ;;
   esac
 }

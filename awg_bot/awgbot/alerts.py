@@ -4,6 +4,8 @@
 владельцам и админам, когда что-то случилось:
 
   iface   awg0 упал (две проверки подряд) и снова поднялся — с временем простоя;
+  warp    WARP упал (health-check увёл клиентов напрямую или туннель не поднялся
+          после перезагрузки) и снова работает — так же, две проверки подряд;
   reboot  сервер перезагрузился (сменился boot_id);
   cert    сертификат Mini App скоро истечёт — значит, продление не сработало;
   disk    диск заполнен на DISK_WARN% (повтор — только после спада ниже DISK_OK%);
@@ -55,7 +57,8 @@ DISK_PATH = os.environ.get("AWG_DISK_PATH", "/")
 SEND_MAX = 49 * 1024 * 1024                     # документ бота — до 50 МБ
 
 # id, подпись кнопки (полстроки в боте), полное название
-KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("reboot", "Перезагрузка", "Сервер перезагрузился"),
+KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("warp", "WARP упал", "WARP упал и снова работает"),
+         ("reboot", "Перезагрузка", "Сервер перезагрузился"),
          ("update", "Новая версия", "Новая версия Тулзы"), ("kernel", "Ядро без AWG", "Ядро без модуля AWG"),
          ("cert", "Сертификат", "Сертификат Mini App истекает"), ("disk", f"Диск {DISK_WARN}%", f"Диск заполнен на {DISK_WARN}%"),
          ("support", "Поддержка", "Пятница: поддержать проект")]
@@ -249,6 +252,24 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             gone = ui.fmt_dur(now - int(st.get("down_since") or now))
             await notify(bot, f"🟢 <b>{host}: awg0 снова работает</b>\nПростой: около {gone}")
         for k in ("down", "down_since", "down_sent"):
+            st.pop(k, None)
+
+    # WARP: включён, а туннеля нет — клиенты WARP идут напрямую, с IP сервера.
+    # Две проверки подряд: перезапуск туннеля из меню или бота не тревога
+    t = d.get("tunnels") or {}
+    if t.get("warp_failed"):
+        st["warp_down"] = int(st.get("warp_down") or 0) + 1
+        if st["warp_down"] == 1:
+            st["warp_since"] = now
+        if st["warp_down"] == IFACE_STRIKES and enabled("warp"):
+            await notify(bot, f"🟠 <b>{host}: WARP упал</b> — клиенты WARP идут напрямую, с IP сервера.\n"
+                              "Туннели → WARP → ▶️ Включить.", ui.kb(("▶️ Включить WARP", "warp:up")))
+            st["warp_sent"] = True
+    else:
+        if st.get("warp_sent") and t.get("warp") == "up":
+            gone = ui.fmt_dur(now - int(st.get("warp_since") or now))
+            await notify(bot, f"🟢 <b>{host}: WARP снова работает</b>\nПростой: около {gone}")
+        for k in ("warp_down", "warp_since", "warp_sent"):
             st.pop(k, None)
 
     # Новая версия: один раз на версию

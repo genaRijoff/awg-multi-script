@@ -410,6 +410,14 @@ def setup(app: web.Application, user_of: UserOf) -> None:
                                   "png": base64.b64encode(png).decode() if png else None,
                                   "mon": store.monitored(store.WGOBF + body["name"])})
 
+    @route("/api/wgobf/rename")
+    async def _wgobf_rename(request: web.Request, user: dict, body: dict) -> web.Response:
+        old, new = _name(body, "old"), _name(body, "new")
+        r = await api.call("wgobf", "rename", old, new)
+        if r.ok:
+            store.rename_note(store.WGOBF + old, store.WGOBF + new)
+        return _result(r)
+
     @route("/api/wgobf/mon")
     async def _wgobf_mon(request: web.Request, user: dict, body: dict) -> web.Response:
         store.set_monitored(store.WGOBF + _name(body), bool(body.get("on")))

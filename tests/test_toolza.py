@@ -238,6 +238,22 @@ with open(WG) as f:
     wg = f.read()
 chk("WG + обфускатор: удаляется ровно свой [Peer]", out.split() == ["a", "c"] and "PublicKey = B" not in wg
     and "PublicKey = A" in wg and "PublicKey = C" in wg and wg.startswith("[Interface]\nPrivateKey = S"), wg)
+WCL = os.path.join(ROOT, "root/wgobf")
+os.makedirs(os.path.join(WCL, "a"), exist_ok=True)
+with open(os.path.join(WCL, "a", "wg.conf"), "w") as f:
+    f.write("[Interface]\nPrivateKey = KA\n")
+rc, out, _ = bash('wgobf_write_bundle() { echo "BUNDLE $1"; }; wgobf_rename_client a alice 2>&1; echo "rc=$?"; wgobf_clients')
+with open(WG) as f:
+    wg = f.read()
+chk("WG + обфускатор: переименование — меняется только имя над пиром, комплект переезжает и пересобирается",
+    "rc=0" in out and "BUNDLE alice" in out and out.split()[-2:] == ["alice", "c"]
+    and "# client=alice\nPublicKey = A\nAllowedIPs = 10.77.1.2/32" in wg and "# client=a\n" not in wg
+    and os.path.isfile(os.path.join(WCL, "alice", "wg.conf")) and not os.path.exists(os.path.join(WCL, "a")), [out, wg])
+rc, out, _ = bash('wgobf_write_bundle() { :; }; for n in c all "bad name" alice; do wgobf_rename_client alice "$n" >/dev/null 2>&1; '
+                  'echo "rc$?"; done; wgobf_rename_client zz q >/dev/null 2>&1; echo "rc$?"; wgobf_clients')
+chk("WG + обфускатор: занятое имя, all, недопустимое и чужой клиент — отказ; то же имя — ничего не меняет",
+    out.split() == ["rc1", "rc1", "rc1", "rc0", "rc1", "alice", "c"], out)
+shutil.rmtree(os.path.join(WCL, "alice"), ignore_errors=True)
 
 rc, out, _ = bash('printf "10.10.0.0/16\\n10.20.1.1/24\\n" | py pick-net awg')
 net = out.strip()
@@ -591,6 +607,10 @@ rc, out, _ = bash(f'WARP_CONF="{TMP}/warp0.conf"; warp_awg_params')
 chk("WARP: параметры AmneziaWG из профиля — все и без \\r, ключи и адреса не попадают",
     out.splitlines() == ["Jc = 4", "Jmin = 40", "Jmax = 70", "S1 = 0", "S2 = 0", "H1 = 1", "H2 = 2", "H3 = 3", "H4 = 4",
                          "I1 = <b 0xc2000000011419fa>"], out)
+rc, out, _ = bash('mkdir -p "$(dirname "$WARP_STATE")"; touch "$WARP_STATE"; warp_failed && echo F; '
+                  'echo warp0 >> "$LINKS"; warp_failed || echo U; sed -i "/^warp0$/d" "$LINKS"; '
+                  'rm -f "$WARP_STATE"; warp_failed || echo OFF')
+chk("WARP: «упал» — включён, а warp0 нет; поднят или выключен руками — не сбой", out.split() == ["F", "U", "OFF"], out)
 rc, out, _ = bash('ip() { [[ "$*" == "-d link show warp0" ]] && echo "5: warp0: <POINTOPOINT> amneziawg"; }; warp_tool; '
                   'ip() { echo "5: warp0: <POINTOPOINT> wireguard"; }; warp_tool')
 chk("WARP: с warp0 из профиля AWG говорим через awg, с обычным — через wg", out.split() == ["awg", "wg"], out)

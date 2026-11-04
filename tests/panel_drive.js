@@ -1360,6 +1360,22 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/wgobf/client/kn1", "text=Ссылка для Keenetic");
     await page.waitForSelector(".card.item:has-text('Мониторинг') .switch.on");
   });
+  await step("обфускатор: переименовать клиента — карточка под новым именем, мониторинг переехал", async () => {
+    const rename = async (from, to) => {
+      await nav("/wgobf/client/" + from, "text=Ссылка для Keenetic");
+      await page.click("button:has-text('Переименовать')");
+      await page.waitForURL(new RegExp("#/wgobf/client/" + from + "/rename$"));
+      await page.fill("input", to);
+      await page.click("[data-name=wgobf-rename-save]");
+      await page.waitForURL(new RegExp("#/wgobf/client/" + to + "$"));
+      await page.waitForSelector("text=Ссылка для Keenetic");
+      await page.waitForSelector(".card.item:has-text('Мониторинг') .switch.on");
+    };
+    await rename("kn1", "kn2");
+    await nav("/wgobf", "[data-name=kn2]");
+    if (await page.locator("[data-name=kn1]").count()) throw new Error("старое имя осталось в списке");
+    await rename("kn2", "kn1");
+  });
   await step("обфускатор: удалить клиента", async () => {
     await page.click("button:has-text('Удалить клиента')");
     await page.waitForURL(/#\/wgobf$/);

@@ -109,6 +109,7 @@ _api_status() {
         | awk -v now="$(date +%s)" '$2 > 0 && now - $2 < 180' | wc -l)"
     fi
     _kv tunnels.warp "$(_api_tun warp_is_up "$WARP_CONF" "$USQUE_CONF")"
+    _kv tunnels.warp_failed:b "$(_b warp_failed)"
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
@@ -724,6 +725,10 @@ _api_wgobf() {
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx" "$(wgobf_route_of "${ip%/32}")"
       done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n route ;;
     route) wgobf_route_set "${1:-}" "${2:-}" ;;
+    rename)
+      [[ -n "${1:-}" && -n "${2:-}" ]] || { _api_usage "wgobf rename СТАРОЕ НОВОЕ"; return; }
+      wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
+      wgobf_rename_client "$1" "$2" ;;
     add|del|bundle)
       name="${1:-}"
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
@@ -745,7 +750,7 @@ _api_wgobf() {
     clean) wgobf_set_clean "${1:-}" ;;
     rotate-key) wgobf_rotate_key ;;
     remove) wgobf_remove quiet ;;
-    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
+    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|rename СТАРОЕ НОВОЕ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
   esac
 }
 

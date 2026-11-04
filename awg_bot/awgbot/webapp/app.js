@@ -4771,8 +4771,22 @@ route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
     d.direct ? [h("h2", {}, "Чистый WireGuard"), hint("Без обфускатора — для iOS и обычного WireGuard. DPI его видит."),
       d.png ? h("img", { class: "qr", src: "data:image/png;base64," + d.png, alt: "QR" }) : null,
       copyBtn("Скопировать конфиг", d.direct)] : null,
+    btn("✏️ Переименовать", () => go(`/wgobf/client/${encodeURIComponent(name)}/rename`), "btn-block"),
     btn("🗑 Удалить клиента", (b) => quickAsk(b, `Удалить клиента ${name}?`, "Клиент удалён", ["wgobf", "del", name],
       () => backWith((p) => (/^\/wgobf\/client\//.test(p) ? "/wgobf" : null))), "btn-danger btn-block"));
+});
+
+route(/^\/wgobf\/client\/([^/]+)\/rename$/, async (ctx, name) => {
+  const input = h("input", { value: name, maxlength: 32, autocapitalize: "off", autocomplete: "off" });
+  ctx.put(title("✏️ Новое имя"), h("label", {}, "Латиница, цифры, _ и -, до 32"), input,
+    enterTo(h("button", { class: "btn-primary btn-block", "data-name": "wgobf-rename-save", onclick: (ev) => busy(ev.currentTarget, async () => {
+      const v = input.value.trim();
+      if (!/^[A-Za-z0-9_-]{1,32}$/.test(v)) throw new Error("Имя: латиница, цифры, _ и -, до 32 символов");
+      if (v !== name) await post("/api/wgobf/rename", { old: name, new: v });
+      // Карточка со старым именем в истории заменяется новой
+      haptic(); backWith(() => "/wgobf/client/" + encodeURIComponent(v));
+    }) }, "Сохранить"), input));
+  input.focus();
 });
 
 // ── Бот ───────────────────────────────────────────────────
@@ -4853,6 +4867,7 @@ route(/^\/bot$/, async (ctx) => {
 
 const ALERT_HINTS = {
   iface: "две проверки подряд без awg0 — и когда он вернётся, с временем простоя",
+  warp: "WARP включён, а туннеля нет (health-check увёл клиентов напрямую) — и когда он снова заработает",
   reboot: "сервер загрузился заново: время работы и поднялся ли awg0",
   update: "вышла новая версия AWG Toolza — один раз на версию",
   kernel: "apt поставил ядро, под которое модуль AWG не собрался",
