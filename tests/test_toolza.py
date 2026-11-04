@@ -576,7 +576,7 @@ with open(conf) as f:
 with open(LINKS, "w") as f:
     f.write("awg0\n")
 run_and_check("WARP: подъём warp0 только с IPv4", "WARP_AUTOSTART_SCRIPT",
-              must=[r"ip link add dev warp0 type wireguard", r"wg setconf warp0", r"ip -4 addr add 172\.16\.0\.2/32 dev warp0",
+              must=[r"ip link add dev warp0 type wireguard", r"(?m)^wg setconf warp0", r"ip -4 addr add 172\.16\.0\.2/32 dev warp0",
                     r"ip route replace default dev warp0 src 172\.16\.0\.2 table 200"],
               must_not=[r"2606::1", r"awg setconf", r"type amneziawg"])
 # Профиль «WARP для России» с параметрами AmneziaWG: чистый WireGuard к Cloudflare
@@ -586,7 +586,7 @@ with open(os.path.join(TMP, "warp0.conf"), "w") as f:
             "I1 = <b 0xc2000000011419fa>\r\nAddress = 172.16.0.2/32\nMTU = 1280\n[Peer]\nPublicKey = Q\nEndpoint = 162.159.192.1:2408\n")
 run_and_check("WARP: профиль с параметрами AmneziaWG — warp0 поднимается через AmneziaWG", "WARP_AUTOSTART_SCRIPT",
               must=[r"ip link add dev warp0 type amneziawg", r"awg setconf warp0", r"ip -4 addr add 172\.16\.0\.2/32 dev warp0"],
-              must_not=[r"type wireguard", r"wg setconf warp0"])
+              must_not=[r"type wireguard", r"(?m)^wg setconf warp0"])
 rc, out, _ = bash(f'WARP_CONF="{TMP}/warp0.conf"; warp_awg_params')
 chk("WARP: параметры AmneziaWG из профиля — все и без \\r, ключи и адреса не попадают",
     out.splitlines() == ["Jc = 4", "Jmin = 40", "Jmax = 70", "S1 = 0", "S2 = 0", "H1 = 1", "H2 = 2", "H3 = 3", "H4 = 4",
