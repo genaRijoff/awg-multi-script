@@ -923,6 +923,26 @@ _api_antiscan() {
   esac
 }
 
+# ── VK и Max мимо VPN ─────────────────────────────────────
+_api_vkblock() {
+  local a="${1:-status}" e on=0
+  shift || true
+  case "$a" in
+    status)
+      read -r -a e <<< "$(_vkblock_get ENTRIES)"
+      vkblock_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b vkblock_rules_ok || echo 0)"
+        _kv v4:n "${e[0]:-0}"; _kv v6:n "${e[1]:-0}"
+        _kv updated:n "$(_vkblock_get UPDATED)"; _kv error "$(_vkblock_get ERROR)"
+        _kv dropped:n "$( (( on )) && vkblock_dropped || echo 0)"
+      } | api_obj ;;
+    on) vkblock_enable ;;
+    off) vkblock_disable ;;
+    update) vkblock_update ;;
+    *) _api_usage "vkblock status|on|off|update" ;;
+  esac
+}
+
 # ── Перенос из Amnezia (Docker) ───────────────────────────
 # Страна сервера (флаг в шапке панели): вручную или снова по геосервисам;
 # refresh — спросить геосервисы сейчас, не дожидаясь суток
@@ -974,8 +994,8 @@ _api_log() {
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
-    antiscan) file="$ANTISCAN_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan [строк]"; return ;;
+    antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -1068,7 +1088,7 @@ _api_readonly() {
     "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status") return 0 ;;
   esac
   return 1
 }
@@ -1116,6 +1136,7 @@ api_dispatch() {
     cert) _api_cert "$@" ;;
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
+    vkblock) _api_vkblock "$@" ;;
     amnezia) _api_amnezia "$@" ;;
     country) _api_country "$@" ;;
     uninstall) _api_uninstall "$@" ;;
@@ -1123,7 +1144,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia country uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -1167,6 +1188,7 @@ api_main() {
     helpers_refresh || true
     expire_watchdog || true
     antiscan_watchdog || true
+    vkblock_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else

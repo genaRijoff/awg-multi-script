@@ -209,6 +209,18 @@ ANTISCAN_SRC="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-list
 # проверку записей, но закрыл бы почти весь IPv4 — такой список не принимается
 ANTISCAN_MAX4=16777216 ANTISCAN_MAX6=4096   # 2^24 адресов IPv4; 2^12 сетей /32 IPv6 (записи /32 и шире)
 
+# ── VK и Max мимо VPN (сети VK — DROP трафика клиентов VPN) ──
+VKBLOCK_DIR="$STATE_DIR/vkblock"            # список и состояние
+VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"    # ON, UPDATED, ERROR, ENTRIES
+VKBLOCK_SCRIPT="/usr/local/bin/awg2-vkblock"
+VKBLOCK_LOG="/var/log/awg2-vkblock.log"
+VKBLOCK_SET="awg2-vk" VKBLOCK_SET6="awg2-vk6" VKBLOCK_TAG="awg2-vkblock"
+VKBLOCK_UNIT="awg2-vkblock.service" VKBLOCK_TIMER="awg2-vkblock-update.timer"
+VKBLOCK_SRC="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-vk.txt"
+# Настоящий список: ~200 записей, ~300 тыс. адресов IPv4 и три сети /29 IPv6.
+# Короче минимума — оборван, шире предела — подменён: прежний не заменяют
+VKBLOCK_MIN=50 VKBLOCK_MAX4=4194304 VKBLOCK_MAX6=4096   # 2^22 адресов IPv4; 2^12 сетей /32 IPv6
+
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
 OWN_IFACES=" awg0 warp0 xray0 tun0 wgcf wgobf0 "

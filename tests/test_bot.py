@@ -2037,6 +2037,51 @@ async def run():
     no_hourglass("антисканер")
     botapi.call = real_call_
 
+    print("VK и Max мимо VPN")
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка «🚫 VK и Max»", ("🚫 VK и Max", "vk") in buttons, buttons)
+    VKST = {"enabled": False, "active": False, "v4": 0, "v6": 0, "updated": 0, "error": "", "dropped": 0}
+    vk_calls = []
+
+    async def vk_call(*args, **kw):
+        if args[:1] != ("vkblock",):
+            return await real_call_(*args, **kw)
+        vk_calls.append((args[1:], kw.get("timeout")))
+        if args[1] == "status":
+            return botapi.Result(True, data=json.loads(json.dumps(VKST)))
+        if args[1] == "on":
+            VKST.update(enabled=True, active=True, v4=204, v6=3, updated=1791500000, dropped=4321,
+                        error="Список сетей VK: в ответе 3 записей <b>")
+        if args[1] == "off":
+            VKST.update(enabled=False, active=False)
+        return botapi.Result(True)
+    botapi.call = vk_call
+    text, buttons = screen(await press("vk"))
+    chk("выключено: что делает и чем грозит, «Включить», журнал, назад в «Сервер»",
+        "⚪️ Выключено" in text and "Max" in text and "мимо туннеля" in text and ("✅ Включить", "vk:on") in buttons
+        and ("📜 Журнал", "diag:log:vkblock|vk") in buttons and ("◀️ Назад", "srv") in buttons
+        and not any(d == "vk:upd" for _, d in buttons), [text, buttons])
+    n = len(vk_calls)
+    text, buttons = screen(await press("vk:on"))
+    chk("включение — с подтверждением и предупреждением про сервисы VK у клиентов",
+        ("✅ Включить", "vk:onok") in buttons and ("✖️ Отмена", "vk") in buttons and "перестанут" in text
+        and not any(c[0][0] == "on" for c in vk_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("vk:onok"))
+    chk("включено: долгий вызов, подсети, счётчик, ошибка экранирована, «Обновить» и «Выключить»",
+        (("on",), 180) in vk_calls and "🟢 Включено · подсетей 207" in text and "Отбито: 4 321 пакетов" in text
+        and "&lt;b&gt;" in text and ("🔄 Обновить список", "vk:upd") in buttons and ("⏹ Выключить", "vk:off") in buttons,
+        [vk_calls[-3:], text, buttons])
+    await press("vk:upd")
+    chk("обновить список — долгий вызов", (("update",), 180) in vk_calls, vk_calls[-3:])
+    text, buttons = screen(await press("vk:off"))
+    chk("выключение — с подтверждением", ("⏹ Выключить", "vk:offok") in buttons, buttons)
+    text, buttons = screen(await press("vk:offok"))
+    chk("выключено снова", (("off",), None) in vk_calls and "⚪️ Выключено" in text, [vk_calls[-3:], text])
+    text, buttons = screen(await press("diag:log:vkblock|vk"))
+    chk("журнал открывается, «Назад» — на экран VK", ("◀️ Назад", "vk") in buttons, [text, buttons])
+    no_hourglass("VK и Max")
+    botapi.call = real_call_
+
     print("Перенос из Amnezia")
     AMZ = {"container": "amnezia-awg2", "running": True, "migrated": False, "proto": "3.1", "port": 51888,
            "net": "10.8.1.0/24", "clients": [{"name": "Petr", "orig": "Пётр <b>", "ip": "10.8.1.1"},

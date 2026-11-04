@@ -67,6 +67,7 @@ async def screen(target: ui.Target) -> None:
         ("🌍 Endpoint", act.data("ep")) if exists else None,
         ("🛠 Починить", act.data("repair")),
         ("🛡 Антисканер", "as"),
+        ("🚫 VK и Max", "vk"),
         ("🐳 Перенос из Amnezia", "amz") if amz else None,
         ("♻️ Перезагрузка", act.data("reboot")),
         ("⚠️ Сбросить", act.data("reset")) if exists else None,

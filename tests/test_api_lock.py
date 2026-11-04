@@ -27,6 +27,7 @@ need_cmds() { :; }
 helpers_refresh() { :; }
 expire_watchdog() { :; }
 antiscan_watchdog() { :; }
+vkblock_watchdog() { :; }
 update_channel_init() { :; }
 _api_client() { echo mutated > "$MARKER"; printf '{"changed":true}' > "$API_DATA"; }
 _api_clients() { printf '[]' > "$API_DATA"; }

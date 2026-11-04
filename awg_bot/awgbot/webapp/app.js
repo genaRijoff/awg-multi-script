@@ -3255,6 +3255,7 @@ route(/^\/server$/, async (ctx) => {
       d.exists ? menuItem("🎛 Параметры AWG", "Jc, S1-S4, H1-H4 вручную", () => go("/server/params")) : null,
       menuItem("🧩 Модуль ядра", "версии, обновление, откат", () => go("/server/module")),
       menuItem("🛡 Антисканер", "сети сканеров РКН и госорганов — не до портов сервера", () => go("/server/antiscan")),
+      menuItem("🚫 VK и Max мимо VPN", "клиенты VPN не ходят через сервер в сети VK", () => go("/server/vkblock")),
       amzOn ? menuItem("🐳 Перенос из Amnezia", amz.migrated ? "сделан — вернуть или удалить контейнер"
         : "сервер из Docker-контейнера, клиенты без перевыдачи", () => go("/server/amnezia")) : null,
       menuItem(d.installed ? "📦 Компоненты" : "📦 Установить компоненты", "пакеты, модуль, amneziawg-tools",
@@ -3322,6 +3323,33 @@ route(/^\/server\/antiscan$/, async (ctx) => {
     h("div", { class: "main" }, h("div", { class: "title mono wrap" }, a)), h("div", { class: "side bad" }, icon("x"))))) : null,
     h("div", { class: "row", style: "gap:8px;margin-top:8px" }, ip, enterTo(add, ip)),
     hint("Клиенты VPN, которые подключаются из этих сетей, тоже не подключатся — для них есть исключения."));
+});
+
+// VK и Max мимо VPN: трафик клиентов VPN в сети VK сервер отбрасывает — приложения
+// VK не видят его адрес. Список качает и проверяет awg2
+route(/^\/server\/vkblock$/, async (ctx) => {
+  const d = (await call("vkblock", "status")) || {};
+  const on = !!d.enabled;
+  ctx.put(title("🚫 VK и Max мимо VPN"),
+    hint("Клиенты VPN не ходят через сервер в сети VK: ВКонтакте, Max, Одноклассники. Приложения VK не видят адрес "
+      + "сервера и не могут сдать его как VPN."),
+    h("div", { class: "card", "data-name": "vkblock-status" },
+      kv("Статус", !on ? h("span", { class: "muted" }, "○ выключено") : d.active ? h("span", { class: "ok" }, "● включено")
+        : h("span", { class: "warn" }, "▲ правило не на месте")),
+      on ? kv("Подсетей", num((d.v4 || 0) + (d.v6 || 0))) : null,
+      on ? kv("Отбито", num(d.dropped) + " пакетов") : null,
+      d.updated ? kv("Список", fmtTime(d.updated)) : null,
+      d.error ? h("div", { class: "small warn" }, "▲ " + d.error) : null),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      on ? btn("⏹ Выключить", (b) => quickAsk(b, "Выключить? Правило и наборы снимаются — клиенты VPN снова пойдут "
+        + "в VK через сервер.", "VK и Max снова через VPN", ["vkblock", "off"]))
+        : btn("✅ Включить", (b) => quickAsk(b, "Включить? ВКонтакте, Max и другие сервисы VK у клиентов через VPN "
+          + "перестанут открываться — в приложении VPN их надо пустить мимо туннеля. Выключить можно здесь или в боте.",
+        "VK и Max мимо VPN включено", ["vkblock", "on"]), "btn-primary"),
+      on ? btn("🔄 Обновить список", (b) => quick(b, "Список обновлён", ["vkblock", "update"])) : null,
+      btn("📜 Журнал", () => go("/log/vkblock"))),
+    hint("Сервисы VK у клиентов через VPN не откроются — в приложении VPN их пускают мимо туннеля. Список сетей VK — "
+      + "C24Be/AS_Network_List, обновляется раз в сутки. Трафик самого сервера не трогается."));
 });
 
 // Перенос из Amnezia (Docker): сервер AWG из контейнера приложения AmneziaVPN — в awg0
@@ -5109,7 +5137,8 @@ route(/^\/bot\/app$/, async (ctx) => {
 const LOGS = { manager: "awg2 — действия", install: "Компоненты", module: "Сборка модуля", awg: "awg0 (awg-quick)",
   expire: "Сроки клиентов", warp: "WARP", "warp-health": "WARP health-check", usque: "usque (WARP MASQUE)", xray: "Xray",
   "xray-routing": "Маршруты Xray", tun2socks: "tun2socks", exits: "Exit-ноды", cascade: "Каскад", dns: "dnscrypt-proxy",
-  "dns-health": "DNS health-check", wgobf: "WG + обфускатор", bot: "Telegram-бот", antiscan: "Антисканер" };
+  "dns-health": "DNS health-check", wgobf: "WG + обфускатор", bot: "Telegram-бот", antiscan: "Антисканер",
+  vkblock: "VK и Max мимо VPN" };
 
 route(/^\/log\/([a-z0-9-]+)$/, async (ctx, name) => {
   const r = await callR(["log", name, "150"]);

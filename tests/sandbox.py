@@ -139,7 +139,7 @@ INSTALL_LOG="{ROOT}/install.log"; EXITS_DIR="$AWG_DIR"
 EXITS_PEERS="$EXITS_DIR/exits_peers.list"; EXITS_STATE="$EXITS_DIR/exits_state"
 for v in DNS_PERSIST_SCRIPT DNS_HEALTH_SCRIPT CASCADE_SCRIPT T2S_ROUTING_SCRIPT XRAY_ROUTING_SCRIPT \\
          EXITS_SCRIPT EXPIRE_BIN WARP_AUTOSTART_SCRIPT WARP_HEALTH_SCRIPT WGOBF_FW USQUE_UP_HOOK ANTISCAN_SCRIPT \\
-         WEB_FW_SCRIPT; do
+         WEB_FW_SCRIPT VKBLOCK_SCRIPT; do
   printf -v "$v" '%s' "{ROOT}/scripts/$v"
 done
 CASCADE_DIR="{ROOT}/etc/awg-cascade"; CASCADE_RULES="$CASCADE_DIR/rules.conf"; CASCADE_LOG="{ROOT}/cascade.log"
@@ -164,6 +164,7 @@ WARP_STATE="$WARP_DIR/state"; WARP_CONF="{ROOT}/etc/wireguard/warp0.conf"; WARP_
 USQUE_DIR="{ROOT}/etc/usque"; USQUE_CONF="$USQUE_DIR/config.json"
 ANTISCAN_DIR="$STATE_DIR/antiscan"; ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf"; ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"
 ANTISCAN_LOG="{ROOT}/antiscan.log"
+VKBLOCK_DIR="$STATE_DIR/vkblock"; VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"; VKBLOCK_LOG="{ROOT}/vkblock.log"
 AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
 AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"
 # Веб-панель: стенд (web_stand.py) передаёт свои конфиг и список адресов

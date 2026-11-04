@@ -759,6 +759,31 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     } finally { await page.unroute(/\/api\/call$/); }
   });
 
+  await step("VK и Max мимо VPN: выключено, «Включить» — с вопросом про сервисы VK у клиентов", async () => {
+    await nav("/server", "text=VK и Max мимо VPN");
+    await page.click("text=VK и Max мимо VPN");
+    await page.waitForSelector("[data-name=vkblock-status] >> text=○ выключено");
+    if (await page.locator("button:has-text('Обновить список')").count()) throw new Error("«Обновить список» при выключенном");
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "vkblock" && b.args[1] === "on")
+        return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data: null }) });
+      if (b.args && b.args[0] === "vkblock" && b.args[1] === "status")
+        return route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data: {
+          enabled: true, active: true, v4: 204, v6: 3, dropped: 4321, updated: 1790000000, error: "" } }) });
+      return route.continue();
+    });
+    try {
+      await page.click("button:has-text('Включить')");
+      await page.waitForSelector(".toast >> text=VK и Max мимо VPN включено");
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Включить? ВКонтакте"));
+      if (!asked.length || !/мимо туннеля/.test(asked[0])) throw new Error("включение без подтверждения: " + JSON.stringify(asked));
+      await page.waitForSelector("[data-name=vkblock-status] >> text=● включено");
+      await page.waitForSelector("[data-name=vkblock-status] >> text=4 321 пакетов");
+      await page.waitForSelector("button:has-text('Обновить список')");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+
   // ── Туннели и DNS ──
   await step("туннели", async () => {
     // Экран туннелей — карточками и в «Классике»
@@ -1650,6 +1675,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
         + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
         + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/amnezia /server/antiscan /server/create /server/endpoint /server/module "
+        + "/server/vkblock "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
         + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");

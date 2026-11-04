@@ -2267,7 +2267,7 @@ chk("api web install (бот): логин admin, пароль сгенериро
 
 print("\n── Антисканер ──")
 # Заглушки с состоянием: ipset (наборы — файлами), iptables/ip6tables (правила
-# INPUT — файлом, -I ставит первым), iptables-save -c (счётчики), curl — отдаёт
+# filter и mangle — файлами, -I ставит первым), iptables-save -c (счётчики), curl — отдаёт
 # списки из каталога ASLISTS. Сеть не нужна.
 ASBIN = os.path.join(TMP, "asbin")
 ASLISTS = os.path.join(TMP, "aslists")
@@ -2300,7 +2300,9 @@ case "$1" in
 esac
 exit 0""",
     "iptables": r"""echo "${0##*/} $*" >> "$CALLS"
-f="$IPT_RULES.${0##*/}"; touch "$f"
+f="$IPT_RULES.${0##*/}"
+if [[ "$1 ${2:-}" == "-t mangle" ]]; then f="$f.mangle"; shift 2; fi
+touch "$f"
 case "$1" in
   -C) shift; c="$1"; shift; grep -qxF -- "$c $*" "$f" ;;
   -I) shift; c="$1"; shift 2; { echo "$c $*"; cat "$f"; } > "$f.n"; mv "$f.n" "$f" ;;
@@ -2310,9 +2312,10 @@ case "$1" in
   -S) echo "-P $2 ACCEPT"; grep "^$2 " "$f" | sed "s/^$2 /-A $2 /" ;;
   *) exit 0 ;;
 esac""",
-    "iptables-save": r"""t="${0##*/}"; t="${t%-save}"
+    "iptables-save": r"""t="${0##*/}"; t="${t%-save}"; f="$IPT_RULES.$t"
+[[ " $* " == *" -t mangle "* ]] && f="$f.mangle"
 if [[ " $* " == *" -c "* ]]; then
-  sed "s/^/[$(cat "$IPT_RULES.$t.cnt" 2>/dev/null || echo 0):0] -A /" "$IPT_RULES.$t" 2>/dev/null
+  sed "s/^/[$(cat "$f.cnt" 2>/dev/null || echo 0):0] -A /" "$f" 2>/dev/null
 else cat "$IPT_SAVE"; fi""",
     "curl": r"""out="" url=""
 while (( $# )); do case "$1" in -o) out="$2"; shift 2 ;; -*) shift ;; *) url="$1"; shift ;; esac; done
@@ -2587,6 +2590,119 @@ chk("api antiscan off: правила сняты, наборы удалены, �
 rc, out, _ = bash(ASPRE + 'bash "$ANTISCAN_SCRIPT" apply; echo "rc=$?"; ls "$IPSET_DIR/sets"')
 chk("выключен — служба при загрузке ничего не ставит", out.split() == ["rc=0"], out)
 rc, out, _ = bash(ASPRE + 'antiscan_remove; ls "$ANTISCAN_DIR" "$ANTISCAN_SCRIPT" 2>&1')
+chk("удаление вместе со скриптом: каталог и скрипт убраны", out.count("No such file") == 2, out)
+
+print("\n── VK и Max мимо VPN ──")
+
+
+def vk_list(n, width=22):
+    return ("# VK\n" + "".join(f"95.{i}.0.0/{width}\n" for i in range(n))
+            + "10.0.0.0/8\n1.0.0.0/4\nfoo bar\n2a00:bdc0::/29\nfe80::/10\n")
+
+
+def mangle(fam=4):
+    try:
+        return open(f"{IPT_RULES}.{'iptables' if fam == 4 else 'ip6tables'}.mangle").read().split("\n")[:-1]
+    except OSError:
+        return []
+
+
+VKRULE = lambda st: (f"PREROUTING -m set --match-set {st} dst -m addrtype ! --dst-type LOCAL "
+                     "-m comment --comment awg2-vkblock -j DROP")
+VKDIR = os.path.join(ROOT, "var/lib/awg2/vkblock")
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(60))
+in4, in6 = ipt(4), ipt(6)
+reset_calls()
+r = api("vkblock", "on", env=ASENV)
+v4 = ipset_set("awg2-vk") or []
+chk("api vkblock on: список скачан, частные и слишком широкие отброшены, DROP в mangle PREROUTING мимо адресов сервера",
+    r.get("ok") and len(v4) == 60 and "95.0.0.0/22" in v4 and not any(x.startswith(("10.", "1.0.")) for x in v4)
+    and mangle(4) == [VKRULE("awg2-vk")], [r, mangle(4), v4[:3]])
+chk("IPv6 — свой набор и правило в ip6tables mangle",
+    ipset_set("awg2-vk6") == ["2a00:bdc0::/29"] and mangle(6) == [VKRULE("awg2-vk6")], [ipset_set("awg2-vk6"), mangle(6)])
+chk("INPUT и FORWARD не тронуты — антисканер и правила сервера отдельно", ipt(4) == in4 and ipt(6) == in6, ipt(4))
+units = os.listdir(os.path.join(ROOT, "units"))
+svc = open(os.path.join(ROOT, "units", "awg2-vkblock.service")).read()
+chk("служба при загрузке — раньше UFW и netfilter-persistent; таймер раз в час",
+    {"awg2-vkblock.service", "awg2-vkblock-update.service", "awg2-vkblock-update.timer"} <= set(units)
+    and "Before=network-pre.target ufw.service netfilter-persistent.service" in svc
+    and "systemctl enable --now awg2-vkblock-update.timer" in calls()
+    and "curl https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-vk.txt" in calls(), units)
+
+with open(f"{IPT_RULES}.iptables.mangle.cnt", "w") as f:
+    f.write("17")
+r = api("vkblock", "status", env=ASENV)
+d = r.get("data") or {}
+chk("api vkblock status: включено, правило на месте, подсети, счётчик отбитых, время списка",
+    r.get("ok") and d.get("enabled") and d.get("active") and d.get("v4") == 60 and d.get("v6") == 1
+    and d.get("dropped") == 17 and d.get("updated", 0) > 0 and d.get("error") == "", d)
+rc, out, _ = bash(ASPRE + "_api_readonly vkblock status && echo RO")
+chk("vkblock status — чтение без очереди api", "RO" in out, out)
+
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(10))
+r = api("vkblock", "update", env=ASENV)
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("оборванный список прежний не заменяет: ошибка видна, набор прежний",
+    "записей" in (d.get("error") or "") and d.get("v4") == 60 and len(ipset_set("awg2-vk") or []) == 60, [r, d])
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(60, 12))
+api("vkblock", "update", env=ASENV)
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("слишком широкий охват (подменённый список) — не принят",
+    "охват" in (d.get("error") or "") and "95.0.0.0/22" in (ipset_set("awg2-vk") or []), d)
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(70))
+api("vkblock", "update", env=ASENV)
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("исправный список: ошибка ушла, набор обновлён", d.get("error") == "" and d.get("v4") == 70, d)
+
+open(f"{IPT_RULES}.iptables.mangle", "w").close()
+reset_calls()
+rc, out, _ = bash(ASPRE + 'vkblock_rules_ok || echo GONE; bash "$VKBLOCK_SCRIPT" heal; echo "rc=$?"')
+chk("правило сбросили — таймер возвращает его без скачивания",
+    "GONE" in out and "rc=0" in out and mangle(4) == [VKRULE("awg2-vk")] and "curl" not in calls(), [out, mangle(4)])
+reset_calls()
+rc, out, _ = bash(ASPRE + 'bash "$VKBLOCK_SCRIPT" heal; echo "rc=$?"')
+chk("правило на месте, список свежий — таймер только проверяет: без скачивания и без изменений",
+    "rc=0" in out and calls() and not any(c.startswith("curl") or " -I " in c or "restore" in c or "swap" in c
+                                          for c in calls()), calls())
+rc, out, _ = bash(ASPRE + 'sed -i "s/^UPDATED=.*/UPDATED=1/" "$VKBLOCK_CONF"; bash "$VKBLOCK_SCRIPT" heal; '
+                  'grep -c "^curl" "$CALLS"')
+chk("список старше суток — таймер обновляет", out.strip().endswith("1"), out)
+
+heal = os.path.join(VKDIR, "heal")
+os.utime(heal, (time.time() - 4 * 3600,) * 2)
+reset_calls()
+bash(ASPRE + "vkblock_watchdog")
+chk("сторож: таймер молчал больше трёх часов — перезапуск",
+    "systemctl start --no-block awg2-vkblock-update.service" in calls(), calls())
+
+r = api("antiscan", "status", env=ASENV)
+chk("антисканер выключен — «VK и Max» от него не зависит",
+    r.get("ok") and not (r.get("data") or {}).get("enabled") and mangle(4) == [VKRULE("awg2-vk")], r)
+
+r = api("vkblock", "off", env=ASENV)
+chk("api vkblock off: правила сняты, наборы удалены",
+    r.get("ok") and mangle(4) == [] and mangle(6) == [] and ipset_set("awg2-vk") is None and ipset_set("awg2-vk6") is None,
+    [r, mangle(4), mangle(6)])
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("выключено — статус и счётчик", d.get("enabled") is False and d.get("active") is False and d.get("dropped") == 0, d)
+rc, out, _ = bash(ASPRE + 'bash "$VKBLOCK_SCRIPT" apply; echo "rc=$?"; ls "$IPSET_DIR/sets"')
+chk("выключено — служба при загрузке ничего не ставит", out.split() == ["rc=0"] and mangle(4) == [], out)
+r = api("vkblock", "update", env=ASENV)
+chk("обновление списка при выключенном — отказ", r.get("ok") is False, r)
+
+with open(os.path.join(ASLISTS, "blacklist-vk.txt"), "w") as f:
+    f.write(vk_list(5))
+os.remove(os.path.join(VKDIR, "vk.list"))
+r = api("vkblock", "on", env=ASENV)
+d = api("vkblock", "status", env=ASENV).get("data") or {}
+chk("включение без годного списка — отказ, выключено, правил нет",
+    r.get("ok") is False and "не получен: в ответе 6 записей — список не принят" in (r.get("error") or "") + (r.get("log") or "")
+    and d.get("enabled") is False and mangle(4) == [], [r, d])
+rc, out, _ = bash(ASPRE + 'vkblock_remove; ls "$VKBLOCK_DIR" "$VKBLOCK_SCRIPT" 2>&1')
 chk("удаление вместе со скриптом: каталог и скрипт убраны", out.count("No such file") == 2, out)
 
 print("\n── Веб-панель: доступ по адресам и только через VPN ──")

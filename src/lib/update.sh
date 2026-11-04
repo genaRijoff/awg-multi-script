@@ -302,6 +302,7 @@ helpers_refresh() {
     T2S_IF T2S_TABLE T2S_ADDR "${RT_FUNCS[@]}" t2s_routing_run
   [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
   antiscan_on && _antiscan_emit &>/dev/null
+  vkblock_on && _vkblock_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
