@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.48"
+VERSION="v1.2.49"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -5280,13 +5280,26 @@ warp_import() {
   printf '%s\n' "$content" | write_file "$WARP_PROFILE" 600
   install -m 600 "$WARP_PROFILE" "$WARP_CONF"
   [[ -f "$WARP_ACCOUNT" ]] || printf '# импортирован готовый профиль\nimported = true\n' | write_file "$WARP_ACCOUNT" 600
+  [[ -n "$(warp_awg_params)" ]] && info "В профиле параметры AmneziaWG — WARP поднимется через AmneziaWG"
   ok "Профиль импортирован — включай туннель"
 }
+
+# Параметры AmneziaWG из профиля WARP (Jc, Jmin, Jmax, S1-S4, H1-H4, I1-I5),
+# строками «Ключ = значение». Их несут готовые профили «WARP для России»:
+# с российских серверов чистый WireGuard к Cloudflare режут, а с мусорными
+# пакетами AmneziaWG рукопожатие проходит.
+warp_awg_params() {
+  sed -nE 's/^[[:space:]]*(Jc|Jmin|Jmax|S[1-4]|H[1-4]|I[1-5])[[:space:]]*=[[:space:]]*(.*[^[:space:]])[[:space:]]*$/\1 = \2/p' \
+    "$WARP_CONF" 2>/dev/null
+}
+
+# wg или awg — чем говорить с warp0: из профиля с параметрами AWG он amneziawg
+warp_tool() { if ip -d link show "$WARP_IF" 2>/dev/null | grep -q amneziawg; then echo awg; else echo wg; fi; }
 
 # Поднимает warp0 из профиля и уводит в него клиентов. Работает и в
 # скрипте автозапуска, поэтому без вывода в интерфейс пользователя.
 warp_wg_bringup() {
-  local priv pub ep mtu addr a tmp
+  local priv pub ep mtu addr a tmp obf kind=wireguard tool=wg
   [[ -f "$WARP_CONF" && -f "$SERVER_CONF" ]] || return 1
   ip link show "$WARP_IF" &>/dev/null && return 0
   priv=$(awk -F' = ' '/^PrivateKey/{print $2; exit}' "$WARP_CONF")
@@ -5298,14 +5311,17 @@ warp_wg_bringup() {
     [[ "$a" == *.* ]] && addr="$a"
   done
   [[ -n "$priv" && -n "$pub" && -n "$ep" && -n "${addr:-}" ]] || { echo "профиль WARP не разобран" >&2; return 1; }
-  ip link add dev "$WARP_IF" type wireguard || return 1
+  # Профиль с параметрами AmneziaWG — через AmneziaWG: wg их не знает и отверг бы
+  obf=$(warp_awg_params)
+  if [[ -n "$obf" ]] && command -v awg >/dev/null; then kind=amneziawg; tool=awg; else obf=""; fi
+  ip link add dev "$WARP_IF" type "$kind" || return 1
   # Временный файл — в /etc/wireguard: пакетный wg на Ubuntu 26.04 не читает
   # из /tmp (AppArmor), а /etc/wireguard — каталог root:700.
   tmp="/etc/wireguard/.warp0.$$"
-  printf '[Interface]\nPrivateKey = %s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = %s\n' \
-    "$priv" "$pub" "$ep" > "$tmp"
+  printf '[Interface]\nPrivateKey = %s\n%s\n\n[Peer]\nPublicKey = %s\nAllowedIPs = 0.0.0.0/0\nEndpoint = %s\n' \
+    "$priv" "$obf" "$pub" "$ep" > "$tmp"
   chmod 600 "$tmp"
-  if ! wg setconf "$WARP_IF" "$tmp"; then rm -f "$tmp"; ip link del "$WARP_IF"; return 1; fi
+  if ! "$tool" setconf "$WARP_IF" "$tmp"; then rm -f "$tmp"; ip link del "$WARP_IF"; return 1; fi
   rm -f "$tmp"
   ip -4 addr add "$addr" dev "$WARP_IF"
   ip link set mtu "${mtu:-1280}" up dev "$WARP_IF" || { ip link del "$WARP_IF"; return 1; }
@@ -5314,7 +5330,7 @@ warp_wg_bringup() {
 
 _warp_autostart_install() {
   emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' \
-    WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_wg_bringup || return 1
+    WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup || return 1
   write_unit awg-warp.service <<EOF
 [Unit]
 Description=AWG Toolza — WARP для клиентов AWG
@@ -5448,6 +5464,7 @@ warp_up() {
     (( i == 3 )) && {
       err "Через WARP трафик не идёт — выключаю, клиенты остаются напрямую"
       [[ "$be" == wg ]] && info "Попробуй найти рабочий endpoint (warpscout) или импортировать профиль"
+      [[ "$be" == wg && -z "$(warp_awg_params)" ]] && info "С российских серверов чистый WireGuard к Cloudflare часто режут — помогает профиль с параметрами AmneziaWG (Jc, Jmin, Jmax)"
       warp_down quiet
       return 1
     }
@@ -5552,8 +5569,8 @@ warp_endpoint_set() {  # ip:порт
   [[ "$1" =~ ^[0-9.]+:[0-9]+$ ]] || { err "Ни один endpoint не прошёл проверку — UDP к Cloudflare, похоже, режут"; return 1; }
   sed -i "s|^Endpoint = .*|Endpoint = $1|" "$WARP_CONF" "$WARP_PROFILE" 2>/dev/null
   if warp_is_up; then
-    pub=$(wg show "$WARP_IF" peers | head -1)
-    [[ -n "$pub" ]] && wg set "$WARP_IF" peer "$pub" endpoint "$1"
+    pub=$("$(warp_tool)" show "$WARP_IF" peers | head -1)
+    [[ -n "$pub" ]] && "$(warp_tool)" set "$WARP_IF" peer "$pub" endpoint "$1"
   fi
   ok "Endpoint: $1"
 }
@@ -9794,7 +9811,7 @@ helpers_refresh() {
   _mod_src_patch "$MOD_SRC_DIR"
   if [[ -f "$WARP_AUTOSTART_SCRIPT" ]]; then
     emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' \
-      WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_wg_bringup
+      WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup
   fi
   if [[ -f "$WARP_HEALTH_SCRIPT" ]]; then
     emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \
@@ -12494,7 +12511,7 @@ _api_warp() {
         # Для карточки: интерфейс, адрес Cloudflare, рукопожатие (wg) и счётчики
         _kv iface "$WARP_IF"
         _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
-        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <(wg show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
+        _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <("$(warp_tool)" show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
         _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
         _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
       warp_status ;;
@@ -18008,5 +18025,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=c95ab7c4ea12bf98
+_BUILD_SUM=bf5979198e14875a
 main "$@"
