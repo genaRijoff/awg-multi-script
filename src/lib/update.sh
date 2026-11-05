@@ -286,8 +286,7 @@ helpers_refresh() {
       WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup
   fi
   if [[ -f "$WARP_HEALTH_SCRIPT" ]]; then
-    emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \
-      WARP_BACKEND_FILE WARP_HEALTH_LOG "${RT_FUNCS[@]}" warp_health_run
+    _warp_health_emit
   fi
   [[ -f "$USQUE_UP_HOOK" ]] && _usque_write &>/dev/null
   if [[ -f "$DNS_PROXY_STATE" ]]; then

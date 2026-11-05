@@ -896,12 +896,16 @@ async def run():
     chk("сервер удалён, пока awg0 лежал, — без ложного «снова работает»",
         not any("снова работает" in t for t in said(mark)) and "down_sent" not in st2, [said(mark), st2])
     # WARP: включён, а туннеля нет — две проверки подряд и кнопка «Включить»; вернулся — с простоем
-    warp = {"failed": True, "state": "off"}
+    warp = {"failed": True, "state": "off", "probe": {"up": False, "health": False, "failover": False}}
+    probes = []
 
     async def warp_status(*args, **kw):
         if args[:1] == ("status",):
             return {"host": "vm1", "server": {"exists": False, "up": False},
                     "tunnels": {"warp": warp["state"], "warp_failed": warp["failed"]}}
+        if args[:2] == ("warp", "probe"):
+            probes.append(args)
+            return dict(warp["probe"])
         return await real_data(*args, **kw)
     al.api.data = warp_status
     st3 = {"boot": "boot-B"}
@@ -915,7 +919,8 @@ async def run():
     await al.tick(BOT, st3)
     rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
     chk("WARP лежит две проверки — 🟠 с кнопкой «Включить WARP»", len(rep) == 1
-        and rep[0].reply_markup.inline_keyboard[0][0].callback_data == "warp:up", warp_said(mark))
+        and rep[0].reply_markup.inline_keyboard[0][0].callback_data == "warp:up"
+        and "Туннели → WARP → ▶️ Включить" in rep[0].text, warp_said(mark))
     mark = len(SESSION.sent)
     await al.tick(BOT, st3)
     chk("пока WARP лежит — молчит", not warp_said(mark), warp_said(mark))
@@ -931,6 +936,54 @@ async def run():
     await al.tick(BOT, st4)
     chk("WARP выключили руками, пока лежал, — без ложного «снова работает»",
         not warp_said(mark) and "warp_sent" not in st4, [warp_said(mark), st4])
+    # Клиентов увёл health-check (метка failover): он уже проверил трижды — сразу, и вернёт WARP сам
+    st5 = {"boot": "boot-B"}
+    warp.update(failed=True, state="off", probe={"up": False, "health": True, "failover": True})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    chk("health-check увёл клиентов — уведомление с первой проверки: вернёт WARP сам",
+        len(rep) == 1 and "Health-check вернёт его сам" in rep[0].text, warp_said(mark))
+    warp.update(failed=False, state="up", probe={"up": True, "health": True, "failover": False, "ok": False})
+    mark, n = len(SESSION.sent), len(probes)
+    await al.tick(BOT, st5)
+    chk("warp0 подняли, а Cloudflare молчит — не «снова работает»: пока сбой не закрыт, бот пингует и с health-check",
+        not warp_said(mark) and st5.get("warp_sent") and probes[n:] == [("warp", "probe", "ping")], [warp_said(mark), probes[n:]])
+    warp["probe"]["ok"] = True
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5)
+    chk("health-check вернул WARP — «снова работает»", any("WARP снова работает" in t for t in warp_said(mark)), warp_said(mark))
+    # Без health-check бот проверяет поднятый WARP сам: не отвечает — клиенты без интернета
+    st6 = {"boot": "boot-B"}
+    warp.update(failed=False, state="up", probe={"up": True, "health": False, "failover": False, "ok": False})
+    mark = len(SESSION.sent)
+    n = len(probes)
+    await al.tick(BOT, st6)
+    chk("WARP поднят, но не отвечает: бот проверил сам, первая проверка — молчит",
+        len(probes) == n + 1 and not warp_said(mark), [probes[n:], warp_said(mark)])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st6)
+    rep = [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "WARP не отвечает" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("не отвечает две проверки — 🟠 «клиенты без интернета», перезапуск и health-check кнопками",
+        len(rep) == 1 and "без интернета" in rep[0].text and cbs == ["warp:restart", "warp:health:on"], [warp_said(mark), cbs])
+    warp["probe"]["ok"] = True
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st6)
+    chk("снова отвечает — «снова работает» с простоем",
+        any("WARP снова работает" in t and "Простой" in t for t in warp_said(mark)) and "warp_sent" not in st6, warp_said(mark))
+    # С health-check поднятый WARP бот не пингует: probe отвечает без ok
+    warp.update(probe={"up": True, "health": True})
+    mark, n = len(SESSION.sent), len(probes)
+    await al.tick(BOT, st6)
+    await al.tick(BOT, st6)
+    chk("с health-check бот не тревожит, пока WARP поднят, и не просит пинг",
+        not warp_said(mark) and "warp_down" not in st6 and probes[n:] == [("warp", "probe")] * 2, [warp_said(mark), st6, probes[n:]])
+    # WARP выключен — не проверяет вовсе
+    warp.update(failed=False, state="off")
+    n = len(probes)
+    await al.tick(BOT, st6)
+    chk("WARP выключен — без проверок", len(probes) == n, probes[n:])
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",
@@ -2080,6 +2133,28 @@ async def run():
     text, buttons = screen(await press("diag:log:vkblock|vk"))
     chk("журнал открывается, «Назад» — на экран VK", ("◀️ Назад", "vk") in buttons, [text, buttons])
     no_hourglass("VK и Max")
+    botapi.call = real_call_
+
+    print("WARP: кнопки из уведомлений")
+    started, real_job_w = [], botapi.job_start
+
+    async def warp_job(*args, **kw):
+        started.append(args)
+        return botapi.Result(False, error="тест: задачу не запускаем")
+    botapi.job_start = warp_job
+    await press("warp:restart")
+    chk("«Перезапустить WARP» — задача awg2 warp restart", ("warp", "restart") in started, started)
+    botapi.job_start = real_job_w
+    health_calls = []
+
+    async def warp_health_call(*args, **kw):
+        if args[:2] == ("warp", "health"):
+            health_calls.append(args)
+            return botapi.Result(True)
+        return await real_call_(*args, **kw)
+    botapi.call = warp_health_call
+    await press("warp:health:on")
+    chk("«Включить health-check» — awg2 warp health on", ("warp", "health", "on") in health_calls, health_calls)
     botapi.call = real_call_
 
     print("Перенос из Amnezia")

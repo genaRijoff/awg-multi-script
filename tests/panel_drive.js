@@ -1502,7 +1502,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
     if (await page.locator(".switch.on").count() !== 8) throw new Error("ждали 8 включённых уведомлений");
-    await page.waitForSelector(".card.item:has-text('WARP упал и снова работает')");
+    await page.waitForSelector(".card.item:has-text('WARP упал или не отвечает и снова работает')");
     await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
     await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 7);

@@ -523,6 +523,15 @@ _api_warp() {
     up) warp_up ;;
     down) warp_down ;;
     restart) warp_down quiet; warp_up ;;
+    # Для уведомлений бота: отвечает ли поднятый warp0. С health-check
+    # проверяет он сам — тогда без пинга, кроме «probe ping» (бот ждёт конца
+    # сбоя); failover — клиентов увёл health-check
+    probe)
+      local h=0
+      unit_active awg-warp-healthcheck.timer && h=1
+      { _kv up:b "$(_b warp_is_up)"; _kv health:b "$h"
+        _kv failover:b "$(_b test -f "$WARP_STATE.failed")"
+        if { (( ! h )) || [[ "${1:-}" == ping ]]; } && warp_is_up; then _kv ok:b "$(_b warp_ping)"; fi; } | api_obj ;;
     health)
       case "${1:-}" in
         on) warp_health_on ;; off) warp_health_off; ok "Health-check выключен" ;;
@@ -542,7 +551,7 @@ _api_warp() {
       [[ "${1:-}" =~ ^(wg|usque)$ ]] || { _api_usage "warp backend wg|usque"; return; }
       warp_set_backend "$1" ;;
     remove) warp_uninstall ;;
-    *) _api_usage "warp status|install|up|down|restart|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
+    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
   esac
 }
 
@@ -1085,7 +1094,7 @@ _api_readonly() {
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
-    "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
     "amnezia scan"|"vkblock "|"vkblock status") return 0 ;;

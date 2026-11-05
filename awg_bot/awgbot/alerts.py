@@ -4,8 +4,10 @@
 владельцам и админам, когда что-то случилось:
 
   iface   awg0 упал (две проверки подряд) и снова поднялся — с временем простоя;
-  warp    WARP упал (health-check увёл клиентов напрямую или туннель не поднялся
-          после перезагрузки) и снова работает — так же, две проверки подряд;
+  warp    WARP упал (health-check увёл клиентов напрямую — сразу; туннель не
+          поднялся после перезагрузки — две проверки подряд) или не отвечает
+          (поднят, а Cloudflare молчит: без health-check это проверяет бот сам,
+          две проверки подряд) и снова работает;
   reboot  сервер перезагрузился (сменился boot_id);
   cert    сертификат Mini App скоро истечёт — значит, продление не сработало;
   disk    диск заполнен на DISK_WARN% (повтор — только после спада ниже DISK_OK%);
@@ -57,7 +59,7 @@ DISK_PATH = os.environ.get("AWG_DISK_PATH", "/")
 SEND_MAX = 49 * 1024 * 1024                     # документ бота — до 50 МБ
 
 # id, подпись кнопки (полстроки в боте), полное название
-KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("warp", "WARP упал", "WARP упал и снова работает"),
+KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("warp", "WARP упал", "WARP упал или не отвечает и снова работает"),
          ("reboot", "Перезагрузка", "Сервер перезагрузился"),
          ("update", "Новая версия", "Новая версия Тулзы"), ("kernel", "Ядро без AWG", "Ядро без модуля AWG"),
          ("cert", "Сертификат", "Сертификат Mini App истекает"), ("disk", f"Диск {DISK_WARN}%", f"Диск заполнен на {DISK_WARN}%"),
@@ -253,16 +255,35 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
         for k in ("down", "down_since", "down_sent"):
             st.pop(k, None)
 
-    # WARP: включён, а туннеля нет — клиенты WARP идут напрямую, с IP сервера.
-    # Две проверки подряд: перезапуск туннеля из меню или бота не тревога
+    # WARP упал: включён, а туннеля нет — клиенты WARP идут напрямую, с IP
+    # сервера. Увёл их health-check (метка failover) — сразу: он уже проверил
+    # трижды; иначе две проверки подряд — перезапуск из меню или бота не тревога.
+    # WARP не отвечает: warp0 поднят, а Cloudflare молчит — клиенты WARP без
+    # интернета. Без health-check это проверяет бот сам (с ним — health-check)
     t = d.get("tunnels") or {}
-    if t.get("warp_failed"):
+    failed, dead, health, failover = bool(t.get("warp_failed")), False, False, False
+    if (failed or t.get("warp") == "up") and enabled("warp"):
+        # Пока сбой не закрыт — пинг и с health-check: «снова работает» только по ответу Cloudflare
+        p = await api.data("warp", "probe", *(("ping",) if st.get("warp_sent") else ()), timeout=30)
+        if isinstance(p, dict):
+            health, failover = bool(p.get("health")), bool(p.get("failover"))
+            dead = not failed and p.get("up") is True and p.get("ok") is False
+    if failed or dead:
         st["warp_down"] = int(st.get("warp_down") or 0) + 1
         if st["warp_down"] == 1:
             st["warp_since"] = now
-        if st["warp_down"] == IFACE_STRIKES and enabled("warp"):
-            await notify(bot, f"🟠 <b>{host}: WARP упал</b> — клиенты WARP идут напрямую, с IP сервера.\n"
-                              "Туннели → WARP → ▶️ Включить.", ui.kb(("▶️ Включить WARP", "warp:up")))
+        need = 1 if failed and failover else IFACE_STRIKES
+        if st["warp_down"] >= need and not st.get("warp_sent") and enabled("warp"):
+            if failed:
+                await notify(bot, f"🟠 <b>{host}: WARP упал</b> — клиенты WARP идут напрямую, с IP сервера.\n"
+                                  + ("Health-check вернёт его сам, когда Cloudflare снова ответит." if health
+                                     else "Туннели → WARP → ▶️ Включить."), ui.kb(("▶️ Включить WARP", "warp:up")))
+            else:
+                await notify(bot, f"🟠 <b>{host}: WARP не отвечает</b> — клиенты WARP без интернета.\n"
+                                  "Перезапусти WARP или включи health-check: он уведёт клиентов напрямую "
+                                  "и сам вернёт WARP, когда Cloudflare ответит.",
+                             ui.kb(("🔄 Перезапустить", "warp:restart"),
+                                   ("🩺 Health-check", "warp:health:on")))
             st["warp_sent"] = True
     else:
         if st.get("warp_sent") and t.get("warp") == "up":

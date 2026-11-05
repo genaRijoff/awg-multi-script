@@ -164,6 +164,7 @@ WARP_STATE="$WARP_DIR/state"; WARP_CONF="{ROOT}/etc/wireguard/warp0.conf"; WARP_
 USQUE_DIR="{ROOT}/etc/usque"; USQUE_CONF="$USQUE_DIR/config.json"
 ANTISCAN_DIR="$STATE_DIR/antiscan"; ANTISCAN_CONF="$ANTISCAN_DIR/antiscan.conf"; ANTISCAN_ALLOW="$ANTISCAN_DIR/allow"
 ANTISCAN_LOG="{ROOT}/antiscan.log"
+WARP_HEALTH_FAILS="{ROOT}/warp-fails"; WARP_HEALTH_RETRY="{ROOT}/warp-retry"; WARP_HEALTH_LOG="{ROOT}/warp-health.log"
 VKBLOCK_DIR="$STATE_DIR/vkblock"; VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"; VKBLOCK_LOG="{ROOT}/vkblock.log"
 AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
 AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"

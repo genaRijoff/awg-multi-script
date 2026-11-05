@@ -502,7 +502,7 @@ emit_script "$T2S_ROUTING_SCRIPT" 't2s_routing_run "$@"' T2S_IF T2S_TABLE T2S_AD
 _xray_emit_routing
 emit_script "$WGOBF_FW" 'wgobf_fw_run "$@"' WGOBF_STATE WGOBF_TAG WGOBF_IF ipt_del_grep ipt_del_tagged wgobf_get wgobf_fw_run
 emit_script "$WARP_AUTOSTART_SCRIPT" 'warp_wg_bringup' WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${{RT_FUNCS[@]}}" warp_awg_params warp_wg_bringup
-emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE WARP_BACKEND_FILE WARP_HEALTH_LOG "${{RT_FUNCS[@]}}" warp_health_run
+_warp_health_emit
 emit_script "$USQUE_UP_HOOK" 'usque_on_connect' WARP_IF WARP_TABLE WARP_PEERS USQUE_LOG "${{RT_FUNCS[@]}}" usque_on_connect
 ls "{ROOT}/scripts"''')
 scripts = out.split()
@@ -616,6 +616,106 @@ rc, out, _ = bash('ip() { [[ "$*" == "-d link show warp0" ]] && echo "5: warp0: 
 chk("WARP: с warp0 из профиля AWG говорим через awg, с обычным — через wg", out.split() == ["awg", "wg"], out)
 with open(os.path.join(TMP, "warp0.conf"), "w") as f:
     f.write("[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32, 2606::1/128\nMTU = 1280\n[Peer]\nPublicKey = Q\nEndpoint = 162.159.192.1:2408\n")
+
+# Health-check WARP: заглушки ping (HC_PING — файл: есть — Cloudflare отвечает) и
+# ip с состоянием warp0 (link add/del — в LINKS) и маршрута таблицы 200 (файл HC_RT)
+HCBIN = os.path.join(TMP, "hcbin")
+os.makedirs(HCBIN, exist_ok=True)
+HC_PING, HC_RT = os.path.join(TMP, "hc-ping-ok"), os.path.join(TMP, "hc-rt")
+HC_STUBS = {
+    "ping": r"""echo "ping $*" >> "$CALLS"; [[ -f "$HC_PING" ]]""",
+    "ip": r"""case "$*" in
+  "link add dev warp0"*) echo warp0 >> "$LINKS" ;;
+  "link del warp0") sed -i "/^warp0$/d" "$LINKS" ;;
+  "-4 -o addr show dev warp0") echo "ip $*" >> "$CALLS"; echo "9: warp0    inet 172.16.0.2/32 scope global warp0"; exit 0 ;;
+  "route show table 200") echo "ip $*" >> "$CALLS"; [[ -f "$HC_RT" ]] && echo "default dev warp0 scope link"; exit 0 ;;
+  "route replace default dev warp0"*"table 200") touch "$HC_RT" ;;
+  "route flush table 200") rm -f "$HC_RT" ;;
+esac
+PATH="${PATH#"${0%/*}:"}" exec ip "$@"
+""",
+}
+for name, body in HC_STUBS.items():
+    with open(os.path.join(HCBIN, name), "w") as f:
+        f.write("#!/usr/bin/env bash\n" + body + "\n")
+    os.chmod(os.path.join(HCBIN, name), 0o755)
+HCPRE = f'export PATH="{HCBIN}:$PATH" HC_PING="{HC_PING}" HC_RT="{HC_RT}"; '
+HCF = {k: os.path.join(ROOT, n) for k, n in (("fails", "warp-fails"), ("retry", "warp-retry"), ("log", "warp-health.log"))}
+
+
+def hc_run(ping_ok, n=1):
+    if ping_ok:
+        open(HC_PING, "w").close()
+    elif os.path.exists(HC_PING):
+        os.remove(HC_PING)
+    reset_calls()
+    for _ in range(n):
+        bash(HCPRE + 'bash "$WARP_HEALTH_SCRIPT"')
+    return calls()
+
+
+def hc_read(k):
+    try:
+        return open(HCF[k]).read().strip()
+    except OSError:
+        return None
+
+
+rc, out, err = bash(f'WARP_CONF="{TMP}/warp0.conf"; _warp_health_emit; mkdir -p "$(dirname "$WARP_STATE")"; '
+                    'touch "$WARP_STATE"; rm -f "$WARP_STATE.failed" "$WARP_BACKEND_FILE"; echo "$WARP_STATE"')
+WSTATE = out.strip()
+with open(LINKS, "w") as f:
+    f.write("awg0\nwarp0\n")
+open(HC_RT, "w").close()
+log = hc_run(True)
+chk("health-check: WARP отвечает — счётчик в ноль, ничего не трогает",
+    rc == 0 and hc_read("fails") == "0" and "link del" not in log and "-I warp0 1.1.1.1" in log, [err, log])
+log = hc_run(False, 2)
+chk("два провала подряд — только счёт, клиенты в туннеле",
+    hc_read("fails") == "2" and "link del" not in log and not os.path.exists(WSTATE + ".failed"), log)
+log = hc_run(False)
+chk("третий провал — клиенты напрямую: маршруты сняты, warp0 убран, WARP остаётся включённым с меткой",
+    "ip link del warp0" in log and "route flush table 200" in log and os.path.exists(WSTATE)
+    and os.path.exists(WSTATE + ".failed") and "FAILOVER" in (open(HCF["log"]).read()), log)
+log = hc_run(False)
+chk("после отказа — пробует вернуть WARP без клиентов: warp0 поднят и убран, маршрутов клиентов нет",
+    "ip link add dev warp0" in log and "ip link del warp0" in log and "route replace default dev warp0" not in log
+    and "lookup 200" not in log.replace("ip rule del lookup 200", "") and hc_read("retry") == "1"
+    and os.path.exists(WSTATE + ".failed") and "RETRY 1" in open(HCF["log"]).read(), log)
+hc_run(False, 9)
+log = hc_run(False)
+chk("первые 10 попыток — каждую минуту, дальше — раз в 5 минут (11-я пропущена)",
+    hc_read("retry") == "11" and "link add" not in log, [hc_read("retry"), log])
+hc_run(False, 3)
+log = hc_run(False)
+chk("15-я — снова попытка: и через час пробует, пока не выключат", hc_read("retry") == "15" and "ip link add dev warp0" in log,
+    [hc_read("retry"), log])
+with open(os.path.join(ROOT, "warp-retry"), "w") as f:
+    f.write("19")
+with open(LINKS, "a") as f:
+    f.write("xray0\n")
+log = hc_run(True)
+chk("пока WARP лежал, включили Xray — WARP не возвращает, чтобы не мешать",
+    "link add" not in log and os.path.exists(WSTATE + ".failed"), log)
+with open(LINKS, "w") as f:
+    f.write("awg0\n")
+with open(os.path.join(ROOT, "warp-retry"), "w") as f:
+    f.write("19")
+log = hc_run(True)
+chk("Cloudflare ответил — WARP вернулся: маршруты клиентов с адресом warp0, метка и счётчики сброшены",
+    "ip link add dev warp0" in log and "ip route replace default dev warp0 src 172.16.0.2 table 200" in log
+    and "ip link del" not in log and not os.path.exists(WSTATE + ".failed") and hc_read("retry") is None
+    and hc_read("fails") == "0" and "RECOVERED" in open(HCF["log"]).read(), log)
+os.remove(HC_RT)
+log = hc_run(True)
+chk("warp0 есть, а маршрутов клиентов нет (попытку прервали) — доставляет их",
+    "ip route replace default dev warp0 src 172.16.0.2 table 200" in log, log)
+with open(LINKS, "w") as f:
+    f.write("awg0\n")
+os.remove(WSTATE)
+log = hc_run(True)
+chk("WARP выключен руками — health-check его не поднимает", "link add" not in log and "route replace" not in log, log)
+bash('rm -f "$WARP_STATE.failed"')
 
 # ── 5. Разбор iptables-save ───────────────────────────────
 print("iptables-save")
@@ -2591,6 +2691,33 @@ rc, out, _ = bash(ASPRE + 'bash "$ANTISCAN_SCRIPT" apply; echo "rc=$?"; ls "$IPS
 chk("выключен — служба при загрузке ничего не ставит", out.split() == ["rc=0"], out)
 rc, out, _ = bash(ASPRE + 'antiscan_remove; ls "$ANTISCAN_DIR" "$ANTISCAN_SCRIPT" 2>&1')
 chk("удаление вместе со скриптом: каталог и скрипт убраны", out.count("No such file") == 2, out)
+
+print("\n── WARP: проверка для уведомлений бота ──")
+with open(LINKS, "w") as f:
+    f.write("awg0\nwarp0\n")
+open(HC_PING, "w").close()
+HCENV = {"PATH": HCBIN + ":" + ENV["PATH"], "HC_PING": HC_PING, "HC_RT": HC_RT}
+r = api("warp", "probe", env=HCENV)
+d = r.get("data") or {}
+chk("warp probe: без health-check бот проверяет сам — WARP отвечает",
+    r.get("ok") and d.get("up") is True and d.get("health") is False and d.get("ok") is True and d.get("failover") is False, r)
+os.remove(HC_PING)
+d = api("warp", "probe", env=HCENV).get("data") or {}
+chk("warp probe: не отвечает — ok: false", d.get("ok") is False, d)
+with open(ACTIVE, "a") as f:
+    f.write("awg-warp-healthcheck.timer\n")
+d = api("warp", "probe", env=HCENV).get("data") or {}
+chk("warp probe: с health-check — без пинга, проверяет он", d.get("health") is True and "ok" not in d, d)
+d = api("warp", "probe", "ping", env=HCENV).get("data") or {}
+chk("warp probe ping: бот ждёт конца сбоя — пингует и с health-check", d.get("health") is True and d.get("ok") is False, d)
+with open(ACTIVE) as f:
+    act = f.read().replace("awg-warp-healthcheck.timer\n", "")
+with open(ACTIVE, "w") as f:
+    f.write(act)
+with open(LINKS, "w") as f:
+    f.write("awg0\n")
+rc, out, _ = bash("_api_readonly warp probe && echo RO")
+chk("warp probe — чтение без очереди api", "RO" in out, out)
 
 print("\n── VK и Max мимо VPN ──")
 

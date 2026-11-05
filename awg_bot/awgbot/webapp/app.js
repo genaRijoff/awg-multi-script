@@ -3958,7 +3958,7 @@ route(/^\/tunnels\/warp$/, async (ctx) => {
     if (v) await runJob(ctx, `WARP: бэкенд ${v}`, ["warp", "backend", v]);
   }
   ctx.put(title("☁️ WARP"), logCard(r.log),
-    conf ? switchRow("🩺 Health-check", "сам перезапускает WARP, если тот перестал отвечать", d.health,
+    conf ? switchRow("🩺 Health-check", "WARP не отвечает — клиенты напрямую, а WARP он вернёт сам", d.health,
       (on) => call("warp", "health", on ? "on" : "off")) : null,
     h("div", { class: "actions" },
       conf && !d.up ? btn("▶️ Включить", () => runJob(ctx, "Включение WARP", ["warp", "up"]), "btn-primary") : null,
@@ -4895,7 +4895,7 @@ route(/^\/bot$/, async (ctx) => {
 
 const ALERT_HINTS = {
   iface: "две проверки подряд без awg0 — и когда он вернётся, с временем простоя",
-  warp: "WARP включён, а туннеля нет (health-check увёл клиентов напрямую) — и когда он снова заработает",
+  warp: "WARP упал (клиенты идут напрямую) или не отвечает (клиенты без интернета) — и когда он снова заработает",
   reboot: "сервер загрузился заново: время работы и поднялся ли awg0",
   update: "вышла новая версия AWG Toolza — один раз на версию",
   kernel: "apt поставил ядро, под которое модуль AWG не собрался",
