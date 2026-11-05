@@ -3996,7 +3996,7 @@ route(/^\/tunnels\/warp\/import$/, async (ctx) => {
     h("label", {}, "wgcf-profile.conf"), fileField(ta), ta,
     btn("📥 Импортировать", (b) => {
       const text = ta.value.trim();
-      if (!text.includes("[Interface]") || !text.includes("[Peer]")) return fail(new Error("Это не похоже на wgcf-profile.conf"));
+      if (!text.includes("PrivateKey") || !text.includes("PublicKey")) return fail(new Error("Это не похоже на wgcf-profile.conf"));
       return busy(b, async () => {
         const r = await callR(["warp", "import"], { stdin: text + "\n" });
         haptic(); toast("✅ " + outcome(r.log, "Профиль импортирован"), 3500); back();
