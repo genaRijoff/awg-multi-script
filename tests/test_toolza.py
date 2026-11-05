@@ -684,6 +684,15 @@ rc, out, _ = bash(f'WARP_CONF="{TMP}/warp0.conf"; warp_awg_params')
 chk("WARP: параметры AmneziaWG из профиля — все и без \\r, ключи и адреса не попадают",
     out.splitlines() == ["Jc = 4", "Jmin = 40", "Jmax = 70", "S1 = 0", "S2 = 0", "H1 = 1", "H2 = 2", "H3 = 3", "H4 = 4",
                          "I1 = <b 0xc2000000011419fa>"], out)
+# Прокси до Telegram: выходы проверяются разом — мёртвые exit-ноды по 8 с
+# каждая растягивали поиск на полминуты
+rc, out, _ = bash('xray_port_owners() { echo "xray (pid 1)"; }; t2s_proxy() { echo 127.0.0.1:1081; }; '
+                  'bot_proxy_probe() { sleep 2; [[ "$1" == *10808 ]]; }; s=$SECONDS; api_main bot proxy candidates; echo "took=$((SECONDS - s))"')
+cand = json.loads(out.strip().splitlines()[-2]) if rc == 0 else {}
+chk("прокси до Telegram: выходы проверяются разом, порядок и ответы на месте",
+    [(r["url"], r["ok"]) for r in cand.get("data") or []] == [("socks5://127.0.0.1:10808", True), ("socks5://127.0.0.1:1081", False)]
+    and int(out.strip().splitlines()[-1].split("=")[1]) < 4, out)
+
 # Профиль, скопированный с телефона: «[» в начале потерялась, \r, «Ключ=значение»,
 # лишние ключи генератора — импорт чинит разметку, warp0 поднимается из него
 WIMP = os.path.join(TMP, "warp-import.conf")

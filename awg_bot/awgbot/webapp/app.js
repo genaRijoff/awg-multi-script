@@ -4939,8 +4939,9 @@ route(/^\/bot\/proxy$/, async (ctx) => {
     h("div", { class: "card" }, kv("Сейчас", h("span", { class: "mono" }, d.proxy || "нет — напрямую")),
       h("div", { class: "muted small" }, "Нужен, если Telegram у хостера заблокирован: SOCKS5/HTTP-прокси или туннель этого сервера.")),
     btn("🔎 Найти на сервере", (b) => busy(b, async () => {
-      toast("Ищу прокси и туннели, проверяю Telegram через каждый…", 6000);
-      const rows = (await call("bot", "proxy", "candidates")) || [];
+      // Пока идёт поиск (до ~10 с) — на экране, а не во всплывашке, которая гаснет раньше
+      cands.replaceChildren(h("div", { class: "card small muted" }, "⏳ Ищу прокси и туннели, проверяю Telegram через каждый…"));
+      const rows = await call("bot", "proxy", "candidates").catch((e) => { cands.replaceChildren(); throw e; }) || [];
       cands.replaceChildren(rows.length ? h("div", { class: "card list" }, rows.map((r) =>
         h("div", { class: "item", onclick: (ev) => apply(null, r.url) },
           h("div", { class: "dot " + (r.ok ? "on" : "bad") }),
