@@ -288,7 +288,7 @@ chk("Xray: два выхода, балансировщик, РФ напряму�
 rc, out, _ = bash(f'py xray-del "{XC}" proxy_two_example_com; py xray-prepare "{XC}" native; cat "{XC}"')
 xc = json.loads(out)
 chk("Xray: удаление выхода чинит балансировщик", not xc["routing"].get("balancers")
-    and any(i.get("protocol") == "tun" for i in xc["inbounds"])
+    and any(i.get("protocol") == "tun" and i["settings"].get("name") == "xray0" for i in xc["inbounds"])
     and all(r.get("outboundTag") != "proxy_two_example_com" for r in xc["routing"]["rules"]), out[:300])
 
 # ── Xray: пробы на бинаре ─────────────────────────────────
@@ -472,6 +472,15 @@ mains = [r for r in xf["routing"]["rules"] if r.get("inboundTag")]
 chk("Xray: чужой тег tun — одно общее правило, выход по умолчанию меняется",
     rc == 0 and out.strip() == "B" and len(mains) == 1 and mains[0] == {"type": "field", "inboundTag": ["tun-in"], "outboundTag": "B"}
     and xf["inbounds"][0]["tag"] == "tun-in", [out, xf])
+chk("Xray: у входа tun имя xray0 и в старом конфиге без имени — Xray 26.x иначе называет его utunN",
+    xf["inbounds"][0]["settings"].get("name") == "xray0", xf["inbounds"][0])
+with open(XF, "w") as f:
+    json.dump({"inbounds": [{"protocol": "tun", "tag": "tun-in", "settings": {"name": "utun42", "mtu": 1400}}],
+               "outbounds": [{"protocol": "vless", "tag": "A"}]}, f)
+rc, out, _ = bash(f'py xray-prepare "{XF}" native')
+xf = json.load(open(XF))
+chk("Xray: чужое имя устройства — снова xray0, остальные настройки входа на месте",
+    rc == 0 and xf["inbounds"][0]["settings"] == {"name": "xray0", "mtu": 1400}, xf["inbounds"][0])
 bash("client_remove xc1 >/dev/null 2>&1")
 
 # ── 4. Служебные скрипты ──────────────────────────────────

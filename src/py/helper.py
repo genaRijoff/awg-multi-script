@@ -1304,6 +1304,7 @@ def cmd_conf_hooks(path, mode, *allow):
 # ════════════════════════ Xray ════════════════════════
 SKIP_PROTO = ("freedom", "blackhole", "dns")
 KNOWN_IN = {"xray0", "tun-in", "tun-probe", "socks-in"}
+XRAY_IF = "xray0"                   # интерфейс входа tun — как XRAY_IF в awg2
 SNIFF = {"enabled": True, "destOverride": ["http", "tls", "quic"]}
 
 
@@ -1812,8 +1813,8 @@ def cmd_xray_prepare(path, mode, peers=""):
     native: inbound tun видит адрес клиента (перед xray0 нет NAT), а через
     tun2socks все соединения приходят с 127.0.0.1."""
     conf = jload(path)
-    conf.setdefault("routing", {})["rules"] = [r for r in conf["routing"].get("rules") or []
-                                               if r.get("ruleTag") != XRAY_CLIENT_RULE]
+    routing = conf.setdefault("routing", {})
+    routing["rules"] = [r for r in routing.get("rules") or [] if r.get("ruleTag") != XRAY_CLIENT_RULE]
     inb = [i for i in conf.get("inbounds") or []
            if not (i.get("tag") == "xray0" and i.get("protocol") == "dokodemo-door")]
     socks = next((i for i in inb if i.get("tag") == "socks-in"), None)
@@ -1837,6 +1838,12 @@ def cmd_xray_prepare(path, mode, peers=""):
                    "sniffing": SNIFF}
             inb.insert(0, tun)
         tun["tag"] = "tun-in"
+        # Имя устройства — всегда xray0: без имени Xray 26.x называет его
+        # случайно (utun10…utun1024), awg2 не дожидался xray0 и выключал туннель
+        st = tun.get("settings")
+        if not isinstance(st, dict):
+            st = tun["settings"] = {}
+        st["name"] = XRAY_IF
         want = tun["tag"]
     else:
         inb = [i for i in inb if i.get("protocol") != "tun"]
