@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.50"
+VERSION="v1.2.51"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -452,6 +452,8 @@ WARP_BACKEND_FILE="/etc/awg-warp-backend"
 WARP_AUTOSTART_SCRIPT="$WARP_DIR/warp-autostart.sh"
 WARP_HEALTH_SCRIPT="/usr/local/bin/awg-warp-healthcheck.sh"
 WARP_HEALTH_LOG="/var/log/awg-warp-health.log"
+WARP_HEALTH_FAILS="/tmp/awg-warp-fails"     # провалов подряд
+WARP_HEALTH_RETRY="/tmp/awg-warp-retry"     # попыток вернуть WARP после отказа
 WARPSCOUT_BIN="/usr/local/bin/warpscout"
 WARPSCOUT_DIR="/etc/warpscout"
 WARPSCOUT_ACCOUNT="$WARPSCOUT_DIR/warpscout-account.json"
@@ -579,6 +581,18 @@ ANTISCAN_SRC="https://raw.githubusercontent.com/shadow-netlab/traffic-guard-list
 # запись /19) и ~20 сетей /32 IPv6. Подменённый источник с тысячами /12 прошёл бы
 # проверку записей, но закрыл бы почти весь IPv4 — такой список не принимается
 ANTISCAN_MAX4=16777216 ANTISCAN_MAX6=4096   # 2^24 адресов IPv4; 2^12 сетей /32 IPv6 (записи /32 и шире)
+
+# ── VK и Max мимо VPN (сети VK — DROP трафика клиентов VPN) ──
+VKBLOCK_DIR="$STATE_DIR/vkblock"            # список и состояние
+VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"    # ON, UPDATED, ERROR, ENTRIES
+VKBLOCK_SCRIPT="/usr/local/bin/awg2-vkblock"
+VKBLOCK_LOG="/var/log/awg2-vkblock.log"
+VKBLOCK_SET="awg2-vk" VKBLOCK_SET6="awg2-vk6" VKBLOCK_TAG="awg2-vkblock"
+VKBLOCK_UNIT="awg2-vkblock.service" VKBLOCK_TIMER="awg2-vkblock-update.timer"
+VKBLOCK_SRC="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist-vk.txt"
+# Настоящий список: ~200 записей, ~300 тыс. адресов IPv4 и три сети /29 IPv6.
+# Короче минимума — оборван, шире предела — подменён: прежний не заменяют
+VKBLOCK_MIN=50 VKBLOCK_MAX4=4194304 VKBLOCK_MAX6=4096   # 2^22 адресов IPv4; 2^12 сетей /32 IPv6
 
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
@@ -5328,6 +5342,8 @@ warp_wg_bringup() {
   rm -f "$tmp"
   ip -4 addr add "$addr" dev "$WARP_IF"
   ip link set mtu "${mtu:-1280}" up dev "$WARP_IF" || { ip link del "$WARP_IF"; return 1; }
+  # Health-check возвращает WARP без клиентов: маршруты — только после ответа Cloudflare
+  [[ -n "${WARP_NO_RT:-}" ]] && return 0
   rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "${addr%/*}"
 }
 
@@ -5444,8 +5460,9 @@ warp_usque_install() { _usque_install_bin && _usque_register && _usque_write; }
 
 # ── Включение / выключение ────────────────────────────────
 warp_up() {
-  local be i
+  local be i had=""
   server_exists || { err "Сначала создай сервер"; return 1; }
+  [[ -f "$WARP_STATE" ]] && had=1
   tunnel_guard warp || return 1
   warp_is_up && { info "WARP уже включён"; return 0; }
   be=$(warp_backend)
@@ -5468,7 +5485,13 @@ warp_up() {
       err "Через WARP трафик не идёт — выключаю, клиенты остаются напрямую"
       [[ "$be" == wg ]] && info "Попробуй найти рабочий endpoint (warpscout) или импортировать профиль"
       [[ "$be" == wg && -z "$(warp_awg_params)" ]] && info "С российских серверов чистый WireGuard к Cloudflare часто режут — помогает профиль с параметрами AmneziaWG (Jc, Jmin, Jmax)"
-      warp_down quiet
+      # WARP упал раньше, а health-check включён — он и дальше пробует вернуть его сам
+      if [[ -n "$had" ]] && unit_active awg-warp-healthcheck.timer; then
+        warp_failover
+        info "Health-check продолжит пробовать сам и вернёт WARP, когда Cloudflare ответит"
+      else
+        warp_down quiet
+      fi
       return 1
     }
     sleep 2
@@ -5493,28 +5516,83 @@ warp_down() {
 }
 
 # ── Health-check ──────────────────────────────────────────
-# Три провала подряд — клиенты возвращаются на прямой маршрут.
-warp_health_run() {
-  local f=/tmp/awg-warp-fails n
-  ip link show "$WARP_IF" &>/dev/null || exit 0
-  command -v ping >/dev/null || exit 0
-  if ping -c1 -W3 -I "$WARP_IF" 1.1.1.1 &>/dev/null; then echo 0 > "$f"; exit 0; fi
-  n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
-  echo "$n" > "$f"
-  echo "$(date '+%F %T') FAIL $n/3" >> "$WARP_HEALTH_LOG"
-  (( n >= 3 )) || exit 0
+# Раз в минуту — пинг 1.1.1.1 через warp0. Три провала подряд — клиенты WARP
+# уходят напрямую (warp_failover), а WARP остаётся включённым. Дальше
+# health-check сам возвращает его, пока не вернёт или пока WARP либо
+# health-check не выключат: первые 10 попыток — раз в минуту, потом раз в
+# 5 минут (сеть хостера может лежать часами). Пробует без клиентов: warp0
+# поднимается без их маршрутов, и только ответ Cloudflare возвращает их в туннель.
+warp_ping() { ping -c3 -i0.5 -W2 -I "$WARP_IF" 1.1.1.1 &>/dev/null; }
+
+# Клиенты WARP — напрямую, WARP остаётся включённым с меткой .failed.
+warp_failover() {
   rt_down "$WARP_IF" "$WARP_TABLE"
   # usque держит warp0 сам: гасим службу, иначе warp_is_up остаётся истинным,
   # warp_up отвечает «уже включён», а хук usque при реконнекте вернёт правила.
   if [[ "$(cat "$WARP_BACKEND_FILE" 2>/dev/null)" == usque ]]; then systemctl stop awg-usque.service 2>/dev/null
   else ip link del "$WARP_IF" 2>/dev/null; fi
   echo failed > "$WARP_STATE.failed"
-  echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую" >> "$WARP_HEALTH_LOG"
+}
+
+warp_health_recover() {
+  local r="$WARP_HEALTH_RETRY" n i src
+  n=$(( $(cat "$r" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$r"
+  (( n <= 10 || n % 5 == 0 )) || return 0
+  # Пока WARP лежал, включили другой туннель — ему не мешаем
+  [[ -z "$(tunnel_conflict warp)" ]] || return 0
+  if (( n == 1 || n % 60 == 0 )); then echo "$(date '+%F %T') RETRY $n: пробую вернуть WARP" >> "$WARP_HEALTH_LOG"; fi
+  if [[ "$(cat "$WARP_BACKEND_FILE" 2>/dev/null)" == usque ]]; then
+    # usque поднимает warp0 и маршруты клиентов сам, когда достучится до Cloudflare
+    systemctl start awg-usque.service 2>/dev/null || return 0
+    for i in {1..15}; do ip link show "$WARP_IF" &>/dev/null && break; sleep 1; done
+    if ! { ip link show "$WARP_IF" &>/dev/null && warp_ping; }; then warp_failover; return 0; fi
+  else
+    WARP_NO_RT=1 warp_wg_bringup 2>/dev/null || return 0
+    if ! warp_ping; then ip link del "$WARP_IF" 2>/dev/null; return 0; fi
+    src=$(ip -4 -o addr show dev "$WARP_IF" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')
+    rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "$src" || { warp_failover; return 0; }
+  fi
+  rm -f "$WARP_STATE.failed" "$r"
+  echo 0 > "$WARP_HEALTH_FAILS"
+  echo "$(date '+%F %T') RECOVERED: WARP снова работает, клиенты WARP — в туннеле (попытка $n)" >> "$WARP_HEALTH_LOG"
+}
+
+warp_health_run() {
+  local f="$WARP_HEALTH_FAILS" n src
+  command -v ping >/dev/null || exit 0
+  if ! ip link show "$WARP_IF" &>/dev/null; then
+    # WARP включён, а туннеля нет: health-check увёл клиентов или warp0 не поднялся при загрузке
+    [[ -f "$WARP_STATE" ]] && warp_health_recover
+    exit 0
+  fi
+  if warp_ping; then
+    echo 0 > "$f"
+    # Попытку вернуть WARP прервали между подъёмом warp0 и маршрутами — доставить маршруты
+    if [[ -f "$WARP_STATE" ]] && ! ip route show table "$WARP_TABLE" 2>/dev/null | grep -q '^default'; then
+      src=$(ip -4 -o addr show dev "$WARP_IF" 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4; exit}')
+      rt_up "$WARP_IF" "$WARP_TABLE" "$WARP_PEERS" "$src"
+    fi
+    exit 0
+  fi
+  n=$(( $(cat "$f" 2>/dev/null || echo 0) + 1 ))
+  echo "$n" > "$f"
+  echo "$(date '+%F %T') FAIL $n/3" >> "$WARP_HEALTH_LOG"
+  (( n >= 3 )) || exit 0
+  warp_failover
+  rm -f "$WARP_HEALTH_RETRY"
+  echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую, WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+}
+
+_warp_health_emit() {
+  emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE WARP_CONF WARP_PEERS \
+    WARP_BACKEND_FILE WARP_HEALTH_LOG WARP_HEALTH_FAILS WARP_HEALTH_RETRY XRAY_IF XRAY_UNIT T2S_UNIT EXITS_UNIT "${RT_FUNCS[@]}" \
+    unit_active warp_is_up xray_is_up t2s_is_up exits_is_up tunnel_conflict \
+    warp_awg_params warp_wg_bringup warp_ping warp_failover warp_health_recover warp_health_run
 }
 
 warp_health_on() {
-  emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \
-    WARP_BACKEND_FILE WARP_HEALTH_LOG "${RT_FUNCS[@]}" warp_health_run || return 1
+  _warp_health_emit || return 1
   write_unit awg-warp-healthcheck.service <<EOF
 [Unit]
 Description=AWG Toolza — проверка WARP
@@ -5534,12 +5612,13 @@ OnUnitActiveSec=60s
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl enable --now awg-warp-healthcheck.timer &>/dev/null && ok "Health-check включён (раз в минуту)"
+  systemctl enable --now awg-warp-healthcheck.timer &>/dev/null \
+    && ok "Health-check включён: раз в минуту; WARP не отвечает — клиенты напрямую, WARP вернётся сам"
 }
 
 warp_health_off() {
   remove_unit awg-warp-healthcheck.timer awg-warp-healthcheck.service
-  rm -f "$WARP_HEALTH_SCRIPT" /tmp/awg-warp-fails
+  rm -f "$WARP_HEALTH_SCRIPT" "$WARP_HEALTH_FAILS" "$WARP_HEALTH_RETRY"
 }
 
 # ── warpscout: поиск рабочего endpoint ────────────────────
@@ -9844,8 +9923,7 @@ helpers_refresh() {
       WARP_CONF WARP_IF WARP_TABLE WARP_PEERS "${RT_FUNCS[@]}" warp_awg_params warp_wg_bringup
   fi
   if [[ -f "$WARP_HEALTH_SCRIPT" ]]; then
-    emit_script "$WARP_HEALTH_SCRIPT" 'warp_health_run' WARP_IF WARP_TABLE WARP_STATE \
-      WARP_BACKEND_FILE WARP_HEALTH_LOG "${RT_FUNCS[@]}" warp_health_run
+    _warp_health_emit
   fi
   [[ -f "$USQUE_UP_HOOK" ]] && _usque_write &>/dev/null
   if [[ -f "$DNS_PROXY_STATE" ]]; then
@@ -9860,6 +9938,7 @@ helpers_refresh() {
     T2S_IF T2S_TABLE T2S_ADDR "${RT_FUNCS[@]}" t2s_routing_run
   [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
   antiscan_on && _antiscan_emit &>/dev/null
+  vkblock_on && _vkblock_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
@@ -11522,6 +11601,340 @@ antiscan_remove() {
   rm -rf "$ANTISCAN_DIR" "$ANTISCAN_SCRIPT" "$ANTISCAN_LOG"
 }
 
+# ═════ vkblock ═════
+# VK и Max мимо VPN: трафик клиентов VPN в сети VK (ВКонтакте, Max,
+# Одноклассники и другие сервисы VK) на сервере отбрасывается. Приложения VK
+# на телефоне с VPN не видят адрес сервера и не могут сдать его как VPN.
+# Сервисы VK через VPN у клиентов не откроются — их пускают мимо туннеля.
+#
+# Список — публичный (C24Be/AS_Network_List, blacklist-vk.txt). Проверка та
+# же, что у антисканера (_antiscan_parse): частные и служебные сети и слишком
+# широкие подсети отбрасываются, оборванный или раздутый ответ прежний список
+# не заменяет.
+#
+# Как устроено: наборы ipset hash:net и DROP в mangle PREROUTING — раньше
+# FORWARD, где PostUp сервера ставит свой ACCEPT первым (см. dns.sh). Ловит
+# всех, чей трафик сервер пересылает: awg0, обфускатор, контейнеры Amnezia,
+# клиентов, идущих через WARP, Xray или каскад. Пакеты к адресам самого
+# сервера не трогаются (addrtype LOCAL) — сервер в сети VK остаётся
+# доступным; свой трафик сервера (OUTPUT) — тоже.
+#
+# Служба awg2-vkblock.service ставит наборы и правило при загрузке (раньше
+# UFW и netfilter-persistent), таймер раз в час возвращает правило, если его
+# сбросили, и раз в сутки обновляет список. Без сети — на сохранённом списке.
+
+_vkblock_get() {  # КЛЮЧ — значение из vkblock.conf (файл не исполняется)
+  sed -n "s/^$1=//p" "$VKBLOCK_CONF" 2>/dev/null | tail -1
+}
+
+_vkblock_set() {  # КЛЮЧ ЗНАЧЕНИЕ
+  local v="${2//[$'\n\r']/ }"
+  mkdir -p "$VKBLOCK_DIR" && chmod 700 "$VKBLOCK_DIR"
+  { grep -v "^$1=" "$VKBLOCK_CONF" 2>/dev/null; printf '%s=%s\n' "$1" "$v"; } | write_file "$VKBLOCK_CONF" 600
+}
+
+_vkblock_log() { mkdir -p "$(dirname "$VKBLOCK_LOG")"; echo "[$(date '+%F %T')] $*" >> "$VKBLOCK_LOG"; }
+
+_vkblock_fail() { _vkblock_set ERROR "$1"; _vkblock_log "$1"; return 1; }
+
+vkblock_on() { [[ "$(_vkblock_get ON)" == 1 ]]; }
+
+# Скачать список. Оборванный, пустой или слишком широкий ответ прежний не
+# заменяет; ошибка — в ERROR, время удачного обновления — в UPDATED.
+_vkblock_fetch() {
+  local tmp n s4 s6 keep="оставлен прежний список"
+  mkdir -p "$VKBLOCK_DIR" && chmod 700 "$VKBLOCK_DIR"
+  [[ -s "$VKBLOCK_DIR/vk.list" ]] || keep="список не принят"
+  tmp=$(mktemp "$VKBLOCK_DIR/.dl.XXXXXX") || return 1
+  if ! curl -fsS --proto '=https' --max-time 40 --max-filesize 2000000 -o "$tmp" "$VKBLOCK_SRC" 2>/dev/null; then
+    rm -f "$tmp"; _vkblock_fail "список не скачался"; return 1
+  fi
+  read -r n s4 s6 < <({ _antiscan_parse 4 < "$tmp"; _antiscan_parse 6 < "$tmp"; } | _antiscan_span)
+  if (( n < VKBLOCK_MIN || n > 20000 )); then
+    rm -f "$tmp"; _vkblock_fail "в ответе $n записей — $keep"; return 1
+  fi
+  if (( s4 > VKBLOCK_MAX4 || s6 > VKBLOCK_MAX6 )); then
+    rm -f "$tmp"; _vkblock_fail "слишком широкий охват (IPv4 $s4 адресов, IPv6 $s6 сетей /32) — $keep"; return 1
+  fi
+  chmod 600 "$tmp" && mv -f "$tmp" "$VKBLOCK_DIR/vk.list" || return 1
+  _vkblock_set ERROR ""
+  _vkblock_set UPDATED "$(date +%s)"
+}
+
+_vkblock_rule() {  # набор → VKBLOCK_RULE
+  VKBLOCK_RULE=(-m set --match-set "$1" dst -m addrtype ! --dst-type LOCAL -m comment --comment "$VKBLOCK_TAG" -j DROP)
+}
+
+_vkblock_rule_up() {  # iptables|ip6tables набор
+  _vkblock_rule "$2"
+  "$1" -t mangle -C PREROUTING "${VKBLOCK_RULE[@]}" 2>/dev/null || "$1" -t mangle -I PREROUTING 1 "${VKBLOCK_RULE[@]}"
+}
+
+_vkblock_rule_down() {  # iptables|ip6tables набор
+  local guard=0
+  command -v "$1" &>/dev/null || return 0
+  _vkblock_rule "$2"
+  while (( guard++ < 32 )) && "$1" -t mangle -D PREROUTING "${VKBLOCK_RULE[@]}" 2>/dev/null; do :; done
+  return 0
+}
+
+# Правила на месте: у каждого набора — своё правило
+vkblock_rules_ok() {
+  ipset list -n "$VKBLOCK_SET" &>/dev/null || return 1
+  _vkblock_rule "$VKBLOCK_SET"
+  iptables -t mangle -C PREROUTING "${VKBLOCK_RULE[@]}" 2>/dev/null || return 1
+  ipset list -n "$VKBLOCK_SET6" &>/dev/null || return 0
+  _vkblock_rule "$VKBLOCK_SET6"
+  ip6tables -t mangle -C PREROUTING "${VKBLOCK_RULE[@]}" 2>/dev/null
+}
+
+# Собрать наборы из сохранённого списка и поставить правила.
+_vkblock_apply() {
+  local d n4 n6=0 rc=0
+  # Выключили, пока качался список (выключение ждёт замок не дольше 20 с), —
+  # правило обратно не ставить
+  [[ "$(_vkblock_get ON)" == 1 ]] || { vkblock_down; return 0; }
+  [[ -s "$VKBLOCK_DIR/vk.list" ]] || { _vkblock_log "нечего применять: список ещё не скачан"; return 3; }
+  d=$(mktemp -d "$VKBLOCK_DIR/.apply.XXXXXX") || return 1
+  _antiscan_parse 4 < "$VKBLOCK_DIR/vk.list" | sort -u > "$d/v4"
+  _antiscan_parse 6 < "$VKBLOCK_DIR/vk.list" | sort -u > "$d/v6"
+  : > "$d/none"
+  if ! n4=$(_antiscan_load "$VKBLOCK_SET" inet "$d/v4" "$d/none"); then
+    _vkblock_log "ipset: набор IPv4 не загрузился"; rc=5
+  elif ! _vkblock_rule_up iptables "$VKBLOCK_SET"; then
+    _vkblock_log "iptables: правило не поставилось"; rc=5
+  else
+    if [[ -s "$d/v6" ]] && command -v ip6tables &>/dev/null \
+        && n6=$(_antiscan_load "$VKBLOCK_SET6" inet6 "$d/v6" "$d/none") \
+        && _vkblock_rule_up ip6tables "$VKBLOCK_SET6"; then
+      :
+    else
+      n6=0
+      _vkblock_rule_down ip6tables "$VKBLOCK_SET6"
+      ipset destroy "$VKBLOCK_SET6" 2>/dev/null || true
+    fi
+    _vkblock_set ENTRIES "$n4 $n6"
+    _vkblock_log "применено: IPv4 $n4, IPv6 $n6"
+  fi
+  rm -rf "$d"
+  return "$rc"
+}
+
+vkblock_down() {
+  local s
+  _vkblock_rule_down iptables "$VKBLOCK_SET"
+  _vkblock_rule_down ip6tables "$VKBLOCK_SET6"
+  command -v ipset &>/dev/null || return 0
+  # и временные наборы замены — остаются, если загрузку прервали
+  for s in "$VKBLOCK_SET" "$VKBLOCK_SET6" "$VKBLOCK_SET-new" "$VKBLOCK_SET6-new"; do
+    ipset destroy "$s" 2>/dev/null || true
+  done
+  return 0
+}
+
+# Точка входа службы и таймера (и awg2): apply | update | heal | off.
+vkblock_run() {
+  local mode="${1:-heal}" rc=0 upd
+  mkdir -p "$VKBLOCK_DIR" && chmod 700 "$VKBLOCK_DIR"
+  exec 9>"$VKBLOCK_DIR/.lock"
+  flock -w 180 9 || { _vkblock_log "$mode: занято другой операцией"; return 75; }
+  if [[ "$mode" == off || "$(_vkblock_get ON)" != 1 ]]; then
+    vkblock_down
+    return 0
+  fi
+  case "$mode" in
+    update) _vkblock_fetch || true; _vkblock_apply || rc=$? ;;
+    apply) _vkblock_apply || rc=$? ;;
+    heal)
+      touch "$VKBLOCK_DIR/heal"
+      upd=$(_vkblock_get UPDATED)
+      if (( $(date +%s) - ${upd:-0} > 86400 )); then
+        _vkblock_fetch || true
+        _vkblock_apply || rc=$?
+      elif ! vkblock_rules_ok; then
+        _vkblock_log "правило пропало — применяю заново"
+        _vkblock_apply || rc=$?
+      fi ;;
+    *) echo "использование: ${0##*/} apply|update|heal|off" >&2; return 2 ;;
+  esac
+  return "$rc"
+}
+
+# ── Установка ─────────────────────────────────────────────
+_vkblock_emit() {
+  emit_script "$VKBLOCK_SCRIPT" 'vkblock_run "$@"' \
+    VKBLOCK_DIR VKBLOCK_CONF VKBLOCK_LOG VKBLOCK_SET VKBLOCK_SET6 VKBLOCK_TAG VKBLOCK_SRC \
+    VKBLOCK_MIN VKBLOCK_MAX4 VKBLOCK_MAX6 \
+    write_file _vkblock_get _vkblock_set _vkblock_log _vkblock_fail _antiscan_parse _antiscan_span _antiscan_load \
+    _vkblock_fetch _vkblock_rule _vkblock_rule_up _vkblock_rule_down vkblock_rules_ok _vkblock_apply vkblock_down \
+    vkblock_run || return 1
+  # Раньше UFW и netfilter-persistent: восстановление iptables-persistent найдёт набор
+  write_unit "$VKBLOCK_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — VK и Max мимо VPN: клиенты не ходят через сервер в сети VK
+DefaultDependencies=no
+Wants=network-pre.target local-fs.target
+After=local-fs.target systemd-modules-load.service
+Before=network-pre.target ufw.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$VKBLOCK_SCRIPT apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_unit "${VKBLOCK_TIMER%.timer}.service" <<EOF
+[Unit]
+Description=AWG Toolza — VK и Max мимо VPN: правило на месте, список раз в сутки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$VKBLOCK_SCRIPT heal
+EOF
+  write_unit "$VKBLOCK_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — VK и Max мимо VPN: проверка раз в час
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+vkblock_enable() {
+  local rc=0
+  need_cmds ipset:ipset flock:util-linux || return 1
+  _vkblock_set ON 1
+  _vkblock_emit || { err "Не удалось записать службу"; return 1; }
+  info "Скачиваю и проверяю список сетей VK..."
+  "$VKBLOCK_SCRIPT" update || rc=$?
+  if (( rc )); then
+    _vkblock_set ON 0
+    "$VKBLOCK_SCRIPT" off &>/dev/null || true
+    case $rc in
+      3) err "Список сетей VK не получен: $(_vkblock_get ERROR)" ;;
+      75) err "Занято другой операцией — повтори через минуту" ;;
+      *) err "Не удалось применить правило (код $rc) — журнал: $VKBLOCK_LOG" ;;
+    esac
+    return 1
+  fi
+  systemctl enable "$VKBLOCK_UNIT" &>/dev/null || true
+  systemctl enable --now "$VKBLOCK_TIMER" &>/dev/null || true
+  log_info "VK и Max мимо VPN: включено"
+  ok "VK и Max мимо VPN включено: $(vkblock_summary)"
+  [[ -n "$(_vkblock_get ERROR)" ]] && warn "$(_vkblock_get ERROR)"
+  return 0
+}
+
+vkblock_disable() {
+  local held=0
+  _vkblock_set ON 0
+  remove_unit "$VKBLOCK_TIMER" "${VKBLOCK_TIMER%.timer}.service" "$VKBLOCK_UNIT"
+  # Замок прохода таймера: проход, уже увидевший ON=1, иначе поставил бы правило
+  # обратно после нас. Не дольше 20 с — качающий проход сам увидит ON=0 перед применением
+  mkdir -p "$VKBLOCK_DIR" && chmod 700 "$VKBLOCK_DIR"
+  exec 9>"$VKBLOCK_DIR/.lock"
+  flock -w 20 9 && held=1
+  vkblock_down
+  (( held )) || _vkblock_log "выключение: замок занят дольше 20 с — снято без него"
+  exec 9>&-
+  log_info "VK и Max мимо VPN: выключено"
+  ok "VK и Max снова идут через VPN — правило и наборы сняты"
+}
+
+vkblock_update() {
+  vkblock_on || { err "VK и Max мимо VPN — выключено"; return 1; }
+  _vkblock_emit || return 1
+  "$VKBLOCK_SCRIPT" update || { err "Не удалось применить список — журнал: $VKBLOCK_LOG"; return 1; }
+  if [[ -n "$(_vkblock_get ERROR)" ]]; then warn "$(_vkblock_get ERROR)"; fi
+  ok "Список обновлён: $(vkblock_summary)"
+}
+
+# Отброшено пакетов в сети VK с установки правила (перезагрузка сбрасывает)
+vkblock_dropped() {
+  { iptables-save -c -t mangle 2>/dev/null; ip6tables-save -c -t mangle 2>/dev/null; } \
+    | awk -v tag="$VKBLOCK_TAG" 'index($0, "--comment " tag) && /^\[/ {
+        split(substr($1, 2), c, ":"); n += c[1] } END { printf "%.0f\n", n }'
+}
+
+vkblock_summary() {
+  local e
+  read -r -a e <<< "$(_vkblock_get ENTRIES)"
+  echo "подсетей IPv4 ${e[0]:-0}, IPv6 ${e[1]:-0}"
+}
+
+# ── Меню ──────────────────────────────────────────────────
+_vkblock_show() {
+  local upd err
+  hdr "VK и Max мимо VPN"
+  echo -e "  ${D}Клиенты VPN не ходят через сервер в сети VK: ВКонтакте, Max, Одноклассники."
+  echo -e "  Приложения VK не видят адрес сервера и не могут сдать его как VPN. Сервисы VK"
+  echo -e "  у клиентов через VPN не откроются — их пускают мимо туннеля.${N}"
+  echo ""
+  if vkblock_on; then
+    if vkblock_rules_ok; then echo -e "  Состояние : ${G}● включено${N} — $(vkblock_summary)"
+    else echo -e "  Состояние : ${Y}▲ включено, правило не на месте${N} — вернёт таймер или «Обновить список»"; fi
+    echo -e "  Отбито    : ${W}$(vkblock_dropped)${N} ${D}пакетов в сети VK (сбрасывается при перезагрузке)${N}"
+  else
+    echo -e "  Состояние : ${D}○ выключено${N}"
+  fi
+  upd=$(_vkblock_get UPDATED)
+  [[ -n "$upd" ]] && echo -e "  Список    : обновлён $(date -d "@$upd" '+%d.%m.%Y %H:%M' 2>/dev/null)"
+  err=$(_vkblock_get ERROR)
+  [[ -n "$err" ]] && echo -e "  ${Y}▲ $err${N}"
+  return 0
+}
+
+do_vkblock_menu() {
+  local c
+  while true; do
+    echo ""
+    _vkblock_show
+    echo ""
+    if vkblock_on; then echo -e "  ${C}1)${N} Выключить"; else echo -e "  ${C}1)${N} Включить"; fi
+    echo -e "  ${C}2)${N} Обновить список сейчас"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+    case "$c" in
+      1) if vkblock_on; then vkblock_disable
+         else
+           echo -e "  ${Y}ВКонтакте, Max и другие сервисы VK у клиентов через VPN перестанут открываться —"
+           echo -e "  в приложении VPN их надо пустить мимо туннеля.${N}"
+           ask_yes "  Включить? [y/N]: " n && { vkblock_enable || true; }
+         fi ;;
+      2) vkblock_update || true ;;
+      0) return 0 ;;
+    esac
+    pause
+  done
+}
+
+# Таймер молчит дольше трёх часов (сброшен, заглох) — перезапустить
+vkblock_watchdog() {
+  local age
+  vkblock_on || return 0
+  [[ -f "$VKBLOCK_DIR/heal" ]] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y "$VKBLOCK_DIR/heal" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$VKBLOCK_DIR/heal"
+  timer_heal "$VKBLOCK_TIMER"
+  systemctl start --no-block "${VKBLOCK_TIMER%.timer}.service" &>/dev/null || true
+}
+
+vkblock_remove() {
+  remove_unit "$VKBLOCK_TIMER" "${VKBLOCK_TIMER%.timer}.service" "$VKBLOCK_UNIT"
+  vkblock_down
+  rm -rf "$VKBLOCK_DIR" "$VKBLOCK_SCRIPT" "$VKBLOCK_LOG"
+}
+
 # ═════ uninstall ═════
 # Очистка клиентов и полное удаление.
 
@@ -11681,10 +12094,13 @@ uninstall_all() {
   if [[ "$del_wgobf" == y ]]; then wgobf_remove quiet
   elif wgobf_installed; then info "WG + обфускатор оставлен и продолжит работать сам"; fi
   if web_installed; then info "Веб-панель оставлена — сервера AWG в ней больше нет"; web_vpn_changed; fi
-  # Антисканер работает через свой скрипт и без awg2, но управлять им без
-  # awg2 нечем — уходит вместе со скриптом, иначе остаётся защищать сервер
-  if [[ "$del_self" == y ]]; then antiscan_remove
-  elif antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
+  # Антисканер и «VK и Max мимо VPN» работают через свои скрипты и без awg2,
+  # но управлять ими без awg2 нечем — уходят вместе со скриптом, иначе остаются
+  if [[ "$del_self" == y ]]; then antiscan_remove; vkblock_remove
+  else
+    if antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
+    if vkblock_on; then info "VK и Max мимо VPN оставлено и продолжит работать"; fi
+  fi
   if [[ "$del_bot" == y ]]; then
     bot_uninstall quiet
     # Сертификат — для Mini App бота и веб-панели
@@ -11942,8 +12358,9 @@ do_server_menu() {
     echo -e "  ${Y}8)${N} Сбросить сервер"
     echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
     echo -e "  ${C}10)${N} Перенос из Amnezia ${D}— сервер из Docker-контейнера, клиенты без перевыдачи${N}"
+    echo -e "  ${C}11)${N} VK и Max мимо VPN ${D}— $(vkblock_on && echo "включено" || echo "клиенты VPN не ходят в сети VK")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-10]: ${N}" 0 10 0
+    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -11955,6 +12372,7 @@ do_server_menu() {
       8) do_reset_server || true ;;
       9) do_antiscan_menu || true; continue ;;
       10) do_amnezia_menu || true ;;
+      11) do_vkblock_menu || true; continue ;;
       0) return 0 ;;
     esac
     pause
@@ -12550,6 +12968,15 @@ _api_warp() {
     up) warp_up ;;
     down) warp_down ;;
     restart) warp_down quiet; warp_up ;;
+    # Для уведомлений бота: отвечает ли поднятый warp0. С health-check
+    # проверяет он сам — тогда без пинга, кроме «probe ping» (бот ждёт конца
+    # сбоя); failover — клиентов увёл health-check
+    probe)
+      local h=0
+      unit_active awg-warp-healthcheck.timer && h=1
+      { _kv up:b "$(_b warp_is_up)"; _kv health:b "$h"
+        _kv failover:b "$(_b test -f "$WARP_STATE.failed")"
+        if { (( ! h )) || [[ "${1:-}" == ping ]]; } && warp_is_up; then _kv ok:b "$(_b warp_ping)"; fi; } | api_obj ;;
     health)
       case "${1:-}" in
         on) warp_health_on ;; off) warp_health_off; ok "Health-check выключен" ;;
@@ -12569,7 +12996,7 @@ _api_warp() {
       [[ "${1:-}" =~ ^(wg|usque)$ ]] || { _api_usage "warp backend wg|usque"; return; }
       warp_set_backend "$1" ;;
     remove) warp_uninstall ;;
-    *) _api_usage "warp status|install|up|down|restart|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
+    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
   esac
 }
 
@@ -12950,6 +13377,26 @@ _api_antiscan() {
   esac
 }
 
+# ── VK и Max мимо VPN ─────────────────────────────────────
+_api_vkblock() {
+  local a="${1:-status}" e on=0
+  shift || true
+  case "$a" in
+    status)
+      read -r -a e <<< "$(_vkblock_get ENTRIES)"
+      vkblock_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b vkblock_rules_ok || echo 0)"
+        _kv v4:n "${e[0]:-0}"; _kv v6:n "${e[1]:-0}"
+        _kv updated:n "$(_vkblock_get UPDATED)"; _kv error "$(_vkblock_get ERROR)"
+        _kv dropped:n "$( (( on )) && vkblock_dropped || echo 0)"
+      } | api_obj ;;
+    on) vkblock_enable ;;
+    off) vkblock_disable ;;
+    update) vkblock_update ;;
+    *) _api_usage "vkblock status|on|off|update" ;;
+  esac
+}
+
 # ── Перенос из Amnezia (Docker) ───────────────────────────
 # Страна сервера (флаг в шапке панели): вручную или снова по геосервисам;
 # refresh — спросить геосервисы сейчас, не дожидаясь суток
@@ -13001,8 +13448,8 @@ _api_log() {
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
-    antiscan) file="$ANTISCAN_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan [строк]"; return ;;
+    antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -13092,10 +13539,10 @@ _api_readonly() {
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
-    "tunnels clients"|"warp status"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status") return 0 ;;
   esac
   return 1
 }
@@ -13143,6 +13590,7 @@ api_dispatch() {
     cert) _api_cert "$@" ;;
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
+    vkblock) _api_vkblock "$@" ;;
     amnezia) _api_amnezia "$@" ;;
     country) _api_country "$@" ;;
     uninstall) _api_uninstall "$@" ;;
@@ -13150,7 +13598,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan amnezia country uninstall log job version"
+      echo "         exits cascade dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -13194,6 +13642,7 @@ api_main() {
     helpers_refresh || true
     expire_watchdog || true
     antiscan_watchdog || true
+    vkblock_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else
@@ -18060,5 +18509,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=1f484575f34d88c5
+_BUILD_SUM=4b8e1609b6d6ea11
 main "$@"
