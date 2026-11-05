@@ -331,6 +331,39 @@ rc, out, _ = bash(XRAY_ENV + 'py xray-prepare "$XRAY_CONF" native; xray_test && 
 open(LINKS, "w").close()
 chk("Xray работает (xray0 занят): проверка конфига и проба tun не упираются в busy",
     "TEST-OK" in out and "TUN-YES" in out, out)
+
+# Включение туннеля целиком на Xray 26.7+: устройство входа tun называется по
+# settings.name, без имени — utunN. Заглушка systemctl «запускает» Xray так же
+XSBIN = os.path.join(TMP, "xsbin")
+os.makedirs(XSBIN, exist_ok=True)
+with open(os.path.join(XSBIN, "systemctl"), "w") as f:
+    f.write(r"""#!/usr/bin/env bash
+if [[ "$1" == start && " $* " == *" awg-xray.service "* ]]; then
+  python3 -c 'import json, sys
+c = json.load(open(sys.argv[1]))
+t = [i for i in c.get("inbounds", []) if i.get("protocol") == "tun"]
+print((t[0].get("settings") or {}).get("name") or "utun77" if t else "")' "$XRAY_CONF" >> "$LINKS"
+  echo awg-xray.service >> "$ACTIVE"
+fi
+PATH="${PATH#"${0%/*}:"}" exec systemctl "$@"
+""")
+os.chmod(os.path.join(XSBIN, "systemctl"), 0o755)
+with open(ACTIVE) as f:
+    act_before = f.read()
+XUP = (f'export PATH="{XSBIN}:$PATH" XRAY_CONF; server_exists() {{ return 0; }}; peers_sync() {{ :; }}; peers_seed() {{ :; }}; ')
+rc, out, err = bash(XRAY_ENV + XUP + 'py xray-tun-probe /dev/null 2>/dev/null; '
+                    'python3 - "$XRAY_CONF" <<"EOF"\nimport json, sys\nc = json.load(open(sys.argv[1]))\n'
+                    'for i in c.get("inbounds", []):\n    if i.get("protocol") == "tun": i.get("settings", {}).pop("name", None)\n'
+                    'json.dump(c, open(sys.argv[1], "w"))\nEOF\n'
+                    'xray_up; echo "rc=$?"')
+links = open(LINKS).read().split()
+chk("Xray 26.7+: туннель включается — у входа tun имя xray0, интерфейс xray0, без utunN",
+    "rc=0" in out and "Xray включён" in out and "xray0" in links and not any(x.startswith("utun") for x in links),
+    [out[-400:], err[-300:], links])
+bash(XRAY_ENV + XUP + "xray_down quiet")
+open(LINKS, "w").close()
+with open(ACTIVE, "w") as f:
+    f.write(act_before)
 rc, out, _ = bash("XRAY_STUB_OLD=1; export XRAY_STUB_OLD; " + XRAY_ENV
                   + "xray_add_link 'hysteria2://secret@h2.example.site:443?sni=h2.example.site#H2'")
 chk("Xray без Hysteria2: выход отклонён с подсказкой обновить Xray", rc != 0 and "обнови Xray" in out, out)
@@ -2285,6 +2318,34 @@ mark, _, rest = out.strip().partition("\n--")
 bsum, _, ver = rest.partition("--")
 chk("служебные скрипты пересобираются и для новой сборки той же версии",
     len(bsum) == 16 and ver.startswith("v1.") and mark == f"{ver} {bsum}", out)
+
+# Xray 26.7+ без имени у входа tun поднимает utunN: обновление awg2 сразу
+# ставит имя xray0 в готовый конфиг — служба переживёт перезапуск на новом Xray
+XCF = os.path.join(ROOT, "etc/xray/config.json")
+os.makedirs(os.path.dirname(XCF), exist_ok=True)
+had_xcf = open(XCF).read() if os.path.exists(XCF) else None
+with open(XCF, "w") as f:
+    json.dump({"inbounds": [{"protocol": "socks", "tag": "socks-in", "port": 10808},
+                            {"protocol": "tun", "tag": "tun-in", "settings": {"mtu": 1200}}],
+               "outbounds": [{"protocol": "vless", "tag": "A"}], "routing": {"rules": []}}, f)
+rc, out, _ = bash('server_exists() { return 1; }; cascade_count() { echo 0; }; wgobf_installed() { return 1; }; '
+                  'MOD_SRC_DIR=/nonexistent; echo old > "$STATE_DIR/version"; helpers_refresh')
+xcf = json.load(open(XCF))
+chk("обновление awg2: у входа tun готового конфига Xray — имя xray0, остальное на месте",
+    xcf["inbounds"][1]["settings"] == {"mtu": 1200, "name": "xray0"} and xcf["inbounds"][0] == {"protocol": "socks", "tag": "socks-in", "port": 10808},
+    xcf)
+for body in ('{"inbounds": [{"protocol": "socks", "tag": "socks-in"}]}', "не json {", '{"inbounds": [{"protocol": "tun", "settings": {"name": "xray0"}}]}'):
+    with open(XCF, "w") as f:
+        f.write(body)
+    os.utime(XCF, (1, 1))
+    rc, out, err = bash(f'py xray-tun-name "{XCF}"; echo rc=$?')
+    chk(f"xray-tun-name: без tun, не JSON или уже xray0 — файл не трогает ({body[:24]})",
+        "rc=0" in out and open(XCF).read() == body and os.stat(XCF).st_mtime == 1, [out, err])
+if had_xcf is None:
+    os.remove(XCF)
+else:
+    with open(XCF, "w") as f:
+        f.write(had_xcf)
 
 print("\n── Веб-панель (awg2) ──")
 WEBC = os.path.join(TMP, "awg-web.conf")
