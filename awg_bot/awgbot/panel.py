@@ -470,7 +470,7 @@ def setup(app: web.Application, user_of: UserOf) -> None:
     async def _admin_del(request: web.Request, user: dict, body: dict) -> web.Response:
         _owner(user)
         uid = str(body.get("uid") or "")
-        if not uid.isdigit():
+        if not uid.isascii() or not uid.isdigit():
             raise _bad("uid — число")
         ok, msg = admins.remove(int(uid), removed_by=int(user["id"]))
         return web.json_response({"ok": ok, "message": msg, "error": "" if ok else msg})
