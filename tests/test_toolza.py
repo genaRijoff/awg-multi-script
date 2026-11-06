@@ -2428,7 +2428,8 @@ os.makedirs(os.path.join(EDIR, "c"), exist_ok=True)
 with open(os.path.join(EDIR, "awg0.conf"), "w") as f:
     f.write(OLD20)
 EENV = (f'SERVER_CONF="{EDIR}/awg0.conf"; CLIENT_DIR="{EDIR}/c"; public_ip_cached() {{ echo 198.51.100.7; }}; '
-        'entry_probe() { return 1; }; ')
+        'entry_probe() { return 0; }; ')
+EFAIL = EENV.replace("entry_probe() { return 0; }", "entry_probe() { return 1; }")
 EP = lambda n: next((l.split(" = ", 1)[1] for l in open(os.path.join(EDIR, "c", n + "_awg2.conf")).read().splitlines()  # noqa: E731
                      if l.startswith("Endpoint = ")), None)
 
@@ -2445,10 +2446,27 @@ rc, out, _ = bash(EENV + "client_create carol >/dev/null && client_create dave >
 chk("точки входа: клиенты для проверки созданы", "ok" in out and EP("carol") == "198.51.100.7:51820", out)
 d = ejson("api_main entry list")
 chk("entry list без входов — одна строка «напрямую» с адресом сервера и всеми клиентами",
-    d.get("data") == [{"name": "", "addr": "198.51.100.7:51820", "clients": 4, "default": True}], d)
-d = ejson('api_main entry add "Каскад NL" 203.0.113.5:443')
+    d.get("data") == [{"name": "", "addr": "198.51.100.7:51820", "clients": 4, "default": True, "check": "ok", "checked": 0}], d)
+rc, out, _ = bash(EFAIL + 'api_main entry add "Каскад NL" 203.0.113.5:443')
+d = json.loads(out.strip().splitlines()[-1])
 chk("вход добавляется; провал проверки при добавлении — предупреждение, не ошибка",
     d.get("ok") and "Точка входа «Каскад NL»: 203.0.113.5:443" in d["log"] and "▲" in d["log"] and "проброс" in d["log"], d)
+d = ejson("api_main entry list")
+row = (d.get("data") or [{}, {}])[1]
+chk("итог проверки — в списке: не доходит", row.get("check") == "fail" and row.get("checked", 0) > 0, row)
+bad = [json.loads(bash(EFAIL + c)[1].strip().splitlines()[-1]) for c in (
+    'api_main client entry carol "Каскад NL"', 'api_main entry all "Каскад NL"', 'api_main entry default "Каскад NL"',
+    'api_main entry clients "Каскад NL" carol,dave')]
+chk("неработающий вход клиентам не выдаётся: ни одному, ни всем, ни новым, ни выбранным",
+    all(not b.get("ok") and "не работает" in b.get("error", "") for b in bad) and EP("carol") == "198.51.100.7:51820"
+    and "проброс" in bad[0].get("log", ""), [b.get("error") for b in bad])
+PROBED = os.path.join(EDIR, "probed")
+rc, out, _ = bash(EFAIL + f'api_main entry check "Каскад NL" >/dev/null; rm -f "{PROBED}"; '
+                  f'entry_probe() {{ echo x >> "{PROBED}"; return 0; }}; api_main client entry dave "Каскад NL" >/dev/null; '
+                  f'wc -l < "{PROBED}"; entry_probe() {{ echo x >> "{PROBED}"; return 1; }}; '
+                  f'api_main client entry dave "Каскад NL" >/dev/null; wc -l < "{PROBED}"; api_main client entry dave direct >/dev/null')
+chk("перед выдачей вход проверяется заново; после удачной проверки 10 минут — без новой",
+    out.split()[-2:] == ["1", "1"], out)
 bad = [ejson(c).get("error", "") for c in ('api_main entry add "каскад nl" 1.2.3.4:5', "api_main entry add direct 1.2.3.4:5",
                                             "api_main entry add X 1.2.3.4", "api_main entry add Y 300.1.1.1:5",
                                             "api_main entry add Y 1.2.3.4:70000", 'api_main entry add "a|b" 1.2.3.4:5')]
@@ -2485,9 +2503,10 @@ ents = {c["name"]: c.get("entry") for c in d.get("data") or []}
 chk("в clients list — вход клиента (None — напрямую)",
     ents.get("carol") == "Каскад NL" and ents.get("erin") == "Каскад NL" and ents.get("dave") is None and ents.get("fred") is None, ents)
 d = ejson("api_main entry list")
-chk("entry list: адреса, клиенты на каждом, вход для новых",
-    d.get("data") == [{"name": "", "addr": "198.51.100.7:51820", "clients": 4, "default": False},
-                      {"name": "Каскад NL", "addr": "vpn.example.com:8443", "clients": 2, "default": True}], d)
+chk("entry list: адреса, клиенты на каждом, вход для новых, итог проверки",
+    [{k: r[k] for k in ("name", "addr", "clients", "default", "check")} for r in d.get("data") or []]
+    == [{"name": "", "addr": "198.51.100.7:51820", "clients": 4, "default": False, "check": "ok"},
+        {"name": "Каскад NL", "addr": "vpn.example.com:8443", "clients": 2, "default": True, "check": "ok"}], d)
 ejson("api_main client reissue carol")
 chk("перевыпуск конфига сохраняет вход", EP("carol") == "vpn.example.com:8443", EP("carol"))
 head = open(os.path.join(EDIR, "awg0.conf")).read().split("[Interface]")[0]
@@ -2515,14 +2534,24 @@ rc, out, _ = bash(f'SERVER_CONF="{EDIR}/awg0.conf"; ' + IPT + 'IPT_HIT=1 entry_p
 chk("проверка входа: пакет вернулся — 0, нет — 1, правило не ставится или адрес не найден — 2",
     [l for l in out.split() if "=" in l] == ["a=0", "b=1", "c=2", "d=2"], out)
 ejson('api_main entry add Probe 192.0.2.1:443')
-d = ejson("api_main entry check Probe")
+rc, out, _ = bash(EFAIL + "api_main entry check Probe")
+d = json.loads(out.strip().splitlines()[-1])
 chk("entry check: пакеты не дошли — ошибка с подсказкой про проброс", not d.get("ok") and "UDP 443 → 198.51.100.7:51820" in d.get("error", ""), d)
-rc, out, _ = bash(EENV.replace("entry_probe() { return 1; }", "entry_probe() { return 2; }") + "api_main entry check Probe")
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }", "entry_probe() { return 2; }") + "api_main entry check Probe")
 d = json.loads(out.strip().splitlines()[-1])
 chk("entry check: проверить нельзя — предупреждение, не ошибка", d.get("ok") and "проверь клиентом" in d["log"], d)
-rc, out, _ = bash(EENV.replace("entry_probe() { return 1; }", "entry_probe() { return 0; }") + "api_main entry check Probe")
+rc, out, _ = bash(EENV + "api_main entry check Probe")
 d = json.loads(out.strip().splitlines()[-1])
 chk("entry check: вход работает", d.get("ok") and "Вход работает" in d["log"], d)
+# Выбранные клиенты: незнакомое имя — предупреждение, остальные получают вход
+d = ejson("api_main entry clients Probe carol,erin,nosuch")
+chk("выбранным клиентам — вход; незнакомое имя — предупреждение, в ответе — кому выдан",
+    d.get("ok") and sorted(d.get("data") or []) == ["carol", "erin"] and EP("carol") == EP("erin") == "192.0.2.1:443"
+    and EP("fred") == "198.51.100.7:51820" and "nosuch" in d["log"], d)
+d = ejson("api_main entry clients direct carol")
+chk("выбранным — напрямую", d.get("ok") and EP("carol") == "198.51.100.7:51820" and EP("erin") == "192.0.2.1:443", d)
+d = ejson("api_main entry clients Probe nosuch")
+chk("ни одного знакомого клиента — отказ", not d.get("ok") and "Ни одного" in d.get("error", ""), d)
 
 print("\n── Веб-панель (awg2) ──")
 WEBC = os.path.join(TMP, "awg-web.conf")

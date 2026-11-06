@@ -46,6 +46,11 @@ PACK = {"🖥": "111", "👥": "222", "🌐": "333", "🗑": "444", "⭐": "555"
 
 # ── Окружение бота ────────────────────────────────────────
 API = api_wrapper()
+# Каскад до сервера «работает» только с входов 203.0.113.x — остальные проверку не проходят
+with open(API) as f:
+    _w = f.read()
+with open(API, "w") as f:
+    f.write(_w.replace('api_main "$@"', 'entry_probe() { [[ "$1" == 203.0.113.* ]]; }\napi_main "$@"'))
 STATE = os.path.join(TMP, "botstate")
 os.makedirs(STATE)
 BOT_CONF = os.path.join(TMP, "awg-bot.conf")
@@ -2159,7 +2164,8 @@ async def run():
     chk("вход добавлен — итог awg2 и назад к списку входов",
         "✅" in text and "Каскад NL" in text and "203.0.113.5:443" in text and ("◀️ Назад", "ent") in buttons, [text, buttons])
     text, buttons = screen(await press("ent"))
-    chk("в списке — новый вход кнопкой", any(t.endswith("Каскад NL") and d == "ent:e:1" for t, d in buttons), buttons)
+    chk("в списке — новый вход кнопкой и итог проверки",
+        any(t.endswith("Каскад NL") and d == "ent:e:1" for t, d in buttons) and "✅ работает" in text, [text, buttons])
     text, buttons = screen(await press("cl:v:alice"))
     chk("с точками входа — в карточке «Вход: напрямую» и кнопка «📍 Вход»",
         "Вход: напрямую" in text and ("📍 Вход", "cl:ent:alice") in buttons, [text, buttons])
@@ -2185,9 +2191,46 @@ async def run():
     chk("«напрямую»: без проверки, адреса и удаления", not any(d.startswith(("ent:chk:", "ent:del:", "ent:addr:")) for _, d in buttons)
         and ("⭐ Для новых", "ent:def:0") in buttons, buttons)
     await press("ent:def:0")
+    # Выбрать клиентов: отметка, «Всех», «Выдать», конфиги в чат
+    text, buttons = screen(await press("ent:pick:1"))
+    chk("выбор клиентов: alice уже на входе (📍), никто не отмечен",
+        "Никто не отмечен" in text and any(t == "⬜️ alice 📍" and d == "ent:t:1|0|alice" for t, d in buttons)
+        and ("☑️ Всех", "ent:pa:1|0|all") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:t:1|0|bob"))
+    chk("отметка клиента", "Отмечено: 1" in text and ("✅ Выдать: 1", "ent:go:1") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:go:1"))
+    chk("выдача — с подтверждением и адресом", ("✅ Выдать", "ent:gook:1") in buttons and "203.0.113.5:443" in text, [text, buttons])
+    text, buttons = screen(await press("ent:gook:1"))
+    chk("выдано: кому, Endpoint, «Конфиги» в чат", "✅" in text and "bob" in text and ("📨 Конфиги: 1", "ent:send") in buttons,
+        [text, buttons])
+    sent = await press("ent:send")
+    chk("конфиги выбранных — в чат файлами", any(n == "SendDocument" and m.document.filename == "bob_awg2.conf" for n, m in sent),
+        [n for n, _ in sent])
+    text, _ = screen(await press("ent"))
+    chk("на входе теперь двое", "клиентов 2" in text, text)
+    # Новый адрес проверку не проходит — выдача заперта
+    await press("ent:addr:1")
+    text, buttons = screen(await say("198.51.100.9:8443"))
+    chk("новый адрес не доходит — предупреждение", "✅" in text and "не дошли" in text, text)
+    await press("ent")
+    text, buttons = screen(await press("ent:e:1"))
+    chk("запертый вход: итог проверки и 🔒 на выдаче",
+        "❌" in text and "🔒" in text and ("🔒 Выбрать", "ent:lock:1") in buttons and ("🔒 Всех сюда", "ent:lock:1") in buttons,
+        [text, buttons])
+    sent = await press("ent:lock:1")
+    chk("🔒 — объяснение во всплывающем окне", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    sent = await press("ent:pick:1")
+    chk("выбор клиентов на запертом входе не открывается", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    await press("cl:ents:0|alice")
+    text, buttons = screen(await press("cl:ent:alice"))
+    chk("в карточке клиента запертый вход — 🔒, нажатие объясняет",
+        ("🔒 Каскад NL", "cl:entl") in buttons and "❌" in text, [text, buttons])
+    sent = await press("cl:entl")
+    chk("🔒 в карточке — окно с причиной", any("не прошёл проверку" in a for a in alerts(sent)), alerts(sent))
+    await press("ent")
     text, buttons = screen(await press("ent:del:1"))
     chk("удаление входа с клиентами — с подтверждением и предупреждением",
-        ("🗑 Удалить", "ent:delok:1") in buttons and "перейдут" in text, [text, buttons])
+        ("🗑 Удалить", "ent:delok:1") in buttons and "клиенты (1) перейдут" in text, [text, buttons])
     text, buttons = screen(await press("ent:delok:1"))
     chk("вход удалён", "✅" in text and "удалена" in text, text)
     text, buttons = screen(await press("cl:v:alice"))

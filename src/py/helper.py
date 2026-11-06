@@ -282,6 +282,20 @@ def cmd_entry(conf, op, *args):
         peers[i] = set_meta(peers[i], "entry", name)
         save()
         emit({client})
+    elif op == "assign-many":
+        # Список клиентов через запятую; незнакомые имена — в stderr, остальные назначаются
+        name = want(arg(0)) if arg(0) else ""
+        names = [n for n in arg(1).split(",") if n]
+        known = {peer_name(b) for b in peers if peer_name(b)}
+        for n in names:
+            if n not in known:
+                sys.stderr.write("Клиента %s нет\n" % _shown(n))
+        hit = set(names) & known
+        if not hit:
+            die("Ни одного клиента из списка нет", 2)
+        peers[:] = [set_meta(b, "entry", name) if peer_name(b) in hit else b for b in peers]
+        save()
+        emit(hit)
     elif op == "assign-all":
         name = want(arg(0)) if arg(0) else ""
         peers[:] = [set_meta(b, "entry", name) if peer_name(b) else b for b in peers]
@@ -297,7 +311,7 @@ def cmd_entry(conf, op, *args):
             if peer_name(b) and on(b) not in addr:
                 print(peer_name(b))
     else:
-        die("entry list|get|add|set|del|default|assign|assign-all|of|direct", 2)
+        die("entry list|get|add|set|del|default|assign|assign-many|assign-all|of|direct", 2)
 
 
 def cmd_peer_del(conf, pubkey):

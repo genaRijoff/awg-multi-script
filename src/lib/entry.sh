@@ -58,6 +58,48 @@ _entry_apply() {
   done <<< "$1"
 }
 
+# ── Итоги проверок ────────────────────────────────────────
+# «имя<TAB>адрес<TAB>ok|fail|unknown<TAB>время» в $STATE_DIR/entry-check:
+# итог относится к адресу — новый адрес входа проверяется заново. Не в
+# awg0.conf: после переезда на другой сервер вход проверяется там.
+_entry_check_file() { echo "$STATE_DIR/entry-check"; }
+
+_entry_check_save() {  # имя адрес статус
+  local f
+  f=$(_entry_check_file)
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  { awk -F'\t' -v n="$1" '$1 != n' "$f" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date +%s)"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+_entry_check_get() {  # имя адрес → «статус<TAB>время» последней проверки этого адреса
+  awk -F'\t' -v n="$1" -v a="$2" '$1 == n && $2 == a {print $3 "\t" $4; exit}' "$(_entry_check_file)" 2>/dev/null || true
+}
+
+# Строки py entry list + итог проверки и её время
+_entry_rows_checked() {
+  py entry "$SERVER_CONF" list 2>/dev/null | awk -F'\t' -v OFS='\t' -v f="$(_entry_check_file)" '
+    BEGIN { while ((getline l < f) > 0) { split(l, a, "\t"); st[a[1] "\t" a[2]] = a[3]; ts[a[1] "\t" a[2]] = a[4] } }
+    { k = $1 "\t" $2; print $0, st[k], ts[k] + 0 }'
+}
+
+# Можно ли выдавать вход клиентам: каскад должен доводить пакеты до сервера.
+# Свежая удачная проверка (10 минут) — без новой; иначе проверка сейчас.
+# Проверить нельзя (нет модуля string, адрес не найден) — выдаём с предупреждением.
+ENTRY_FRESH=600
+_entry_ready() {  # имя (пусто — напрямую, всегда можно)
+  local a st ts
+  [[ -n "${1:-}" ]] || return 0
+  a=$(py entry "$SERVER_CONF" get "$1" 2>/dev/null)
+  [[ -n "$a" ]] || { err "Точки входа «$1» нет"; return 1; }
+  IFS=$'\t' read -r st ts <<< "$(_entry_check_get "$1" "$a")"
+  [[ "$st" == ok && "${ts:-0}" =~ ^[0-9]+$ ]] && (( $(date +%s) - ts < ENTRY_FRESH )) && return 0
+  entry_check "$1" quiet && return 0
+  err "Вход «$1» не работает: через $a пакеты до сервера не доходят — клиентам его не выдаю"
+  info "Проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port), затем «Проверить»"
+  return 1
+}
+
 _entry_rewritten_note() {
   (( ENTRY_REWRITTEN )) || return 0
   info "Конфигов переписано: $ENTRY_REWRITTEN — этим клиентам нужен новый конфиг или QR"
@@ -89,6 +131,7 @@ entry_del() {  # имя — его клиенты переходят на «на
   server_exists || { err "Сервер не создан"; return 1; }
   _entry_py del "${1:-}" || return 1
   _entry_apply "$ENTRY_OUT"
+  _entry_check_save "$1" "" gone
   ok "Точка входа «$1» удалена"
   log_info "точка входа удалена: $1"
   [[ -n "$ENTRY_OUT" ]] && info "Её клиенты теперь подключаются напрямую: $(entry_direct)"
@@ -99,6 +142,7 @@ entry_default() {  # имя|direct — вход для новых клиенто
   local e
   server_exists || { err "Сервер не создан"; return 1; }
   e=$(_entry_arg "${1:-}")
+  _entry_ready "$e" || return 1
   _entry_py default "$e" || return 1
   if [[ -n "$e" ]]; then ok "Новые клиенты — через вход «$e»"; else ok "Новые клиенты — напрямую"; fi
 }
@@ -109,6 +153,7 @@ client_entry_set() {  # клиент имя|direct
   local e a
   server_exists || { err "Сервер не создан"; return 1; }
   e=$(_entry_arg "${2:-}")
+  _entry_ready "$e" || return 1
   _entry_py assign "${1:-}" "$e" || return 1
   _entry_apply "$ENTRY_OUT"
   a=$(client_endpoint "$1")
@@ -118,10 +163,28 @@ client_entry_set() {  # клиент имя|direct
   return 0
 }
 
+# Выбранные клиенты (через запятую) — на вход; их имена с новым адресом — в ENTRY_OUT
+entry_assign_clients() {  # имя|direct клиент,клиент...
+  local e n
+  server_exists || { err "Сервер не создан"; return 1; }
+  e=$(_entry_arg "${1:-}")
+  [[ -n "${2:-}" ]] || { err "Не выбраны клиенты"; return 1; }
+  _entry_ready "$e" || return 1
+  _entry_py assign-many "$e" "$2" || return 1
+  while IFS= read -r n; do [[ "$n" == *$'\t'* ]] || { [[ -n "$n" ]] && warn "$n"; }; done <<< "$ENTRY_OUT"
+  ENTRY_OUT=$(grep $'\t' <<< "$ENTRY_OUT" || true)
+  _entry_apply "$ENTRY_OUT"
+  n=$(grep -c . <<< "$ENTRY_OUT" || true)
+  if [[ -n "$e" ]]; then ok "Через вход «$e»: $n клиентов"; else ok "Напрямую: $n клиентов"; fi
+  log_info "вход клиентов: ${e:-напрямую} ← $2"
+  _entry_rewritten_note
+}
+
 entry_assign_all() {  # имя|direct — все клиенты
   local e
   server_exists || { err "Сервер не создан"; return 1; }
   e=$(_entry_arg "${1:-}")
+  _entry_ready "$e" || return 1
   _entry_py assign-all "$e" || return 1
   _entry_apply "$ENTRY_OUT"
   if [[ -n "$e" ]]; then ok "Все клиенты — через вход «$e»"; else ok "Все клиенты — напрямую"; fi
@@ -153,13 +216,22 @@ entry_probe() {  # хост:порт
   return "$rc"
 }
 
-entry_check() {  # имя [soft] — soft: провал проверки — предупреждение, не ошибка
+# soft — провал проверки только предупреждением; quiet — без вывода, только
+# итог (его пишет _entry_ready). Итог запоминается — по нему боту и панели
+# видно, можно ли выдавать вход клиентам.
+entry_check() {  # имя [soft|quiet]
   local a m rc=0
   server_exists || { err "Сервер не создан"; return 1; }
   a=$(py entry "$SERVER_CONF" get "${1:-}" 2>/dev/null)
   [[ -n "$a" ]] || { err "Точки входа «${1:-}» нет"; return 1; }
-  info "Проверяю вход «$1»: пакет с сервера на $a должен вернуться на порт AWG"
+  [[ "${2:-}" == quiet ]] || info "Проверяю вход «$1»: пакет с сервера на $a должен вернуться на порт AWG"
   entry_probe "$a" || rc=$?
+  _entry_check_save "$1" "$a" "$(case "$rc" in 0) echo ok ;; 1) echo fail ;; *) echo unknown ;; esac)"
+  if [[ "${2:-}" == quiet ]]; then
+    (( rc == 2 )) && warn "Вход «$1» проверить не удалось — выдаю как есть, проверь клиентом"
+    (( rc != 1 ))
+    return
+  fi
   case "$rc" in
     0) ok "Вход работает: пакеты через $a доходят до этого сервера" ;;
     1) m="Через $a пакеты до сервера не дошли — проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port)"
@@ -194,17 +266,35 @@ _entry_pick() {  # [direct — с «напрямую»] → имя в CHOSEN (п
   return 0
 }
 
+# Клиенты номерами через пробел или запятую → имена через запятую в _ENTRY_PICKED
+_ENTRY_PICKED=""
+_entry_pick_clients() {
+  local names=() i v picked=()
+  mapfile -t names < <(clients_tsv | cut -f1 | grep .)
+  (( ${#names[@]} )) || { warn "Клиентов нет"; return 1; }
+  for i in "${!names[@]}"; do printf "  ${G}%3d)${N} %s ${D}— %s${N}\n" "$((i + 1))" "${names[$i]}" "$(client_endpoint "${names[$i]}")"; done
+  read_line v "${C}  Номера через пробел (Enter — отмена): ${N}"
+  for i in ${v//,/ }; do
+    [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#names[@]} )) || { warn "Нет номера: $i"; continue; }
+    picked+=("${names[$((i - 1))]}")
+  done
+  (( ${#picked[@]} )) || return 1
+  _ENTRY_PICKED=$(IFS=,; echo "${picked[*]}")
+}
+
 do_entries_menu() {
   server_exists || { err "Сервер не создан"; return 1; }
-  local c n a k d def
+  local c n a k d st def
   while true; do
     echo ""
     hdr "Точки входа (каскад)"
     echo -e "  ${D}Клиент подключается через сервер-вход, где UDP-порт проброшен на этот.${N}"
     echo -e "  ${D}В его конфиге Endpoint — адрес входа. Напрямую: $(entry_direct)${N}"
-    while IFS=$'\t' read -r n a k d; do
-      [[ -n "$n" ]] && echo -e "  ${W}•${N} $n ${D}— $a, клиентов $k$( (( d )) && echo ', по умолчанию')${N}"
-    done < <(_entry_rows)
+    while IFS=$'\t' read -r n a k d st _; do
+      [[ -n "$n" ]] || continue
+      case "$st" in ok) st="${G}работает${N}" ;; fail) st="${R}не доходит${N}" ;; unknown) st="${Y}не проверить${N}" ;; *) st="${D}не проверялся${N}" ;; esac
+      echo -e "  ${W}•${N} $n ${D}— $a, клиентов $k$( (( d )) && echo ', по умолчанию')${N} · $st"
+    done < <(_entry_rows_checked)
     def=$(entry_default_get)
     echo ""
     echo -e "  ${G}1)${N} Добавить"
@@ -212,9 +302,10 @@ do_entries_menu() {
     echo -e "  ${C}3)${N} Проверить"
     echo -e "  ${C}4)${N} Вход для новых клиентов ${D}— ${def:-напрямую}${N}"
     echo -e "  ${C}5)${N} Перевести всех клиентов"
-    echo -e "  ${R}6)${N} Удалить"
+    echo -e "  ${C}6)${N} Выбрать клиентов"
+    echo -e "  ${R}7)${N} Удалить"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-6]: ${N}" 0 6 0
+    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
     case "$c" in
       1) read_line n "${C}  Название (например, Каскад NL): ${N}"
          [[ -n "$n" ]] || continue
@@ -228,7 +319,9 @@ do_entries_menu() {
       4) _entry_pick direct && { entry_default "${CHOSEN:-direct}" || true; } ;;
       5) _entry_pick direct || continue
          ask_yes "  Переписать Endpoint во всех конфигах? [y/N]: " n && { entry_assign_all "${CHOSEN:-direct}" || true; } ;;
-      6) _entry_pick || continue
+      6) _entry_pick direct || continue
+         _entry_pick_clients && { entry_assign_clients "${CHOSEN:-direct}" "$_ENTRY_PICKED" || true; } ;;
+      7) _entry_pick || continue
          ask_yes "  Удалить «$CHOSEN»? Его клиенты перейдут на «напрямую» [y/N]: " n && { entry_del "$CHOSEN" || true; } ;;
       0) return 0 ;;
     esac

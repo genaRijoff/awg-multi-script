@@ -598,30 +598,45 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   await step("точки входа (каскад)", async () => {
     await nav("/server/entries", "text=Новая точка входа");
     await page.waitForSelector(".ecard >> text=Напрямую");
-    const nameIn = "input[placeholder='Каскад NL']", addrIn = "input[placeholder='203.0.113.5:443']";
+    const nameIn = "input[placeholder='Каскад NL']", addrIn = "input[placeholder='203.0.113.5:443']", card = ".ecard[data-name='Каскад NL']";
     await page.fill(nameIn, "Каскад NL");
     await expectAlert("хост:порт", async () => { await page.fill(addrIn, "bad"); await page.click("button:has-text('Добавить')"); });
     await page.fill(addrIn, "203.0.113.5:443");
     await page.click("button:has-text('Добавить')");
-    await page.waitForSelector(".ecard[data-name='Каскад NL'] >> text=203.0.113.5:443", { timeout: 30000 });
+    await page.waitForSelector(`${card} >> text=работает`, { timeout: 30000 });
     await shot("22b-entries");
-    // Вход клиенту — выбором в его карточке
+    // Вход клиенту — выбором в его карточке (прежний вид экрана сменяется свежим — ждём кнопку входа)
     await nav("/client/alice", ".rchips button[data-v='Каскад NL']");
     await page.click(".rchips button[data-v='Каскад NL']");
-    await page.waitForSelector(".toast >> text=Каскад NL");
-    await page.waitForSelector(".rchips button.on[data-v='Каскад NL']");
-    await page.waitForSelector("text=203.0.113.5:443");
-    // Новый адрес входа — на своём экране
+    await page.waitForSelector(".toast >> text=Каскад NL", { timeout: 30000 });
+    await page.waitForSelector(".rchips button.on[data-v='Каскад NL']", { timeout: 15000 });
+    // Выбранным клиентам — отметкой: «Все», «Выдать», затем конфиги архивом
+    await nav("/server/entries/" + encodeURIComponent("Каскад NL") + "/clients", ".bar button:has-text('Все')");
+    await page.click(".bar button:has-text('Все')");
+    await page.waitForSelector(".ecard.sel");
+    await shot("22c-entry-clients");
+    await page.click(".bar button:has-text('Выдать')");
+    await page.waitForSelector("text=/Вход «Каскад NL»: \\d+/", { timeout: 30000 });
+    await page.waitForSelector("button:has-text('архивом')");
+    // Новый адрес проверку не проходит — выдача заперта
     await nav("/server/entries/" + encodeURIComponent("Каскад NL"), "input[inputmode=url]");
     await page.fill("input[inputmode=url]", "198.51.100.9:8443");
     await page.click("button:has-text('Сохранить')");
     await page.waitForSelector(".toast", { timeout: 30000 });
     await nav("/server/entries", "text=Новая точка входа");
-    await page.waitForSelector(".ecard[data-name='Каскад NL'] >> text=198.51.100.9:8443");
-    await page.click(".ecard[data-name='Каскад NL'] button:has-text('Удалить')");
-    await page.waitForSelector(".ecard[data-name='Каскад NL']", { state: "detached", timeout: 30000 });
+    await page.waitForSelector(`${card} >> text=пакеты не доходят`, { timeout: 15000 });
+    await page.waitForSelector(`${card} button.locked:has-text('Выбрать')`);
+    await expectAlert("не прошёл проверку", async () => { await page.click(`${card} button:has-text('Всех сюда')`); });
+    await nav("/client/alice", ".rchips button.on[data-v='Каскад NL']");
+    await page.click(".rchips button[data-v='']");
+    await page.waitForSelector(".toast >> text=напрямую", { timeout: 30000 });
+    await page.waitForSelector(".rchips button.locked[data-v='Каскад NL']", { timeout: 15000 });
+    await expectAlert("не прошёл проверку", async () => { await page.click(".rchips button[data-v='Каскад NL']"); });
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.click(`${card} button:has-text('Удалить')`);
+    await page.waitForSelector(card, { state: "detached", timeout: 30000 });
     await nav("/client/alice", ".a-acts");
-    if (await page.locator(".rchips button[data-v='Каскад NL']").count()) throw new Error("удалённый вход остался в карточке клиента");
+    await page.waitForSelector(".rchips button[data-v='Каскад NL']", { state: "detached", timeout: 15000 });
   });
   await step("модуль ядра", async () => {
     await nav("/server/module", "text=Ядро");

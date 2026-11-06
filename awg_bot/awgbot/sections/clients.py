@@ -416,12 +416,20 @@ async def _entry(cb: CallbackQuery, state: FSMContext, name: str) -> None:
              "Через какой адрес клиент подключается. После смены в его конфиге и QR новый Endpoint — "
              "старый конфиг клиенту нужно заменить.", ""]
     lines += [f"{'🔘' if e['name'] == cur else '⚪️'} {esc(entries.label(e))} — <code>{esc(e.get('addr', ''))}</code>"
-              for e in ents]
+              + (f"\n   {entries.status(e)}" if e.get("name") else "") for e in ents]
+    if any(not entries.usable(e) for e in ents):
+        lines += ["", "🔒 — вход не прошёл проверку, выдать его нельзя."]
     await ui.render(cb, "\n".join(lines), ui.kb(
-        [(f"{'🔘' if e['name'] == cur else '⚪️'} {entries.label(e)}", act.data("ents", f"{i}|{name}"))
+        [(f"{'🔘' if e['name'] == cur else '⚪️' if entries.usable(e) else '🔒'} {entries.label(e)}",
+          act.data("ents", f"{i}|{name}") if entries.usable(e) or e["name"] == cur else act.data("entl"))
          for i, e in enumerate(ents)],
         ("📍 Точки входа", "ent"),
         ui.back(act.data("v", name))))
+
+
+@act("entl")
+async def _entry_locked(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await cb.answer(entries.LOCKED, show_alert=True)
 
 
 @act("ents")

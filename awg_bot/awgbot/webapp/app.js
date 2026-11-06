@@ -2781,8 +2781,9 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
     const at = ents.find((e) => e.name === cur);
     entryBox.replaceChildren(h("div", { class: "card rcard" }, h("div", { class: "eyebrow" }, "вход"),
       h("div", { class: "chips rchips" }, ents.map((e) => h("button", {
-        class: e.name === cur ? "on" : null, "data-v": e.name, title: e.addr,
-        onclick: (ev) => (e.name === cur ? null : busy(ev.currentTarget, async () => {
+        class: e.name === cur ? "on" : !entryUsable(e) ? "locked" : null, "data-v": e.name,
+        title: entryUsable(e) ? e.addr : ENTRY_LOCKED,
+        onclick: (ev) => (e.name === cur ? null : !entryUsable(e) ? fail(new Error(ENTRY_LOCKED)) : busy(ev.currentTarget, async () => {
           await call("client", "entry", name, e.name || "direct");
           haptic(); toast(`Вход ${name}: ${e.name || "напрямую"} — отправь клиенту новый конфиг или QR`, 4500);
           S.clients = null; render();
@@ -3671,6 +3672,58 @@ route(/^\/server\/endpoint$/, async (ctx) => {
       linkTo("📍 Точки входа", "/server/entries"), ": у них в конфиге адрес входа, смена Endpoint их не трогает."));
 });
 
+// Выдать вход выбранным клиентам: отметка, «Все», затем конфиги архивом
+route(/^\/server\/entries\/([^/]+)\/clients$/, async (ctx, key) => {
+  const ename = key === "-" ? "" : key;
+  const [ents] = await Promise.all([call("entry", "list"), loadClients()]);
+  const e = (ents || []).find((r) => r.name === ename);
+  const label = ename || "Напрямую";
+  if (!e) return ctx.put(title("📍 " + label), h("div", { class: "card empty" }, "Такой точки входа уже нет"));
+  if (!entryUsable(e)) {
+    return ctx.put(title("📍 " + label), h("div", { class: "card" }, h("b", {}, "🔒 Вход не прошёл проверку"),
+      h("div", { class: "muted small", style: "margin-top:6px" }, ENTRY_LOCKED)),
+    btn("🩺 Проверить", (b) => quick(b, "Вход работает", ["entry", "check", e.name]), "btn-primary btn-block"));
+  }
+  const rows = sortRows((S.clients.rows || []).filter((c) => c.name && !c.amnezia), "name");
+  const sel = new Set();
+  const list = h("div"), bar = h("div", { class: "bar" });
+  function draw() {
+    list.replaceChildren(...rows.map((c) => ecard({ cls: sel.has(c.name) ? "sel" : "", name: c.name, attrs: { "data-name": c.name },
+      onopen: () => { sel.has(c.name) ? sel.delete(c.name) : sel.add(c.name); draw(); },
+      right: h("div", { class: "check" + (sel.has(c.name) ? " on" : "") }, sel.has(c.name) ? icon("check") : null),
+      meta: [(c.entry || "") === ename ? tag("уже здесь", "accent", "map-pin") : tag(c.entry ? "вход " + c.entry : "напрямую")],
+      lines: [c.ip] })));
+    bar.replaceChildren(
+      h("button", { onclick: () => { const all = rows.every((c) => sel.has(c.name));
+        rows.forEach((c) => (all ? sel.delete(c.name) : sel.add(c.name))); draw(); } }, "Все"),
+      h("button", { class: "btn-primary", disabled: !sel.size || null, onclick: (ev) => give(ev.currentTarget) },
+        icon("map-pin"), `Выдать ${sel.size || ""}`));
+  }
+  async function give(b) {
+    const picked = rows.filter((c) => sel.has(c.name)).map((c) => c.name);
+    if (!picked.length || !await confirmTg(`Вход «${label}» — клиентам: ${picked.length}. Endpoint в их конфигах станет ${e.addr}; `
+      + "в старых конфигах прежний адрес — клиентам нужны новые.")) return;
+    await busy(b, async () => {
+      const r = await callR(["entry", "clients", e.name || "direct", picked.join(",")], { timeout: 300 });
+      const done = Array.isArray(r.data) ? r.data : picked;
+      haptic(); S.clients = null;
+      ctx.put(title("📍 " + label),
+        h("div", { class: "card" }, h("b", {}, `✅ Вход «${label}»: ${done.length}`),
+          h("div", { class: "muted small", style: "margin-top:6px" }, done.join(", ")),
+          kv("Endpoint", h("span", { class: "mono" }, e.addr))),
+        hint("В старых конфигах прежний адрес — отправь клиентам новые конфиги или QR."),
+        h("button", { class: "btn-primary btn-block", onclick: (ev) => busy(ev.currentTarget,
+          () => deliver({ what: "zip", names: done }, "Архив конфигов — в чате с ботом")) },
+        TO("📦 Конфиги архивом в чат", "📦 Скачать конфиги архивом")),
+        h("button", { class: "btn-block", onclick: () => replace("/server/entries") }, "📍 К точкам входа"));
+    });
+  }
+  ctx.put(title("📍 " + label),
+    hint(`Отметь клиентов: им выдаётся ${e.name ? "адрес входа" : "адрес сервера"} ${e.addr}, затем — новые конфиги и QR.`),
+    rows.length ? list : h("div", { class: "card empty" }, "Клиентов нет"), rows.length ? bar : null);
+  draw();
+});
+
 route(/^\/server\/entries\/([^/]+)$/, async (ctx, name) => {
   const e = ((await call("entry", "list")) || []).find((r) => r.name === name);
   if (!e) return ctx.put(title("📍 " + name), h("div", { class: "card empty" }, "Такой точки входа уже нет"));
@@ -3689,26 +3742,50 @@ route(/^\/server\/entries\/([^/]+)$/, async (ctx, name) => {
 // Точки входа (каскад): клиент подключается через сервер-вход — любой сервер,
 // где UDP-порт проброшен на этот. Первая строка списка — «напрямую» (имя пустое)
 const ENTRY_ADDR_RE = /^[a-z0-9.-]+:\d{1,5}$/i;
+// Выдавать вход клиентам можно, если проверка прошла или проверить нельзя;
+// не прошёл или не проверялся — кнопки выдачи заперты (awg2 и сам проверит)
+const entryUsable = (e) => !e.name || e.check === "ok" || e.check === "unknown";
+const ENTRY_LOCKED = "Вход не прошёл проверку: через него пакеты не доходят до сервера. Проверь проброс на сервере-входе и нажми «Проверить».";
+function entryStatus(e) {
+  if (!e.name) return null;
+  const ago = Math.floor(Date.now() / 1000) - (e.checked || 0);
+  const when = !e.checked ? "" : ago < 3600 ? ` · ${Math.floor(ago / 60)} мин назад` : ago < 172800 ? ` · ${Math.floor(ago / 3600)} ч назад` : "";
+  return { ok: ["работает" + when, "ok"], fail: ["пакеты не доходят" + when, "bad"], unknown: ["проверить нельзя", "warn"] }[e.check]
+    || ["не проверялся", "warn"];
+}
+// Кнопка выдачи входа: заперта — серая, по нажатию объясняет почему
+function entryAct(e, ic, label, fn) {
+  if (entryUsable(e)) return act(ic, label, fn);
+  const b = act("lock", label, () => fail(new Error(ENTRY_LOCKED)));
+  b.classList.add("locked");
+  b.title = ENTRY_LOCKED;
+  return b;
+}
 route(/^\/server\/entries$/, async (ctx) => {
   const rows = (await call("entry", "list")) || [];
   const name = h("input", { placeholder: "Каскад NL", maxlength: 24, autocomplete: "off" });
   const addr = h("input", { placeholder: "203.0.113.5:443", autocapitalize: "off", autocomplete: "off", inputmode: "url" });
   const label = (e) => e.name || "Напрямую";
   const arg = (e) => e.name || "direct";
-  const card = (e) => ecard({ state: e.clients ? "on" : "", name: label(e), attrs: { "data-name": e.name },
+  const card = (e) => {
+    const st = entryStatus(e);
+    return ecard({ state: !entryUsable(e) ? "bad" : e.clients ? "on" : "", name: label(e), attrs: { "data-name": e.name },
     right: e.default ? pill("для новых", "ok") : null,
-    meta: [tag("клиентов " + (e.clients || 0), "", "users")],
-    lines: [h("span", { class: "mono" }, e.addr || ""), e.name ? null : "этот сервер: IP или домен из «Endpoint»"],
+    meta: [tag("клиентов " + (e.clients || 0), "", "users"), st ? tag(st[0], st[1], entryUsable(e) ? "circle-check" : "lock") : null],
+    lines: [h("span", { class: "mono" }, e.addr || ""), e.name ? null : "этот сервер: IP или домен из «Endpoint»",
+      entryUsable(e) ? null : "🔒 Выдать клиентам нельзя, пока вход не пройдёт проверку"],
     acts: [
       e.name ? act("stethoscope", "Проверить", (b) => quick(b, "Вход работает", ["entry", "check", e.name])) : null,
       e.name ? act("pencil", "Адрес", () => go("/server/entries/" + encodeURIComponent(e.name))) : null,
-      e.default ? null : act("user-plus", "Для новых", (b) => quick(b, `Новые клиенты — ${e.name ? "через «" + e.name + "»" : "напрямую"}`,
+      entryAct(e, "list-checks", "Выбрать", () => go(`/server/entries/${e.name ? encodeURIComponent(e.name) : "-"}/clients`)),
+      e.default ? null : entryAct(e, "user-plus", "Для новых", (b) => quick(b, `Новые клиенты — ${e.name ? "через «" + e.name + "»" : "напрямую"}`,
         ["entry", "default", arg(e)])),
-      act("users", "Всех сюда", (b) => quickAsk(b, `Перевести всех клиентов на «${label(e)}»? Endpoint перепишется во всех конфигах `
+      entryAct(e, "users", "Всех сюда", (b) => quickAsk(b, `Перевести всех клиентов на «${label(e)}»? Endpoint перепишется во всех конфигах `
         + `на ${e.addr} — каждому клиенту нужен новый конфиг или QR.`, "Клиенты переведены", ["entry", "all", arg(e)])),
       e.name ? act("trash-2", "Удалить", (b) => quickAsk(b, `Удалить точку входа «${e.name}»?`
         + (e.clients ? ` Её клиенты (${e.clients}) перейдут на «напрямую» — им нужен новый конфиг.` : ""),
       "Точка входа удалена", ["entry", "del", e.name]), "bad") : null].filter(Boolean) });
+  };
   ctx.put(title("📍 Точки входа"),
     hint("Клиент подключается через сервер-вход — любой сервер, где UDP-порт проброшен на этот (каскад Тулзы, iptables, "
       + "nginx stream). В конфиге и QR такого клиента Endpoint — адрес входа, остальное как у всех. Вход клиенту — в его "

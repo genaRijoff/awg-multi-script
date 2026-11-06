@@ -683,15 +683,21 @@ _api_cascade() {
 }
 
 # Точки входа (каскад). Строка с пустым именем — «напрямую», первая в списке.
+# check — итог последней проверки (ok|fail|unknown, пусто — не проверялся):
+# по нему бот и панель решают, можно ли выдавать вход клиентам.
 _api_entry() {
-  local a="${1:-}" n
+  local a="${1:-}"
   shift || true
   case "$a" in
     ""|list)
       server_exists || { err "Сервер не создан"; return 1; }
-      { printf '\t%s\t%s\t%s\n' "$(entry_direct)" "$(py entry "$SERVER_CONF" direct | grep -c . || true)" \
+      { printf '\t%s\t%s\t%s\tok\t0\n' "$(entry_direct)" "$(py entry "$SERVER_CONF" direct | grep -c . || true)" \
           "$([[ -z "$(entry_default_get)" ]] && echo 1 || echo 0)"
-        py entry "$SERVER_CONF" list; } | api_rows name addr clients:n default:b ;;
+        _entry_rows_checked; } | api_rows name addr clients:n default:b check checked:n ;;
+    clients)
+      [[ -n "${2:-}" ]] || { _api_usage "entry clients ИМЯ|direct КЛИЕНТ,КЛИЕНТ..."; return; }
+      entry_assign_clients "$1" "$2" || return 1
+      cut -f1 <<< "$ENTRY_OUT" | api_list ;;
     add)
       [[ -n "${2:-}" ]] || { _api_usage "entry add ИМЯ ХОСТ:ПОРТ"; return; }
       entry_add "$1" "$2" ;;
@@ -710,7 +716,7 @@ _api_entry() {
     all)
       [[ -n "${1:-}" ]] || { _api_usage "entry all ИМЯ|direct"; return; }
       entry_assign_all "$1" ;;
-    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct" ;;
+    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct|clients ИМЯ|direct A,B" ;;
   esac
 }
 
