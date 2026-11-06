@@ -226,7 +226,9 @@ entry_check() {  # имя [soft|quiet]
   [[ -n "$a" ]] || { err "Точки входа «${1:-}» нет"; return 1; }
   [[ "${2:-}" == quiet ]] || info "Проверяю вход «$1»: пакет с сервера на $a должен вернуться на порт AWG"
   entry_probe "$a" || rc=$?
-  _entry_check_save "$1" "$a" "$(case "$rc" in 0) echo ok ;; 1) echo fail ;; *) echo unknown ;; esac)"
+  m=$(case "$rc" in 0) echo ok ;; 1) echo fail ;; *) echo unknown ;; esac)
+  _entry_check_save "$1" "$a" "$m"
+  log_info "проверка входа «$1» ($a → $(public_ip_cached):$(server_port)): $m"
   if [[ "${2:-}" == quiet ]]; then
     (( rc == 2 )) && warn "Вход «$1» проверить не удалось — выдаю как есть, проверь клиентом"
     (( rc != 1 ))

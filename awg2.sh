@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.53"
+VERSION="v1.2.54"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -2758,9 +2758,10 @@ _postup_lines() {
   echo "PostDown = iptables -t nat -D POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
 }
 
-# Клиентский конфиг. $1 файл, $2 приватный ключ, $3 адрес, $4 psk, $5 DNS, $6 MTU.
+# Клиентский конфиг. $1 файл, $2 приватный ключ, $3 адрес, $4 psk, $5 DNS, $6 MTU,
+# $7 Endpoint (по умолчанию — сервер напрямую; у клиента точки входа — её адрес).
 write_client_conf() {
-  local f="$1" priv="$2" addr="$3" psk="$4" dns="$5" mtu="$6" srv_pub
+  local f="$1" priv="$2" addr="$3" psk="$4" dns="$5" mtu="$6" ep="${7:-}" srv_pub
   srv_pub=$(conf_iface_get PrivateKey | awg pubkey) || return 1
   {
     echo "[Interface]"
@@ -2774,7 +2775,7 @@ write_client_conf() {
     echo "[Peer]"
     echo "PublicKey = $srv_pub"
     echo "PresharedKey = $psk"
-    echo "Endpoint = $(endpoint_host):$(server_port)"
+    echo "Endpoint = ${ep:-$(entry_direct)}"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = $(keepalive_for "$(server_proto)")"
   } | write_file "$f" 600
@@ -3535,7 +3536,7 @@ do_proto_menu() {
 # ── Endpoint ──────────────────────────────────────────────
 # endpoint_set ДОМЕН|"" [переписать_выданные 1|0] — пусто = публичный IP.
 endpoint_set() {
-  local d="${1,,}" rw="${2:-1}" ep port f
+  local d="${1,,}" rw="${2:-1}" ep port f n
   server_exists || { err "Сервер не создан"; return 1; }
   port=$(server_port)
   if [[ -n "$d" ]]; then
@@ -3546,8 +3547,13 @@ endpoint_set() {
   fi
   ok "Endpoint для новых конфигов: $ep"
   if [[ "$rw" == 1 ]]; then
-    while read -r f; do sed -i "s|^Endpoint = .*|Endpoint = $ep|" "$f"; done < <(client_files)
+    # Клиенты на точках входа подключаются через вход — их Endpoint не меняется
+    while read -r n; do
+      f=$(client_file "$n")
+      [[ -f "$f" ]] && sed -i "s|^Endpoint = .*|Endpoint = $ep|" "$f"
+    done < <(py entry "$SERVER_CONF" direct)
     ok "Выданные конфиги обновлены — клиентам нужно забрать новые"
+    [[ -n "$(py entry "$SERVER_CONF" list)" ]] && info "Конфиги клиентов на точках входа не тронуты — у них адрес входа"
   fi
 }
 
@@ -3560,8 +3566,9 @@ do_endpoint_menu() {
   echo -e "  Сейчас: ${W}${cur:-$(public_ip_cached)}:$port${N} ${D}(${cur:+домен}${cur:-IP})${N}"
   echo -e "  ${C}1)${N} Задать домен"
   echo -e "  ${C}2)${N} Вернуться на IP"
+  echo -e "  ${C}3)${N} Точки входа ${D}— клиенты через другой сервер (каскад): $(py entry "$SERVER_CONF" list | grep -c . || true)${N}"
   echo -e "  ${W}0)${N} ← Назад"
-  read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+  read_choice c "${C}  Выбор [0-3]: ${N}" 0 3 0
   case "$c" in
     1) while true; do
          read_line d "${C}  Домен (Enter — отмена): ${N}"; d="${d// /}"
@@ -3572,6 +3579,7 @@ do_endpoint_menu() {
        domain_points_here "$d" || ask_yes "  Всё равно задать? [y/N]: " n || return 0 ;;
     2) [[ -n "$cur" ]] || { info "Уже IP"; return 0; }
        d="" ;;
+    3) do_entries_menu; return 0 ;;
     *) return 0 ;;
   esac
   rw=0
@@ -3636,17 +3644,19 @@ share_config() {  # файл [qr]
 # Добавляет клиента в awg0.conf и в работающий интерфейс, пишет его конфиг.
 # Мимикрия берётся из I_LINES/MIMICRY. $5 — срок действия (unix-время), пусто — бессрочно.
 client_add() {
-  local name="$1" addr="$2" dns="$3" mtu="$4" expire="${5:-}" priv pub psk size
+  local name="$1" addr="$2" dns="$3" mtu="$4" expire="${5:-}" priv pub psk size ent=""
   priv=$(awg genkey) && pub=$(awg pubkey <<< "$priv") && psk=$(awg genpsk) || return 1
   size=$(stat -c%s "$SERVER_CONF")
-  printf '\n[Peer]\n# %s\n# mimicry=%s\nPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' \
-    "$name" "$(mimicry_tag)" "$pub" "$psk" "$addr" >> "$SERVER_CONF"
+  client_new_entry
+  [[ -n "$_ENTRY_NEW" ]] && ent="# entry=$_ENTRY_NEW"$'\n'
+  printf '\n[Peer]\n# %s\n# mimicry=%s\n%sPublicKey = %s\nPresharedKey = %s\nAllowedIPs = %s\n' \
+    "$name" "$(mimicry_tag)" "$ent" "$pub" "$psk" "$addr" >> "$SERVER_CONF"
   if iface_up && ! awg set "$AWG_IF" peer "$pub" preshared-key <(printf '%s\n' "$psk") allowed-ips "$addr"; then
     truncate -s "$size" "$SERVER_CONF"
     err "Ядро не приняло пира — запись откатана"
     return 1
   fi
-  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "$dns" "$mtu" || return 1
+  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "$dns" "$mtu" "$_ENTRY_NEW_ADDR" || return 1
   if [[ -n "$expire" ]]; then
     expire_install
     py expire-set "$SERVER_CONF" "$name" "$expire"
@@ -3739,7 +3749,8 @@ client_reissue() {  # имя
   [[ -f "$TRAFFIC_DB" ]] && { py traffic-rekey "$TRAFFIC_DB" "$old" "$pub" || warn "Счётчики трафика начнутся заново"; }
   rm -f "$EXPIRE_STATE_DIR/warn1h_${old//[^A-Za-z0-9]/_}"
   mimicry_from_spec server || return 1
-  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "1.1.1.1, 1.0.0.1" "$(conf_iface_get MTU)" || return 1
+  write_client_conf "$(client_file "$name")" "$priv" "$addr" "$psk" "1.1.1.1, 1.0.0.1" "$(conf_iface_get MTU)" \
+    "$(client_endpoint "$name")" || return 1
   peer_meta_set "$name" mimicry "$(mimicry_tag)" || true
   log_info "клиент перевыпущен: $name"
   ok "Новый конфиг $name: $(client_file "$name")"
@@ -4173,19 +4184,365 @@ do_clients_menu() {
     echo -e "  ${C}9)${N} Сменить мимикрию"
     echo -e "  ${R}10)${N} Удалить"
     echo -e "  ${C}11)${N} Перевыпустить конфиг ${D}— новый ключ; перенесённым из Amnezia — конфиг и QR${N}"
+    echo -e "  ${C}12)${N} Вход клиента ${D}— напрямую или через точку входа (каскад)${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
+    read_choice c "${C}  Выбор [0-12]: ${N}" 0 12 0
     case "$c" in
       1) do_add_client || true ;;     6) do_bulk_add || true ;;
       2) do_list_clients || true ;;   7) do_expire_menu || true ;;
       3) do_show_client || true ;;    8) do_export_clients || true ;;
       4) do_show_client_qr || true ;; 9) do_change_mimicry || true ;;
       5) do_rename_client || true ;;  10) do_delete_client || true ;;
-      11) do_reissue_client || true ;;
+      11) do_reissue_client || true ;;  12) do_client_entry || true ;;
       0) return 0 ;;
     esac
     pause
   done
+}
+
+# ═════ entry ═════
+# Точки входа (каскад): клиент подключается не к этому серверу напрямую, а
+# через сервер-вход — любой сервер, где UDP-порт проброшен сюда (каскад Тулзы,
+# свой iptables, nginx stream). В конфиге такого клиента Endpoint — адрес
+# входа; ключи, лимиты, скорость, сроки и выходы — как у всех, сервер разницы
+# не видит. Хранение — py entry: список в шапке awg0.conf, вход клиента —
+# метка его пира, поэтому всё попадает в любой бэкап вместе с клиентами.
+
+entry_direct() { echo "$(endpoint_host):$(server_port)"; }
+
+# Endpoint для конфига клиента: адрес его входа, без входа — сервер напрямую.
+client_endpoint() {  # имя
+  local a
+  a=$(py entry "$SERVER_CONF" of "$1" 2>/dev/null)
+  echo "${a:-$(entry_direct)}"
+}
+
+# Вход нового клиента: _O_ENTRY пусто — вход по умолчанию, direct — напрямую,
+# иначе имя входа. Итог — в _ENTRY_NEW (имя, пусто — напрямую) и
+# _ENTRY_NEW_ADDR (его адрес); помнится до смены списка или _O_ENTRY: пакет
+# из 200 клиентов не спрашивает Python 400 раз.
+_O_ENTRY="" _ENTRY_NEW="" _ENTRY_NEW_ADDR="" _ENTRY_NEW_KEY="-"
+client_new_entry() {
+  [[ "$_ENTRY_NEW_KEY" == "$_O_ENTRY" ]] && return 0
+  _ENTRY_NEW="" _ENTRY_NEW_ADDR=""
+  case "$_O_ENTRY" in
+    "") _ENTRY_NEW=$(entry_default_get) ;;
+    direct) ;;
+    *) _ENTRY_NEW="$_O_ENTRY" ;;
+  esac
+  [[ -n "$_ENTRY_NEW" ]] && _ENTRY_NEW_ADDR=$(py entry "$SERVER_CONF" get "$_ENTRY_NEW" 2>/dev/null)
+  [[ -n "$_ENTRY_NEW_ADDR" ]] || _ENTRY_NEW=""
+  _ENTRY_NEW_KEY="$_O_ENTRY"
+}
+_entry_new_reset() { _ENTRY_NEW_KEY="-"; }
+
+# py entry: вывод — в ENTRY_OUT, отказ — в err.
+ENTRY_OUT=""
+_entry_py() {
+  _entry_new_reset
+  ENTRY_OUT=$(py entry "$SERVER_CONF" "$@" 2>&1) && return 0
+  err "${ENTRY_OUT##*$'\n'}"
+  ENTRY_OUT=""
+  return 1
+}
+
+# Строки «клиент<TAB>адрес» (пусто — напрямую) → Endpoint в их конфигах.
+# У перенесённых из Amnezia файла нет — им адрес достанется при перевыпуске.
+ENTRY_REWRITTEN=0
+_entry_apply() {
+  local n a f direct
+  direct=$(entry_direct)
+  ENTRY_REWRITTEN=0
+  while IFS=$'\t' read -r n a; do
+    [[ -n "$n" ]] || continue
+    f=$(client_file "$n")
+    [[ -f "$f" ]] && grep -q '^Endpoint = ' "$f" || continue
+    sed -i "s|^Endpoint = .*|Endpoint = ${a:-$direct}|" "$f" && ENTRY_REWRITTEN=$((ENTRY_REWRITTEN + 1))
+  done <<< "$1"
+}
+
+# ── Итоги проверок ────────────────────────────────────────
+# «имя<TAB>адрес<TAB>ok|fail|unknown<TAB>время» в $STATE_DIR/entry-check:
+# итог относится к адресу — новый адрес входа проверяется заново. Не в
+# awg0.conf: после переезда на другой сервер вход проверяется там.
+_entry_check_file() { echo "$STATE_DIR/entry-check"; }
+
+_entry_check_save() {  # имя адрес статус
+  local f
+  f=$(_entry_check_file)
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  { awk -F'\t' -v n="$1" '$1 != n' "$f" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$(date +%s)"; } > "$f.tmp" && mv -f "$f.tmp" "$f"
+}
+
+_entry_check_get() {  # имя адрес → «статус<TAB>время» последней проверки этого адреса
+  awk -F'\t' -v n="$1" -v a="$2" '$1 == n && $2 == a {print $3 "\t" $4; exit}' "$(_entry_check_file)" 2>/dev/null || true
+}
+
+# Строки py entry list + итог проверки и её время
+_entry_rows_checked() {
+  py entry "$SERVER_CONF" list 2>/dev/null | awk -F'\t' -v OFS='\t' -v f="$(_entry_check_file)" '
+    BEGIN { while ((getline l < f) > 0) { split(l, a, "\t"); st[a[1] "\t" a[2]] = a[3]; ts[a[1] "\t" a[2]] = a[4] } }
+    { k = $1 "\t" $2; print $0, st[k], ts[k] + 0 }'
+}
+
+# Можно ли выдавать вход клиентам: каскад должен доводить пакеты до сервера.
+# Свежая удачная проверка (10 минут) — без новой; иначе проверка сейчас.
+# Проверить нельзя (нет модуля string, адрес не найден) — выдаём с предупреждением.
+ENTRY_FRESH=600
+_entry_ready() {  # имя (пусто — напрямую, всегда можно)
+  local a st ts
+  [[ -n "${1:-}" ]] || return 0
+  a=$(py entry "$SERVER_CONF" get "$1" 2>/dev/null)
+  [[ -n "$a" ]] || { err "Точки входа «$1» нет"; return 1; }
+  IFS=$'\t' read -r st ts <<< "$(_entry_check_get "$1" "$a")"
+  [[ "$st" == ok && "${ts:-0}" =~ ^[0-9]+$ ]] && (( $(date +%s) - ts < ENTRY_FRESH )) && return 0
+  entry_check "$1" quiet && return 0
+  err "Вход «$1» не работает: через $a пакеты до сервера не доходят — клиентам его не выдаю"
+  info "Проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port), затем «Проверить»"
+  return 1
+}
+
+_entry_rewritten_note() {
+  (( ENTRY_REWRITTEN )) || return 0
+  info "Конфигов переписано: $ENTRY_REWRITTEN — этим клиентам нужен новый конфиг или QR"
+}
+
+# «имя» или пусто/direct — напрямую
+_entry_arg() { [[ "${1:-}" == direct ]] && echo "" || echo "${1:-}"; }
+
+entry_add() {  # имя хост:порт
+  server_exists || { err "Сервер не создан"; return 1; }
+  _entry_py add "${1:-}" "${2:-}" || return 1
+  ok "Точка входа «$1»: $(py entry "$SERVER_CONF" get "$1")"
+  log_info "точка входа добавлена: $1"
+  entry_check "$1" soft || true
+  info "Вход клиенту — в его карточке («Вход»); всем новым — «По умолчанию»"
+}
+
+entry_set() {  # имя хост:порт — новый адрес входа; конфиги его клиентов переписываются
+  server_exists || { err "Сервер не создан"; return 1; }
+  _entry_py set "${1:-}" "${2:-}" || return 1
+  _entry_apply "$ENTRY_OUT"
+  ok "Точка входа «$1»: $(py entry "$SERVER_CONF" get "$1")"
+  log_info "точка входа изменена: $1"
+  _entry_rewritten_note
+  entry_check "$1" soft || true
+}
+
+entry_del() {  # имя — его клиенты переходят на «напрямую»
+  server_exists || { err "Сервер не создан"; return 1; }
+  _entry_py del "${1:-}" || return 1
+  _entry_apply "$ENTRY_OUT"
+  _entry_check_save "$1" "" gone
+  ok "Точка входа «$1» удалена"
+  log_info "точка входа удалена: $1"
+  [[ -n "$ENTRY_OUT" ]] && info "Её клиенты теперь подключаются напрямую: $(entry_direct)"
+  _entry_rewritten_note
+}
+
+entry_default() {  # имя|direct — вход для новых клиентов
+  local e
+  server_exists || { err "Сервер не создан"; return 1; }
+  e=$(_entry_arg "${1:-}")
+  _entry_ready "$e" || return 1
+  _entry_py default "$e" || return 1
+  if [[ -n "$e" ]]; then ok "Новые клиенты — через вход «$e»"; else ok "Новые клиенты — напрямую"; fi
+}
+
+entry_default_get() { py entry "$SERVER_CONF" list 2>/dev/null | awk -F'\t' '$4 == 1 {print $1; exit}'; }
+
+client_entry_set() {  # клиент имя|direct
+  local e a
+  server_exists || { err "Сервер не создан"; return 1; }
+  e=$(_entry_arg "${2:-}")
+  _entry_ready "$e" || return 1
+  _entry_py assign "${1:-}" "$e" || return 1
+  _entry_apply "$ENTRY_OUT"
+  a=$(client_endpoint "$1")
+  if [[ -n "$e" ]]; then ok "$1 → вход «$e» ($a)"; else ok "$1 → напрямую ($a)"; fi
+  log_info "вход клиента: $1 → ${e:-напрямую}"
+  (( ENTRY_REWRITTEN )) && info "Клиенту нужен новый конфиг или QR — в старом прежний Endpoint"
+  return 0
+}
+
+# Выбранные клиенты (через запятую) — на вход; их имена с новым адресом — в ENTRY_OUT
+entry_assign_clients() {  # имя|direct клиент,клиент...
+  local e n
+  server_exists || { err "Сервер не создан"; return 1; }
+  e=$(_entry_arg "${1:-}")
+  [[ -n "${2:-}" ]] || { err "Не выбраны клиенты"; return 1; }
+  _entry_ready "$e" || return 1
+  _entry_py assign-many "$e" "$2" || return 1
+  while IFS= read -r n; do [[ "$n" == *$'\t'* ]] || { [[ -n "$n" ]] && warn "$n"; }; done <<< "$ENTRY_OUT"
+  ENTRY_OUT=$(grep $'\t' <<< "$ENTRY_OUT" || true)
+  _entry_apply "$ENTRY_OUT"
+  n=$(grep -c . <<< "$ENTRY_OUT" || true)
+  if [[ -n "$e" ]]; then ok "Через вход «$e»: $n клиентов"; else ok "Напрямую: $n клиентов"; fi
+  log_info "вход клиентов: ${e:-напрямую} ← $2"
+  _entry_rewritten_note
+}
+
+entry_assign_all() {  # имя|direct — все клиенты
+  local e
+  server_exists || { err "Сервер не создан"; return 1; }
+  e=$(_entry_arg "${1:-}")
+  _entry_ready "$e" || return 1
+  _entry_py assign-all "$e" || return 1
+  _entry_apply "$ENTRY_OUT"
+  if [[ -n "$e" ]]; then ok "Все клиенты — через вход «$e»"; else ok "Все клиенты — напрямую"; fi
+  log_info "вход всех клиентов: ${e:-напрямую}"
+  _entry_rewritten_note
+}
+
+# Доходит ли пакет через вход до этого сервера: шлём с сервера UDP с меткой
+# на адрес входа и ловим его на своём порту AWG (правило raw со строкой
+# метки). Простой проброс порта (DNAT) возвращает пакет сюда же.
+# 0 — дошёл, 1 — нет, 2 — проверить нельзя (адрес не найден, нет модуля string).
+ENTRY_PROBE_TAG="awg2-entry-check"
+entry_probe() {  # хост:порт
+  local host="${1%:*}" port="${1##*:}" ip mark i n rc=1
+  if valid_ip "$host"; then ip="$host"
+  else ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}'); fi
+  [[ -n "$ip" ]] || return 2
+  mark="$ENTRY_PROBE_TAG-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
+  ipt_del_grep raw "--comment \"?${ENTRY_PROBE_TAG}\"?( |$)"
+  iptables -t raw -I PREROUTING 1 -p udp --dport "$(server_port)" -m string --algo bm --string "$mark" \
+    -m comment --comment "$ENTRY_PROBE_TAG" -j ACCEPT 2>/dev/null || return 2
+  for i in 1 2 3 4; do
+    { printf '%s' "$mark" > "/dev/udp/$ip/$port"; } 2>/dev/null || true
+    sleep 0.5
+    n=$(iptables -t raw -L PREROUTING -v -x -n 2>/dev/null | awk -v t="$ENTRY_PROBE_TAG" 'index($0, t) {print $1; exit}')
+    [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) && { rc=0; break; }
+  done
+  ipt_del_grep raw "--comment \"?${ENTRY_PROBE_TAG}\"?( |$)"
+  return "$rc"
+}
+
+# soft — провал проверки только предупреждением; quiet — без вывода, только
+# итог (его пишет _entry_ready). Итог запоминается — по нему боту и панели
+# видно, можно ли выдавать вход клиентам.
+entry_check() {  # имя [soft|quiet]
+  local a m rc=0
+  server_exists || { err "Сервер не создан"; return 1; }
+  a=$(py entry "$SERVER_CONF" get "${1:-}" 2>/dev/null)
+  [[ -n "$a" ]] || { err "Точки входа «${1:-}» нет"; return 1; }
+  [[ "${2:-}" == quiet ]] || info "Проверяю вход «$1»: пакет с сервера на $a должен вернуться на порт AWG"
+  entry_probe "$a" || rc=$?
+  m=$(case "$rc" in 0) echo ok ;; 1) echo fail ;; *) echo unknown ;; esac)
+  _entry_check_save "$1" "$a" "$m"
+  log_info "проверка входа «$1» ($a → $(public_ip_cached):$(server_port)): $m"
+  if [[ "${2:-}" == quiet ]]; then
+    (( rc == 2 )) && warn "Вход «$1» проверить не удалось — выдаю как есть, проверь клиентом"
+    (( rc != 1 ))
+    return
+  fi
+  case "$rc" in
+    0) ok "Вход работает: пакеты через $a доходят до этого сервера" ;;
+    1) m="Через $a пакеты до сервера не дошли — проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port)"
+       if [[ "${2:-}" == soft ]]; then warn "$m"; else err "$m"; fi
+       info "Вход не простым пробросом (прокси, фильтр по адресам) проверку может не пройти и рабочим — тогда проверь клиентом" ;;
+    *) warn "Проверить вход не удалось (адрес не найден или нет модуля iptables string) — проверь клиентом"
+       rc=0 ;;
+  esac
+  return "$rc"
+}
+
+# ── Меню awg2 ─────────────────────────────────────────────
+_entry_rows() { py entry "$SERVER_CONF" list 2>/dev/null; }
+
+_entry_pick() {  # [direct — с «напрямую»] → имя в CHOSEN (пусто — напрямую)
+  local rows=() i c n a k d off=0
+  mapfile -t rows < <(_entry_rows)
+  if [[ "${1:-}" == direct ]]; then
+    off=1
+    echo -e "  ${G}  1)${N} Напрямую ${D}— $(entry_direct)${N}"
+  else
+    (( ${#rows[@]} )) || { warn "Точек входа нет"; return 1; }
+  fi
+  for i in "${!rows[@]}"; do
+    IFS=$'\t' read -r n a k d <<< "${rows[$i]}"
+    printf "  ${G}%3d)${N} %s ${D}— %s, клиентов %s%s${N}\n" "$((i + 1 + off))" "$n" "$a" "$k" "$( (( d )) && echo ', по умолчанию')"
+  done
+  read_choice c "${C}  Номер (0 — отмена): ${N}" 0 "$(( ${#rows[@]} + off ))" 0
+  (( c == 0 )) && return 1
+  CHOSEN=""
+  (( c > off )) && CHOSEN=$(cut -f1 <<< "${rows[$((c - 1 - off))]}")
+  return 0
+}
+
+# Клиенты номерами через пробел или запятую → имена через запятую в _ENTRY_PICKED
+_ENTRY_PICKED=""
+_entry_pick_clients() {
+  local names=() i v picked=()
+  mapfile -t names < <(clients_tsv | cut -f1 | grep .)
+  (( ${#names[@]} )) || { warn "Клиентов нет"; return 1; }
+  for i in "${!names[@]}"; do printf "  ${G}%3d)${N} %s ${D}— %s${N}\n" "$((i + 1))" "${names[$i]}" "$(client_endpoint "${names[$i]}")"; done
+  read_line v "${C}  Номера через пробел (Enter — отмена): ${N}"
+  for i in ${v//,/ }; do
+    [[ "$i" =~ ^[0-9]+$ ]] && (( i >= 1 && i <= ${#names[@]} )) || { warn "Нет номера: $i"; continue; }
+    picked+=("${names[$((i - 1))]}")
+  done
+  (( ${#picked[@]} )) || return 1
+  _ENTRY_PICKED=$(IFS=,; echo "${picked[*]}")
+}
+
+do_entries_menu() {
+  server_exists || { err "Сервер не создан"; return 1; }
+  local c n a k d st def
+  while true; do
+    echo ""
+    hdr "Точки входа (каскад)"
+    echo -e "  ${D}Клиент подключается через сервер-вход, где UDP-порт проброшен на этот.${N}"
+    echo -e "  ${D}В его конфиге Endpoint — адрес входа. Напрямую: $(entry_direct)${N}"
+    while IFS=$'\t' read -r n a k d st _; do
+      [[ -n "$n" ]] || continue
+      case "$st" in ok) st="${G}работает${N}" ;; fail) st="${R}не доходит${N}" ;; unknown) st="${Y}не проверить${N}" ;; *) st="${D}не проверялся${N}" ;; esac
+      echo -e "  ${W}•${N} $n ${D}— $a, клиентов $k$( (( d )) && echo ', по умолчанию')${N} · $st"
+    done < <(_entry_rows_checked)
+    def=$(entry_default_get)
+    echo ""
+    echo -e "  ${G}1)${N} Добавить"
+    echo -e "  ${C}2)${N} Изменить адрес"
+    echo -e "  ${C}3)${N} Проверить"
+    echo -e "  ${C}4)${N} Вход для новых клиентов ${D}— ${def:-напрямую}${N}"
+    echo -e "  ${C}5)${N} Перевести всех клиентов"
+    echo -e "  ${C}6)${N} Выбрать клиентов"
+    echo -e "  ${R}7)${N} Удалить"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
+    case "$c" in
+      1) read_line n "${C}  Название (например, Каскад NL): ${N}"
+         [[ -n "$n" ]] || continue
+         read_line a "${C}  Адрес входа хост:порт: ${N}"
+         [[ -n "$a" ]] && { entry_add "$n" "${a// /}" || true; } ;;
+      2) _entry_pick || continue
+         n="$CHOSEN"
+         read_line a "${C}  Новый адрес «$n» хост:порт: ${N}"
+         [[ -n "$a" ]] && { entry_set "$n" "${a// /}" || true; } ;;
+      3) _entry_pick && { entry_check "$CHOSEN" || true; } ;;
+      4) _entry_pick direct && { entry_default "${CHOSEN:-direct}" || true; } ;;
+      5) _entry_pick direct || continue
+         ask_yes "  Переписать Endpoint во всех конфигах? [y/N]: " n && { entry_assign_all "${CHOSEN:-direct}" || true; } ;;
+      6) _entry_pick direct || continue
+         _entry_pick_clients && { entry_assign_clients "${CHOSEN:-direct}" "$_ENTRY_PICKED" || true; } ;;
+      7) _entry_pick || continue
+         ask_yes "  Удалить «$CHOSEN»? Его клиенты перейдут на «напрямую» [y/N]: " n && { entry_del "$CHOSEN" || true; } ;;
+      0) return 0 ;;
+    esac
+    pause
+  done
+}
+
+do_client_entry() {
+  server_exists || { err "Сервер не создан"; return 1; }
+  local name
+  [[ -n "$(_entry_rows)" ]] || { warn "Точек входа нет — добавь: Сервер → Endpoint → Точки входа"; return 1; }
+  _pick_client || return 0
+  name="${CHOSEN%%$'\t'*}"
+  echo -e "  Сейчас: ${W}$(client_endpoint "$name")${N}"
+  _entry_pick direct || return 0
+  client_entry_set "$name" "${CHOSEN:-direct}" && share_config "$(client_file "$name")" qr
 }
 
 # ═════ expire ═════
@@ -6342,6 +6699,7 @@ cascade_rule_add() {
   (( added )) || return 1
   _cascade_persist
   info "На клиенте Endpoint: ${W}$(public_ip_cached):$in${N}"
+  info "Если на целевом сервере Тулза — добавь там этот адрес в «Сервер → Точки входа»: конфиги и QR клиентов будут с ним"
 }
 
 cascade_list() {
@@ -12768,7 +13126,7 @@ _api_clients_del() {
 _O_EXPIRE="" _O_MIM="" _O_DNS="" _O_MTU=""
 _api_client_opts() {
   local kv v
-  _O_EXPIRE="" _O_MIM=server _O_DNS="1.1.1.1, 1.0.0.1" _O_MTU=""
+  _O_EXPIRE="" _O_MIM=server _O_DNS="1.1.1.1, 1.0.0.1" _O_MTU="" _O_ENTRY=""
   for kv in "$@"; do
     v="${kv#*=}"
     case "${kv%%=*}" in
@@ -12781,6 +13139,9 @@ _api_client_opts() {
       dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }
            _O_MTU="$v" ;;
+      entry) [[ "$v" == direct || -n "$(py entry "$SERVER_CONF" get "$v" 2>/dev/null)" ]] \
+               || { err "Точки входа «$v» нет"; return 1; }
+             _O_ENTRY="$v" ;;
       *) err "Неизвестный параметр: ${kv%%=*}"; return 1 ;;
     esac
   done
@@ -12789,7 +13150,7 @@ _api_client_opts() {
 # clients bulk a,b,c | префикс:число [опции] — мимикрия генерируется один раз.
 _api_clients_bulk() {
   local spec="${1:-}" names=() parts=() n i prefix count part addr created=()
-  [[ -n "$spec" ]] || { _api_usage "clients bulk ИМЯ,ИМЯ... | ПРЕФИКС:ЧИСЛО [expire=] [mimicry=] [dns=] [mtu=]"; return; }
+  [[ -n "$spec" ]] || { _api_usage "clients bulk ИМЯ,ИМЯ... | ПРЕФИКС:ЧИСЛО [expire=] [mimicry=] [dns=] [mtu=] [entry=]"; return; }
   shift
   server_exists || { err "Сервер не создан"; return 1; }
   _api_client_opts "$@" || return 1
@@ -12827,7 +13188,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue|entry ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -12852,6 +13213,12 @@ _api_client() {
       [[ -n "${1:-}" ]] || { _api_usage "client expire ИМЯ unix-время|+30d|+12h|дата"; return; }
       client_expire_set "$name" "$(_api_ts "$1")" ;;
     unexpire) client_expire_clear "$name" ;;
+    entry)
+      [[ -n "${1:-}" ]] || { _api_usage "client entry ИМЯ ВХОД|direct"; return; }
+      client_entry_set "$name" "$1" || return 1
+      f=$(client_file "$name")
+      { _kv name "$name"; _kv endpoint "$(client_endpoint "$name")"; _kv file "$f"
+        [[ -f "$f" ]] && _kv text:f "$f"; } | api_obj ;;
     limit)
       [[ -n "${1:-}" ]] || { _api_usage "client limit ИМЯ 50G|500M|off [month|total]"; return; }
       client_limit_set "$name" "$1" "${2:-month}" ;;
@@ -12866,7 +13233,7 @@ _api_client() {
       client_reissue "$name" || return 1
       f=$(client_file "$name")
       { _kv name "$name"; _kv file "$f"; _kv text:f "$f"; } | api_obj ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..." ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue|entry ИМЯ ..." ;;
   esac
 }
 
@@ -13152,6 +13519,44 @@ _api_cascade() {
     remove) cascade_uninstall quiet ;;
     diag) cascade_diagnose ;;
     *) _api_usage "cascade list|add ...|del ПРОТО ПОРТ|reapply|clear|remove|diag" ;;
+  esac
+}
+
+# Точки входа (каскад). Строка с пустым именем — «напрямую», первая в списке.
+# check — итог последней проверки (ok|fail|unknown, пусто — не проверялся):
+# по нему бот и панель решают, можно ли выдавать вход клиентам.
+_api_entry() {
+  local a="${1:-}"
+  shift || true
+  case "$a" in
+    ""|list)
+      server_exists || { err "Сервер не создан"; return 1; }
+      { printf '\t%s\t%s\t%s\tok\t0\n' "$(entry_direct)" "$(py entry "$SERVER_CONF" direct | grep -c . || true)" \
+          "$([[ -z "$(entry_default_get)" ]] && echo 1 || echo 0)"
+        _entry_rows_checked; } | api_rows name addr clients:n default:b check checked:n ;;
+    clients)
+      [[ -n "${2:-}" ]] || { _api_usage "entry clients ИМЯ|direct КЛИЕНТ,КЛИЕНТ..."; return; }
+      entry_assign_clients "$1" "$2" || return 1
+      cut -f1 <<< "$ENTRY_OUT" | api_list ;;
+    add)
+      [[ -n "${2:-}" ]] || { _api_usage "entry add ИМЯ ХОСТ:ПОРТ"; return; }
+      entry_add "$1" "$2" ;;
+    set)
+      [[ -n "${2:-}" ]] || { _api_usage "entry set ИМЯ ХОСТ:ПОРТ"; return; }
+      entry_set "$1" "$2" ;;
+    del)
+      [[ -n "${1:-}" ]] || { _api_usage "entry del ИМЯ"; return; }
+      entry_del "$1" ;;
+    check)
+      [[ -n "${1:-}" ]] || { _api_usage "entry check ИМЯ"; return; }
+      entry_check "$1" ;;
+    default)
+      [[ -n "${1:-}" ]] || { _api_usage "entry default ИМЯ|direct"; return; }
+      entry_default "$1" ;;
+    all)
+      [[ -n "${1:-}" ]] || { _api_usage "entry all ИМЯ|direct"; return; }
+      entry_assign_all "$1" ;;
+    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct|clients ИМЯ|direct A,B" ;;
   esac
 }
 
@@ -13579,7 +13984,7 @@ _api_readonly() {
     "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan"|"vkblock "|"vkblock status") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list") return 0 ;;
   esac
   return 1
 }
@@ -13620,6 +14025,7 @@ api_dispatch() {
     t2s) _api_t2s "$@" ;;
     exits) _api_exits "$@" ;;
     cascade) _api_cascade "$@" ;;
+    entry) _api_entry "$@" ;;
     dns) _api_dns "$@" ;;
     wgobf) _api_wgobf "$@" ;;
     update) _api_update "$@" ;;
@@ -13635,7 +14041,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
+      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -15627,7 +16033,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=d130c5dfeee66f35
+_PY_HELPER_SUM=11b3e003518e656d
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -15789,6 +16195,160 @@ def cmd_meta_set(conf, name, key, value):
         die("клиент %s не найден" % name, 2)
     peers[i] = set_meta(peers[i], key, value)
     write_atomic(conf, head + "".join(peers))
+
+
+# ════════════════════════ Точки входа ════════════════════════
+# Клиент подключается не к серверу напрямую, а через сервер-вход (каскад,
+# проброс порта): в его конфиге Endpoint — адрес входа. Список — метки шапки
+# awg0.conf «# AWG_ENTRY=имя|хост:порт», вход для новых клиентов —
+# «# AWG_ENTRY_DEFAULT=имя», вход клиента — метка пира «# entry=имя». Всё в
+# awg0.conf — в любом бэкапе вместе с клиентами. Пустое имя — напрямую.
+ENTRY_KEY, ENTRY_DEF = "AWG_ENTRY", "AWG_ENTRY_DEFAULT"
+ENTRY_NAME = re.compile(r"[^\W_][\w .-]{0,23}")
+ENTRY_MAX = 20
+ENTRY_LINE = re.compile(r"^# (?:%s|%s)=" % (ENTRY_KEY, ENTRY_DEF))
+HOST_RE = re.compile(r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def entries_read(head):
+    """Шапка awg0.conf → [(имя, хост:порт)], имя входа по умолчанию."""
+    ents, default = [], ""
+    for line in head.splitlines():
+        if line.lstrip().startswith("["):
+            break
+        m = re.match(r"^# %s=(.+)\|(\S+?)\s*$" % ENTRY_KEY, line)
+        if m:
+            ents.append((m.group(1), m.group(2)))
+            continue
+        m = re.match(r"^# %s=(.*?)\s*$" % ENTRY_DEF, line)
+        if m:
+            default = m.group(1)
+    if default not in dict(ents):
+        default = ""
+    return ents, default
+
+
+def entries_write(head, ents, default):
+    lines = [l for l in head.split("\n") if not ENTRY_LINE.match(l)]
+    at = next((i for i, l in enumerate(lines) if l.lstrip().startswith("[")), len(lines))
+    lines[at:at] = (["# %s=%s|%s" % (ENTRY_KEY, n, a) for n, a in ents]
+                    + (["# %s=%s" % (ENTRY_DEF, default)] if default else []))
+    return "\n".join(lines)
+
+
+def entry_addr(v):
+    """«хост:порт» точки входа: IPv4 или домен, порт 1-65535."""
+    v = v.strip().lower()
+    m = re.fullmatch(r"([^\s:/]+):(\d{1,5})", v)
+    if not m:
+        die("Адрес входа — хост:порт, например 203.0.113.5:443 или vpn.example.com:443", 2)
+    host, port = m.group(1), int(m.group(2))
+    if not 1 <= port <= 65535:
+        die("Порт входа: 1-65535", 2)
+    if re.fullmatch(r"[\d.]+", host):
+        parts = host.split(".")
+        if len(parts) != 4 or any(not p or (len(p) > 1 and p[0] == "0") or int(p) > 255 for p in parts):
+            die("Неверный IPv4: %s" % host, 2)
+    elif not HOST_RE.fullmatch(host):
+        die("Неверный адрес: %s — нужен IPv4 или домен" % _shown(host), 2)
+    return "%s:%d" % (host, port)
+
+
+def cmd_entry(conf, op, *args):
+    """Точки входа. Команды, меняющие вход клиентов, печатают «клиент<TAB>адрес»
+    (пусто — напрямую) — по ним awg2 переписывает Endpoint в их конфигах."""
+    head, peers = split_peers(read(conf))
+    ents, default = entries_read(head)
+    addr = dict(ents)
+    arg = lambda i: args[i] if len(args) > i else ""  # noqa: E731
+
+    def want(name):
+        if name not in addr:
+            die("Точки входа «%s» нет" % _shown(name), 2)
+        return name
+
+    def save():
+        write_atomic(conf, entries_write(head, ents, default) + "".join(peers))
+
+    def emit(names):
+        for b in peers:
+            n = peer_name(b)
+            if n and n in names:
+                print("%s\t%s" % (n, addr.get(peer_meta(b, "entry"), "")))
+
+    on = lambda b: peer_meta(b, "entry")  # noqa: E731
+    if op == "list":
+        for n, a in ents:
+            print("%s\t%s\t%d\t%d" % (n, a, sum(1 for b in peers if on(b) == n), n == default))
+    elif op == "get":
+        print(addr.get(arg(0), ""))
+    elif op == "add":
+        name, a = arg(0).strip(), entry_addr(arg(1))
+        if not ENTRY_NAME.fullmatch(name):
+            die("Имя входа: буквы, цифры, пробел, точка, _ и -, до 24 символов", 2)
+        if name.lower() in ("direct", "напрямую") or name.lower() in (n.lower() for n in addr):
+            die("Имя «%s» занято" % name, 2)
+        if len(ents) >= ENTRY_MAX:
+            die("Точек входа уже %d — больше нельзя" % ENTRY_MAX, 2)
+        ents.append((name, a))
+        save()
+    elif op == "set":
+        name, a = want(arg(0)), entry_addr(arg(1))
+        ents[:] = [(n, a if n == name else x) for n, x in ents]
+        addr[name] = a
+        save()
+        emit({peer_name(b) for b in peers if on(b) == name})
+    elif op == "del":
+        name = want(arg(0))
+        hit = {peer_name(b) for b in peers if on(b) == name}
+        ents[:] = [(n, x) for n, x in ents if n != name]
+        del addr[name]
+        if default == name:
+            default = ""
+        peers[:] = [set_meta(b, "entry", "") if on(b) == name else b for b in peers]
+        save()
+        emit(hit)
+    elif op == "default":
+        default = want(arg(0)) if arg(0) else ""
+        save()
+    elif op == "assign":
+        client, name = arg(0), (want(arg(1)) if arg(1) else "")
+        i = find_peer(peers, name=client)
+        if i < 0:
+            die("Клиента %s нет" % _shown(client), 2)
+        peers[i] = set_meta(peers[i], "entry", name)
+        save()
+        emit({client})
+    elif op == "assign-many":
+        # Список клиентов через запятую; незнакомые имена — в stderr, остальные назначаются
+        name = want(arg(0)) if arg(0) else ""
+        names = [n for n in arg(1).split(",") if n]
+        known = {peer_name(b) for b in peers if peer_name(b)}
+        for n in names:
+            if n not in known:
+                sys.stderr.write("Клиента %s нет\n" % _shown(n))
+        hit = set(names) & known
+        if not hit:
+            die("Ни одного клиента из списка нет", 2)
+        peers[:] = [set_meta(b, "entry", name) if peer_name(b) in hit else b for b in peers]
+        save()
+        emit(hit)
+    elif op == "assign-all":
+        name = want(arg(0)) if arg(0) else ""
+        peers[:] = [set_meta(b, "entry", name) if peer_name(b) else b for b in peers]
+        save()
+        emit({peer_name(b) for b in peers if peer_name(b)})
+    elif op == "of":
+        # Адрес входа клиента (пусто — напрямую или вход удалён)
+        i = find_peer(peers, name=arg(0))
+        print(addr.get(on(peers[i]), "") if i >= 0 else "")
+    elif op == "direct":
+        # Клиенты без входа — им переписывается Endpoint при смене домена сервера
+        for b in peers:
+            if peer_name(b) and on(b) not in addr:
+                print(peer_name(b))
+    else:
+        die("entry list|get|add|set|del|default|assign|assign-many|assign-all|of|direct", 2)
 
 
 def cmd_peer_del(conf, pubkey):
@@ -17848,7 +18408,8 @@ def _first_ip(value):
 def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
     """Клиенты awg0 со статистикой `awg show dump`, туннелями и трафиком за
     месяц и по лимиту — для бота."""
-    _, peers = split_peers(read(conf))
+    head, peers = split_peers(read(conf))
+    entries = dict(entries_read(head)[0])
     stats = {}
     try:
         for line in read(dump).splitlines()[1:]:
@@ -17890,6 +18451,8 @@ def cmd_clients_json(conf, dump, client_dir, warp, xray, exits, db=""):
             "endpoint": "" if s[2] in ("", "(none)") else s[2], "file": path,
             # Перенесён из Amnezia: приватный ключ только у клиента — исходное имя
             "amnezia": peer_meta(b, "amnezia") or None,
+            # Точка входа (каскад): None — напрямую или вход удалён
+            "entry": peer_meta(b, "entry") if peer_meta(b, "entry") in entries else None,
         }
         limit, period = parse_limit(peer_meta(b, "limit"))
         by = peer_meta(b, "blocked_by")
@@ -18605,7 +19168,7 @@ COMMANDS = {
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
-    "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,
+    "entry": cmd_entry, "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,
     "clients-json": cmd_clients_json, "api-envelope": cmd_api_envelope,
     "api-job-status": cmd_api_job_status, "api-jobs": cmd_api_jobs,
     "tg-targets": cmd_tg_targets,
@@ -18628,5 +19191,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=7a1dfcced6957c2e
+_BUILD_SUM=a8738100a35b00aa
 main "$@"
