@@ -25,6 +25,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import re
 import secrets
 import time
@@ -99,7 +100,22 @@ class _Lock:
 
 def _load(now: float) -> dict[str, dict]:
     data = store.load(_file())
-    return {k: v for k, v in data.items() if isinstance(v, dict) and float(v.get("exp") or 0) > now}
+    active = {}
+    for k, v in data.items():
+        if not isinstance(v, dict):
+            continue
+        try:
+            exp = float(v.get("exp") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(exp) or exp <= now:
+            continue
+        try:
+            v["opens"] = max(0, int(v.get("opens") or 0))
+        except (TypeError, ValueError, OverflowError):
+            v["opens"] = 0
+        active[k] = v
+    return active
 
 
 def create(name: str, pub: str, by: str, now: float | None = None) -> tuple[str, str, int]:

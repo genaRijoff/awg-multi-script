@@ -228,7 +228,7 @@ async def _port_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 @ask.on("srv_mtu")
 async def _mtu_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1280 <= int(v) <= 1500:
+    if not v.isascii() or not v.isdigit() or not 1280 <= int(v) <= 1500:
         await ask.retry(msg, state, ctx, "MTU — число 1280-1500")
         return
     await _wizard_set(msg, state, "mtu", v)
