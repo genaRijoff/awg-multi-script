@@ -160,8 +160,18 @@ async def _run(*args: Any, stdin: str | bytes | None = None,
             return Result(False, proc.returncode or 1,
                           error="Установленный awg2 не знает команду api — обнови AWG Toolza")
         return Result(False, proc.returncode or 1, log=tail, error="awg2 ответил не JSON")
-    return Result(bool(env.get("ok")), int(env.get("rc") or 0), env.get("data"),
-                  env.get("log") or "", env.get("error") or "")
+    if not isinstance(env, dict):
+        log.warning("awg2 api %s: JSON-ответ не является объектом", args[:2])
+        return Result(False, proc.returncode or 1, error="awg2 вернул некорректный JSON-ответ")
+    try:
+        rc = int(env.get("rc") or 0)
+    except (TypeError, ValueError, OverflowError):
+        rc = proc.returncode or 1
+    log_text = env.get("log") if isinstance(env.get("log"), str) else ""
+    error = env.get("error") if isinstance(env.get("error"), str) else ""
+    # Только JSON true означает успех: bool("false") в Python было бы True,
+    # и панель показала бы успешное изменение, которого на сервере не было.
+    return Result(env.get("ok") is True, rc, env.get("data"), log_text, error)
 
 
 async def data(*args: Any, default: Any = None, **kw: Any) -> Any:

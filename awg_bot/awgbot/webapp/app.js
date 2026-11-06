@@ -5357,7 +5357,10 @@ function refreshStatus() {
 }
 
 async function webStart() {
-  try { S.me = await post("/api/me"); } catch (_) { return; }      // 401 — экран входа уже на месте
+  try { S.me = await post("/api/me"); } catch (e) {
+    if (!e.login) showLogin(e.message);       // сбой сети/API не должен оставлять вечную «Загрузку…»
+    return;                                   // 401 — экран входа уже показан в post()
+  }
   drawTop();                                                     // лента и шапка — после входа
   render();
   if (curPath() !== "/") refreshStatus();                       // обзор грузит сводку сам

@@ -110,10 +110,21 @@ def _load(now: float) -> dict[str, dict]:
             continue
         if not math.isfinite(exp) or exp <= now:
             continue
+        name, pub = v.get("name"), v.get("pub")
+        if not isinstance(name, str) or not NAME_RE.match(name) or not isinstance(pub, str) or not pub:
+            continue
+        try:
+            made = float(v.get("made") or 0)
+            v["made"] = made if math.isfinite(made) else 0.0
+        except (TypeError, ValueError):
+            v["made"] = 0.0
         try:
             v["opens"] = max(0, int(v.get("opens") or 0))
         except (TypeError, ValueError, OverflowError):
             v["opens"] = 0
+        # Дальше exp и made используются в арифметике и сортировке: храним
+        # нормализованные числа, а не исходные строки из повреждённого JSON.
+        v["exp"] = exp
         active[k] = v
     return active
 
