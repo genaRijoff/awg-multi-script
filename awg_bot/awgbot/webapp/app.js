@@ -2773,6 +2773,23 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
   const enc = encodeURIComponent(name);
   const chartBox = h("div");
   call("traffic", "daily", name, 30).then((t) => t && t.total && chartBox.replaceChildren(lineChart(t))).catch(() => {});
+  // Точка входа (каскад) — выбор в карточке, если входы есть или клиент на входе
+  const entryBox = h("div");
+  call("entry", "list").then((ents) => {
+    if (!ents || !(ents.some((e) => e.name) || c.entry)) return;
+    const cur = c.entry || "";
+    const at = ents.find((e) => e.name === cur);
+    entryBox.replaceChildren(h("div", { class: "card rcard" }, h("div", { class: "eyebrow" }, "вход"),
+      h("div", { class: "chips rchips" }, ents.map((e) => h("button", {
+        class: e.name === cur ? "on" : null, "data-v": e.name, title: e.addr,
+        onclick: (ev) => (e.name === cur ? null : busy(ev.currentTarget, async () => {
+          await call("client", "entry", name, e.name || "direct");
+          haptic(); toast(`Вход ${name}: ${e.name || "напрямую"} — отправь клиенту новый конфиг или QR`, 4500);
+          S.clients = null; render();
+        })) }, e.name || "Напрямую"))),
+      h("div", { class: "muted small" }, "Endpoint в конфиге: ", h("span", { class: "mono" }, at ? at.addr : "—"), " · ",
+        linkTo("Точки входа →", "/server/entries"))));
+  }).catch(() => {});
 
   async function setExpire(btn) {
     const v = await sheet("Срок действия", [
@@ -2856,7 +2873,7 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       c.endpoint ? kv("Адрес клиента", h("span", { class: "mono" }, c.endpoint.replace(/:\d+$/, ""))) : null,
       c.amnezia ? kv("Из Amnezia", (c.amnezia !== name ? `«${c.amnezia}» · ` : "") + "конфиг есть только у клиента")
         : kv("Мимикрия", h("span", { class: "mono" }, !c.mimicry || c.mimicry === "none" ? "без I1-I5" : c.mimicry)),
-      c.note ? kv("Заметка", c.note) : null), routeCard()),
+      c.note ? kv("Заметка", c.note) : null), routeCard(), entryBox),
     area("traf", h("div", { class: "card" },
       kv("За месяц", fmtBytes(c.month)), kv("Сегодня", fmtBytes(c.today)),
       kv("Лимит", badMeta(c, "limit") ? "метка повреждена — клиент заблокирован, задай лимит заново"
@@ -3235,7 +3252,8 @@ route(/^\/server$/, async (ctx) => {
         tag("MTU " + d.mtu), tag(d.region === "ru" ? "Россия" : "мир", "", "globe")],
       lines: [h("span", { onclick: (ev) => { ev.stopPropagation(); copy(d.endpoint); }, style: "cursor:pointer" }, d.endpoint || "", " ", icon("copy"))],
       acts: [act("refresh-cw", "Рестарт", (b) => quickAsk(b, AWG0_RESTART, "awg0 перезапущен", ["server", "restart"])),
-        act("shuffle", "Протокол", () => go("/server/proto")), act("globe", "Endpoint", () => go("/server/endpoint"))] })
+        act("shuffle", "Протокол", () => go("/server/proto")), act("globe", "Endpoint", () => go("/server/endpoint")),
+        act("map-pin", "Входы", () => go("/server/entries"))] })
       : ecard({ name: "Сервер не создан", right: pill(d.installed ? "компоненты есть" : "нет компонентов", d.installed ? "ok" : "warn"),
         lines: ["Создай сервер — те же вопросы, что в меню awg2"] }),
     d.exists ? statGrid([
@@ -3256,6 +3274,7 @@ route(/^\/server$/, async (ctx) => {
       menuItem("🧩 Модуль ядра", "версии, обновление, откат", () => go("/server/module")),
       menuItem("🛡 Антисканер", "сети сканеров РКН и госорганов — не до портов сервера", () => go("/server/antiscan")),
       menuItem("🚫 VK и Max мимо VPN", "клиенты VPN не ходят через сервер в сети VK", () => go("/server/vkblock")),
+      d.exists ? menuItem("📍 Точки входа", "клиенты через другой сервер (каскад) — свой Endpoint", () => go("/server/entries")) : null,
       amzOn ? menuItem("🐳 Перенос из Amnezia", amz.migrated ? "сделан — вернуть или удалить контейнер"
         : "сервер из Docker-контейнера, клиенты без перевыдачи", () => go("/server/amnezia")) : null,
       menuItem(d.installed ? "📦 Компоненты" : "📦 Установить компоненты", "пакеты, модуль, amneziawg-tools",
@@ -3647,7 +3666,64 @@ route(/^\/server\/endpoint$/, async (ctx) => {
       if (!DOMAIN_RE.test(v)) return fail(new Error("Нужно имя вида vpn.example.com"));
       return save(b, v);
     }, "btn-primary btn-block"),
-    d.domain ? btn("🔢 Вернуть публичный IP", (b) => save(b, "ip"), "btn-block") : null);
+    d.domain ? btn("🔢 Вернуть публичный IP", (b) => save(b, "ip"), "btn-block") : null,
+    h("div", { class: "muted small", style: "margin:8px 4px" }, "Клиентам через другой сервер (каскад) — ",
+      linkTo("📍 Точки входа", "/server/entries"), ": у них в конфиге адрес входа, смена Endpoint их не трогает."));
+});
+
+route(/^\/server\/entries\/([^/]+)$/, async (ctx, name) => {
+  const e = ((await call("entry", "list")) || []).find((r) => r.name === name);
+  if (!e) return ctx.put(title("📍 " + name), h("div", { class: "card empty" }, "Такой точки входа уже нет"));
+  const addr = h("input", { value: e.addr, placeholder: "203.0.113.5:443", autocapitalize: "off", autocomplete: "off", inputmode: "url" });
+  ctx.put(title("📍 " + name),
+    h("div", { class: "card" }, kv("Адрес", h("span", { class: "mono" }, e.addr)), kv("Клиентов", String(e.clients || 0))),
+    h("label", {}, "Новый адрес: хост:порт, проброшенный на этот сервер"), addr,
+    btn("💾 Сохранить", (b) => {
+      const a = addr.value.replace(/\s/g, "");
+      if (!ENTRY_ADDR_RE.test(a)) return fail(new Error("Нужен хост:порт, например 203.0.113.5:443"));
+      return quick(b, "Адрес изменён", ["entry", "set", name, a], () => back());
+    }, "btn-primary btn-block"),
+    e.clients ? hint(`Endpoint перепишется в конфигах ${e.clients} клиентов — им нужен новый конфиг или QR.`) : null);
+});
+
+// Точки входа (каскад): клиент подключается через сервер-вход — любой сервер,
+// где UDP-порт проброшен на этот. Первая строка списка — «напрямую» (имя пустое)
+const ENTRY_ADDR_RE = /^[a-z0-9.-]+:\d{1,5}$/i;
+route(/^\/server\/entries$/, async (ctx) => {
+  const rows = (await call("entry", "list")) || [];
+  const name = h("input", { placeholder: "Каскад NL", maxlength: 24, autocomplete: "off" });
+  const addr = h("input", { placeholder: "203.0.113.5:443", autocapitalize: "off", autocomplete: "off", inputmode: "url" });
+  const label = (e) => e.name || "Напрямую";
+  const arg = (e) => e.name || "direct";
+  const card = (e) => ecard({ state: e.clients ? "on" : "", name: label(e), attrs: { "data-name": e.name },
+    right: e.default ? pill("для новых", "ok") : null,
+    meta: [tag("клиентов " + (e.clients || 0), "", "users")],
+    lines: [h("span", { class: "mono" }, e.addr || ""), e.name ? null : "этот сервер: IP или домен из «Endpoint»"],
+    acts: [
+      e.name ? act("stethoscope", "Проверить", (b) => quick(b, "Вход работает", ["entry", "check", e.name])) : null,
+      e.name ? act("pencil", "Адрес", () => go("/server/entries/" + encodeURIComponent(e.name))) : null,
+      e.default ? null : act("user-plus", "Для новых", (b) => quick(b, `Новые клиенты — ${e.name ? "через «" + e.name + "»" : "напрямую"}`,
+        ["entry", "default", arg(e)])),
+      act("users", "Всех сюда", (b) => quickAsk(b, `Перевести всех клиентов на «${label(e)}»? Endpoint перепишется во всех конфигах `
+        + `на ${e.addr} — каждому клиенту нужен новый конфиг или QR.`, "Клиенты переведены", ["entry", "all", arg(e)])),
+      e.name ? act("trash-2", "Удалить", (b) => quickAsk(b, `Удалить точку входа «${e.name}»?`
+        + (e.clients ? ` Её клиенты (${e.clients}) перейдут на «напрямую» — им нужен новый конфиг.` : ""),
+      "Точка входа удалена", ["entry", "del", e.name]), "bad") : null].filter(Boolean) });
+  ctx.put(title("📍 Точки входа"),
+    hint("Клиент подключается через сервер-вход — любой сервер, где UDP-порт проброшен на этот (каскад Тулзы, iptables, "
+      + "nginx stream). В конфиге и QR такого клиента Endpoint — адрес входа, остальное как у всех. Вход клиенту — в его "
+      + "карточке, всем новым — «Для новых»."),
+    rows.map(card),
+    rows.length <= 20 ? [h("h2", {}, "Новая точка входа"),
+      h("label", {}, "Название — до 24 символов"), name,
+      h("label", {}, "Адрес входа: хост:порт, проброшенный на этот сервер"), addr,
+      btn("➕ Добавить", (b) => {
+        const n = name.value.trim().replace(/\s+/g, " ");
+        const a = addr.value.replace(/\s/g, "");
+        if (!n || n.length > 24 || /[|,=#]/.test(n)) return fail(new Error("Название — до 24 символов: буквы, цифры, пробел, точка, _ и -"));
+        if (!ENTRY_ADDR_RE.test(a)) return fail(new Error("Нужен хост:порт, например 203.0.113.5:443"));
+        return quick(b, "Точка входа добавлена", ["entry", "add", n, a]);
+      }, "btn-primary btn-block")] : null);
 });
 
 route(/^\/server\/module$/, async (ctx) => {

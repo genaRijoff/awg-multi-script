@@ -15,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, FSInputFile, Message
 
 from .. import api, ask, media, share, store, ui, webapp
+from . import entries
 from ..ui import esc
 
 router = Router()
@@ -308,7 +309,17 @@ def speed_text(c: dict) -> str:
     return f"{sp} Мбит/с" if sp else ""
 
 
-def card_text(c: dict, route: dict) -> str:
+def entry_text(c: dict, ents: list[dict] | None) -> str:
+    """«Вход: …» — только когда точки входа есть или клиент на входе."""
+    named = [e for e in ents or [] if e.get("name")]
+    if not named and not c.get("entry"):
+        return ""
+    e = next((e for e in ents or [] if e.get("name") == (c.get("entry") or "")), None)
+    addr = f" — <code>{esc(e['addr'])}</code>" if e and e.get("addr") else ""
+    return f"Вход: {'«' + esc(c['entry']) + '»' if c.get('entry') else 'напрямую'}{addr}"
+
+
+def card_text(c: dict, route: dict, ents: list[dict] | None = None) -> str:
     name = c["name"]
     note = store.strip_tag(store.note(name))
     month = c.get("month")
@@ -327,6 +338,7 @@ def card_text(c: dict, route: dict) -> str:
         f"Мимикрия: {esc(c['mimicry']) if c.get('mimicry') not in (None, '', 'none') else 'без I1-I5'}"
         if not c.get("amnezia") else "",
         f"Маршрут: {route_of(c, route)}",
+        entry_text(c, ents),
         ("🐳 Перенесён из Amnezia" + (f" («{esc(c['amnezia'])}»)" if c["amnezia"] != name else "")
          + " — конфиг есть только у самого клиента, в Тулзе его можно перевыпустить") if c.get("amnezia") else "",
         f"Заметка: {esc(note)}" if note else "",
@@ -335,13 +347,14 @@ def card_text(c: dict, route: dict) -> str:
 
 
 async def card(target: ui.Target, name: str) -> None:
-    c, route = await asyncio.gather(client(name), active_route())
+    c, route, ents = await asyncio.gather(client(name), active_route(), entries.entries())
     if c is None:
         await ui.render(target, f"Клиента <b>{esc(name)}</b> нет.", ui.kb(ui.back("cl")))
         return
     mon = store.monitored(name)
     imported = bool(c.get("amnezia"))
-    await ui.render(target, card_text(c, route), ui.kb(
+    has_entries = any(e.get("name") for e in ents or []) or bool(c.get("entry"))
+    await ui.render(target, card_text(c, route, ents), ui.kb(
         ("📄 Конфиг и QR", act.data("conf", name)) if not imported else None,
         ("🔗 Ссылка 5 мин", act.data("shr", name)) if not imported else None,
         ("🔁 Перевыпустить конфиг", act.data("rei", name)) if imported else None,
@@ -352,6 +365,7 @@ async def card(target: ui.Target, name: str) -> None:
         ("📊 Трафик по дням", act.data("tday", name)),
         ("🎭 Мимикрия", act.data("mim", name)) if not imported else None,
         ("🌐 Маршрут", act.data("tun", name)) if route["kind"] in ("warp", "xray", "exits") else None,
+        ("📍 Вход", act.data("ent", name)) if has_entries else None,
         ("📝 Заметка", act.data("note", name)),
         ("🔕 Мониторинг" if mon else "🔔 Мониторинг", act.data("mon", name)),
         ("🗑 Удалить", act.data("del", name)),
@@ -386,6 +400,48 @@ async def _reissue_ok(cb: CallbackQuery, state: FSMContext, name: str) -> None:
     await cb.answer(f"Новый конфиг: {name}")
     await send_config(cb.bot, ui.chat_of(cb).chat.id, name)  # type: ignore[arg-type]
     await card(cb, name)
+
+
+# ── Вход клиента (точка входа, каскад) ────────────────────
+@act("ent")
+async def _entry(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    c, ents = await asyncio.gather(client(name), entries.entries())
+    if c is None or ents is None:
+        await ui.render(cb, f"Клиента <b>{esc(name)}</b> нет." if c is None else "Точки входа не прочитаны.",
+                        ui.kb(ui.back(act.data("v", name))))
+        return
+    await ui.remember(state, "centry", [e["name"] for e in ents])
+    cur = c.get("entry") or ""
+    lines = [f"<b>📍 Вход {esc(name)}</b>", "",
+             "Через какой адрес клиент подключается. После смены в его конфиге и QR новый Endpoint — "
+             "старый конфиг клиенту нужно заменить.", ""]
+    lines += [f"{'🔘' if e['name'] == cur else '⚪️'} {esc(entries.label(e))} — <code>{esc(e.get('addr', ''))}</code>"
+              for e in ents]
+    await ui.render(cb, "\n".join(lines), ui.kb(
+        [(f"{'🔘' if e['name'] == cur else '⚪️'} {entries.label(e)}", act.data("ents", f"{i}|{name}"))
+         for i, e in enumerate(ents)],
+        ("📍 Точки входа", "ent"),
+        ui.back(act.data("v", name))))
+
+
+@act("ents")
+async def _entry_set(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    idx, _, name = arg.partition("|")
+    ename = await ui.recall(state, "centry", idx)
+    if ename is None:
+        await _entry(cb, state, name)
+        return
+    r = await api.call("client", "entry", name, entries.arg(ename))
+    if not r.ok or not isinstance(r.data, dict):
+        await ui.render(cb, ui.fail(r, f"Вход {name}"), ui.kb(ui.back(act.data("v", name))))
+        return
+    imported = not r.data.get("text")
+    await ui.render(cb, f"✅ <b>{esc(name)}</b> → {'вход «' + esc(ename) + '»' if ename else 'напрямую'}\n"
+                        f"Endpoint: <code>{esc(r.data.get('endpoint', ''))}</code>\n\n"
+                        + ("Конфига в Тулзе нет (перенесён из Amnezia) — адрес войдёт в перевыпущенный."
+                           if imported else "В старом конфиге клиента прежний адрес — отправь ему новый конфиг или QR."),
+                    ui.kb(("📄 Конфиг и QR", act.data("conf", name)) if not imported else None,
+                          ui.back(act.data("v", name), "◀️ К клиенту")))
 
 
 @act("mon")

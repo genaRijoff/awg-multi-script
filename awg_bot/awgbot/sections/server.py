@@ -65,6 +65,7 @@ async def screen(target: ui.Target) -> None:
         ("🔀 Протокол", act.data("proto")) if exists else None,
         ("🎛 Параметры AWG", act.data("par")) if exists else None,
         ("🌍 Endpoint", act.data("ep")) if exists else None,
+        ("📍 Точки входа", "ent") if exists else None,
         ("🛠 Починить", act.data("repair")),
         ("🛡 Антисканер", "as"),
         ("🚫 VK и Max", "vk"),
@@ -566,9 +567,12 @@ async def _ep(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     dom = info.get("domain")
     await ui.render(cb, f"<b>🌍 Endpoint</b>\n\nВ конфигах: <code>{esc(info.get('endpoint', ''))}</code>\n"
                         + ("Домен задан — сервер можно переносить без перевыдачи конфигов." if dom
-                           else "Сейчас IP. С доменом переезд сервера не требует новых конфигов."),
+                           else "Сейчас IP. С доменом переезд сервера не требует новых конфигов.")
+                        + "\n\n📍 Клиентам через другой сервер (каскад) — «Точки входа»: "
+                          "у них в конфиге адрес входа, смена Endpoint их не трогает.",
                     ui.kb(("✏️ Указать домен", act.data("epdom")),
                           ("🔢 Публичный IP", act.data("epset", "ip")) if dom else None,
+                          ("📍 Точки входа", "ent"),
                           ui.back("srv")))
 
 

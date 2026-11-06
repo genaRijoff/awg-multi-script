@@ -49,7 +49,7 @@ CACHE_TTL = float(os.environ.get("AWG_API_CACHE_TTL", 5))
 CACHED = {("status",), ("version",), ("server", "info"), ("tunnels", "status"), ("xray", "status"),
           ("exits", "status"), ("warp", "status"), ("dns", "status"), ("t2s", "status"), ("wgobf", "status"),
           ("clients", "list"), ("bot", "status"), ("cert", "status"), ("update", "status"), ("mimicry",),
-          ("traffic", "daily"), ("backup", "list")}
+          ("traffic", "daily"), ("backup", "list"), ("entry", "list")}
 _cache: dict[tuple[str, ...], tuple[float, "Result"]] = {}
 _inflight: dict[tuple[str, ...], "asyncio.Task[Result]"] = {}
 _gen = 0                            # растёт на каждой записи: чтение, начатое до неё, в кэш не ложится

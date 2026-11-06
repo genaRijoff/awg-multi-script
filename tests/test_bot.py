@@ -62,7 +62,8 @@ sys.path.insert(0, os.path.join(HERE, "..", "awg_bot"))
 
 from awgbot import admins, api as botapi, bot as botmod, jobs, store, ui, webapp  # noqa: E402
 
-USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "xr:delq:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:")
+USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "xr:delq:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:",
+              "ent:e:", "cl:ents:")
 
 logging.getLogger("aiogram").setLevel(logging.WARNING)
 
@@ -1253,7 +1254,7 @@ async def run():
                "cl:lim:alice", "cl:spd:alice", "cl:tday:alice", "cl:tsrv", "ntf", "abk",
                "diag", "diag:status", "diag:dpi", "diag:logs", "diag:log:manager", "diag:sniff",
                "bk", "bk:list", "tun", "tc::warp", "warp", "warp:backend", "xr", "t2s", "ex", "cas", "dns",
-               "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web"]
+               "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web", "ent", "cl:ent:alice"]
     broken = []
     for data in screens:
         sent = await press(data)
@@ -2134,6 +2135,67 @@ async def run():
     chk("журнал открывается, «Назад» — на экран VK", ("◀️ Назад", "vk") in buttons, [text, buttons])
     no_hourglass("VK и Max")
     botapi.call = real_call_
+
+    print("Точки входа (каскад)")
+    text, buttons = screen(await press("srv"))
+    chk("в «Сервере» — кнопка «📍 Точки входа»", ("📍 Точки входа", "ent") in buttons, buttons)
+    text, buttons = screen(await press("srv:ep"))
+    chk("в «Endpoint» — про каскад и кнопка «📍 Точки входа»", ("📍 Точки входа", "ent") in buttons and "каскад" in text, [text, buttons])
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("без точек входа в карточке клиента нет ни строки «Вход», ни кнопки",
+        "Вход:" not in text and not any(d == "cl:ent:alice" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("ent"))
+    chk("экран входов: что это, «напрямую» с адресом сервера, «Добавить», назад в «Сервер»",
+        "каскад" in text and "Напрямую" in text and ("➕ Добавить", "ent:add") in buttons and ("◀️ Назад", "srv") in buttons,
+        [text, buttons])
+    await press("ent:add")
+    text, _ = screen(await say("a|b"))
+    chk("название с «|» — переспрашивает", "⚠️" in text, text)
+    text, _ = screen(await say("Каскад NL"))
+    chk("после названия — спрашивает адрес", "Вход «Каскад NL»" in text and "203.0.113.5:443" in text, text)
+    text, _ = screen(await say("abc"))
+    chk("адрес без порта — переспрашивает", "⚠️" in text, text)
+    text, buttons = screen(await say("203.0.113.5:443"))
+    chk("вход добавлен — итог awg2 и назад к списку входов",
+        "✅" in text and "Каскад NL" in text and "203.0.113.5:443" in text and ("◀️ Назад", "ent") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent"))
+    chk("в списке — новый вход кнопкой", any(t.endswith("Каскад NL") and d == "ent:e:1" for t, d in buttons), buttons)
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("с точками входа — в карточке «Вход: напрямую» и кнопка «📍 Вход»",
+        "Вход: напрямую" in text and ("📍 Вход", "cl:ent:alice") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:ent:alice"))
+    chk("выбор входа клиента: напрямую отмечено, вход — кнопкой с номером",
+        ("🔘 Напрямую", "cl:ents:0|alice") in buttons and ("⚪️ Каскад NL", "cl:ents:1|alice") in buttons
+        and "203.0.113.5:443" in text, [text, buttons])
+    text, buttons = screen(await press("cl:ents:1|alice"))
+    chk("вход клиента сменён: новый Endpoint и кнопка «Конфиг и QR»",
+        "alice" in text and "Каскад NL" in text and "Endpoint: <code>203.0.113.5:443</code>" in text
+        and ("📄 Конфиг и QR", "cl:conf:alice") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("в карточке — вход и его адрес", "Вход: «Каскад NL» — <code>203.0.113.5:443</code>" in text, text)
+    await press("ent")
+    text, buttons = screen(await press("ent:e:1"))
+    chk("карточка входа: адрес, клиентов 1, действия",
+        "203.0.113.5:443" in text and "Клиентов: 1" in text and ("🩺 Проверить", "ent:chk:1") in buttons
+        and ("⭐ Для новых", "ent:def:1") in buttons and ("👥 Всех сюда", "ent:all:1") in buttons
+        and ("🗑 Удалить", "ent:del:1") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:def:1"))
+    chk("«Для новых» — отмечен, кнопка пропала", "⭐ да" in text and not any(d == "ent:def:1" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("ent:e:0"))
+    chk("«напрямую»: без проверки, адреса и удаления", not any(d.startswith(("ent:chk:", "ent:del:", "ent:addr:")) for _, d in buttons)
+        and ("⭐ Для новых", "ent:def:0") in buttons, buttons)
+    await press("ent:def:0")
+    text, buttons = screen(await press("ent:del:1"))
+    chk("удаление входа с клиентами — с подтверждением и предупреждением",
+        ("🗑 Удалить", "ent:delok:1") in buttons and "перейдут" in text, [text, buttons])
+    text, buttons = screen(await press("ent:delok:1"))
+    chk("вход удалён", "✅" in text and "удалена" in text, text)
+    text, buttons = screen(await press("cl:v:alice"))
+    chk("после удаления последнего входа в карточке снова нет «Вход»", "Вход:" not in text, text)
+    with open(os.path.join(ROOT, "etc/amnezia/amneziawg/awg0.conf")) as f:
+        conf = f.read()
+    chk("в awg0.conf не осталось меток входа", "AWG_ENTRY" not in conf and "entry=" not in conf, conf[:300])
+    no_hourglass("точки входа")
 
     print("WARP: кнопки из уведомлений")
     started, real_job_w = [], botapi.job_start

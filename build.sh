@@ -13,7 +13,7 @@ cd "$(dirname "$0")"
 OUT="${1:-dist/awg2.sh}"
 
 LIBS=(
-  core const sys net conf module params mimicry server clients expire speed
+  core const sys net conf module params mimicry server clients entry expire speed
   tunnels warp dns cascade xray tun2socks exits wgobf cert
   backup amnezia update bot web antiscan vkblock uninstall diag menu api cli
 )

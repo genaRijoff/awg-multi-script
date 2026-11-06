@@ -215,9 +215,10 @@ _postup_lines() {
   echo "PostDown = iptables -t nat -D POSTROUTING -s $net -o $dev -j MASQUERADE 2>/dev/null || true; iptables -D FORWARD -i awg0 -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o awg0 -j ACCEPT 2>/dev/null || true"
 }
 
-# Клиентский конфиг. $1 файл, $2 приватный ключ, $3 адрес, $4 psk, $5 DNS, $6 MTU.
+# Клиентский конфиг. $1 файл, $2 приватный ключ, $3 адрес, $4 psk, $5 DNS, $6 MTU,
+# $7 Endpoint (по умолчанию — сервер напрямую; у клиента точки входа — её адрес).
 write_client_conf() {
-  local f="$1" priv="$2" addr="$3" psk="$4" dns="$5" mtu="$6" srv_pub
+  local f="$1" priv="$2" addr="$3" psk="$4" dns="$5" mtu="$6" ep="${7:-}" srv_pub
   srv_pub=$(conf_iface_get PrivateKey | awg pubkey) || return 1
   {
     echo "[Interface]"
@@ -231,7 +232,7 @@ write_client_conf() {
     echo "[Peer]"
     echo "PublicKey = $srv_pub"
     echo "PresharedKey = $psk"
-    echo "Endpoint = $(endpoint_host):$(server_port)"
+    echo "Endpoint = ${ep:-$(entry_direct)}"
     echo "AllowedIPs = 0.0.0.0/0, ::/0"
     echo "PersistentKeepalive = $(keepalive_for "$(server_proto)")"
   } | write_file "$f" 600
@@ -992,7 +993,7 @@ do_proto_menu() {
 # ── Endpoint ──────────────────────────────────────────────
 # endpoint_set ДОМЕН|"" [переписать_выданные 1|0] — пусто = публичный IP.
 endpoint_set() {
-  local d="${1,,}" rw="${2:-1}" ep port f
+  local d="${1,,}" rw="${2:-1}" ep port f n
   server_exists || { err "Сервер не создан"; return 1; }
   port=$(server_port)
   if [[ -n "$d" ]]; then
@@ -1003,8 +1004,13 @@ endpoint_set() {
   fi
   ok "Endpoint для новых конфигов: $ep"
   if [[ "$rw" == 1 ]]; then
-    while read -r f; do sed -i "s|^Endpoint = .*|Endpoint = $ep|" "$f"; done < <(client_files)
+    # Клиенты на точках входа подключаются через вход — их Endpoint не меняется
+    while read -r n; do
+      f=$(client_file "$n")
+      [[ -f "$f" ]] && sed -i "s|^Endpoint = .*|Endpoint = $ep|" "$f"
+    done < <(py entry "$SERVER_CONF" direct)
     ok "Выданные конфиги обновлены — клиентам нужно забрать новые"
+    [[ -n "$(py entry "$SERVER_CONF" list)" ]] && info "Конфиги клиентов на точках входа не тронуты — у них адрес входа"
   fi
 }
 
@@ -1017,8 +1023,9 @@ do_endpoint_menu() {
   echo -e "  Сейчас: ${W}${cur:-$(public_ip_cached)}:$port${N} ${D}(${cur:+домен}${cur:-IP})${N}"
   echo -e "  ${C}1)${N} Задать домен"
   echo -e "  ${C}2)${N} Вернуться на IP"
+  echo -e "  ${C}3)${N} Точки входа ${D}— клиенты через другой сервер (каскад): $(py entry "$SERVER_CONF" list | grep -c . || true)${N}"
   echo -e "  ${W}0)${N} ← Назад"
-  read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+  read_choice c "${C}  Выбор [0-3]: ${N}" 0 3 0
   case "$c" in
     1) while true; do
          read_line d "${C}  Домен (Enter — отмена): ${N}"; d="${d// /}"
@@ -1029,6 +1036,7 @@ do_endpoint_menu() {
        domain_points_here "$d" || ask_yes "  Всё равно задать? [y/N]: " n || return 0 ;;
     2) [[ -n "$cur" ]] || { info "Уже IP"; return 0; }
        d="" ;;
+    3) do_entries_menu; return 0 ;;
     *) return 0 ;;
   esac
   rw=0

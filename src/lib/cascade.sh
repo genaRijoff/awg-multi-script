@@ -162,6 +162,7 @@ cascade_rule_add() {
   (( added )) || return 1
   _cascade_persist
   info "На клиенте Endpoint: ${W}$(public_ip_cached):$in${N}"
+  info "Если на целевом сервере Тулза — добавь там этот адрес в «Сервер → Точки входа»: конфиги и QR клиентов будут с ним"
 }
 
 cascade_list() {

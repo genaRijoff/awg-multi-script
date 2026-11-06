@@ -595,6 +595,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/server", "text=Endpoint");
     await page.waitForSelector("text=vpn.example.com");
   });
+  await step("точки входа (каскад)", async () => {
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.waitForSelector(".ecard >> text=Напрямую");
+    const nameIn = "input[placeholder='Каскад NL']", addrIn = "input[placeholder='203.0.113.5:443']";
+    await page.fill(nameIn, "Каскад NL");
+    await expectAlert("хост:порт", async () => { await page.fill(addrIn, "bad"); await page.click("button:has-text('Добавить')"); });
+    await page.fill(addrIn, "203.0.113.5:443");
+    await page.click("button:has-text('Добавить')");
+    await page.waitForSelector(".ecard[data-name='Каскад NL'] >> text=203.0.113.5:443", { timeout: 30000 });
+    await shot("22b-entries");
+    // Вход клиенту — выбором в его карточке
+    await nav("/client/alice", ".rchips button[data-v='Каскад NL']");
+    await page.click(".rchips button[data-v='Каскад NL']");
+    await page.waitForSelector(".toast >> text=Каскад NL");
+    await page.waitForSelector(".rchips button.on[data-v='Каскад NL']");
+    await page.waitForSelector("text=203.0.113.5:443");
+    // Новый адрес входа — на своём экране
+    await nav("/server/entries/" + encodeURIComponent("Каскад NL"), "input[inputmode=url]");
+    await page.fill("input[inputmode=url]", "198.51.100.9:8443");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".toast", { timeout: 30000 });
+    await nav("/server/entries", "text=Новая точка входа");
+    await page.waitForSelector(".ecard[data-name='Каскад NL'] >> text=198.51.100.9:8443");
+    await page.click(".ecard[data-name='Каскад NL'] button:has-text('Удалить')");
+    await page.waitForSelector(".ecard[data-name='Каскад NL']", { state: "detached", timeout: 30000 });
+    await nav("/client/alice", ".a-acts");
+    if (await page.locator(".rchips button[data-v='Каскад NL']").count()) throw new Error("удалённый вход остался в карточке клиента");
+  });
   await step("модуль ядра", async () => {
     await nav("/server/module", "text=Ядро");
     await page.click("summary"); await page.waitForSelector("details[open] pre");
@@ -1675,7 +1703,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
         + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
         + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/amnezia /server/antiscan /server/create /server/endpoint /server/module "
-        + "/server/vkblock "
+        + "/server/vkblock /server/entries "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
         + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");

@@ -286,7 +286,7 @@ _api_clients_del() {
 _O_EXPIRE="" _O_MIM="" _O_DNS="" _O_MTU=""
 _api_client_opts() {
   local kv v
-  _O_EXPIRE="" _O_MIM=server _O_DNS="1.1.1.1, 1.0.0.1" _O_MTU=""
+  _O_EXPIRE="" _O_MIM=server _O_DNS="1.1.1.1, 1.0.0.1" _O_MTU="" _O_ENTRY=""
   for kv in "$@"; do
     v="${kv#*=}"
     case "${kv%%=*}" in
@@ -299,6 +299,9 @@ _api_client_opts() {
       dns) valid_dns_list "$v" || { err "dns: IPv4 через запятую"; return 1; }; _O_DNS="$v" ;;
       mtu) [[ "$v" =~ ^[0-9]+$ ]] && (( v >= 1280 && v <= 1500 )) || { err "mtu: 1280-1500"; return 1; }
            _O_MTU="$v" ;;
+      entry) [[ "$v" == direct || -n "$(py entry "$SERVER_CONF" get "$v" 2>/dev/null)" ]] \
+               || { err "Точки входа «$v» нет"; return 1; }
+             _O_ENTRY="$v" ;;
       *) err "Неизвестный параметр: ${kv%%=*}"; return 1 ;;
     esac
   done
@@ -307,7 +310,7 @@ _api_client_opts() {
 # clients bulk a,b,c | префикс:число [опции] — мимикрия генерируется один раз.
 _api_clients_bulk() {
   local spec="${1:-}" names=() parts=() n i prefix count part addr created=()
-  [[ -n "$spec" ]] || { _api_usage "clients bulk ИМЯ,ИМЯ... | ПРЕФИКС:ЧИСЛО [expire=] [mimicry=] [dns=] [mtu=]"; return; }
+  [[ -n "$spec" ]] || { _api_usage "clients bulk ИМЯ,ИМЯ... | ПРЕФИКС:ЧИСЛО [expire=] [mimicry=] [dns=] [mtu=] [entry=]"; return; }
   shift
   server_exists || { err "Сервер не создан"; return 1; }
   _api_client_opts "$@" || return 1
@@ -345,7 +348,7 @@ _api_clients_bulk() {
 
 _api_client() {
   local a="${1:-}" name="${2:-}" f
-  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..."; return; }
+  [[ -n "$name" ]] || { _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue|entry ИМЯ ..."; return; }
   shift 2
   case "$a" in
     add)
@@ -370,6 +373,12 @@ _api_client() {
       [[ -n "${1:-}" ]] || { _api_usage "client expire ИМЯ unix-время|+30d|+12h|дата"; return; }
       client_expire_set "$name" "$(_api_ts "$1")" ;;
     unexpire) client_expire_clear "$name" ;;
+    entry)
+      [[ -n "${1:-}" ]] || { _api_usage "client entry ИМЯ ВХОД|direct"; return; }
+      client_entry_set "$name" "$1" || return 1
+      f=$(client_file "$name")
+      { _kv name "$name"; _kv endpoint "$(client_endpoint "$name")"; _kv file "$f"
+        [[ -f "$f" ]] && _kv text:f "$f"; } | api_obj ;;
     limit)
       [[ -n "${1:-}" ]] || { _api_usage "client limit ИМЯ 50G|500M|off [month|total]"; return; }
       client_limit_set "$name" "$1" "${2:-month}" ;;
@@ -384,7 +393,7 @@ _api_client() {
       client_reissue "$name" || return 1
       f=$(client_file "$name")
       { _kv name "$name"; _kv file "$f"; _kv text:f "$f"; } | api_obj ;;
-    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue ИМЯ ..." ;;
+    *) _api_usage "client add|del|rename|conf|mimicry|expire|unexpire|limit|limit-reset|limit-mode|speed|reissue|entry ИМЯ ..." ;;
   esac
 }
 
@@ -670,6 +679,38 @@ _api_cascade() {
     remove) cascade_uninstall quiet ;;
     diag) cascade_diagnose ;;
     *) _api_usage "cascade list|add ...|del ПРОТО ПОРТ|reapply|clear|remove|diag" ;;
+  esac
+}
+
+# Точки входа (каскад). Строка с пустым именем — «напрямую», первая в списке.
+_api_entry() {
+  local a="${1:-}" n
+  shift || true
+  case "$a" in
+    ""|list)
+      server_exists || { err "Сервер не создан"; return 1; }
+      { printf '\t%s\t%s\t%s\n' "$(entry_direct)" "$(py entry "$SERVER_CONF" direct | grep -c . || true)" \
+          "$([[ -z "$(entry_default_get)" ]] && echo 1 || echo 0)"
+        py entry "$SERVER_CONF" list; } | api_rows name addr clients:n default:b ;;
+    add)
+      [[ -n "${2:-}" ]] || { _api_usage "entry add ИМЯ ХОСТ:ПОРТ"; return; }
+      entry_add "$1" "$2" ;;
+    set)
+      [[ -n "${2:-}" ]] || { _api_usage "entry set ИМЯ ХОСТ:ПОРТ"; return; }
+      entry_set "$1" "$2" ;;
+    del)
+      [[ -n "${1:-}" ]] || { _api_usage "entry del ИМЯ"; return; }
+      entry_del "$1" ;;
+    check)
+      [[ -n "${1:-}" ]] || { _api_usage "entry check ИМЯ"; return; }
+      entry_check "$1" ;;
+    default)
+      [[ -n "${1:-}" ]] || { _api_usage "entry default ИМЯ|direct"; return; }
+      entry_default "$1" ;;
+    all)
+      [[ -n "${1:-}" ]] || { _api_usage "entry all ИМЯ|direct"; return; }
+      entry_assign_all "$1" ;;
+    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct" ;;
   esac
 }
 
@@ -1097,7 +1138,7 @@ _api_readonly() {
     "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan"|"vkblock "|"vkblock status") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list") return 0 ;;
   esac
   return 1
 }
@@ -1138,6 +1179,7 @@ api_dispatch() {
     t2s) _api_t2s "$@" ;;
     exits) _api_exits "$@" ;;
     cascade) _api_cascade "$@" ;;
+    entry) _api_entry "$@" ;;
     dns) _api_dns "$@" ;;
     wgobf) _api_wgobf "$@" ;;
     update) _api_update "$@" ;;
@@ -1153,7 +1195,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
+      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
