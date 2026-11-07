@@ -687,7 +687,7 @@ _api_cascade() {
     list)
       cascade_rules | while IFS='|' read -r p in dst out cm; do
         on=0
-        iptables-save -t nat 2>/dev/null | grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)" && on=1
+        grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)" <<< "$(iptables-save -t nat 2>/dev/null)" && on=1
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$in" "$dst" "$out" "$cm" "$on"
       done | api_rows proto in:n dst out:n comment applied:b ;;
     add)

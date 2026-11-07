@@ -168,7 +168,7 @@ WARP_HEALTH_FAILS="{ROOT}/warp-fails"; WARP_HEALTH_RETRY="{ROOT}/warp-retry"; WA
 VKBLOCK_DIR="$STATE_DIR/vkblock"; VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"; VKBLOCK_LOG="{ROOT}/vkblock.log"
 RUDIRECT_DIR="$STATE_DIR/rudirect"; RUDIRECT_CONF="$RUDIRECT_DIR/rudirect.conf"; RUDIRECT_USER="{ROOT}/etc/awg2/rudirect"
 RUDIRECT_LOG="{ROOT}/rudirect.log"; TUNFAIL_CONF="{ROOT}/etc/awg2/tunnel-fail.conf"; TUNFAIL_LOG="{ROOT}/tunfail.log"
-DIAG_FWD="{ROOT}/ip_forward"
+DIAG_FWD="{ROOT}/ip_forward"; RUDIRECT_RPF="{ROOT}/rpf"
 AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
 AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"
 # Веб-панель: стенд (web_stand.py) передаёт свои конфиг и список адресов

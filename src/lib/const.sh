@@ -232,6 +232,7 @@ RUDIRECT_LOG="/var/log/awg2-rudirect.log"
 RUDIRECT_SET="awg2-ru" RUDIRECT_TAG="awg2-rudirect"
 # Метка в старших битах: младшие заняты чужими (wg-quick — 51820)
 RUDIRECT_MARK="0x52550000/0xffff0000" RUDIRECT_PRIO=90     # приоритет раньше туннелей (100-249)
+RUDIRECT_RPF="/proc/sys/net/ipv4/conf"                # rp_filter аплинка: строгий ломает ответы
 RUDIRECT_UNIT="awg2-rudirect.service" RUDIRECT_TIMER="awg2-rudirect-update.timer"
 RUDIRECT_SRCS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
 # Настоящий список: ~8700 сетей, ~45 млн адресов IPv4. Короче или уже — оборван,

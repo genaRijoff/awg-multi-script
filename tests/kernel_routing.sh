@@ -2,7 +2,7 @@
 # Маршрутизация туннелей на настоящем ядре: правила клиентов, «если туннель
 # упал» (unreachable под маршрутом), метка и правило «РФ напрямую», «куда идёт
 # адрес» — настоящими ip, ipset и iptables в отдельном сетевом пространстве.
-# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect
+# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf
 # (или через tests/test_kernel_routing.py — он сам пропустит, если netns нет).
 # shellcheck disable=SC2034  # пути — для функций awg2, подключённых через eval
 set -u
@@ -30,8 +30,39 @@ ok() { if eval "$2"; then echo "  OK   $1"; pass=$((pass+1)); else echo "  FAIL 
 rg() { ip -4 route get "$1" from "$2" iif awg0 ${3:+mark $3} 2>&1; }
 
 ip link set lo up
-ip tuntap add mode tun dev awg0; ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
-ip link add eth0 type veth peer name eth0p; ip addr add 203.0.113.10/24 dev eth0; ip link set eth0 up; ip link set eth0p up
+if [[ "$PART" == rpf ]]; then
+  # Настоящий трафик: клиент и «интернет» — свои сетевые пространства
+  for c in nsenter python3; do command -v "$c" &>/dev/null || { echo "ПРОПУСК rpf: нет $c"; exit 0; }; done
+  unshare -n sleep 600 & CLI=$!; unshare -n sleep 600 & NET=$!; sleep 0.3
+  trap 'kill $CLI $NET 2>/dev/null' EXIT
+  ip link add awg0 type veth peer name c0; ip link set c0 netns "$CLI"
+  ip link add eth0 type veth peer name i0; ip link set i0 netns "$NET"
+  ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
+  ip addr add 203.0.113.10/24 dev eth0; ip link set eth0 up
+  nsenter -t "$CLI" -n sh -c 'ip link set lo up; ip addr add 10.23.45.2/24 dev c0; ip link set c0 up; ip route add default via 10.23.45.1'
+  nsenter -t "$NET" -n sh -c 'ip link set lo up; ip addr add 203.0.113.1/24 dev i0; ip link set i0 up; ip addr add 77.1.1.1/32 dev lo'
+  cat > "$T/srv.py" <<'PY'
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("0.0.0.0", 443)); s.listen(8)
+while True:
+    c, _ = s.accept(); c.recv(4096); c.sendall(b"OK"); c.close()
+PY
+  cat > "$T/cl.py" <<'PY'
+import socket, sys
+try:
+    c = socket.create_connection((sys.argv[1], 443), timeout=2); c.sendall(b"x" * 3000)
+    sys.exit(0 if c.recv(10) == b"OK" else 1)
+except OSError:
+    sys.exit(1)
+PY
+  nsenter -t "$NET" -n python3 -I "$T/srv.py" & SRV=$!
+  trap 'kill $CLI $NET $SRV 2>/dev/null' EXIT
+  iptables -t nat -A POSTROUTING -s 10.23.45.0/24 -o eth0 -j MASQUERADE
+  reach() { nsenter -t "$CLI" -n python3 -I "$T/cl.py" "$1"; }
+else
+  ip tuntap add mode tun dev awg0; ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
+  ip link add eth0 type veth peer name eth0p; ip addr add 203.0.113.10/24 dev eth0; ip link set eth0 up; ip link set eth0p up
+fi
 ip route add default via 203.0.113.1 dev eth0
 echo 1 > /proc/sys/net/ipv4/ip_forward
 for f in /proc/sys/net/ipv4/conf/*/rp_filter; do echo 2 > "$f" 2>/dev/null; done
@@ -86,7 +117,7 @@ rt_up tun0 100 -
 ok "поднят tun2socks — удержание WARP снято, клиент в tun0" '! ip rule show | grep -q "lookup 200" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev tun0"* ]]'
 tunfail_guard_run >/dev/null
 ok "сторож при живом tun2socks WARP не держит" '! ip rule show | grep -q "lookup 200"'
-else
+elif [[ "$PART" == rudirect ]]; then
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
 mkdir -p "$RUDIRECT_DIR" "$RUDIRECT_USER"
 for b in $(seq 0 255); do for c in 0 64 128 192; do echo "77.$b.$c.0/18"; done; done > "$RUDIRECT_DIR/ru.list"
@@ -100,6 +131,14 @@ ok "сводка: $(rudirect_summary)" '[[ "$(rudirect_summary)" == "сетей 
 rudirect_run apply >/dev/null
 ok "повтор apply — без дублей правил" '(( $(iptables-save -t mangle | grep -c awg2-rudirect) == 2 && $(ip rule show | grep -c "fwmark 0x52550000") == 1 ))'
 ok "счётчики читаются: $(rudirect_counters)" '[[ "$(rudirect_counters)" =~ ^[0-9]+\ [0-9]+$ ]]'
+# Много клиентов в туннелях — длинный «ip rule show»: при pipefail «… | grep -q»
+# ловил SIGPIPE и правило «пропадало»
+for i in $(seq 1 250); do ip rule add from "10.99.$((i / 200)).$((i % 200 + 1))" lookup 300 priority 300; done
+f=0; for i in $(seq 1 40); do rudirect_rules_ok || f=$((f + 1)); done
+ok "250 правил клиентов, pipefail — правила на месте 40 раз из 40 (ложных: $f)" '(( f == 0 ))'
+f=0; for i in $(seq 1 40); do tunfail_held warp && f=$((f + 1)); done
+ok "…и удержание WARP не мерещится" '(( f == 0 ))'
+while ip rule del lookup 300 2>/dev/null; do :; done
 echo "── Куда идёт адрес (ядро) ──"
 rudirect_on() { [[ "$(_rud_get ON)" == 1 ]]; }
 out=$(diag_route alice 77.1.1.1); ok "сеть России — rudirect: $out" '[[ "$out" == *$'"'"'\trudirect\teth0\t'"'"'* ]]'
@@ -114,6 +153,30 @@ out=$(diag_route alice 1.1.1.1); ok "пересылка выключена — n
 echo 1 > /proc/sys/net/ipv4/ip_forward
 _rud_set ON 0; rudirect_run off
 ok "off: правила и набор сняты" '! ipset list -n awg2-ru &>/dev/null && ! iptables-save -t mangle | grep -q awg2-rudirect && ! ip rule show | grep -q fwmark'
+else
+echo "── РФ напрямую: настоящий трафик и строгий rp_filter на аплинке ──"
+mkwarp; rt_up warp0 200 "$WARP_PEERS"
+mkdir -p "$RUDIRECT_DIR" "$RUDIRECT_USER"
+for b in $(seq 0 255); do for c in 0 64 128 192; do echo "77.$b.$c.0/18"; done; done > "$RUDIRECT_DIR/ru.list"
+rpf() { cat "/proc/sys/net/ipv4/conf/$1/rp_filter"; }
+echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
+ok "без «РФ напрямую» сеть России — в WARP (выхода у него нет): ответа нет" '! reach 77.1.1.1'
+_rud_set ON 1; rudirect_run apply; rc=$?
+ok "apply: код 0, rp_filter на eth0 строгий → мягкий" '(( rc == 0 )) && [[ "$(rpf eth0)" == 2 ]] && grep -q "rp_filter на eth0: строгий → мягкий" "$RUDIRECT_LOG"'
+ok "клиент в WARP получил ответ из сети России напрямую" 'reach 77.1.1.1'
+echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
+ok "rp_filter снова строгий — ответа нет (то, что ломало сайты РФ)" '! reach 77.1.1.1'
+ok "…правила не на месте" '! rudirect_rules_ok'
+out=$(diag_route alice 77.1.1.1); ok "куда идёт: подсказка про rp_filter: $out" '[[ "$out" == *$'"'"'\tnone\teth0\t'"'"'*rp_filter* ]]'
+rudirect_run heal
+ok "таймер вернул мягкий — ответ есть" '[[ "$(rpf eth0)" == 2 ]] && rudirect_rules_ok && reach 77.1.1.1'
+out=$(diag_route alice 77.1.1.1); ok "куда идёт: снова rudirect" '[[ "$out" == *$'"'"'\trudirect\teth0\t'"'"'* ]]'
+echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 0 > /proc/sys/net/ipv4/conf/eth0/rp_filter
+ok "all=1, eth0=0 — тоже строгий" '! rudirect_rules_ok && ! reach 77.1.1.1'
+rudirect_run heal
+ok "…починен (eth0=2 сильнее all=1) — ответ есть" '[[ "$(rpf eth0)" == 2 ]] && rudirect_rules_ok && reach 77.1.1.1'
+echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
+out=$(diag_route bob 77.1.1.1); ok "клиент без туннеля при строгом — rudirect без подсказки (обратный путь и так eth0)" '[[ "$out" == *$'"'"'\trudirect\teth0\t'"'"'* ]]'
 fi
 echo "проверок: $((pass+fail)), провалов: $fail"
 (( fail == 0 ))

@@ -86,7 +86,46 @@ _rud_rule() {  # интерфейс → RUDIRECT_RULE
                  -m comment --comment "$RUDIRECT_TAG" -j MARK --set-xmark "$RUDIRECT_MARK")
 }
 
-_rud_ip_rule_on() { ip rule show 2>/dev/null | grep -q "fwmark ${RUDIRECT_MARK} lookup main"; }
+# Без «ip rule show | grep -q»: grep выходит на первой строке, ip получает
+# SIGPIPE, и при pipefail (awg2) длинный список правил — «правила нет».
+_rud_ip_rule_on() { [[ "$(ip rule show 2>/dev/null)" == *"fwmark ${RUDIRECT_MARK} lookup main"* ]]; }
+
+# Аплинки — устройства маршрутов по умолчанию в main, кроме своих
+_rud_uplinks() {
+  ip -4 route show default 2>/dev/null | awk -v own="$OWN_IFACES" '
+    { for (i = 1; i < NF; i++) if ($i == "dev" && index(own, " " $(i + 1) " ") == 0 && !seen[$(i + 1)]++) print $(i + 1) }'
+}
+
+# Строгий rp_filter на аплинке (1; действует большее из all и устройства)
+# молча отбрасывает ответы сайтов РФ: обратный путь к адресу клиента ядро
+# ищет по правилу «from клиент lookup <туннель>» — он ведёт в туннель, а
+# ответ пришёл на аплинк. Мягкий (2) проверяет только, что путь есть.
+_rud_rpf_strict() {  # устройство
+  local a d
+  a=$(cat "$RUDIRECT_RPF/all/rp_filter" 2>/dev/null) || a=0
+  d=$(cat "$RUDIRECT_RPF/$1/rp_filter" 2>/dev/null) || return 1
+  (( (a > d ? a : d) == 1 ))
+}
+
+_rud_rpf_ok() {
+  local dev
+  for dev in $(_rud_uplinks); do ! _rud_rpf_strict "$dev" || return 1; done
+  return 0
+}
+
+_rud_rpf_loose() {
+  local dev
+  for dev in $(_rud_uplinks); do
+    _rud_rpf_strict "$dev" || continue
+    if echo 2 > "$RUDIRECT_RPF/$dev/rp_filter" 2>/dev/null; then
+      _rud_log "rp_filter на $dev: строгий → мягкий (иначе ответы сайтов РФ отбрасываются)"
+    else
+      _rud_log "rp_filter на $dev: не удалось сделать мягким — ответы сайтов РФ клиентам в туннеле не дойдут"
+      return 1
+    fi
+  done
+  return 0
+}
 
 _rud_rules_up() {
   local dev
@@ -96,6 +135,7 @@ _rud_rules_up() {
       || iptables -t mangle -I PREROUTING 1 "${RUDIRECT_RULE[@]}" || return 1
   done
   _rud_ip_rule_on || ip rule add fwmark "$RUDIRECT_MARK" lookup main priority "$RUDIRECT_PRIO" || return 1
+  _rud_rpf_loose || return 1
   ip route flush cache 2>/dev/null || true
 }
 
@@ -110,12 +150,13 @@ _rud_rules_down() {
   return 0
 }
 
-# Правила на месте: набор, метка для awg0 и правило маршрутизации
+# Правила на месте: набор, метка для awg0, правило маршрутизации и не
+# строгий rp_filter на аплинке
 rudirect_rules_ok() {
   ipset list -n "$RUDIRECT_SET" &>/dev/null || return 1
   _rud_rule "$AWG_IF"
   iptables -t mangle -C PREROUTING "${RUDIRECT_RULE[@]}" 2>/dev/null || return 1
-  _rud_ip_rule_on
+  _rud_ip_rule_on && _rud_rpf_ok
 }
 
 # Собрать набор из сохранённого списка и своих и поставить правила.
@@ -184,9 +225,10 @@ rudirect_run() {
 _rudirect_emit() {
   emit_script "$RUDIRECT_SCRIPT" 'rudirect_run "$@"' \
     RUDIRECT_DIR RUDIRECT_CONF RUDIRECT_USER RUDIRECT_LOG RUDIRECT_SET RUDIRECT_TAG RUDIRECT_MARK RUDIRECT_PRIO \
-    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 AWG_IF WGOBF_IF \
+    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 RUDIRECT_RPF AWG_IF WGOBF_IF OWN_IFACES \
     write_file _rud_get _rud_set _rud_log _rud_fail _antiscan_parse _antiscan_span _antiscan_load \
-    _rud_fetch _rud_user_file _rud_user_cidrs _rud_has_domains _rud_rule _rud_ip_rule_on _rud_rules_up \
+    _rud_fetch _rud_user_file _rud_user_cidrs _rud_has_domains _rud_rule _rud_ip_rule_on _rud_uplinks \
+    _rud_rpf_strict _rud_rpf_ok _rud_rpf_loose _rud_rules_up \
     _rud_rules_down rudirect_rules_ok _rud_apply rudirect_down rudirect_run || return 1
   write_unit "$RUDIRECT_UNIT" <<EOF
 [Unit]

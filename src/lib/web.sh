@@ -156,7 +156,7 @@ _web_fw_run() {  # apply|down|check
   rule=(! -i lo -p tcp --dport "$port" -m conntrack --ctstate NEW -m set ! --match-set)
   if [[ "${1:-}" == check ]]; then
     if [[ "$mode" != ip && "$mode" != vpn ]]; then
-      [[ ! -e "$WEB_NETS_FILE" ]] && ! iptables -S INPUT 2>/dev/null | grep -qE -- "--comment \"?$WEB_FW_TAG\"?( |\$)"
+      [[ ! -e "$WEB_NETS_FILE" ]] && ! grep -qE -- "--comment \"?$WEB_FW_TAG\"?( |\$)" <<< "$(iptables -S INPUT 2>/dev/null)"
       return
     fi
     nets=$(_web_fw_nets | grep .)

@@ -51,7 +51,7 @@ _tunfail_hold() {  # имя
   local name="$1" table net mode f line ip
   table=$(_tunfail_table "$name")
   ip route replace unreachable default metric 4096 table "$table" 2>/dev/null || return 1
-  ip rule show 2>/dev/null | grep -qE "lookup $table\$" && return 1
+  grep -qE "lookup $table\$" <<< "$(ip rule show 2>/dev/null)" && return 1
   net=$(server_net) || return 1
   case "$name" in
     warp) rt_rules_file "$WARP_PEERS" "$table" ;;
@@ -112,7 +112,7 @@ tunfail_held() {  # имя
   local table
   table=$(_tunfail_table "$1")
   [[ "$(rt_fail_mode "$1")" == block ]] && rt_tunnel_on "$table" && ! rt_table_live "$table" \
-    && ip rule show 2>/dev/null | grep -qE "lookup $table\$" \
+    && grep -qE "lookup $table\$" <<< "$(ip rule show 2>/dev/null)" \
     && ip route show table "$table" 2>/dev/null | grep -q '^unreachable default'
 }
 
