@@ -8,7 +8,6 @@ import hashlib
 import hmac
 import json
 import multiprocessing
-import os
 import sys
 import tempfile
 import time
@@ -244,4 +243,4 @@ class AuthHardeningTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main(argv=sys.argv[:1], verbosity=2)
