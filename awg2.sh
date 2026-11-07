@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.56"
+VERSION="v1.2.57"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -603,6 +603,7 @@ RUDIRECT_LOG="/var/log/awg2-rudirect.log"
 RUDIRECT_SET="awg2-ru" RUDIRECT_TAG="awg2-rudirect"
 # Метка в старших битах: младшие заняты чужими (wg-quick — 51820)
 RUDIRECT_MARK="0x52550000/0xffff0000" RUDIRECT_PRIO=90     # приоритет раньше туннелей (100-249)
+RUDIRECT_RPF="/proc/sys/net/ipv4/conf"                # rp_filter аплинка: строгий ломает ответы
 RUDIRECT_UNIT="awg2-rudirect.service" RUDIRECT_TIMER="awg2-rudirect-update.timer"
 RUDIRECT_SRCS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
 # Настоящий список: ~8700 сетей, ~45 млн адресов IPv4. Короче или уже — оборван,
@@ -6925,7 +6926,7 @@ cascade_list() {
   printf "  ${D}%-3s %-4s %-6s %-16s %-6s %s${N}\n" "#" "" "ВХОД" "ЦЕЛЬ" "ВЫХОД" "КОММЕНТАРИЙ"
   for i in "${!rows[@]}"; do
     IFS='|' read -r p in dst out cm <<< "${rows[$i]}"
-    if iptables-save -t nat 2>/dev/null | grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)"; then mark="${G}●${N}"; else mark="${R}○${N}"; fi
+    if grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)" <<< "$(iptables-save -t nat 2>/dev/null)"; then mark="${G}●${N}"; else mark="${R}○${N}"; fi
     printf "  %-3s %b %-4s %-6s %-16s %-6s %s\n" "$((i + 1)))" "$mark" "${p^^}" "$in" "$dst" "$out" "${cm:-—}"
   done
   echo -e "  ${D}● применено, ○ записано, но в iptables нет (Переприменить правила)${N}"
@@ -7840,7 +7841,7 @@ EOF
     t2s_down quiet
     return 1
   fi
-  for i in $(seq 1 10); do ip rule show | grep -q "lookup $T2S_TABLE" && break; sleep 0.5; done
+  for i in $(seq 1 10); do grep -q "lookup $T2S_TABLE" <<< "$(ip rule show)" && break; sleep 0.5; done
   ok "tun2socks включён: все клиенты идут через $proxy"
 }
 
@@ -11176,7 +11177,7 @@ _web_fw_run() {  # apply|down|check
   rule=(! -i lo -p tcp --dport "$port" -m conntrack --ctstate NEW -m set ! --match-set)
   if [[ "${1:-}" == check ]]; then
     if [[ "$mode" != ip && "$mode" != vpn ]]; then
-      [[ ! -e "$WEB_NETS_FILE" ]] && ! iptables -S INPUT 2>/dev/null | grep -qE -- "--comment \"?$WEB_FW_TAG\"?( |\$)"
+      [[ ! -e "$WEB_NETS_FILE" ]] && ! grep -qE -- "--comment \"?$WEB_FW_TAG\"?( |\$)" <<< "$(iptables -S INPUT 2>/dev/null)"
       return
     fi
     nets=$(_web_fw_nets | grep .)
@@ -12669,7 +12670,46 @@ _rud_rule() {  # интерфейс → RUDIRECT_RULE
                  -m comment --comment "$RUDIRECT_TAG" -j MARK --set-xmark "$RUDIRECT_MARK")
 }
 
-_rud_ip_rule_on() { ip rule show 2>/dev/null | grep -q "fwmark ${RUDIRECT_MARK} lookup main"; }
+# Без «ip rule show | grep -q»: grep выходит на первой строке, ip получает
+# SIGPIPE, и при pipefail (awg2) длинный список правил — «правила нет».
+_rud_ip_rule_on() { [[ "$(ip rule show 2>/dev/null)" == *"fwmark ${RUDIRECT_MARK} lookup main"* ]]; }
+
+# Аплинки — устройства маршрутов по умолчанию в main, кроме своих
+_rud_uplinks() {
+  ip -4 route show default 2>/dev/null | awk -v own="$OWN_IFACES" '
+    { for (i = 1; i < NF; i++) if ($i == "dev" && index(own, " " $(i + 1) " ") == 0 && !seen[$(i + 1)]++) print $(i + 1) }'
+}
+
+# Строгий rp_filter на аплинке (1; действует большее из all и устройства)
+# молча отбрасывает ответы сайтов РФ: обратный путь к адресу клиента ядро
+# ищет по правилу «from клиент lookup <туннель>» — он ведёт в туннель, а
+# ответ пришёл на аплинк. Мягкий (2) проверяет только, что путь есть.
+_rud_rpf_strict() {  # устройство
+  local a d
+  a=$(cat "$RUDIRECT_RPF/all/rp_filter" 2>/dev/null) || a=0
+  d=$(cat "$RUDIRECT_RPF/$1/rp_filter" 2>/dev/null) || return 1
+  (( (a > d ? a : d) == 1 ))
+}
+
+_rud_rpf_ok() {
+  local dev
+  for dev in $(_rud_uplinks); do ! _rud_rpf_strict "$dev" || return 1; done
+  return 0
+}
+
+_rud_rpf_loose() {
+  local dev
+  for dev in $(_rud_uplinks); do
+    _rud_rpf_strict "$dev" || continue
+    if echo 2 > "$RUDIRECT_RPF/$dev/rp_filter" 2>/dev/null; then
+      _rud_log "rp_filter на $dev: строгий → мягкий (иначе ответы сайтов РФ отбрасываются)"
+    else
+      _rud_log "rp_filter на $dev: не удалось сделать мягким — ответы сайтов РФ клиентам в туннеле не дойдут"
+      return 1
+    fi
+  done
+  return 0
+}
 
 _rud_rules_up() {
   local dev
@@ -12679,6 +12719,7 @@ _rud_rules_up() {
       || iptables -t mangle -I PREROUTING 1 "${RUDIRECT_RULE[@]}" || return 1
   done
   _rud_ip_rule_on || ip rule add fwmark "$RUDIRECT_MARK" lookup main priority "$RUDIRECT_PRIO" || return 1
+  _rud_rpf_loose || return 1
   ip route flush cache 2>/dev/null || true
 }
 
@@ -12693,12 +12734,13 @@ _rud_rules_down() {
   return 0
 }
 
-# Правила на месте: набор, метка для awg0 и правило маршрутизации
+# Правила на месте: набор, метка для awg0, правило маршрутизации и не
+# строгий rp_filter на аплинке
 rudirect_rules_ok() {
   ipset list -n "$RUDIRECT_SET" &>/dev/null || return 1
   _rud_rule "$AWG_IF"
   iptables -t mangle -C PREROUTING "${RUDIRECT_RULE[@]}" 2>/dev/null || return 1
-  _rud_ip_rule_on
+  _rud_ip_rule_on && _rud_rpf_ok
 }
 
 # Собрать набор из сохранённого списка и своих и поставить правила.
@@ -12767,9 +12809,10 @@ rudirect_run() {
 _rudirect_emit() {
   emit_script "$RUDIRECT_SCRIPT" 'rudirect_run "$@"' \
     RUDIRECT_DIR RUDIRECT_CONF RUDIRECT_USER RUDIRECT_LOG RUDIRECT_SET RUDIRECT_TAG RUDIRECT_MARK RUDIRECT_PRIO \
-    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 AWG_IF WGOBF_IF \
+    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 RUDIRECT_RPF AWG_IF WGOBF_IF OWN_IFACES \
     write_file _rud_get _rud_set _rud_log _rud_fail _antiscan_parse _antiscan_span _antiscan_load \
-    _rud_fetch _rud_user_file _rud_user_cidrs _rud_has_domains _rud_rule _rud_ip_rule_on _rud_rules_up \
+    _rud_fetch _rud_user_file _rud_user_cidrs _rud_has_domains _rud_rule _rud_ip_rule_on _rud_uplinks \
+    _rud_rpf_strict _rud_rpf_ok _rud_rpf_loose _rud_rules_up \
     _rud_rules_down rudirect_rules_ok _rud_apply rudirect_down rudirect_run || return 1
   write_unit "$RUDIRECT_UNIT" <<EOF
 [Unit]
@@ -13090,7 +13133,7 @@ _tunfail_hold() {  # имя
   local name="$1" table net mode f line ip
   table=$(_tunfail_table "$name")
   ip route replace unreachable default metric 4096 table "$table" 2>/dev/null || return 1
-  ip rule show 2>/dev/null | grep -qE "lookup $table\$" && return 1
+  grep -qE "lookup $table\$" <<< "$(ip rule show 2>/dev/null)" && return 1
   net=$(server_net) || return 1
   case "$name" in
     warp) rt_rules_file "$WARP_PEERS" "$table" ;;
@@ -13151,7 +13194,7 @@ tunfail_held() {  # имя
   local table
   table=$(_tunfail_table "$1")
   [[ "$(rt_fail_mode "$1")" == block ]] && rt_tunnel_on "$table" && ! rt_table_live "$table" \
-    && ip rule show 2>/dev/null | grep -qE "lookup $table\$" \
+    && grep -qE "lookup $table\$" <<< "$(ip rule show 2>/dev/null)" \
     && ip route show table "$table" 2>/dev/null | grep -q '^unreachable default'
 }
 
@@ -13728,7 +13771,11 @@ diag_route() {  # клиент адрес
             [[ "$(exits_state_get balancer)" == ecmp ]] && ip route show table "$EXITS_TABLE" 2>/dev/null | grep -q nexthop \
               && note+=" (балансировка: соединения делятся между нодами)" ;;
           *)
-            if [[ -n "$mark" ]]; then kind=rudirect note="напрямую с сервера — сеть России («РФ напрямую»)"
+            if [[ -n "$mark" ]] && _rud_rpf_strict "$dev" \
+                 && [[ "$(ip -4 route get "$ip" from "$cip" iif "$AWG_IF" 2>/dev/null)" != *" dev $dev "* ]]; then
+              # Без метки клиент идёт в туннель: обратный путь — туда же, ответ на $dev отбросят
+              kind=none note="сеть России, но ответы отбросит строгий rp_filter на $dev — «РФ напрямую → Починить»"
+            elif [[ -n "$mark" ]]; then kind=rudirect note="напрямую с сервера — сеть России («РФ напрямую»)"
             elif [[ -n "$tun" ]]; then kind=direct note="напрямую с сервера — клиент не в туннеле ($tun)"
             else kind=direct note="напрямую с сервера — туннели выключены"; fi ;;
         esac
@@ -14572,7 +14619,7 @@ _api_cascade() {
     list)
       cascade_rules | while IFS='|' read -r p in dst out cm; do
         on=0
-        iptables-save -t nat 2>/dev/null | grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)" && on=1
+        grep -qE -- "$(cascade_tag "$p" "$in")\"?( |$)" <<< "$(iptables-save -t nat 2>/dev/null)" && on=1
         printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$in" "$dst" "$out" "$cm" "$on"
       done | api_rows proto in:n dst out:n comment applied:b ;;
     add)
@@ -20308,5 +20355,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=fdf0939576ceb634
+_BUILD_SUM=baf26fa44f0f0311
 main "$@"
