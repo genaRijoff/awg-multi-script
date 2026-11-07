@@ -8,6 +8,7 @@
 import base64
 import difflib
 import importlib
+import ipaddress
 import json
 import os
 import re
@@ -200,11 +201,24 @@ def entries_write(head, ents, default):
 
 
 def entry_addr(v):
-    """«хост:порт» точки входа: IPv4 или домен, порт 1-65535."""
+    """«хост:порт» точки входа: IPv4, домен или [IPv6], порт 1-65535."""
     v = v.strip().lower()
+    m6 = re.fullmatch(r"\[([0-9a-f:.]+)\]:(\d{1,5})", v)
+    if m6:
+        try:
+            ip = ipaddress.IPv6Address(m6.group(1))
+        except ValueError:
+            die("Неверный IPv6: %s" % _shown(m6.group(1)), 2)
+        if not ip.is_global:
+            die("IPv6 входа — глобальный адрес (не fe80::, не fd00::, не локальный)", 2)
+        if not 1 <= int(m6.group(2)) <= 65535:
+            die("Порт входа: 1-65535", 2)
+        return "[%s]:%d" % (ip.compressed, int(m6.group(2)))
+    if v.startswith("["):
+        die("Неверный IPv6-адрес входа — нужен [адрес]:порт, например [2001:db8::1]:443", 2)
     m = re.fullmatch(r"([^\s:/]+):(\d{1,5})", v)
     if not m:
-        die("Адрес входа — хост:порт, например 203.0.113.5:443 или vpn.example.com:443", 2)
+        die("Адрес входа — хост:порт, например 203.0.113.5:443, vpn.example.com:443 или [2001:db8::1]:443", 2)
     host, port = m.group(1), int(m.group(2))
     if not 1 <= port <= 65535:
         die("Порт входа: 1-65535", 2)

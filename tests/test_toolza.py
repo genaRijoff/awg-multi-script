@@ -2553,6 +2553,72 @@ chk("выбранным — напрямую", d.get("ok") and EP("carol") == "1
 d = ejson("api_main entry clients Probe nosuch")
 chk("ни одного знакомого клиента — отказ", not d.get("ok") and "Ни одного" in d.get("error", ""), d)
 
+print("\n── IPv6 сервера — точкой входа ──")
+V6 = "2a01:4f8:c0c:1234::1"
+IP6 = (r'ip() { case "$*" in "-6 route show default") echo "default via fe80::1 dev eth0 proto ra metric 100";; '
+       r'*"-6 -o addr show"*) printf "%s\n" "2: eth0    inet6 2a01:4f8:c0c:1234:aaaa:bbbb:cccc:dddd/64 scope global temporary dynamic" '
+       r'"2: eth0    inet6 fd00::5/64 scope global" "2: eth0    inet6 2a01:4f8:c0c:1234::1/64 scope global dynamic mngtmpaddr" '
+       r'"2: eth0    inet6 2a01:4f8:c0c:1234::2/64 scope global deprecated";; esac; }; ')
+rc, out, _ = bash(IP6 + "public_ip6; _own_ip6 2a01:4f8:c0c:1234::1 && echo OWN; _own_ip6 2a01:4f8:c0c:9999::1 || echo FOREIGN")
+chk("глобальный IPv6 сервера: без временного, ULA и устаревшего; свой адрес узнаётся",
+    out.split() == [V6, "OWN", "FOREIGN"], out)
+bad = [ejson(f"api_main entry add X {a}").get("error", "") for a in ("[fd00::1]:443", "[fe80::1]:443", "[zz::1]:443")]
+chk("IPv6 входа: ULA, link-local и кривой адрес — отказ", "глобальный" in bad[0] and "глобальный" in bad[1] and "IPv6" in bad[2], bad)
+d = ejson("api_main entry add Внешний6 [2A01:4F8:C0C:5678:0:0:0:1]:443")
+chk("[IPv6]:порт — сокращается и в нижнем регистре",
+    d.get("ok") and json.loads(bash(EENV + 'py entry "$SERVER_CONF" get Внешний6')[1] or '""') if False else
+    bash(EENV + 'py entry "$SERVER_CONF" get Внешний6')[1].strip() == "[2a01:4f8:c0c:5678::1]:443", d)
+ejson("api_main entry del Внешний6")
+SELF = (IP6 + f'IPV6_SYSCTL="{EDIR}/v6sysctl"; UFW_DEFAULTS="{EDIR}/ufwdef"; '
+        'ss() { echo "UNCONN 0 0 0.0.0.0:51820 0.0.0.0:*"; echo "UNCONN 0 0 [::]:51820 [::]:*"; }; '
+        'curl() { [[ -z "${NO6:-}" ]]; }; ufw_active() { [[ -n "${UFWON:-}" ]]; }; '
+        'ufw() { echo "Status: active"; echo "51820/udp                  ALLOW       Anywhere"; '
+        '[[ -n "${V4ONLY:-}" ]] || echo "51820/udp (v6)             ALLOW       Anywhere (v6)"; }; ')
+with open(os.path.join(EDIR, "v6sysctl"), "w") as f:
+    f.write("0\n")
+with open(os.path.join(EDIR, "ufwdef"), "w") as f:
+    f.write("IPV6=yes\n")
+cases = {"ok": "", "off": f'echo 1 > "{EDIR}/v6sysctl"; ', "port": "", "nolisten": 'ss() { echo "UNCONN 0 0 0.0.0.0:51820 0.0.0.0:*"; }; ',
+         "ufwno": f'UFWON=1; echo IPV6=no > "{EDIR}/ufwdef"; ', "v4only": "UFWON=1 V4ONLY=1; ", "noroute": "NO6=1; "}
+res = {}
+for k, pre in cases.items():
+    with open(os.path.join(EDIR, "v6sysctl"), "w") as f:
+        f.write("0\n")
+    with open(os.path.join(EDIR, "ufwdef"), "w") as f:
+        f.write("IPV6=yes\n")
+    port = "443" if k == "port" else "51820"
+    rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + pre
+                      + f'entry_probe "[{V6}]:{port}"; echo "rc=$? $ENTRY_PROBE_WHY"')
+    res[k] = out.strip().splitlines()[-1]
+chk("свой IPv6: всё готово — 0; IPv6 выключен, чужой порт, AWG не слушает IPv6, UFW без IPv6, порт только для IPv4, нет маршрута — 1 с причиной",
+    res["ok"] == "rc=0" and "выключен" in res["off"] and "не порт AWG" in res["port"] and "не слушает" in res["nolisten"]
+    and "IPV6=no" in res["ufwno"] and "только для IPv4" in res["v4only"] and "нет выхода" in res["noroute"]
+    and all(v.startswith("rc=1") for k, v in res.items() if k != "ok"), res)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + "api_main entry add-ipv6")
+d = json.loads(out.strip().splitlines()[-1])
+chk("entry add-ipv6: вход «IPv6» на [IPv6 сервера]:порт AWG, проверка своего IPv6 пройдена",
+    d.get("ok") and d["data"] == {"name": "IPv6", "addr": f"[{V6}]:51820"} and "Вход работает" in d["log"], d)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + "api_main entry add-ipv6")
+d = json.loads(out.strip().splitlines()[-1])
+chk("повторно — не дублируется", d.get("ok") and "уже есть" in d["log"] and d["data"]["name"] == "IPv6", d)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + "NO6=1; api_main entry check IPv6; api_main client entry carol IPv6")
+lines = [json.loads(l) for l in out.strip().splitlines() if l.startswith("{")]
+chk("свой IPv6 без маршрута наружу: проверка — с причиной, выдача клиенту — отказ с причиной",
+    not lines[0]["ok"] and "нет выхода в интернет по IPv6" in lines[0]["error"]
+    and not lines[1]["ok"] and "не готов" in lines[1]["error"] and "IPv6" in lines[1]["error"], lines)
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + "S_FIRST_CLIENT=carol; _server_create_ipv6")
+chk("создание сервера с IPv6: вход для новых и первый клиент — на IPv6", f"[{V6}]:51820" in out and EP("carol") == f"[{V6}]:51820"
+    and json.loads(bash(EENV + "api_main entry list")[1].strip().splitlines()[-1])["data"][-1]["default"], out)
+ejson("api_main entry all direct")
+rc, out, _ = bash(EENV.replace("entry_probe() { return 0; }; ", "") + SELF + 'NO6=1; S_FIRST_CLIENT=dave; _server_create_ipv6')
+chk("создание сервера: IPv6 не готов — причина, клиенты на IPv4", "нет выхода в интернет по IPv6" in out and "IPv4" in out
+    and EP("dave") == "198.51.100.7:51820", out)
+ejson("api_main entry del IPv6")
+rc, out, _ = bash('server_create_ready() { return 0; }; public_ip6() { :; }; server_create_opts endpoint=ipv6 2>&1; echo rc=$?')
+chk("server create endpoint=ipv6 без IPv6 у сервера — отказ", "нет глобального IPv6" in out and "rc=1" in out, out[-300:])
+rc, out, _ = bash(IP6 + 'api_main server info')
+chk("server info: IPv6 сервера", json.loads(out.strip().splitlines()[-1])["data"].get("ipv6") == V6, out[-300:])
+
 print("\n── Веб-панель (awg2) ──")
 WEBC = os.path.join(TMP, "awg-web.conf")
 WEBPRE = (f'WEB_CONF="{WEBC}"; WEB_LOG="{TMP}/awg-web.log"; WEB_DIR="{TMP}/awg-web"; BOT_DIR="{TMP}/awg-bot"; '

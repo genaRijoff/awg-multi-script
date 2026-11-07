@@ -95,8 +95,13 @@ _entry_ready() {  # имя (пусто — напрямую, всегда мож
   IFS=$'\t' read -r st ts <<< "$(_entry_check_get "$1" "$a")"
   [[ "$st" == ok && "${ts:-0}" =~ ^[0-9]+$ ]] && (( $(date +%s) - ts < ENTRY_FRESH )) && return 0
   entry_check "$1" quiet && return 0
-  err "Вход «$1» не работает: через $a пакеты до сервера не доходят — клиентам его не выдаю"
-  info "Проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port), затем «Проверить»"
+  if [[ -n "$ENTRY_PROBE_WHY" ]]; then
+    err "Вход «$1» не готов: $ENTRY_PROBE_WHY — клиентам его не выдаю"
+    info "Исправь и нажми «Проверить»"
+  else
+    err "Вход «$1» не работает: через $a пакеты до сервера не доходят — клиентам его не выдаю"
+    info "Проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port), затем «Проверить»"
+  fi
   return 1
 }
 
@@ -196,25 +201,86 @@ entry_assign_all() {  # имя|direct — все клиенты
 # на адрес входа и ловим его на своём порту AWG (правило raw со строкой
 # метки). Простой проброс порта (DNAT) возвращает пакет сюда же.
 # 0 — дошёл, 1 — нет, 2 — проверить нельзя (адрес не найден, нет модуля string).
-ENTRY_PROBE_TAG="awg2-entry-check"
-entry_probe() {  # хост:порт
-  local host="${1%:*}" port="${1##*:}" ip mark i n rc=1
-  if valid_ip "$host"; then ip="$host"
+# Почему проверка не прошла, если причина известна точнее «пакеты не дошли».
+ENTRY_PROBE_TAG="awg2-entry-check" ENTRY_PROBE_WHY=""
+entry_probe() {  # хост:порт ([IPv6]:порт)
+  local host="${1%:*}" port="${1##*:}" ip mark i n ipt=iptables rc=1
+  ENTRY_PROBE_WHY=""
+  host="${host#[}"; host="${host%]}"
+  if [[ "$host" == *:* ]]; then
+    # Свой IPv6: клиенты придут на этот сервер напрямую, каскада нет
+    _own_ip6 "$host" && { _entry_ipv6_self "$host" "$port"; return; }
+    ip="$host"; ipt=ip6tables
+  elif valid_ip "$host"; then ip="$host"
   else ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}'); fi
   [[ -n "$ip" ]] || return 2
   mark="$ENTRY_PROBE_TAG-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
-  ipt_del_grep raw "--comment \"?${ENTRY_PROBE_TAG}\"?( |$)"
-  iptables -t raw -I PREROUTING 1 -p udp --dport "$(server_port)" -m string --algo bm --string "$mark" \
+  _entry_probe_clean "$ipt"
+  "$ipt" -t raw -I PREROUTING 1 -p udp --dport "$(server_port)" -m string --algo bm --string "$mark" \
     -m comment --comment "$ENTRY_PROBE_TAG" -j ACCEPT 2>/dev/null || return 2
   for i in 1 2 3 4; do
     { printf '%s' "$mark" > "/dev/udp/$ip/$port"; } 2>/dev/null || true
     sleep 0.5
-    n=$(iptables -t raw -L PREROUTING -v -x -n 2>/dev/null | awk -v t="$ENTRY_PROBE_TAG" 'index($0, t) {print $1; exit}')
+    n=$("$ipt" -t raw -L PREROUTING -v -x -n 2>/dev/null | awk -v t="$ENTRY_PROBE_TAG" 'index($0, t) {print $1; exit}')
     [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) && { rc=0; break; }
   done
-  ipt_del_grep raw "--comment \"?${ENTRY_PROBE_TAG}\"?( |$)"
+  _entry_probe_clean "$ipt"
   return "$rc"
 }
+
+_entry_probe_clean() {  # iptables|ip6tables
+  local rule
+  while IFS= read -r rule; do
+    printf '%s\n' "${rule/#-A /-D }" | xargs "$1" -t raw 2>/dev/null || true
+  done < <("$1-save" -t raw 2>/dev/null | grep -E -- "^-A .*--comment \"?${ENTRY_PROBE_TAG}\"?( |$)" || true)
+}
+
+_own_ip6() { ip -6 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print tolower(a[1])}' | grep -qxF "${1,,}"; }
+
+# Свой IPv6 как вход: IPv6 включён, адрес на месте, порт — порт AWG, AWG
+# его слушает, UFW пускает IPv6 и у сервера есть выход в интернет по IPv6.
+IPV6_SYSCTL="/proc/sys/net/ipv6/conf/all/disable_ipv6" UFW_DEFAULTS="/etc/default/ufw"
+_entry_ipv6_self() {  # адрес порт
+  local a="$1" p="$2" ls out
+  [[ "$(cat "$IPV6_SYSCTL" 2>/dev/null || echo 1)" == 0 ]] \
+    || { ENTRY_PROBE_WHY="IPv6 на сервере выключен (net.ipv6.conf.all.disable_ipv6)"; return 1; }
+  [[ "$p" == "$(server_port)" ]] || { ENTRY_PROBE_WHY="порт $p — не порт AWG ($(server_port))"; return 1; }
+  # Сокеты AWG в ядре: есть строки, а IPv6 среди них нет — AWG IPv6 не слушает
+  ls=$(ss -lunH "sport = :$p" 2>/dev/null || true)
+  if [[ -n "$ls" ]] && ! grep -qE '\[::\]|\*:' <<< "$ls"; then
+    ENTRY_PROBE_WHY="AWG не слушает порт $p по IPv6 — перезапусти awg0"; return 1
+  fi
+  if ufw_active; then
+    grep -qiE '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*no' "$UFW_DEFAULTS" 2>/dev/null \
+      && { ENTRY_PROBE_WHY="в UFW выключен IPv6 (IPV6=no в /etc/default/ufw) — порт AWG по IPv6 закрыт"; return 1; }
+    out=$(LC_ALL=C ufw status 2>/dev/null || true)
+    grep -qE "^$p/udp \(v6\)[[:space:]]+ALLOW" <<< "$out" \
+      || { ENTRY_PROBE_WHY="в UFW порт $p/udp открыт только для IPv4"; return 1; }
+  fi
+  curl -6 -fsS --max-time 6 -o /dev/null https://api64.ipify.org 2>/dev/null \
+    || curl -6 -fsS --max-time 6 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+    || { ENTRY_PROBE_WHY="у сервера нет выхода в интернет по IPv6 — у хостера IPv6 не работает или не маршрутизируется"; return 1; }
+  return 0
+}
+
+# IPv6 этого сервера — точкой входа (по умолчанию с именем «IPv6»).
+entry_add_ipv6() {  # [имя]
+  local a have
+  server_exists || { err "Сервер не создан"; return 1; }
+  a=$(public_ip6)
+  [[ -n "$a" ]] || { err "У сервера нет глобального IPv6 — его включают у хостера"; return 1; }
+  a="[$a]:$(server_port)"
+  have=$(py entry "$SERVER_CONF" list 2>/dev/null | awk -F'\t' -v x="$a" '$2 == x {print $1; exit}')
+  if [[ -n "$have" ]]; then
+    ok "IPv6 сервера уже есть: вход «$have» ($a)"
+    entry_check "$have" soft || true
+    ENTRY_NAME="$have"
+    return 0
+  fi
+  ENTRY_NAME="${1:-IPv6}"
+  entry_add "$ENTRY_NAME" "$a"
+}
+ENTRY_NAME=""
 
 # soft — провал проверки только предупреждением; quiet — без вывода, только
 # итог (его пишет _entry_ready). Итог запоминается — по нему боту и панели
@@ -236,9 +302,11 @@ entry_check() {  # имя [soft|quiet]
   fi
   case "$rc" in
     0) ok "Вход работает: пакеты через $a доходят до этого сервера" ;;
-    1) m="Через $a пакеты до сервера не дошли — проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port)"
+    1) if [[ -n "$ENTRY_PROBE_WHY" ]]; then m="Вход «$1» не готов: $ENTRY_PROBE_WHY"
+       else m="Через $a пакеты до сервера не дошли — проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port)"; fi
        if [[ "${2:-}" == soft ]]; then warn "$m"; else err "$m"; fi
-       info "Вход не простым пробросом (прокси, фильтр по адресам) проверку может не пройти и рабочим — тогда проверь клиентом" ;;
+       [[ -n "$ENTRY_PROBE_WHY" ]] \
+         || info "Вход не простым пробросом (прокси, фильтр по адресам) проверку может не пройти и рабочим — тогда проверь клиентом" ;;
     *) warn "Проверить вход не удалось (адрес не найден или нет модуля iptables string) — проверь клиентом"
        rc=0 ;;
   esac
@@ -299,15 +367,16 @@ do_entries_menu() {
     done < <(_entry_rows_checked)
     def=$(entry_default_get)
     echo ""
-    echo -e "  ${G}1)${N} Добавить"
+    echo -e "  ${G}1)${N} Добавить${D}$([[ -n "$(public_ip6)" ]] && echo " — или 8) IPv6 этого сервера")${N}"
     echo -e "  ${C}2)${N} Изменить адрес"
     echo -e "  ${C}3)${N} Проверить"
     echo -e "  ${C}4)${N} Вход для новых клиентов ${D}— ${def:-напрямую}${N}"
     echo -e "  ${C}5)${N} Перевести всех клиентов"
     echo -e "  ${C}6)${N} Выбрать клиентов"
     echo -e "  ${R}7)${N} Удалить"
+    [[ -n "$(public_ip6)" ]] && echo -e "  ${G}8)${N} IPv6 этого сервера ${D}— $(public_ip6)${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
+    read_choice c "${C}  Выбор [0-8]: ${N}" 0 8 0
     case "$c" in
       1) read_line n "${C}  Название (например, Каскад NL): ${N}"
          [[ -n "$n" ]] || continue
@@ -325,6 +394,7 @@ do_entries_menu() {
          _entry_pick_clients && { entry_assign_clients "${CHOSEN:-direct}" "$_ENTRY_PICKED" || true; } ;;
       7) _entry_pick || continue
          ask_yes "  Удалить «$CHOSEN»? Его клиенты перейдут на «напрямую» [y/N]: " n && { entry_del "$CHOSEN" || true; } ;;
+      8) entry_add_ipv6 || true ;;
       0) return 0 ;;
     esac
     pause

@@ -320,9 +320,15 @@ async def wizard(target: ui.Target, state: FSMContext) -> None:
         await ui.render(target, head + "<b>UDP-порт</b>",
                         ui.kb(("🎲 Случайный", _w("port", "")), ("✏️ Ввести…", _w("port", "ask")), cancel))
     elif step == "endpoint":
+        v6 = (await api.data("server", "info", default={}) or {}).get("ipv6") or ""
         await ui.render(target, head + "<b>Адрес в конфигах клиентов</b>\nДомен вместо IP — переезд сервера "
-                                       "без перевыдачи конфигов.",
-                        ui.kb(("IP этого сервера", _w("endpoint", "")), ("✏️ Домен…", _w("endpoint", "ask")), cancel))
+                                       "без перевыдачи конфигов."
+                        + (f"\n\nУ сервера есть IPv6 <code>{esc(v6)}</code>: клиенты могут подключаться по нему. "
+                           "У кого в сети IPv6 нет — в карточке клиента вход меняется на «напрямую» (IPv4)."
+                           if v6 else ""),
+                        ui.kb(("IP этого сервера", _w("endpoint", "")),
+                              ("🌐 IPv6 сервера", _w("endpoint", "ipv6")) if v6 else None,
+                              ("✏️ Домен…", _w("endpoint", "ask")), cancel))
     else:
         await ui.render(target, head + "\n".join([
             f"Регион: {'Россия' if wiz['region'] == 'ru' else 'мир'}",
@@ -330,7 +336,8 @@ async def wizard(target: ui.Target, state: FSMContext) -> None:
             f"Версия: AWG {wiz['proto']} · MTU {wiz['mtu']}",
             f"Подсеть: {esc(wiz['net'] or 'случайная 10.x.y.0/24')}",
             f"DNS: {esc(wiz['dns'])}",
-            f"Порт: {wiz['port'] or 'случайный'} · endpoint: {esc(wiz['endpoint'] or 'IP сервера')}",
+            f"Порт: {wiz['port'] or 'случайный'} · endpoint: "
+            + esc({"": "IP сервера", "ipv6": "IPv6 сервера"}.get(wiz["endpoint"], wiz["endpoint"])),
         ]), ui.kb(ui.Row(("✅ Создать сервер", act.data("createok")), cancel)))
 
 

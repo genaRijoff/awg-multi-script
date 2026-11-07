@@ -139,6 +139,8 @@ _api_server() {
         # Почему нет 3.1: components | tools | module | check (не прошла проба)
         _kv proto31_why "$([[ $rc == 0 ]] || proto_why 3.1)"
         _kv reboot "$(reboot_reason)"
+        # Глобальный IPv6 сервера — для входа клиентов по IPv6 (пусто — нет)
+        _kv ipv6 "$(public_ip6)"
         if server_exists; then
           _kv up:b "$(_b iface_up)"; _kv proto "$(server_proto)"
           _kv profile "$(server_profile)"; _kv profile_label "$(profile_label)"
@@ -701,6 +703,9 @@ _api_entry() {
     add)
       [[ -n "${2:-}" ]] || { _api_usage "entry add ИМЯ ХОСТ:ПОРТ"; return; }
       entry_add "$1" "$2" ;;
+    add-ipv6)
+      entry_add_ipv6 "${1:-}" || return 1
+      { _kv name "$ENTRY_NAME"; _kv addr "$(py entry "$SERVER_CONF" get "$ENTRY_NAME")"; } | api_obj ;;
     set)
       [[ -n "${2:-}" ]] || { _api_usage "entry set ИМЯ ХОСТ:ПОРТ"; return; }
       entry_set "$1" "$2" ;;
@@ -716,7 +721,7 @@ _api_entry() {
     all)
       [[ -n "${1:-}" ]] || { _api_usage "entry all ИМЯ|direct"; return; }
       entry_assign_all "$1" ;;
-    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct|clients ИМЯ|direct A,B" ;;
+    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|add-ipv6 [ИМЯ]|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct|clients ИМЯ|direct A,B" ;;
   esac
 }
 

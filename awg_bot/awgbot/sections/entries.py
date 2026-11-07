@@ -14,6 +14,7 @@ from aiogram import Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
+import asyncio
 import time
 
 from .. import api, ask, ui
@@ -66,7 +67,7 @@ async def show(cb: CallbackQuery, state: FSMContext, arg_: str = "") -> None:
 
 
 async def screen(target: ui.Target, state: FSMContext) -> None:
-    rows = await entries()
+    rows, info = await asyncio.gather(entries(), api.data("server", "info", default={}))
     if rows is None:
         r = await api.call("entry", "list")
         await ui.render(target, ui.fail(r, TITLE), ui.kb(ui.back("srv")))
@@ -81,10 +82,22 @@ async def screen(target: ui.Target, state: FSMContext) -> None:
                      f"<code>{esc(e.get('addr', ''))}</code>, клиентов {e.get('clients', 0)}"
                      + ("" if not e.get("name") else f"\n   {status(e)}"))
     lines += ["", "⭐ — вход для новых клиентов. Вход клиента — «📍 Вход» в его карточке."]
+    # IPv6 этого сервера — входом в одно нажатие, если его ещё нет
+    v6 = (info or {}).get("ipv6") or ""
+    v6_new = bool(v6) and not any(str(e.get("addr", "")).startswith(f"[{v6}]") for e in rows)
+    if v6_new:
+        lines.append(f"🌐 У сервера есть IPv6 <code>{esc(v6)}</code> — клиентов можно подключать по нему.")
     await ui.render(target, "\n".join(lines), ui.kb(
         [(("⭐ " if e.get("default") else "") + label(e), act.data("e", str(i))) for i, e in enumerate(rows)],
         ("➕ Добавить", act.data("add")) if len(rows) <= 20 else None,
+        ("🌐 IPv6 сервера", act.data("v6")) if v6_new and len(rows) <= 20 else None,
         ui.back("srv")))
+
+
+@act("v6")
+async def _add_v6(cb: CallbackQuery, state: FSMContext, arg_: str) -> None:
+    await ui.render(cb, "⏳ Добавляю IPv6 сервера и проверяю…")
+    await ui.result(cb, await api.call("entry", "add-ipv6"), "IPv6 сервера", act.data())
 
 
 async def _entry(state: FSMContext, idx: str) -> tuple[str, dict] | None:
@@ -335,7 +348,7 @@ async def _del_ok(cb: CallbackQuery, state: FSMContext, idx: str) -> None:
 
 
 ADDR_HINT = ("Адрес сервера-входа и порт, который проброшен на этот сервер: "
-             "<code>203.0.113.5:443</code> или <code>vpn.example.com:443</code>")
+             "<code>203.0.113.5:443</code>, <code>vpn.example.com:443</code> или <code>[2001:db8::1]:443</code>")
 
 
 @act("addr")

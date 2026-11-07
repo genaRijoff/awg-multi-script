@@ -226,6 +226,11 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       await page.click(".chip >> text=Мощный"); await page.waitForSelector(".chip >> text=Цепочка I1-I5");
       await page.waitForSelector("select >> nth=0");
       await shot("12-create-pro");
+      // У сервера есть IPv6 — переключатель «Клиенты — по IPv6»; включён — поля домена нет
+      await page.click(".card.item:has-text('Клиенты — по IPv6')");
+      await page.waitForSelector("text=Домен для конфигов", { state: "detached" });
+      await page.click(".card.item:has-text('Клиенты — по IPv6')");
+      await page.waitForSelector("text=Домен для конфигов");
       await page.click(".chip >> text=AmneziaVPN");
       await page.click(".chip >> text=Пакет I1 (DNS)");
       await page.fill("input[placeholder^='случайная']", "10.66.1.7/25");
@@ -637,6 +642,14 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector(card, { state: "detached", timeout: 30000 });
     await nav("/client/alice", ".a-acts");
     await page.waitForSelector(".rchips button[data-v='Каскад NL']", { state: "detached", timeout: 15000 });
+    // IPv6 этого сервера — входом в одно нажатие; после добавления кнопки нет
+    await nav("/server/entries", "button:has-text('IPv6 этого сервера')");
+    await page.click("button:has-text('IPv6 этого сервера')");
+    await page.waitForSelector(".ecard[data-name=IPv6] >> text=работает", { timeout: 30000 });
+    await page.waitForSelector(".ecard[data-name=IPv6] >> text=[2a01:4f8:c0c:1234::1]:51820");
+    if (await page.locator("button:has-text('IPv6 этого сервера')").count()) throw new Error("кнопка IPv6 осталась после добавления");
+    await page.click(".ecard[data-name=IPv6] button:has-text('Удалить')");
+    await page.waitForSelector(".ecard[data-name=IPv6]", { state: "detached", timeout: 30000 });
   });
   await step("модуль ядра", async () => {
     await nav("/server/module", "text=Ядро");

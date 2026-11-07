@@ -207,7 +207,7 @@ setup_autostart() {
 # ── Запись конфигов ───────────────────────────────────────
 # Параметры создаваемого сервера (заполняются меню или --auto).
 S_PROFILE=lite S_PROTO=2.0 S_REGION=world S_DNS="1.1.1.1, 1.0.0.1" MTU=1280
-S_NET="" S_PORT="" S_ENDPOINT_DOMAIN="" S_FIRST_CLIENT=""
+S_NET="" S_PORT="" S_ENDPOINT_DOMAIN="" S_FIRST_CLIENT="" S_ENDPOINT_V6=0
 
 _postup_lines() {
   local net="$1" dev="$2"
@@ -490,8 +490,14 @@ _choose_port() {
 }
 
 _choose_endpoint() {
-  local d
-  S_ENDPOINT_DOMAIN=""
+  local d v6
+  S_ENDPOINT_DOMAIN="" S_ENDPOINT_V6=0
+  v6=$(public_ip6)
+  if [[ -n "$v6" ]]; then
+    echo -e "  ${D}У сервера есть IPv6: $v6. Клиенты без IPv6 в своей сети по нему не подключатся —${N}"
+    echo -e "  ${D}тогда в их карточке вход меняется на «напрямую» (IPv4).${N}"
+    ask_yes "  Подключать новых клиентов по IPv6? [y/N]: " n && { S_ENDPOINT_V6=1; return 0; }
+  fi
   ask_yes "  Использовать в конфигах домен вместо IP (переезд без перевыдачи)? [y/N]: " n || return 0
   while true; do
     read_line d "${C}  Домен (Enter — отмена): ${N}"
@@ -530,20 +536,36 @@ server_create() {
     return 1
   fi
   success_box "Сервер создан: AWG $S_PROTO, клиент $S_FIRST_CLIENT"
+  (( S_ENDPOINT_V6 )) && _server_create_ipv6
   echo "Файл конфигурации: $(client_file "$S_FIRST_CLIENT")"
   mimicry_module_warnings
 }
 
+# IPv6 при создании: точка входа «IPv6», она же — для новых клиентов, и
+# первый клиент сразу на ней. Не готов IPv6 — сервер остаётся на IPv4.
+_server_create_ipv6() {
+  local log
+  mktmp log || return 0
+  if entry_add_ipv6 > "$log" && entry_default "$ENTRY_NAME" >> "$log" \
+      && client_entry_set "$S_FIRST_CLIENT" "$ENTRY_NAME" >> "$log"; then
+    ok "Клиенты подключаются по IPv6: $(client_endpoint "$S_FIRST_CLIENT")"
+    info "Клиенту без IPv6 в его сети — вход «напрямую» (IPv4) в его карточке"
+  else
+    grep -E '×|▲' "$log" || true
+    warn "IPv6 не готов — клиенты подключаются по IPv4. Разобраться: Сервер → Точки входа → IPv6 → Проверить"
+  fi
+}
+
 # Создание без вопросов: server_create_opts ключ=значение...
 #   profile=lite|pro  proto=2.0|3.1  region=world|ru  dns="1.1.1.1, 1.0.0.1"
-#   mtu=  port=  net=10.x.y.0/24  endpoint=домен  client=имя  mimicry=строка
+#   mtu=  port=  net=10.x.y.0/24  endpoint=домен|ipv6  client=имя  mimicry=строка
 # Не заданное — как у «AmneziaVPN»: версия 3.1, если компоненты её умеют.
 server_create_opts() {
   local kv k v mim=""
   server_create_ready || return 1
   [[ -n "$REBOOT_WHY" ]] && warn "$REBOOT_WHY"
   S_PROFILE=lite; S_PROTO=""; S_REGION=world; S_DNS="1.1.1.1, 1.0.0.1"; MTU=""
-  S_PORT=""; S_NET=""; S_ENDPOINT_DOMAIN=""; S_FIRST_CLIENT=""
+  S_PORT=""; S_NET=""; S_ENDPOINT_DOMAIN=""; S_FIRST_CLIENT=""; S_ENDPOINT_V6=0
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
@@ -558,7 +580,12 @@ server_create_opts() {
            v="${v%.*}.0/24"
            taken_networks | py net-overlaps "$v" >/dev/null && { err "Сеть $v пересекается с адресами сервера"; return 1; }
            S_NET="$v" ;;
-      endpoint) [[ -z "$v" ]] || valid_domain "$v" || { err "endpoint: домен"; return 1; }; S_ENDPOINT_DOMAIN="${v,,}" ;;
+      endpoint) if [[ "$v" == ipv6 ]]; then
+                  [[ -n "$(public_ip6)" ]] || { err "endpoint=ipv6: у сервера нет глобального IPv6"; return 1; }
+                  S_ENDPOINT_V6=1
+                else
+                  [[ -z "$v" ]] || valid_domain "$v" || { err "endpoint: домен или ipv6"; return 1; }; S_ENDPOINT_DOMAIN="${v,,}"
+                fi ;;
       client) _name_free "$v" || { err "Имя клиента недопустимо"; return 1; }; S_FIRST_CLIENT="$v" ;;
       mimicry) mim="$v" ;;
       *) err "Неизвестный параметр: $k"; return 1 ;;
@@ -611,7 +638,8 @@ do_create_server() {
   echo -e "  Версия   : ${W}AWG $S_PROTO${N}, профиль ${W}$(profile_label "$S_PROFILE")${N}"
   echo -e "  Мимикрия : ${W}$MIMICRY${N}${CPS_DOMAIN:+ ($CPS_DOMAIN)}"
   echo -e "  Подсеть  : ${W}$S_NET${N}, MTU ${W}$MTU${N}, DNS ${W}$S_DNS${N}"
-  echo -e "  Endpoint : ${W}${S_ENDPOINT_DOMAIN:-$(public_ip_cached)}:$S_PORT${N}"
+  if (( S_ENDPOINT_V6 )); then echo -e "  Endpoint : ${W}[$(public_ip6)]:$S_PORT${N} ${D}(IPv6)${N}"
+  else echo -e "  Endpoint : ${W}${S_ENDPOINT_DOMAIN:-$(public_ip_cached)}:$S_PORT${N}"; fi
   ask_yes "  Создать? [Y/n]: " y || { info "Отменено"; return 0; }
   server_create && share_config "$(client_file "$S_FIRST_CLIENT")"
 }

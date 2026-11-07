@@ -46,11 +46,13 @@ PACK = {"🖥": "111", "👥": "222", "🌐": "333", "🗑": "444", "⭐": "555"
 
 # ── Окружение бота ────────────────────────────────────────
 API = api_wrapper()
-# Каскад до сервера «работает» только с входов 203.0.113.x — остальные проверку не проходят
+# Каскад до сервера «работает» только с входов 203.0.113.x — остальные проверку не проходят;
+# у сервера есть IPv6, и он готов принимать клиентов
 with open(API) as f:
     _w = f.read()
 with open(API, "w") as f:
-    f.write(_w.replace('api_main "$@"', 'entry_probe() { [[ "$1" == 203.0.113.* ]]; }\napi_main "$@"'))
+    f.write(_w.replace('api_main "$@"', 'entry_probe() { [[ "$1" == 203.0.113.* || "$1" == "[2a01:4f8:c0c:1234::1]:"* ]]; }\n'
+                       'public_ip6() { echo 2a01:4f8:c0c:1234::1; }\napi_main "$@"'))
 STATE = os.path.join(TMP, "botstate")
 os.makedirs(STATE)
 BOT_CONF = os.path.join(TMP, "awg-bot.conf")
@@ -2239,6 +2241,25 @@ async def run():
         conf = f.read()
     chk("в awg0.conf не осталось меток входа", "AWG_ENTRY" not in conf and "entry=" not in conf, conf[:300])
     no_hourglass("точки входа")
+
+    print("IPv6 сервера — точкой входа")
+    text, buttons = screen(await press("ent"))
+    chk("у сервера есть IPv6 — в «Точках входа» адрес и кнопка «🌐 IPv6 сервера»",
+        "2a01:4f8:c0c:1234::1" in text and ("🌐 IPv6 сервера", "ent:v6") in buttons, [text, buttons])
+    text, buttons = screen(await press("ent:v6"))
+    chk("IPv6 сервера добавлен: вход «IPv6» на [IPv6]:порт AWG, проверка пройдена",
+        "✅" in text and "[2a01:4f8:c0c:1234::1]:51820" in text and "Вход работает" in text and ("◀️ Назад", "ent") in buttons,
+        [text, buttons])
+    text, buttons = screen(await press("ent"))
+    v6 = [d for t, d in buttons if t.endswith("IPv6") and d.startswith("ent:e:")]
+    chk("после добавления — вход в списке, кнопки «🌐» нет", v6 and not any(d == "ent:v6" for _, d in buttons), [text, buttons])
+    idx = v6[0].rsplit(":", 1)[-1] if v6 else "1"
+    await press(f"ent:del:{idx}")
+    text, _ = screen(await press(f"ent:delok:{idx}"))
+    with open(os.path.join(ROOT, "etc/amnezia/amneziawg/awg0.conf")) as f:
+        conf = f.read()
+    chk("вход IPv6 удаляется, меток не осталось", "удалена" in text and "AWG_ENTRY" not in conf, [text, conf[:200]])
+    no_hourglass("IPv6 сервера")
 
     print("WARP: кнопки из уведомлений")
     started, real_job_w = [], botapi.job_start

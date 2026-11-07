@@ -3477,8 +3477,10 @@ route(/^\/server\/create$/, async (ctx) => {
       h("label", {}, "Подсеть клиентов"), net,
       hint("Случайная — меньше шансов совпасть с домашней сетью клиента"),
       h("label", {}, "UDP-порт — 443 или 1024-65535"), port,
-      h("label", {}, "Домен для конфигов (необязательно)"), ep,
-      hint("С доменом сервер можно перенести без перевыдачи конфигов. A-запись должна указывать сюда"),
+      info.ipv6 ? switchRow("Клиенты — по IPv6", `адрес ${info.ipv6}; у кого в сети IPv6 нет — вход «напрямую» в карточке клиента`,
+        !!f.v6, (on) => { f.v6 = on; draw(); }) : null,
+      f.v6 ? null : [h("label", {}, "Домен для конфигов (необязательно)"), ep,
+        hint("С доменом сервер можно перенести без перевыдачи конфигов. A-запись должна указывать сюда")],
       h("label", {}, "Имя первого клиента"), first,
     ].flat(Infinity).filter((n) => n != null));
   }
@@ -3506,7 +3508,8 @@ route(/^\/server\/create$/, async (ctx) => {
       a.push(`port=${+p}`);
     }
     const e = ep.value.trim().toLowerCase();
-    if (e) {
+    if (f.v6 && info.ipv6) a.push("endpoint=ipv6");
+    else if (e) {
       if (!DOMAIN_RE.test(e)) throw new Error("Домен — имя вида vpn.example.com");
       a.push(`endpoint=${e}`);
     }
@@ -3741,7 +3744,7 @@ route(/^\/server\/entries\/([^/]+)$/, async (ctx, name) => {
 
 // Точки входа (каскад): клиент подключается через сервер-вход — любой сервер,
 // где UDP-порт проброшен на этот. Первая строка списка — «напрямую» (имя пустое)
-const ENTRY_ADDR_RE = /^[a-z0-9.-]+:\d{1,5}$/i;
+const ENTRY_ADDR_RE = /^(\[[0-9a-f:.]+\]|[a-z0-9.-]+):\d{1,5}$/i;
 // Выдавать вход клиентам можно, если проверка прошла или проверить нельзя;
 // не прошёл или не проверялся — кнопки выдачи заперты (awg2 и сам проверит)
 const entryUsable = (e) => !e.name || e.check === "ok" || e.check === "unknown";
@@ -3762,7 +3765,11 @@ function entryAct(e, ic, label, fn) {
   return b;
 }
 route(/^\/server\/entries$/, async (ctx) => {
-  const rows = (await call("entry", "list")) || [];
+  const [list, info] = await Promise.all([call("entry", "list"), call("server", "info").catch(() => ({}))]);
+  const rows = list || [];
+  // IPv6 этого сервера — входом в одно нажатие, если его ещё нет
+  const v6 = (info && info.ipv6) || "";
+  const v6New = !!v6 && !rows.some((e) => String(e.addr || "").startsWith(`[${v6}]`));
   const name = h("input", { placeholder: "Каскад NL", maxlength: 24, autocomplete: "off" });
   const addr = h("input", { placeholder: "203.0.113.5:443", autocapitalize: "off", autocomplete: "off", inputmode: "url" });
   const label = (e) => e.name || "Напрямую";
@@ -3791,9 +3798,13 @@ route(/^\/server\/entries$/, async (ctx) => {
       + "nginx stream). В конфиге и QR такого клиента Endpoint — адрес входа, остальное как у всех. Вход клиенту — в его "
       + "карточке, всем новым — «Для новых»."),
     rows.map(card),
+    v6New && rows.length <= 20 ? [h("div", { class: "card" }, h("b", {}, "🌐 У сервера есть IPv6"),
+      h("div", { class: "muted small", style: "margin-top:6px" }, h("span", { class: "mono" }, v6),
+        " — клиентов можно подключать по нему. У кого в сети IPv6 нет — оставь им «напрямую» (IPv4).")),
+    btn("🌐 IPv6 этого сервера", (b) => quick(b, "IPv6 сервера добавлен", ["entry", "add-ipv6"]), "btn-block")] : null,
     rows.length <= 20 ? [h("h2", {}, "Новая точка входа"),
       h("label", {}, "Название — до 24 символов"), name,
-      h("label", {}, "Адрес входа: хост:порт, проброшенный на этот сервер"), addr,
+      h("label", {}, "Адрес входа: хост:порт, проброшенный на этот сервер ([IPv6]:порт — тоже)"), addr,
       btn("➕ Добавить", (b) => {
         const n = name.value.trim().replace(/\s+/g, " ");
         const a = addr.value.replace(/\s/g, "");
