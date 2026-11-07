@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.55"
+VERSION="v1.2.56"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -593,6 +593,27 @@ VKBLOCK_SRC="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blackl
 # Настоящий список: ~200 записей, ~300 тыс. адресов IPv4 и три сети /29 IPv6.
 # Короче минимума — оборван, шире предела — подменён: прежний не заменяют
 VKBLOCK_MIN=50 VKBLOCK_MAX4=4194304 VKBLOCK_MAX6=4096   # 2^22 адресов IPv4; 2^12 сетей /32 IPv6
+
+# ── РФ напрямую (клиенты в туннеле — к сетям России мимо него) ──
+RUDIRECT_DIR="$STATE_DIR/rudirect"           # список РФ и состояние
+RUDIRECT_CONF="$RUDIRECT_DIR/rudirect.conf"  # ON, UPDATED, ERROR, ENTRIES, SRC
+RUDIRECT_USER="/etc/awg2/rudirect"           # свои списки (в бэкапе): direct.list, tunnel.list
+RUDIRECT_SCRIPT="/usr/local/bin/awg2-rudirect"
+RUDIRECT_LOG="/var/log/awg2-rudirect.log"
+RUDIRECT_SET="awg2-ru" RUDIRECT_TAG="awg2-rudirect"
+# Метка в старших битах: младшие заняты чужими (wg-quick — 51820)
+RUDIRECT_MARK="0x52550000/0xffff0000" RUDIRECT_PRIO=90     # приоритет раньше туннелей (100-249)
+RUDIRECT_UNIT="awg2-rudirect.service" RUDIRECT_TIMER="awg2-rudirect-update.timer"
+RUDIRECT_SRCS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
+# Настоящий список: ~8700 сетей, ~45 млн адресов IPv4. Короче или уже — оборван,
+# шире — подменён: прежний не заменяют. Своих записей — не больше 500
+RUDIRECT_MIN=2000 RUDIRECT_MINADDR=20000000 RUDIRECT_MAX4=134217728 RUDIRECT_USER_MAX=500
+
+# ── Если туннель упал (режим на каждый туннель: напрямую или блокировать) ──
+TUNFAIL_CONF="/etc/awg2/tunnel-fail.conf"    # warp=block, xray=direct… (нет строки — direct)
+TUNFAIL_SCRIPT="/usr/local/bin/awg2-tunfail"
+TUNFAIL_LOG="/var/log/awg2-tunfail.log"
+TUNFAIL_UNIT="awg2-tunfail.service" TUNFAIL_TIMER="awg2-tunfail.timer"
 
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
@@ -4484,7 +4505,7 @@ _own_ip6() { ip -6 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/
 
 # Свой IPv6 как вход: IPv6 включён, адрес на месте, порт — порт AWG, AWG
 # его слушает, UFW пускает IPv6 и у сервера есть выход в интернет по IPv6.
-IPV6_SYSCTL="/proc/sys/net/ipv6/conf/all/disable_ipv6" UFW_DEFAULTS="/etc/default/ufw"
+IPV6_SYSCTL="/proc/sys/net/ipv6/conf/all/disable_ipv6"
 _entry_ipv6_self() {  # адрес порт
   local a="$1" p="$2" ls out
   [[ "$(cat "$IPV6_SYSCTL" 2>/dev/null || echo 1)" == 0 ]] \
@@ -5386,7 +5407,66 @@ tunnel_peers_forget() {
 # опираются только на константы и базовые помощники.
 RT_FUNCS=(valid_ip valid_cidr conf_iface_get server_net ipt_add ipt_ins ipt_del
           ipt_del_grep ipt_del_tagged rp_filter_loose rt_fw_up rt_fw_down rt_up rt_down
-          rt_rules_clear rt_rules_file SERVER_CONF AWG_IF WGOBF_IF WGOBF_STATE)
+          rt_rules_clear rt_rules_file rt_fail_name rt_fail_mode rt_fail_route rt_tunnel_on rt_table_live rt_release_held
+          SERVER_CONF AWG_IF WGOBF_IF WGOBF_STATE TUNFAIL_CONF TUNFAIL_LOG WARP_STATE XRAY_STATE
+          EXITS_STATE T2S_UNIT T2S_TABLE WARP_TABLE XRAY_TABLE EXITS_TABLE EXITS_TABLE_BASE EXITS_TABLE_MAX)
+
+# ── Если туннель упал ─────────────────────────────────────
+# Режим на туннель (TUNFAIL_CONF «warp=block»): direct — как раньше, упавший
+# туннель отпускает клиентов напрямую, с адреса сервера; block — клиенты
+# остаются в таблице туннеля, где под основным маршрутом лежит «недоступно»
+# (metric 4096): пока туннель лежит, их трафик никуда не уходит, кроме «РФ
+# напрямую» (правило 90 — раньше таблиц туннелей). Выключенный руками туннель
+# отпускает клиентов в любом режиме: его состояния к этому моменту уже нет.
+rt_fail_name() {  # таблица → warp|xray|t2s|exits
+  case "$1" in
+    "$T2S_TABLE") echo t2s ;; "$WARP_TABLE") echo warp ;; "$XRAY_TABLE") echo xray ;; *) echo exits ;;
+  esac
+}
+
+rt_fail_mode() {  # таблица|имя → direct|block
+  local n="$1"
+  [[ "$n" =~ ^[0-9]+$ ]] && n=$(rt_fail_name "$1")
+  [[ "$(sed -n "s/^$n=//p" "$TUNFAIL_CONF" 2>/dev/null | tail -1)" == block ]] && echo block || echo direct
+}
+
+# «Недоступно» под основным маршрутом — в режиме block, иначе снять.
+rt_fail_route() {  # таблица
+  if [[ "$(rt_fail_mode "$1")" == block ]]; then
+    ip route replace unreachable default metric 4096 table "$1"
+  else
+    ip route del unreachable default metric 4096 table "$1" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Туннель включён (а не выключен руками) — по его состоянию.
+rt_tunnel_on() {  # таблица
+  case "$1" in
+    "$WARP_TABLE") [[ -f "$WARP_STATE" ]] ;;
+    "$XRAY_TABLE") [[ -f "$XRAY_STATE" ]] ;;
+    "$T2S_TABLE") systemctl is-enabled --quiet "$T2S_UNIT" 2>/dev/null ;;
+    *) [[ "$(head -1 "$EXITS_STATE" 2>/dev/null)" == active ]] ;;
+  esac
+}
+
+rt_table_live() { ip route show table "$1" 2>/dev/null | grep -q ' dev '; }   # в таблице есть живой маршрут
+
+# Поднимается туннель — снять «удержание» лежащих: их правила (приоритет у
+# каждого свой) иначе перехватили бы клиентов в «недоступно».
+rt_release_held() {  # таблица, которую не трогать
+  local t
+  for t in $(ip rule show 2>/dev/null | awk '$(NF - 1) == "lookup" {print $NF}' | sort -u); do
+    [[ "$t" =~ ^[0-9]+$ && "$t" != "$1" ]] || continue
+    (( t == T2S_TABLE || t == WARP_TABLE || t == XRAY_TABLE || t == EXITS_TABLE \
+       || (t >= EXITS_TABLE_BASE && t <= EXITS_TABLE_MAX) )) || continue
+    (( $1 == EXITS_TABLE && t >= EXITS_TABLE_BASE && t <= EXITS_TABLE_MAX )) && continue
+    rt_table_live "$t" && continue
+    rt_rules_clear "$t"
+    ip route flush table "$t" 2>/dev/null || true
+  done
+  return 0
+}
 
 rt_rules_clear() {  # таблица
   local guard=0
@@ -5464,6 +5544,8 @@ rt_up() {  # устройство таблица peers|- [src] [nonat]
   else
     ip route replace default dev "$dev" table "$table" || return 1
   fi
+  rt_fail_route "$table"
+  rt_release_held "$table"
   rt_rules_clear "$table"
   if [[ "$peers" == - ]]; then
     ip rule add from "$net" lookup "$table" priority "$table" || return 1
@@ -5474,6 +5556,16 @@ rt_up() {  # устройство таблица peers|- [src] [nonat]
 }
 
 rt_down() {  # устройство таблица
+  # Режим block и туннель включён — он упал, а не выключен: клиентов не
+  # отпускаем, в таблице остаётся только «недоступно»
+  if [[ "$(rt_fail_mode "$2")" == block ]] && rt_tunnel_on "$2"; then
+    ip route flush table "$2" 2>/dev/null || true
+    ip route replace unreachable default metric 4096 table "$2" 2>/dev/null || true
+    rt_fw_down "$1"
+    mkdir -p "$(dirname "$TUNFAIL_LOG")" 2>/dev/null
+    echo "[$(date '+%F %T')] $1 упал — клиенты удержаны до его возврата (режим «блокировать»)" >> "$TUNFAIL_LOG" 2>/dev/null
+    return 0
+  fi
   rt_rules_clear "$2"
   ip route flush table "$2" 2>/dev/null || true
   rt_fw_down "$1"
@@ -5516,6 +5608,9 @@ tunnels_panic_reset() {
     warn "клиенты пойдут напрямую через сервер. Настройки сохранятся."
     ask_yes "  Продолжить? [Y/n]: " y || return 0
   fi
+  # Состояния — раньше остановки и маршрутов: в режиме «блокировать» rt_down
+  # и остановка служб иначе удержали бы клиентов включённого туннеля
+  rm -f "$XRAY_STATE" "$EXITS_STATE" "$WARP_STATE"
   # Автозапуск тоже снимаем: иначе после перезагрузки туннель вернётся
   for u in "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" "$T2S_UNIT" "$EXITS_UNIT" awg-usque.service awg-warp.service; do
     systemctl disable --now "$u" &>/dev/null || true
@@ -5529,7 +5624,6 @@ tunnels_panic_reset() {
     [[ -f "$dev" ]] && rt_fw_down "$(basename "$dev" .conf)"
   done
   for dev in "$XRAY_IF" "$T2S_IF" "$WARP_IF"; do ip link del "$dev" &>/dev/null || true; done
-  rm -f "$XRAY_STATE" "$EXITS_STATE" "$WARP_STATE"
   net=$(server_net 2>/dev/null) || net=""
   dev=$(uplink_iface 2>/dev/null) || dev=""
   # То же, что ставит PostUp сервера — на случай, если его правила сбиты
@@ -5627,6 +5721,8 @@ do_tunnels_menu() {
     echo -e "  ${C}4)${N} AWG exit-ноды       $(_tun_state exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
     echo -e "  ${C}5)${N} Каскад портов       $(cascade_state_line)"
     echo -e "  ${C}6)${N} Шифрованный DNS     $(dns_state_line)"
+    echo -e "  ${C}7)${N} РФ напрямую         $(rudirect_on && echo -e "${G}● включено${N}" || echo -e "${D}○ выключено${N}")"
+    echo -e "  ${C}8)${N} Если туннель упал   $(tunfail_any_block && echo -e "${Y}● где-то «блокировать»${N}" || echo -e "${D}○ напрямую (как было)${N}")"
     echo -e "  ${R}9)${N} Аварийный сброс ${D}— все клиенты напрямую${N}"
     echo -e "  ${W}0)${N} ← Назад"
     read_choice c "${C}  Выбор: ${N}" 0 9 0
@@ -5637,6 +5733,8 @@ do_tunnels_menu() {
       4) do_exits_menu || true ;;
       5) do_cascade_menu || true ;;
       6) do_dns_menu || true ;;
+      7) do_rudirect_menu || true ;;
+      8) do_tunfail_menu || true ;;
       9) tunnels_panic_reset || true; pause ;;
       0) return 0 ;;
     esac
@@ -5983,6 +6081,8 @@ warp_up() {
 }
 
 warp_down() {
+  # Состояние — раньше маршрутов: в режиме «блокировать» rt_down иначе удержал бы клиентов
+  rm -f "$WARP_STATE"
   rt_down "$WARP_IF" "$WARP_TABLE"
   if [[ "$(warp_backend)" == usque ]]; then
     systemctl stop awg-usque.service &>/dev/null || true
@@ -6060,7 +6160,11 @@ warp_health_run() {
   (( n >= 3 )) || exit 0
   warp_failover
   rm -f "$WARP_HEALTH_RETRY"
-  echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую, WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+  if [[ "$(rt_fail_mode warp)" == block ]]; then
+    echo "$(date '+%F %T') FAILOVER: клиенты WARP удержаны (режим «блокировать»), WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+  else
+    echo "$(date '+%F %T') FAILOVER: клиенты идут напрямую, WARP вернётся сам" >> "$WARP_HEALTH_LOG"
+  fi
 }
 
 _warp_health_emit() {
@@ -7500,13 +7604,15 @@ xray_up() {
 }
 
 xray_down() {
+  # Состояние — раньше остановки: ExecStop маршрутов в режиме «блокировать»
+  # иначе удержал бы клиентов, а ConditionPathExists не даст Xray стартовать
+  rm -f "$XRAY_STATE"
   systemctl stop "$XRAY_ROUTING_UNIT" &>/dev/null || true
   systemctl disable "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl stop "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl reset-failed "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   rt_down "$XRAY_IF" "$XRAY_TABLE"
   ip link del "$XRAY_IF" &>/dev/null || true
-  rm -f "$XRAY_STATE"
   [[ "${1:-}" == quiet ]] || ok "Xray выключен — клиенты идут напрямую"
 }
 
@@ -7888,6 +7994,7 @@ exits_peer_rule() {  # строка «ноды через пробел»
   if [[ -n "$pnode" && "$up" == *" $pnode "* ]] && t=$(exits_table_for "$pnode") \
      && ip route replace default dev "awg-exit-$pnode" table "$t" 2>/dev/null; then
     table="$t"
+    rt_fail_route "$t"
   fi
   ip rule add from "$pip" lookup "$table" priority "$EXITS_TABLE" || true
 }
@@ -7905,6 +8012,7 @@ exits_routing_start() {
   done
   (( ${#up[@]} )) || { echo "ни одна exit-нода не поднята" >&2; return 1; }
   net=$(server_net) || return 1
+  rt_release_held "$EXITS_TABLE"
   exits_rules_clear
   [[ " ${up[*]} " == *" $single "* ]] || single="${up[0]}"
   if [[ "$balancer" == ecmp ]] && (( ${#up[@]} > 1 )); then
@@ -7920,6 +8028,8 @@ exits_routing_start() {
   fi
   [[ -n "$routed" ]] || ip route replace default dev "awg-exit-$single" table "$EXITS_TABLE" \
     || { echo "не удалось поставить маршрут в таблицу $EXITS_TABLE" >&2; return 1; }
+  # Режим «блокировать»: нода упала — клиенты в «недоступно», а не напрямую
+  rt_fail_route "$EXITS_TABLE"
   for n in "${up[@]}"; do rt_fw_up "awg-exit-$n"; done
   # Клиенты WG + обфускатора — своим списком, при любом режиме клиентов AWG
   if [[ -f "$EXITS_PEERS.wgobf" ]]; then
@@ -7934,8 +8044,21 @@ exits_routing_start() {
 }
 
 exits_routing_stop() {
-  local n
-  exits_rules_clear
+  local n t rules
+  # «Блокировать» и exit-ноды включены — остановка (перезапуск, сбой), а не
+  # выключение: клиенты остаются в своих таблицах, там только «недоступно»
+  if [[ "$(rt_fail_mode exits)" == block ]] && rt_tunnel_on "$EXITS_TABLE"; then
+    rules=$(ip rule show 2>/dev/null)
+    for t in "$EXITS_TABLE" $(seq "$EXITS_TABLE_BASE" "$EXITS_TABLE_MAX"); do
+      [[ "$t" == "$EXITS_TABLE" ]] || grep -qE "lookup $t\$" <<< "$rules" || continue
+      ip route flush table "$t" 2>/dev/null || true
+      ip route replace unreachable default metric 4096 table "$t" 2>/dev/null || true
+    done
+    mkdir -p "$(dirname "$TUNFAIL_LOG")" 2>/dev/null
+    echo "[$(date '+%F %T')] exit-ноды остановлены — клиенты удержаны до их возврата (режим «блокировать»)" >> "$TUNFAIL_LOG" 2>/dev/null
+  else
+    exits_rules_clear
+  fi
   while IFS= read -r n; do rt_fw_down "awg-exit-$n"; done < <(exits_nodes)
   return 0
 }
@@ -8005,10 +8128,11 @@ exits_up() {  # all|peers
 }
 
 exits_down() {
+  # Состояние — раньше остановки: в режиме «блокировать» ExecStop иначе удержал бы клиентов
+  [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
   systemctl disable --now "$EXITS_UNIT" &>/dev/null || true
   systemctl reset-failed "$EXITS_UNIT" &>/dev/null || true
   exits_routing_stop
-  [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
   [[ "${1:-}" == quiet ]] || ok "Exit-ноды выключены — клиенты идут напрямую"
 }
 
@@ -9571,7 +9695,7 @@ _backup_tunnel_paths() {
   local p
   _BACKUP_TUNNEL_PATHS=()
   for p in "$XRAY_DIR" "$EXITS_STATE" "$EXITS_PEERS" "$EXITS_PEERS.wgobf" "$CASCADE_RULES" "$T2S_CONF" "$DNS_PROXY_CONF" \
-           "$EXITS_DIR"/awg-exit-*.conf; do
+           "$EXITS_DIR"/awg-exit-*.conf "$RUDIRECT_USER"/direct.list "$RUDIRECT_USER"/tunnel.list "$TUNFAIL_CONF"; do
     [[ -e "$p" ]] && _BACKUP_TUNNEL_PATHS+=("${p#/}")
   done
   return 0
@@ -9774,6 +9898,18 @@ _restore_tunnels() {  # каталог бэкапа
     _dns_write_conf
     [[ -n "$names" ]] && { _dns_upstream_write "$names" || warn "Резолверы DNS из бэкапа не приняты — стоят по умолчанию"; }
   fi
+  # Свои списки «РФ напрямую» и режимы «если туннель упал» — построчно, с проверкой
+  for n in direct tunnel; do
+    [[ -f "$x$RUDIRECT_USER/$n.list" ]] || continue
+    while IFS= read -r f; do _rud_entry_norm "$f"; done < <(grep -vE '^[[:space:]]*(#|$)' "$x$RUDIRECT_USER/$n.list") \
+      | sort -u | head -n "$RUDIRECT_USER_MAX" | write_file "$RUDIRECT_USER/$n.list" 600
+  done
+  if [[ -f "$x$TUNFAIL_CONF" ]]; then
+    grep -xE '(warp|xray|t2s|exits)=block' "$x$TUNFAIL_CONF" | sort -u | write_file "$TUNFAIL_CONF" 644
+    [[ -s "$TUNFAIL_CONF" ]] || rm -f "$TUNFAIL_CONF"
+    _tunfail_units || true
+  fi
+  rudirect_on && { _rudirect_emit && "$RUDIRECT_SCRIPT" apply; } &>/dev/null
   rm -f "$XRAY_STATE"
   [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
   for n in $(exits_nodes); do systemctl enable --now "awg-quick@awg-exit-$n" &>/dev/null || warn "Нода $n не поднялась"; done
@@ -10433,6 +10569,8 @@ helpers_refresh() {
   [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
   antiscan_on && _antiscan_emit &>/dev/null
   vkblock_on && _vkblock_emit &>/dev/null
+  rudirect_on && _rudirect_emit &>/dev/null
+  tunfail_any_block && _tunfail_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
   # Xray 26.7+ без имени у входа tun поднимает utunN вместо xray0 — имя в
@@ -12442,6 +12580,707 @@ vkblock_remove() {
   rm -rf "$VKBLOCK_DIR" "$VKBLOCK_SCRIPT" "$VKBLOCK_LOG"
 }
 
+# ═════ rudirect ═════
+# РФ напрямую для всех туннелей: клиенты, уведённые в туннель (WARP, Xray,
+# tun2socks, exit-ноды), ходят к сетям России мимо него — прямо с сервера.
+# Полезно, когда сервер в России, а выход — за границей: российские сайты и
+# банки видят российский адрес, а выход не тратится на них.
+#
+# Как устроено: набор ipset сетей РФ плюс свои адреса «всегда напрямую»,
+# минус «всегда через туннель» (записи nomatch). Пакеты клиентов (awg0,
+# wgobf0) к этим сетям помечаются в mangle PREROUTING, а правило ip rule
+# с приоритетом 90 — раньше правил туннелей (100-249) — отправляет помеченные
+# в main: туда же, куда идут клиенты без туннеля. Свой трафик сервера и
+# пакеты к его адресам не трогаются. У Xray своё «РФ напрямую» (по доменам и
+# geoip) — оно работает вместе с этим.
+#
+# Список — ipverse/rir-ip (по данным RIPE), запасной — ipdeny. Проверка — как
+# у антисканера, плюс границы под Россию (RUDIRECT_MIN и др.): не прошёл —
+# остаётся прежний. Служба ставит набор и правила при загрузке, таймер раз в
+# час лечит их и перечитывает домены своих списков, раз в сутки обновляет
+# список РФ. Без сети — на сохранённом.
+
+_rud_get() { sed -n "s/^$1=//p" "$RUDIRECT_CONF" 2>/dev/null | tail -1; }
+
+_rud_set() {  # КЛЮЧ ЗНАЧЕНИЕ
+  local v="${2//[$'\n\r']/ }"
+  mkdir -p "$RUDIRECT_DIR" && chmod 700 "$RUDIRECT_DIR"
+  { grep -v "^$1=" "$RUDIRECT_CONF" 2>/dev/null; printf '%s=%s\n' "$1" "$v"; } | write_file "$RUDIRECT_CONF" 600
+}
+
+_rud_log() { mkdir -p "$(dirname "$RUDIRECT_LOG")"; echo "[$(date '+%F %T')] $*" >> "$RUDIRECT_LOG"; }
+
+_rud_fail() { _rud_set ERROR "$1"; _rud_log "$1"; return 1; }
+
+rudirect_on() { [[ "$(_rud_get ON)" == 1 ]]; }
+
+# Скачать список РФ: по очереди из источников, первый прошедший проверку.
+_rud_fetch() {
+  local tmp src lbl n s4 why="" keep="оставлен прежний список"
+  mkdir -p "$RUDIRECT_DIR" && chmod 700 "$RUDIRECT_DIR"
+  [[ -s "$RUDIRECT_DIR/ru.list" ]] || keep="список не принят"
+  tmp=$(mktemp "$RUDIRECT_DIR/.dl.XXXXXX") || return 1
+  for src in $RUDIRECT_SRCS; do
+    # Подпись источника: ipverse (GitHub), ipdeny.com
+    lbl="${src#https://}"
+    if [[ "$lbl" == raw.githubusercontent.com/* ]]; then lbl="${lbl#*/}"; lbl="${lbl%%/*}"
+    else lbl="${lbl%%/*}"; lbl="${lbl#www.}"; fi
+    if ! curl -fsS --proto '=https' --max-time 60 --max-filesize 5000000 -o "$tmp" "$src" 2>/dev/null; then
+      _rud_log "${src#https://}: не скачался"; why+="${why:+; }$lbl: не скачался"; continue
+    fi
+    read -r n s4 _ < <(_antiscan_parse 4 < "$tmp" | _antiscan_span)
+    if (( n < RUDIRECT_MIN || n > 100000 || s4 < RUDIRECT_MINADDR || s4 > RUDIRECT_MAX4 )); then
+      _rud_log "${src#https://}: $n сетей, $s4 адресов — не похоже на список РФ"
+      why+="${why:+; }$lbl: $n сетей, $s4 адресов — не похоже на список РФ"; continue
+    fi
+    chmod 600 "$tmp" && mv -f "$tmp" "$RUDIRECT_DIR/ru.list" || return 1
+    _rud_set ERROR ""
+    _rud_set UPDATED "$(date +%s)"
+    _rud_set SRC "$lbl"
+    _rud_log "список РФ: $n сетей, $s4 адресов (${src#https://})"
+    return 0
+  done
+  rm -f "$tmp"
+  _rud_fail "список РФ не получен (${why:-нет источников}) — $keep"
+}
+
+# Свои списки: строка — IPv4, подсеть или домен (# — комментарий). Домены
+# разрешаются в адреса при каждом применении — таймер перечитывает их раз в час.
+_rud_user_file() { echo "$RUDIRECT_USER/$1.list"; }   # direct|tunnel
+
+_rud_user_cidrs() {  # direct|tunnel → подсети
+  local f line h
+  f=$(_rud_user_file "$1")
+  [[ -s "$f" ]] || return 0
+  while IFS= read -r line; do
+    line="${line%%#*}"; line="${line//[[:space:]]/}"
+    [[ -n "$line" ]] || continue
+    if [[ "$line" =~ ^[0-9./]+$ ]]; then echo "$line"
+    else
+      for h in $(getent ahostsv4 "$line" 2>/dev/null | awk '{print $1}' | sort -u); do echo "$h/32"; done
+    fi
+  done < "$f" | _antiscan_parse 4
+}
+
+_rud_has_domains() { grep -hvE '^[[:space:]]*(#|$)|^[[:space:]]*[0-9./]+[[:space:]]*(#.*)?$' "$(_rud_user_file direct)" "$(_rud_user_file tunnel)" 2>/dev/null | grep -q .; }
+
+_rud_rule() {  # интерфейс → RUDIRECT_RULE
+  RUDIRECT_RULE=(-i "$1" -m set --match-set "$RUDIRECT_SET" dst -m addrtype ! --dst-type LOCAL
+                 -m comment --comment "$RUDIRECT_TAG" -j MARK --set-xmark "$RUDIRECT_MARK")
+}
+
+_rud_ip_rule_on() { ip rule show 2>/dev/null | grep -q "fwmark ${RUDIRECT_MARK} lookup main"; }
+
+_rud_rules_up() {
+  local dev
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _rud_rule "$dev"
+    iptables -t mangle -C PREROUTING "${RUDIRECT_RULE[@]}" 2>/dev/null \
+      || iptables -t mangle -I PREROUTING 1 "${RUDIRECT_RULE[@]}" || return 1
+  done
+  _rud_ip_rule_on || ip rule add fwmark "$RUDIRECT_MARK" lookup main priority "$RUDIRECT_PRIO" || return 1
+  ip route flush cache 2>/dev/null || true
+}
+
+_rud_rules_down() {
+  local dev guard
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _rud_rule "$dev"; guard=0
+    while (( guard++ < 32 )) && iptables -t mangle -D PREROUTING "${RUDIRECT_RULE[@]}" 2>/dev/null; do :; done
+  done
+  guard=0
+  while (( guard++ < 32 )) && ip rule del fwmark "$RUDIRECT_MARK" lookup main priority "$RUDIRECT_PRIO" 2>/dev/null; do :; done
+  return 0
+}
+
+# Правила на месте: набор, метка для awg0 и правило маршрутизации
+rudirect_rules_ok() {
+  ipset list -n "$RUDIRECT_SET" &>/dev/null || return 1
+  _rud_rule "$AWG_IF"
+  iptables -t mangle -C PREROUTING "${RUDIRECT_RULE[@]}" 2>/dev/null || return 1
+  _rud_ip_rule_on
+}
+
+# Собрать набор из сохранённого списка и своих и поставить правила.
+_rud_apply() {
+  local d n nd nt rc=0
+  # Выключили, пока качался список, — правила обратно не ставить
+  [[ "$(_rud_get ON)" == 1 ]] || { rudirect_down; return 0; }
+  [[ -s "$RUDIRECT_DIR/ru.list" ]] || { _rud_log "нечего применять: список РФ ещё не скачан"; return 3; }
+  d=$(mktemp -d "$RUDIRECT_DIR/.apply.XXXXXX") || return 1
+  _rud_user_cidrs direct | sort -u > "$d/my"
+  _rud_user_cidrs tunnel | sort -u > "$d/excl"
+  { _antiscan_parse 4 < "$RUDIRECT_DIR/ru.list"; cat "$d/my"; } | sort -u > "$d/v4"
+  nd=$(grep -c . "$d/my" || true); nt=$(grep -c . "$d/excl" || true)
+  if ! n=$(_antiscan_load "$RUDIRECT_SET" inet "$d/v4" "$d/excl"); then
+    _rud_log "ipset: набор не загрузился"; rc=5
+  elif ! _rud_rules_up; then
+    _rud_log "iptables или ip rule: правило не поставилось"; rc=5
+  else
+    _rud_set ENTRIES "$(( n - nd )) $nd $nt"
+    _rud_log "применено: сетей РФ $(( n - nd )), своих напрямую $nd, через туннель $nt"
+  fi
+  rm -rf "$d"
+  return "$rc"
+}
+
+rudirect_down() {
+  local s
+  _rud_rules_down
+  command -v ipset &>/dev/null || return 0
+  for s in "$RUDIRECT_SET" "$RUDIRECT_SET-new"; do ipset destroy "$s" 2>/dev/null || true; done
+  ip route flush cache 2>/dev/null || true
+  return 0
+}
+
+# Точка входа службы и таймера (и awg2): apply | update | heal | off.
+rudirect_run() {
+  local mode="${1:-heal}" rc=0 upd
+  mkdir -p "$RUDIRECT_DIR" && chmod 700 "$RUDIRECT_DIR"
+  exec 9>"$RUDIRECT_DIR/.lock"
+  flock -w 180 9 || { _rud_log "$mode: занято другой операцией"; return 75; }
+  if [[ "$mode" == off || "$(_rud_get ON)" != 1 ]]; then
+    rudirect_down
+    return 0
+  fi
+  case "$mode" in
+    update) _rud_fetch || true; _rud_apply || rc=$? ;;
+    apply) _rud_apply || rc=$? ;;
+    heal)
+      touch "$RUDIRECT_DIR/heal"
+      upd=$(_rud_get UPDATED)
+      if (( $(date +%s) - ${upd:-0} > 86400 )); then
+        _rud_fetch || true
+        _rud_apply || rc=$?
+      elif ! rudirect_rules_ok; then
+        _rud_log "правило пропало — применяю заново"
+        _rud_apply || rc=$?
+      elif _rud_has_domains; then
+        _rud_apply || rc=$?           # адреса доменов из своих списков меняются
+      fi ;;
+    *) echo "использование: ${0##*/} apply|update|heal|off" >&2; return 2 ;;
+  esac
+  return "$rc"
+}
+
+# ── Установка ─────────────────────────────────────────────
+_rudirect_emit() {
+  emit_script "$RUDIRECT_SCRIPT" 'rudirect_run "$@"' \
+    RUDIRECT_DIR RUDIRECT_CONF RUDIRECT_USER RUDIRECT_LOG RUDIRECT_SET RUDIRECT_TAG RUDIRECT_MARK RUDIRECT_PRIO \
+    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 AWG_IF WGOBF_IF \
+    write_file _rud_get _rud_set _rud_log _rud_fail _antiscan_parse _antiscan_span _antiscan_load \
+    _rud_fetch _rud_user_file _rud_user_cidrs _rud_has_domains _rud_rule _rud_ip_rule_on _rud_rules_up \
+    _rud_rules_down rudirect_rules_ok _rud_apply rudirect_down rudirect_run || return 1
+  write_unit "$RUDIRECT_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — РФ напрямую: клиенты в туннеле ходят к сетям России мимо него
+DefaultDependencies=no
+Wants=network-pre.target local-fs.target
+After=local-fs.target systemd-modules-load.service
+Before=network-pre.target ufw.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$RUDIRECT_SCRIPT apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_unit "${RUDIRECT_TIMER%.timer}.service" <<EOF
+[Unit]
+Description=AWG Toolza — РФ напрямую: правила на месте, домены раз в час, список раз в сутки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$RUDIRECT_SCRIPT heal
+EOF
+  write_unit "$RUDIRECT_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — РФ напрямую: проверка раз в час
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+rudirect_enable() {
+  local rc=0
+  server_exists || { err "Сервер не создан"; return 1; }
+  need_cmds ipset:ipset flock:util-linux || return 1
+  _rud_set ON 1
+  _rudirect_emit || { err "Не удалось записать службу"; return 1; }
+  info "Скачиваю и проверяю список сетей России..."
+  "$RUDIRECT_SCRIPT" update || rc=$?
+  if (( rc )); then
+    _rud_set ON 0
+    "$RUDIRECT_SCRIPT" off &>/dev/null || true
+    case $rc in
+      3) err "Список сетей России не получен: $(_rud_get ERROR)" ;;
+      75) err "Занято другой операцией — повтори через минуту" ;;
+      *) err "Не удалось поставить правила (код $rc) — журнал: Журнал «РФ напрямую»" ;;
+    esac
+    return 1
+  fi
+  systemctl enable "$RUDIRECT_UNIT" &>/dev/null || true
+  systemctl enable --now "$RUDIRECT_TIMER" &>/dev/null || true
+  log_info "РФ напрямую: включено"
+  ok "РФ напрямую включено: $(rudirect_summary)"
+  [[ -n "$(_rud_get ERROR)" ]] && warn "$(_rud_get ERROR)"
+  return 0
+}
+
+rudirect_disable() {
+  local held=0
+  _rud_set ON 0
+  remove_unit "$RUDIRECT_TIMER" "${RUDIRECT_TIMER%.timer}.service" "$RUDIRECT_UNIT"
+  mkdir -p "$RUDIRECT_DIR" && chmod 700 "$RUDIRECT_DIR"
+  exec 9>"$RUDIRECT_DIR/.lock"
+  flock -w 20 9 && held=1
+  rudirect_down
+  (( held )) || _rud_log "выключение: замок занят дольше 20 с — снято без него"
+  exec 9>&-
+  _rud_log "выключено"
+  log_info "РФ напрямую: выключено"
+  ok "РФ напрямую выключено: клиенты в туннеле снова идут через него ко всем сайтам"
+}
+
+rudirect_update() {
+  rudirect_on || { err "РФ напрямую — выключено"; return 1; }
+  _rudirect_emit || return 1
+  "$RUDIRECT_SCRIPT" update || { err "Не удалось применить список — журнал «РФ напрямую»"; return 1; }
+  if [[ -n "$(_rud_get ERROR)" ]]; then warn "$(_rud_get ERROR)"; fi
+  ok "Список обновлён: $(rudirect_summary)"
+}
+
+# Починить: правила и набор заново из сохранённого списка (без скачивания)
+rudirect_repair() {
+  rudirect_on || { err "РФ напрямую — выключено"; return 1; }
+  _rudirect_emit || return 1
+  systemctl enable "$RUDIRECT_UNIT" &>/dev/null || true
+  systemctl enable --now "$RUDIRECT_TIMER" &>/dev/null || true
+  "$RUDIRECT_SCRIPT" apply || { err "Не удалось применить — журнал «РФ напрямую»"; return 1; }
+  rudirect_rules_ok || { err "Правила не на месте и после починки — журнал «РФ напрямую»"; return 1; }
+  ok "Правила на месте: $(rudirect_summary)"
+}
+
+# Пакетов и байт, ушедших мимо туннеля, с установки правил (перезагрузка сбрасывает)
+rudirect_counters() {
+  iptables-save -c -t mangle 2>/dev/null | awk -v tag="$RUDIRECT_TAG" 'index($0, "--comment " tag) && /^\[/ {
+      split(substr($1, 2), c, ":"); sub(/\].*/, "", c[2]); p += c[1]; b += c[2] }
+    END { printf "%.0f %.0f\n", p, b }'
+}
+
+rudirect_summary() {
+  local e
+  read -r -a e <<< "$(_rud_get ENTRIES)"
+  echo "сетей РФ ${e[0]:-0}, своих напрямую ${e[1]:-0}, через туннель ${e[2]:-0}"
+}
+
+# ── Свои списки ───────────────────────────────────────────
+# Запись: IPv4, подсеть (не шире /12) или домен; из URL берётся домен.
+# Частные и служебные сети не принимаются: они и так не идут через туннель.
+_rud_entry_norm() {  # ввод → нормальная запись или пусто
+  local raw="${1//[[:space:]]/}" v
+  if [[ "$raw" =~ ^[0-9.]+(/[0-9]+)?$ ]]; then
+    v=$(_antiscan_parse 4 <<< "$raw")
+    [[ -n "$v" ]] || return 1
+    echo "${v%/32}"     # одиночный адрес — без /32: «1.2.3.4» и «1.2.3.4/32» — одна запись
+    return 0
+  fi
+  v="${raw,,}"; v="${v#*://}"; v="${v%%/*}"; v="${v%%:*}"
+  valid_domain "$v" && echo "$v"
+}
+
+rudirect_list() {  # direct|tunnel → записи
+  local f
+  f=$(_rud_user_file "$1")
+  [[ -f "$f" ]] && grep -vE '^[[:space:]]*(#|$)' "$f"
+  return 0
+}
+
+rudirect_list_add() {  # direct|tunnel запись
+  local kind="$1" v f other
+  [[ "$kind" == direct || "$kind" == tunnel ]] || { err "Список: direct | tunnel"; return 1; }
+  v=$(_rud_entry_norm "${2:-}") || { err "Нужен публичный IPv4, подсеть не шире /12 или домен: ${2:-пусто}"; return 1; }
+  f=$(_rud_user_file "$kind")
+  mkdir -p "$RUDIRECT_USER" && chmod 700 "$RUDIRECT_USER"
+  grep -qxF "$v" "$f" 2>/dev/null && { info "$v уже в списке"; return 0; }
+  other=$(_rud_user_file "$([[ "$kind" == direct ]] && echo tunnel || echo direct)")
+  grep -qxF "$v" "$other" 2>/dev/null && { err "$v уже в другом списке — сначала убери его оттуда"; return 1; }
+  (( $(rudirect_list "$kind" | grep -c . || true) < RUDIRECT_USER_MAX )) \
+    || { err "В списке уже $RUDIRECT_USER_MAX записей"; return 1; }
+  { cat "$f" 2>/dev/null; echo "$v"; } | write_file "$f" 600
+  _rud_log "$([[ "$kind" == direct ]] && echo 'напрямую' || echo 'через туннель') + $v"
+  ok "$v — $([[ "$kind" == direct ]] && echo 'всегда напрямую' || echo 'всегда через туннель')"
+  _rud_reapply
+}
+
+rudirect_list_del() {  # direct|tunnel запись|all
+  local kind="$1" v="${2:-}" f
+  [[ "$kind" == direct || "$kind" == tunnel ]] || { err "Список: direct | tunnel"; return 1; }
+  f=$(_rud_user_file "$kind")
+  if [[ "$v" == all ]]; then
+    rm -f "$f"; _rud_log "$kind: список очищен"; ok "Список очищен"
+  else
+    v=$(_rud_entry_norm "$v") || v="${2:-}"
+    grep -qxF "$v" "$f" 2>/dev/null || { err "$v в списке нет"; return 1; }
+    grep -vxF "$v" "$f" | write_file "$f" 600
+    _rud_log "$kind − $v"; ok "Убрано: $v"
+  fi
+  _rud_reapply
+}
+
+_rud_reapply() {
+  rudirect_on || { info "РФ напрямую выключено — список вступит в силу при включении"; return 0; }
+  _rudirect_emit && "$RUDIRECT_SCRIPT" apply || { err "Не удалось применить — журнал «РФ напрямую»"; return 1; }
+}
+
+# Таймер молчит дольше трёх часов (сброшен, заглох) — перезапустить
+rudirect_watchdog() {
+  local age
+  rudirect_on || return 0
+  [[ -f "$RUDIRECT_DIR/heal" ]] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y "$RUDIRECT_DIR/heal" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$RUDIRECT_DIR/heal"
+  timer_heal "$RUDIRECT_TIMER"
+  systemctl start --no-block "${RUDIRECT_TIMER%.timer}.service" &>/dev/null || true
+}
+
+rudirect_remove() {
+  remove_unit "$RUDIRECT_TIMER" "${RUDIRECT_TIMER%.timer}.service" "$RUDIRECT_UNIT"
+  rudirect_down
+  rm -rf "$RUDIRECT_DIR" "$RUDIRECT_SCRIPT" "$RUDIRECT_LOG"
+}
+
+# ── Меню ──────────────────────────────────────────────────
+_rudirect_show() {
+  local upd err c
+  hdr "РФ напрямую"
+  echo -e "  ${D}Клиенты в туннеле (WARP, Xray, tun2socks, exit-ноды) ходят к сетям России мимо"
+  echo -e "  него, прямо с сервера. Полезно, когда сервер в России, а выход — за границей.${N}"
+  echo ""
+  if rudirect_on; then
+    if rudirect_rules_ok; then echo -e "  Состояние : ${G}● включено${N} — $(rudirect_summary)"
+    else echo -e "  Состояние : ${Y}▲ включено, правило не на месте${N} — «Починить» или подождать таймер"; fi
+    read -r c _ <<< "$(rudirect_counters)"
+    echo -e "  Мимо туннеля: ${W}${c:-0}${N} ${D}пакетов (сбрасывается при перезагрузке)${N}"
+  else
+    echo -e "  Состояние : ${D}○ выключено${N}"
+  fi
+  upd=$(_rud_get UPDATED)
+  [[ -n "$upd" ]] && echo -e "  Список    : обновлён $(date -d "@$upd" '+%d.%m.%Y %H:%M' 2>/dev/null) ${D}($(_rud_get SRC))${N}"
+  err=$(_rud_get ERROR)
+  [[ -n "$err" ]] && echo -e "  ${Y}▲ $err${N}"
+  return 0
+}
+
+_rudirect_list_menu() {  # direct|tunnel
+  local kind="$1" rows=() i c v title
+  title=$([[ "$kind" == direct ]] && echo "Всегда напрямую" || echo "Всегда через туннель")
+  while true; do
+    mapfile -t rows < <(rudirect_list "$kind")
+    echo ""
+    hdr "$title"
+    (( ${#rows[@]} )) || echo -e "  ${D}Список пуст${N}"
+    for i in "${!rows[@]}"; do echo -e "  ${C}$((i + 1)))${N} ${rows[$i]}"; done
+    echo -e "  ${G}a)${N} Добавить ${D}— IPv4, подсеть или домен${N}"
+    (( ${#rows[@]} )) && echo -e "  ${R}x)${N} Очистить"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Номер — убрать: ${N}" 0 "${#rows[@]}" 0 "a|x"
+    case "$c" in
+      0) return 0 ;;
+      a) read_line v "${C}  Адрес, подсеть или домен: ${N}"; [[ -n "$v" ]] && { rudirect_list_add "$kind" "$v" || true; } ;;
+      x) ask_yes "  Очистить список? [y/N]: " n && { rudirect_list_del "$kind" all || true; } ;;
+      *) rudirect_list_del "$kind" "${rows[$((c - 1))]}" || true ;;
+    esac
+  done
+}
+
+do_rudirect_menu() {
+  local c
+  while true; do
+    echo ""
+    _rudirect_show
+    echo ""
+    if rudirect_on; then echo -e "  ${C}1)${N} Выключить"; else echo -e "  ${C}1)${N} Включить"; fi
+    echo -e "  ${C}2)${N} Обновить список сейчас"
+    echo -e "  ${C}3)${N} Всегда напрямую ${D}— свои адреса: $(rudirect_list direct | grep -c . || true)${N}"
+    echo -e "  ${C}4)${N} Всегда через туннель ${D}— исключения: $(rudirect_list tunnel | grep -c . || true)${N}"
+    echo -e "  ${C}5)${N} Починить ${D}— поставить правила заново${N}"
+    echo -e "  ${C}6)${N} Журнал"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Выбор [0-6]: ${N}" 0 6 0
+    case "$c" in
+      1) if rudirect_on; then rudirect_disable
+         else
+           echo -e "  ${D}Клиенты в туннеле пойдут к сайтам России с адреса сервера.${N}"
+           ask_yes "  Включить? [y/N]: " n && { rudirect_enable || true; }
+         fi ;;
+      2) rudirect_update || true ;;
+      3) _rudirect_list_menu direct; continue ;;
+      4) _rudirect_list_menu tunnel; continue ;;
+      5) rudirect_repair || true ;;
+      6) tail -n 40 "$RUDIRECT_LOG" 2>/dev/null || info "Журнал пуст" ;;
+      0) return 0 ;;
+    esac
+    pause
+  done
+}
+
+# ═════ tunfail ═════
+# Если туннель упал: на каждый туннель (WARP, Xray, tun2socks, exit-ноды) —
+# «напрямую» (как было: клиенты идут с адреса сервера) или «блокировать»
+# (клиенты ждут туннель без интернета, кроме «РФ напрямую»). Режим работает в
+# rt_up / rt_down (tunnels.sh): у включения и у падения туннеля. Здесь — выбор,
+# применение на ходу, сторож и меню.
+#
+# Сторож (awg2-tunfail.service: при загрузке и по таймеру раз в минуту) держит
+# клиентов включённого, но лежащего туннеля в режиме «блокировать»: после
+# перезагрузки, пока туннель не поднялся, и если служба туннеля не дошла до
+# своих правил (Xray не дождался выхода, exit-ноды не поднялись). Поднят другой
+# туннель — лежащий не держится: его правила перехватили бы чужих клиентов.
+
+TUNFAIL_NAMES="warp xray t2s exits"
+
+_tunfail_table() {
+  case "$1" in
+    warp) echo "$WARP_TABLE" ;; xray) echo "$XRAY_TABLE" ;; t2s) echo "$T2S_TABLE" ;; exits) echo "$EXITS_TABLE" ;;
+  esac
+}
+
+tunfail_label() {
+  case "$1" in warp) echo WARP ;; xray) echo Xray ;; t2s) echo tun2socks ;; exits) echo "Exit-ноды WG" ;; esac
+}
+
+_tunfail_log() { mkdir -p "$(dirname "$TUNFAIL_LOG")"; echo "[$(date '+%F %T')] $*" >> "$TUNFAIL_LOG"; }
+
+tunfail_any_block() { grep -q '=block$' "$TUNFAIL_CONF" 2>/dev/null; }
+tunfail_block() { [[ "$(rt_fail_mode "$1")" == block ]]; }   # имя
+
+# Таблицы, на которые сейчас есть правила клиентов
+_tunfail_rule_tables() { ip rule show 2>/dev/null | awk '$(NF - 1) == "lookup" && $NF ~ /^[0-9]+$/ {print $NF}' | sort -un; }
+
+_tunfail_is_exit_table() { (( $1 == EXITS_TABLE || ($1 >= EXITS_TABLE_BASE && $1 <= EXITS_TABLE_MAX) )); }
+
+# Поднят другой туннель (у него живой маршрут)
+_tunfail_other_live() {  # имя
+  local t me
+  me=$(_tunfail_table "$1")
+  for t in $(_tunfail_rule_tables); do
+    (( t == me )) && continue
+    [[ "$1" == exits ]] && _tunfail_is_exit_table "$t" && continue
+    (( t == T2S_TABLE || t == WARP_TABLE || t == XRAY_TABLE )) || _tunfail_is_exit_table "$t" || continue
+    rt_table_live "$t" && return 0
+  done
+  return 1
+}
+
+# Правила клиентов туннеля — в его таблицу с «недоступно». 0 — удержание
+# поставлено сейчас, 1 — правила уже были (держит сам туннель) или не вышло.
+_tunfail_hold() {  # имя
+  local name="$1" table net mode f line ip
+  table=$(_tunfail_table "$name")
+  ip route replace unreachable default metric 4096 table "$table" 2>/dev/null || return 1
+  ip rule show 2>/dev/null | grep -qE "lookup $table\$" && return 1
+  net=$(server_net) || return 1
+  case "$name" in
+    warp) rt_rules_file "$WARP_PEERS" "$table" ;;
+    xray) rt_rules_file "$XRAY_PEERS" "$table" ;;
+    t2s) ip rule add from "$net" lookup "$table" priority "$table" ;;
+    exits)
+      mode=$(sed -n 's/^mode=//p' "$EXITS_STATE" 2>/dev/null | head -1)
+      if [[ "${mode:-all}" == all ]]; then ip rule add from "$net" lookup "$table" priority "$table"
+      else f="$EXITS_PEERS"; fi
+      for f in ${f:+"$f"} "$EXITS_PEERS.wgobf"; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r line; do
+          ip="${line%%|*}"; ip="${ip//[[:space:]]/}"
+          valid_ip "$ip" && ip rule add from "$ip" lookup "$table" priority "$table"
+        done < "$f"
+      done ;;
+  esac
+  return 0
+}
+
+# Отпустить клиентов лежащего туннеля (режим «напрямую»): правила и маршруты
+# его таблиц сняты — клиенты идут напрямую. Живой туннель — только снять
+# «недоступно» под его маршрутом.
+_tunfail_release() {  # имя
+  local name="$1" t table
+  table=$(_tunfail_table "$name")
+  for t in "$table" $( [[ "$name" == exits ]] && _tunfail_rule_tables ); do
+    [[ "$name" == exits && "$t" != "$table" ]] && ! _tunfail_is_exit_table "$t" && continue
+    if rt_table_live "$t"; then
+      ip route del unreachable default metric 4096 table "$t" 2>/dev/null || true
+    else
+      rt_rules_clear "$t"
+      ip route flush table "$t" 2>/dev/null || true
+    fi
+  done
+  return 0
+}
+
+# Точка входа сторожа: включённый, но лежащий туннель в режиме «блокировать»
+# держит своих клиентов; работающий — получает «недоступно» под маршрутом.
+tunfail_guard_run() {
+  local name table
+  for name in $TUNFAIL_NAMES; do
+    [[ "$(rt_fail_mode "$name")" == block ]] || continue
+    table=$(_tunfail_table "$name")
+    rt_tunnel_on "$table" || continue
+    if rt_table_live "$table"; then rt_fail_route "$table"; continue; fi
+    _tunfail_other_live "$name" && continue
+    if _tunfail_hold "$name"; then
+      _tunfail_log "$(tunfail_label "$name") включён, но не работает — клиенты удержаны до его подъёма"
+    fi
+  done
+  return 0
+}
+
+# Удержан сейчас: включён, не работает, режим «блокировать», правила стоят
+tunfail_held() {  # имя
+  local table
+  table=$(_tunfail_table "$1")
+  [[ "$(rt_fail_mode "$1")" == block ]] && rt_tunnel_on "$table" && ! rt_table_live "$table" \
+    && ip rule show 2>/dev/null | grep -qE "lookup $table\$" \
+    && ip route show table "$table" 2>/dev/null | grep -q '^unreachable default'
+}
+
+# ── Установка ─────────────────────────────────────────────
+_tunfail_emit() {
+  emit_script "$TUNFAIL_SCRIPT" 'tunfail_guard_run' WARP_PEERS XRAY_PEERS EXITS_PEERS TUNFAIL_NAMES \
+    "${RT_FUNCS[@]}" _tunfail_table tunfail_label _tunfail_log _tunfail_rule_tables _tunfail_is_exit_table \
+    _tunfail_other_live _tunfail_hold tunfail_guard_run || return 1
+  # Один юнит: при загрузке (сразу за awg0 — раньше туннелей) и от таймера
+  write_unit "$TUNFAIL_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — если туннель упал: клиенты туннелей в режиме «блокировать» не уходят напрямую
+After=network-online.target awg-quick@awg0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$TUNFAIL_SCRIPT
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_unit "$TUNFAIL_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — если туннель упал: проверка раз в минуту
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=10
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+_tunfail_units() {
+  if tunfail_any_block; then
+    _tunfail_emit || { err "Не удалось записать службу сторожа"; return 1; }
+    systemctl enable "$TUNFAIL_UNIT" &>/dev/null || true
+    systemctl enable --now "$TUNFAIL_TIMER" &>/dev/null || true
+  else
+    remove_unit "$TUNFAIL_TIMER" "$TUNFAIL_UNIT"
+  fi
+  return 0
+}
+
+# Режим туннелю (или всем) и сразу — на ходу.
+tunfail_set() {  # warp|xray|t2s|exits|all direct|block
+  local name="$1" mode="${2:-}" n list
+  [[ "$mode" == direct || "$mode" == block ]] || { err "Режим: direct | block"; return 1; }
+  if [[ "$name" == all ]]; then list="$TUNFAIL_NAMES"
+  elif [[ " $TUNFAIL_NAMES " == *" $name "* ]]; then list="$name"
+  else err "Туннель: warp | xray | t2s | exits | all"; return 1; fi
+  mkdir -p "$(dirname "$TUNFAIL_CONF")"
+  for n in $list; do
+    { grep -v "^$n=" "$TUNFAIL_CONF" 2>/dev/null; [[ "$mode" == block ]] && echo "$n=block"; } \
+      | write_file "$TUNFAIL_CONF" 644
+    if [[ "$mode" == block ]]; then tunfail_guard_run; else _tunfail_release "$n"; fi
+    _tunfail_log "$(tunfail_label "$n"): если упал — $([[ "$mode" == block ]] && echo блокировать || echo напрямую)"
+    log_info "если туннель упал: $n → $mode"
+  done
+  [[ -s "$TUNFAIL_CONF" ]] || rm -f "$TUNFAIL_CONF"
+  _tunfail_units || return 1
+  if [[ "$mode" == block ]]; then
+    ok "$([[ "$name" == all ]] && echo "Все туннели" || tunfail_label "$name"): если упадёт — клиенты ждут его без интернета (кроме «РФ напрямую»)"
+  else
+    ok "$([[ "$name" == all ]] && echo "Все туннели" || tunfail_label "$name"): если упадёт — клиенты идут напрямую, как раньше"
+  fi
+}
+
+# Строки статуса: имя, режим, включён, работает, удержан
+tunfail_rows() {
+  local n table
+  for n in $TUNFAIL_NAMES; do
+    table=$(_tunfail_table "$n")
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$n" "$(tunfail_label "$n")" "$(rt_fail_mode "$n")" \
+      "$(rt_tunnel_on "$table" && echo 1 || echo 0)" "$(rt_table_live "$table" && echo 1 || echo 0)" \
+      "$(tunfail_held "$n" && echo 1 || echo 0)"
+  done
+}
+
+# Таймер сторожа молчит (сброшен, заглох) — вернуть
+tunfail_watchdog() {
+  tunfail_any_block || return 0
+  systemctl is-active --quiet "$TUNFAIL_TIMER" 2>/dev/null && return 0
+  _tunfail_units &>/dev/null || true
+}
+
+tunfail_remove() {
+  remove_unit "$TUNFAIL_TIMER" "$TUNFAIL_UNIT"
+  rm -f "$TUNFAIL_SCRIPT" "$TUNFAIL_CONF" "$TUNFAIL_LOG"
+}
+
+# ── Меню ──────────────────────────────────────────────────
+do_tunfail_menu() {
+  local c n mode en up st rows=()
+  while true; do
+    echo ""
+    hdr "Если туннель упал"
+    echo -e "  ${D}Напрямую — как раньше: клиенты упавшего туннеля идут с адреса сервера."
+    echo -e "  Блокировать — ждут туннель без интернета (кроме «РФ напрямую»): адрес сервера"
+    echo -e "  не засветится. Выключенный руками туннель клиентов отпускает в любом режиме.${N}"
+    echo ""
+    mapfile -t rows < <(tunfail_rows)
+    for c in "${!rows[@]}"; do
+      IFS=$'\t' read -r n _ mode _ _ st <<< "${rows[$c]}"
+      echo -e "  ${C}$((c + 1)))${N} $(printf '%-14s' "$(tunfail_label "$n")") $([[ "$mode" == block ]] && echo "${Y}блокировать${N}" || echo "напрямую")$( (( st )) && echo " ${R}— сейчас удерживает клиентов${N}")"
+    done
+    echo -e "  ${C}a)${N} Всем — напрямую ${D}(как было)${N}"
+    echo -e "  ${C}l)${N} Журнал"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Номер — переключить: ${N}" 0 4 0 "a|l"
+    case "$c" in
+      0) return 0 ;;
+      a) tunfail_set all direct || true ;;
+      l) tail -n 40 "$TUNFAIL_LOG" 2>/dev/null || info "Журнал пуст" ;;
+      *) IFS=$'\t' read -r n _ mode en up _ <<< "${rows[$((c - 1))]}"
+         if [[ "$mode" == block ]]; then tunfail_set "$n" direct || true
+         elif (( en && ! up )); then
+           # Включён, но лежит: «блокировать» сразу оставит его клиентов без интернета
+           warn "$(tunfail_label "$n") сейчас не работает: его клиенты сразу останутся без интернета (кроме «РФ напрямую»)"
+           if ask_yes "  Блокировать? [y/N]: " n; then tunfail_set "$n" block || true; fi
+         else tunfail_set "$n" block || true; fi ;;
+    esac
+    pause
+  done
+}
+
 # ═════ uninstall ═════
 # Очистка клиентов и полное удаление.
 
@@ -12473,7 +13312,11 @@ clients_clean() {
 # Все туннели: службы, правила и настройки. Бэкап делается до вызова.
 tunnels_remove_all() {
   local n
+  # «Блокировать» — раньше сброса: туннелей не будет, держать клиентов незачем.
+  # «РФ напрямую» без туннелей ничего не делает — уходит вместе с ними
+  tunfail_remove
   tunnels_panic_reset quiet
+  rudirect_remove
   for n in $(exits_nodes); do systemctl disable --now "awg-quick@awg-exit-$n" &>/dev/null || true; done
   remove_unit awg-warp.service awg-usque.service awg-warp-healthcheck.timer awg-warp-healthcheck.service \
     "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" awg-xray-rugeo.timer awg-xray-rugeo.service \
@@ -12490,7 +13333,7 @@ tunnels_remove_all() {
     "$USQUE_DIR" "$USQUE_BIN" "$USQUE_SYSCTL" "$WARPSCOUT_DIR" "$WARPSCOUT_BIN" \
     "$XRAY_DIR" "$XRAY_BIN" "$XRAY_ROUTING_SCRIPT" "$XRAY_ASSET_DIR"/geo{ip,site}.dat "$XRAY_ASSET_DIR"/geo{ip,site}_RU.dat \
     "$T2S_DIR" "$T2S_BIN" "$T2S_ROUTING_SCRIPT" "$EXITS_SCRIPT" \
-    "$DNS_PROXY_STATE" "$DNS_PERSIST_SCRIPT" "$DNS_HEALTH_SCRIPT" "$DNS_SYSCTL"
+    "$DNS_PROXY_STATE" "$DNS_PERSIST_SCRIPT" "$DNS_HEALTH_SCRIPT" "$DNS_SYSCTL" "$RUDIRECT_USER"
 }
 
 # Файлы, которые кладёт «make install» amneziawg-tools.
@@ -12808,18 +13651,108 @@ do_diag_menu() {
     echo -e "  ${C}3)${N} Тест мимикрии ${D}— захват пакетов клиента${N}"
     echo -e "  ${C}4)${N} DPI со стороны клиента"
     echo -e "  ${C}5)${N} Модуль ядра и утилиты ${D}— подробный отчёт${N}"
+    echo -e "  ${C}6)${N} Куда идёт адрес ${D}— туннель, нода или напрямую для клиента${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-5]: ${N}" 0 5 0
+    read_choice c "${C}  Выбор [0-6]: ${N}" 0 6 0
     case "$c" in
       1) do_status ;;
       2) do_check_domains || true ;;
       3) do_sniff_test || true ;;
       4) do_client_dpi_hint ;;
       5) components_report || true ;;
+      6) do_diag_route || true ;;
       0) return 0 ;;
     esac
     pause
   done
+}
+
+# ── Куда идёт адрес ───────────────────────────────────────
+# Для клиента и адреса (IP, домен или ссылка): каждый IPv4 адреса — решение
+# самого ядра (ip route get от имени клиента, с меткой «РФ напрямую», если
+# адрес в её наборе) и что раньше маршрута: «VK и Max» отбрасывает, клиент
+# заблокирован. Строки «ip<TAB>вид<TAB>устройство<TAB>пояснение»; вид:
+# warp | xray | t2s | exit | direct | rudirect | held | drop | blocked | none.
+# Ничего не меняет — только читает.
+DIAG_FWD="/proc/sys/net/ipv4/ip_forward"
+diag_route() {  # клиент адрес
+  local name="${1:-}" addr="${2:-}" row cip orig host ips=() ip kind dev note out mark tun xo
+  server_exists || { err "Сервер не создан"; return 1; }
+  row=$(clients_tsv | awk -F'\t' -v n="$name" '$1 == n {print; exit}')
+  [[ -n "$row" ]] || { err "Клиента $name нет"; return 1; }
+  # Через «|»: подряд идущие табы read схлопнул бы, и пустой срок сдвинул бы колонки
+  IFS='|' read -r _ _ cip _ orig _ <<< "${row//$'\t'/|}"
+  cip="${orig:-$cip}"; cip="${cip%%,*}"; cip="${cip%%/*}"; cip="${cip//[[:space:]]/}"
+  host="${addr//[[:space:]]/}"; host="${host,,}"
+  host="${host#*://}"; host="${host%%/*}"; host="${host%%\?*}"
+  [[ "$host" == *:* && "$host" != *:*:* ]] && host="${host%%:*}"
+  if valid_ip "$host"; then ips=("$host")
+  elif valid_domain "$host"; then
+    mapfile -t ips < <(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u | head -8)
+    (( ${#ips[@]} )) || { err "Домен $host не разрешается в IPv4 с этого сервера"; return 1; }
+  else
+    err "Нужен IPv4, домен или ссылка: $addr"; return 1
+  fi
+  tun=$(tunnel_conflict none)
+  for ip in "${ips[@]}"; do
+    kind="" dev="" note="" mark=""
+    if [[ -n "$orig" ]]; then
+      kind=blocked note="клиент заблокирован (срок или лимит трафика) — его трафик не идёт никуда"
+    elif vkblock_on && ipset test "$VKBLOCK_SET" "$ip" &>/dev/null; then
+      kind=drop note="сеть VK — отбрасывается («VK и Max мимо VPN»)"
+    else
+      rudirect_on && ipset test "$RUDIRECT_SET" "$ip" &>/dev/null && mark="${RUDIRECT_MARK%%/*}"
+      if ! ip link show "$AWG_IF" &>/dev/null; then
+        kind=none note="awg0 не поднят — проверить маршрут нельзя"
+      elif ! out=$(ip -4 route get "$ip" from "$cip" iif "$AWG_IF" ${mark:+mark "$mark"} 2>&1); then
+        if [[ "$(cat "$DIAG_FWD" 2>/dev/null)" == 0 ]]; then
+          kind=none note="пересылка пакетов на сервере выключена (ip_forward) — «Сервер → Починить»"
+        elif [[ "$out" == *nreachable* || "$out" == *"No route"* ]] && tunfail_any_block; then
+          kind=held note="туннель лежит, режим «блокировать» — клиент ждёт его без интернета"
+        elif [[ "$out" == *nreachable* || "$out" == *"No route"* ]]; then
+          kind=none note="у ядра нет маршрута для клиента — «Туннели → Аварийный сброс» вернёт прямой"
+        else
+          kind=none note="ядро не ответило: ${out##*: }"
+        fi
+      else
+        dev=$(awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}' <<< "$out")
+        case "$dev" in
+          "$WARP_IF") kind=warp note="через WARP" ;;
+          "$T2S_IF") kind=t2s note="через tun2socks ($(t2s_proxy))" ;;
+          "$XRAY_IF")
+            kind=xray
+            xo=$(grep -E "^${cip//./\\.}\|" "$XRAY_PEERS" 2>/dev/null | head -1 | cut -d'|' -f2)
+            note="через Xray$([[ -n "$xo" ]] && echo ", свой выход $xo" || echo ", выход по умолчанию")"
+            xray_ru_on && note+="; внутри Xray РФ-сайты — напрямую по его правилам" ;;
+          awg-exit-*) kind=exit note="через exit-ноду ${dev#awg-exit-}"
+            [[ "$(exits_state_get balancer)" == ecmp ]] && ip route show table "$EXITS_TABLE" 2>/dev/null | grep -q nexthop \
+              && note+=" (балансировка: соединения делятся между нодами)" ;;
+          *)
+            if [[ -n "$mark" ]]; then kind=rudirect note="напрямую с сервера — сеть России («РФ напрямую»)"
+            elif [[ -n "$tun" ]]; then kind=direct note="напрямую с сервера — клиент не в туннеле ($tun)"
+            else kind=direct note="напрямую с сервера — туннели выключены"; fi ;;
+        esac
+      fi
+    fi
+    printf '%s\t%s\t%s\t%s\n' "$ip" "$kind" "$dev" "$note"
+  done
+}
+
+do_diag_route() {
+  local name addr ip kind dev note
+  _pick_client || return 0
+  name="${CHOSEN%%$'\t'*}"
+  read_line addr "${C}  Адрес, домен или ссылка: ${N}"
+  [[ -n "$addr" ]] || return 0
+  echo ""
+  hdr "Куда идёт $addr у $name"
+  while IFS=$'\t' read -r ip kind dev note; do
+    case "$kind" in
+      warp|xray|t2s|exit) echo -e "  ${G}●${N} $ip — $note" ;;
+      direct|rudirect) echo -e "  ${C}●${N} $ip — $note" ;;
+      *) echo -e "  ${Y}▲${N} $ip — $note" ;;
+    esac
+  done < <(diag_route "$name" "$addr")
 }
 
 # ═════ menu ═════
@@ -13062,6 +13995,7 @@ _api_status() {
     fi
     _kv tunnels.warp "$(_api_tun warp_is_up "$WARP_CONF" "$USQUE_CONF")"
     _kv tunnels.warp_failed:b "$(_b warp_failed)"
+    _kv tunnels.warp_block:b "$(_b tunfail_block warp)"
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
@@ -13396,7 +14330,15 @@ _api_diag() {
       [[ -n "${2:-}" ]] || { _api_usage "diag sniff ИМЯ"; return; }
       sniff_client "$2" ;;
     dpi-hint) do_client_dpi_hint ;;
-    *) _api_usage "diag status|domains world|ru|sniff-list|sniff ИМЯ|dpi-hint" ;;
+    route)
+      [[ -n "${3:-}" ]] || { _api_usage "diag route КЛИЕНТ АДРЕС"; return; }
+      local rows
+      # err пишет в stdout: при отказе он в rows — вернуть его в журнал
+      if ! rows=$(diag_route "$2" "$3"); then printf '%s\n' "$rows"; return 1; fi
+      { _kv client "$2"; _kv input "$3"
+        _kv ip "$(clients_name_ip | awk -F'|' -v n="$2" '$1 == n {print $2; exit}')"
+        _kv rows:j "$(printf '%s\n' "$rows" | py json-rows ip kind dev note)"; } | api_obj ;;
+    *) _api_usage "diag status|domains world|ru|sniff-list|sniff ИМЯ|dpi-hint|route КЛИЕНТ АДРЕС" ;;
   esac
 }
 
@@ -13440,6 +14382,9 @@ _api_tunnels() {
         _kv cascade:n "$(cascade_count)"
         if dns_installed; then _kv dns "$(dns_running && echo up || echo off)"; else _kv dns none; fi
         _kv active "$(tunnel_conflict none)"
+        _kv rudirect:b "$(_b rudirect_on)"
+        _kv fail_block:b "$(_b tunfail_any_block)"
+        _kv held "$(for n in $TUNFAIL_NAMES; do tunfail_held "$n" && tunfail_label "$n"; done | paste -sd, -)"
         # Счётчики интерфейсов туннелей (для карточек и сводки панели): есть — поднят
         _kv ifs:j "$(for i in "$WARP_IF" "$XRAY_IF" "$T2S_IF"; do
                       [[ -r "/sys/class/net/$i/statistics/rx_bytes" ]] || continue
@@ -13460,7 +14405,15 @@ _api_tunnels() {
     client)
       [[ -n "${3:-}" ]] || { _api_usage "tunnels client warp|xray ИМЯ|all|none [on|off]"; return; }
       tunnel_client "$2" "$3" "${4:-}" ;;
-    *) _api_usage "tunnels status|panic|clients warp|xray|client warp|xray ИМЯ|all|none [on|off]" ;;
+    fail)
+      case "${2:-}" in
+        ""|list) tunfail_rows | api_rows name label mode enabled:b up:b held:b ;;
+        set)
+          [[ -n "${4:-}" ]] || { _api_usage "tunnels fail set warp|xray|t2s|exits|all direct|block"; return; }
+          tunfail_set "$3" "$4" ;;
+        *) _api_usage "tunnels fail [list]|set warp|xray|t2s|exits|all direct|block" ;;
+      esac ;;
+    *) _api_usage "tunnels status|panic|clients warp|xray|client warp|xray ИМЯ|all|none [on|off]|fail [list|set ...]" ;;
   esac
 }
 
@@ -13633,6 +14586,35 @@ _api_cascade() {
     remove) cascade_uninstall quiet ;;
     diag) cascade_diagnose ;;
     *) _api_usage "cascade list|add ...|del ПРОТО ПОРТ|reapply|clear|remove|diag" ;;
+  esac
+}
+
+# РФ напрямую: клиенты в туннеле — к сетям России мимо него.
+_api_rudirect() {
+  local a="${1:-}" p b e
+  shift || true
+  case "$a" in
+    ""|status)
+      read -r p b <<< "$(rudirect_counters)"
+      { _kv enabled:b "$(_b rudirect_on)"; _kv active:b "$(_b rudirect_rules_ok)"
+        read -r -a e <<< "$(_rud_get ENTRIES)"
+        _kv ru:n "${e[0]:-0}"; _kv mine:n "${e[1]:-0}"; _kv excl:n "${e[2]:-0}"
+        _kv updated:n "$(_rud_get UPDATED)"; _kv src "$(_rud_get SRC)"; _kv error "$(_rud_get ERROR)"
+        _kv packets:n "${p:-0}"; _kv bytes:n "${b:-0}"
+        _kv direct:j "$(rudirect_list direct | py json-list)"
+        _kv tunnel:j "$(rudirect_list tunnel | py json-list)"
+        _kv xray_ru:b "$(_b xray_ru_on)"; } | api_obj ;;
+    on) rudirect_enable ;;
+    off) rudirect_disable ;;
+    update) rudirect_update ;;
+    repair) rudirect_repair ;;
+    add)
+      [[ -n "${2:-}" ]] || { _api_usage "rudirect add direct|tunnel АДРЕС"; return; }
+      rudirect_list_add "$1" "$2" ;;
+    del)
+      [[ -n "${2:-}" ]] || { _api_usage "rudirect del direct|tunnel АДРЕС|all"; return; }
+      rudirect_list_del "$1" "$2" ;;
+    *) _api_usage "rudirect status|on|off|update|repair|add direct|tunnel АДРЕС|del direct|tunnel АДРЕС|all" ;;
   esac
 }
 
@@ -14008,7 +14990,8 @@ _api_log() {
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
     antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock [строк]"; return ;;
+    rudirect) file="$RUDIRECT_LOG" ;;   tunfail) file="$TUNFAIL_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock|rudirect|tunfail [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -14093,7 +15076,8 @@ _api_readonly() {
   # server params set — правят общие файлы) сюда не попадают — в очередь.
   [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
   case "$a $b $c" in
-    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get") return 0 ;;
+    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get"|\
+    "tunnels fail "|"tunnels fail list") return 0 ;;
   esac
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
@@ -14101,7 +15085,7 @@ _api_readonly() {
     "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
   esac
   return 1
 }
@@ -14143,6 +15127,7 @@ api_dispatch() {
     exits) _api_exits "$@" ;;
     cascade) _api_cascade "$@" ;;
     entry) _api_entry "$@" ;;
+    rudirect) _api_rudirect "$@" ;;
     dns) _api_dns "$@" ;;
     wgobf) _api_wgobf "$@" ;;
     update) _api_update "$@" ;;
@@ -14158,7 +15143,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
+      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock rudirect amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -14203,6 +15188,8 @@ api_main() {
     expire_watchdog || true
     antiscan_watchdog || true
     vkblock_watchdog || true
+    rudirect_watchdog || true
+    tunfail_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else
@@ -19321,5 +20308,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=3db3ce83d6c0c75c
+_BUILD_SUM=fdf0939576ceb634
 main "$@"
