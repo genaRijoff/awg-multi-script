@@ -110,6 +110,7 @@ _api_status() {
     fi
     _kv tunnels.warp "$(_api_tun warp_is_up "$WARP_CONF" "$USQUE_CONF")"
     _kv tunnels.warp_failed:b "$(_b warp_failed)"
+    _kv tunnels.warp_block:b "$(_b tunfail_block warp)"
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
@@ -444,7 +445,15 @@ _api_diag() {
       [[ -n "${2:-}" ]] || { _api_usage "diag sniff ИМЯ"; return; }
       sniff_client "$2" ;;
     dpi-hint) do_client_dpi_hint ;;
-    *) _api_usage "diag status|domains world|ru|sniff-list|sniff ИМЯ|dpi-hint" ;;
+    route)
+      [[ -n "${3:-}" ]] || { _api_usage "diag route КЛИЕНТ АДРЕС"; return; }
+      local rows
+      # err пишет в stdout: при отказе он в rows — вернуть его в журнал
+      if ! rows=$(diag_route "$2" "$3"); then printf '%s\n' "$rows"; return 1; fi
+      { _kv client "$2"; _kv input "$3"
+        _kv ip "$(clients_name_ip | awk -F'|' -v n="$2" '$1 == n {print $2; exit}')"
+        _kv rows:j "$(printf '%s\n' "$rows" | py json-rows ip kind dev note)"; } | api_obj ;;
+    *) _api_usage "diag status|domains world|ru|sniff-list|sniff ИМЯ|dpi-hint|route КЛИЕНТ АДРЕС" ;;
   esac
 }
 
@@ -488,6 +497,9 @@ _api_tunnels() {
         _kv cascade:n "$(cascade_count)"
         if dns_installed; then _kv dns "$(dns_running && echo up || echo off)"; else _kv dns none; fi
         _kv active "$(tunnel_conflict none)"
+        _kv rudirect:b "$(_b rudirect_on)"
+        _kv fail_block:b "$(_b tunfail_any_block)"
+        _kv held "$(for n in $TUNFAIL_NAMES; do tunfail_held "$n" && tunfail_label "$n"; done | paste -sd, -)"
         # Счётчики интерфейсов туннелей (для карточек и сводки панели): есть — поднят
         _kv ifs:j "$(for i in "$WARP_IF" "$XRAY_IF" "$T2S_IF"; do
                       [[ -r "/sys/class/net/$i/statistics/rx_bytes" ]] || continue
@@ -508,7 +520,15 @@ _api_tunnels() {
     client)
       [[ -n "${3:-}" ]] || { _api_usage "tunnels client warp|xray ИМЯ|all|none [on|off]"; return; }
       tunnel_client "$2" "$3" "${4:-}" ;;
-    *) _api_usage "tunnels status|panic|clients warp|xray|client warp|xray ИМЯ|all|none [on|off]" ;;
+    fail)
+      case "${2:-}" in
+        ""|list) tunfail_rows | api_rows name label mode enabled:b up:b held:b ;;
+        set)
+          [[ -n "${4:-}" ]] || { _api_usage "tunnels fail set warp|xray|t2s|exits|all direct|block"; return; }
+          tunfail_set "$3" "$4" ;;
+        *) _api_usage "tunnels fail [list]|set warp|xray|t2s|exits|all direct|block" ;;
+      esac ;;
+    *) _api_usage "tunnels status|panic|clients warp|xray|client warp|xray ИМЯ|all|none [on|off]|fail [list|set ...]" ;;
   esac
 }
 
@@ -681,6 +701,35 @@ _api_cascade() {
     remove) cascade_uninstall quiet ;;
     diag) cascade_diagnose ;;
     *) _api_usage "cascade list|add ...|del ПРОТО ПОРТ|reapply|clear|remove|diag" ;;
+  esac
+}
+
+# РФ напрямую: клиенты в туннеле — к сетям России мимо него.
+_api_rudirect() {
+  local a="${1:-}" p b e
+  shift || true
+  case "$a" in
+    ""|status)
+      read -r p b <<< "$(rudirect_counters)"
+      { _kv enabled:b "$(_b rudirect_on)"; _kv active:b "$(_b rudirect_rules_ok)"
+        read -r -a e <<< "$(_rud_get ENTRIES)"
+        _kv ru:n "${e[0]:-0}"; _kv mine:n "${e[1]:-0}"; _kv excl:n "${e[2]:-0}"
+        _kv updated:n "$(_rud_get UPDATED)"; _kv src "$(_rud_get SRC)"; _kv error "$(_rud_get ERROR)"
+        _kv packets:n "${p:-0}"; _kv bytes:n "${b:-0}"
+        _kv direct:j "$(rudirect_list direct | py json-list)"
+        _kv tunnel:j "$(rudirect_list tunnel | py json-list)"
+        _kv xray_ru:b "$(_b xray_ru_on)"; } | api_obj ;;
+    on) rudirect_enable ;;
+    off) rudirect_disable ;;
+    update) rudirect_update ;;
+    repair) rudirect_repair ;;
+    add)
+      [[ -n "${2:-}" ]] || { _api_usage "rudirect add direct|tunnel АДРЕС"; return; }
+      rudirect_list_add "$1" "$2" ;;
+    del)
+      [[ -n "${2:-}" ]] || { _api_usage "rudirect del direct|tunnel АДРЕС|all"; return; }
+      rudirect_list_del "$1" "$2" ;;
+    *) _api_usage "rudirect status|on|off|update|repair|add direct|tunnel АДРЕС|del direct|tunnel АДРЕС|all" ;;
   esac
 }
 
@@ -1056,7 +1105,8 @@ _api_log() {
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
     antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock [строк]"; return ;;
+    rudirect) file="$RUDIRECT_LOG" ;;   tunfail) file="$TUNFAIL_LOG" ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock|rudirect|tunfail [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -1141,7 +1191,8 @@ _api_readonly() {
   # server params set — правят общие файлы) сюда не попадают — в очередь.
   [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
   case "$a $b $c" in
-    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get") return 0 ;;
+    "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get"|\
+    "tunnels fail "|"tunnels fail list") return 0 ;;
   esac
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
@@ -1149,7 +1200,7 @@ _api_readonly() {
     "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
   esac
   return 1
 }
@@ -1191,6 +1242,7 @@ api_dispatch() {
     exits) _api_exits "$@" ;;
     cascade) _api_cascade "$@" ;;
     entry) _api_entry "$@" ;;
+    rudirect) _api_rudirect "$@" ;;
     dns) _api_dns "$@" ;;
     wgobf) _api_wgobf "$@" ;;
     update) _api_update "$@" ;;
@@ -1206,7 +1258,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock amnezia country uninstall log job version"
+      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock rudirect amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -1251,6 +1303,8 @@ api_main() {
     expire_watchdog || true
     antiscan_watchdog || true
     vkblock_watchdog || true
+    rudirect_watchdog || true
+    tunfail_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
       api_dispatch "${API_ARGS[@]}" || rc=$?
     else

@@ -97,6 +97,7 @@ exits_peer_rule() {  # строка «ноды через пробел»
   if [[ -n "$pnode" && "$up" == *" $pnode "* ]] && t=$(exits_table_for "$pnode") \
      && ip route replace default dev "awg-exit-$pnode" table "$t" 2>/dev/null; then
     table="$t"
+    rt_fail_route "$t"
   fi
   ip rule add from "$pip" lookup "$table" priority "$EXITS_TABLE" || true
 }
@@ -114,6 +115,7 @@ exits_routing_start() {
   done
   (( ${#up[@]} )) || { echo "ни одна exit-нода не поднята" >&2; return 1; }
   net=$(server_net) || return 1
+  rt_release_held "$EXITS_TABLE"
   exits_rules_clear
   [[ " ${up[*]} " == *" $single "* ]] || single="${up[0]}"
   if [[ "$balancer" == ecmp ]] && (( ${#up[@]} > 1 )); then
@@ -129,6 +131,8 @@ exits_routing_start() {
   fi
   [[ -n "$routed" ]] || ip route replace default dev "awg-exit-$single" table "$EXITS_TABLE" \
     || { echo "не удалось поставить маршрут в таблицу $EXITS_TABLE" >&2; return 1; }
+  # Режим «блокировать»: нода упала — клиенты в «недоступно», а не напрямую
+  rt_fail_route "$EXITS_TABLE"
   for n in "${up[@]}"; do rt_fw_up "awg-exit-$n"; done
   # Клиенты WG + обфускатора — своим списком, при любом режиме клиентов AWG
   if [[ -f "$EXITS_PEERS.wgobf" ]]; then
@@ -143,8 +147,21 @@ exits_routing_start() {
 }
 
 exits_routing_stop() {
-  local n
-  exits_rules_clear
+  local n t rules
+  # «Блокировать» и exit-ноды включены — остановка (перезапуск, сбой), а не
+  # выключение: клиенты остаются в своих таблицах, там только «недоступно»
+  if [[ "$(rt_fail_mode exits)" == block ]] && rt_tunnel_on "$EXITS_TABLE"; then
+    rules=$(ip rule show 2>/dev/null)
+    for t in "$EXITS_TABLE" $(seq "$EXITS_TABLE_BASE" "$EXITS_TABLE_MAX"); do
+      [[ "$t" == "$EXITS_TABLE" ]] || grep -qE "lookup $t\$" <<< "$rules" || continue
+      ip route flush table "$t" 2>/dev/null || true
+      ip route replace unreachable default metric 4096 table "$t" 2>/dev/null || true
+    done
+    mkdir -p "$(dirname "$TUNFAIL_LOG")" 2>/dev/null
+    echo "[$(date '+%F %T')] exit-ноды остановлены — клиенты удержаны до их возврата (режим «блокировать»)" >> "$TUNFAIL_LOG" 2>/dev/null
+  else
+    exits_rules_clear
+  fi
   while IFS= read -r n; do rt_fw_down "awg-exit-$n"; done < <(exits_nodes)
   return 0
 }
@@ -214,10 +231,11 @@ exits_up() {  # all|peers
 }
 
 exits_down() {
+  # Состояние — раньше остановки: в режиме «блокировать» ExecStop иначе удержал бы клиентов
+  [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
   systemctl disable --now "$EXITS_UNIT" &>/dev/null || true
   systemctl reset-failed "$EXITS_UNIT" &>/dev/null || true
   exits_routing_stop
-  [[ -f "$EXITS_STATE" ]] && exits_state_set state inactive
   [[ "${1:-}" == quiet ]] || ok "Exit-ноды выключены — клиенты идут напрямую"
 }
 

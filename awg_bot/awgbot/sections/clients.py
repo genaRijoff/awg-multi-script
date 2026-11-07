@@ -968,7 +968,7 @@ async def _tun(cb: CallbackQuery, state: FSMContext, name: str) -> None:
         await ui.render(cb, f"<b>🌐 Маршрут: {esc(name)}</b>\n\n"
                             + ("Все клиенты идут через tun2socks — выбора по клиентам у него нет."
                                if kind == "tun2socks" else "Туннели выключены — все клиенты идут напрямую."),
-                        ui.kb(("🌐 Туннели и DNS", "tun"), ui.back(back_to)))
+                        ui.kb(("🌐 Туннели и DNS", "tun"), ("🧭 Куда идёт", f"diag:rtc:{name}|t"), ui.back(back_to)))
         return
 
     def opt(label: str, value: str, cur: bool) -> ui.Button:
@@ -995,7 +995,7 @@ async def _tun(cb: CallbackQuery, state: FSMContext, name: str) -> None:
         buttons = [opt(f"Через {TUNNEL_NAMES[kind]}", "on", on), opt("Напрямую", "off", not on)]
         note = ""
     await ui.render(cb, f"<b>🌐 Маршрут: {esc(name)}</b>\nРаботает туннель: {TUNNEL_NAMES[kind]}.{note}",
-                    ui.kb(buttons, ui.back(back_to)))
+                    ui.kb(buttons, ("🧭 Куда идёт", f"diag:rtc:{name}|t"), ui.back(back_to)))
 
 
 @act("rt")

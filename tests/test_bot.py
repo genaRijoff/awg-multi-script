@@ -910,7 +910,7 @@ async def run():
     async def warp_status(*args, **kw):
         if args[:1] == ("status",):
             return {"host": "vm1", "server": {"exists": False, "up": False},
-                    "tunnels": {"warp": warp["state"], "warp_failed": warp["failed"]}}
+                    "tunnels": {"warp": warp["state"], "warp_failed": warp["failed"], "warp_block": warp.get("block", False)}}
         if args[:2] == ("warp", "probe"):
             probes.append(args)
             return dict(warp["probe"])
@@ -961,6 +961,17 @@ async def run():
     mark = len(SESSION.sent)
     await al.tick(BOT, st5)
     chk("health-check вернул WARP — «снова работает»", any("WARP снова работает" in t for t in warp_said(mark)), warp_said(mark))
+    # «Если туннель упал → блокировать»: клиенты WARP ждут его, а не уходят напрямую
+    st5b = {"boot": "boot-B"}
+    warp.update(failed=True, state="off", block=True, probe={"up": False, "health": True, "failover": True})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st5b)
+    rep = [m for n, m in SESSION.sent[mark:] if n == "SendMessage" and "WARP упал" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("режим «блокировать»: WARP упал — клиенты ждут без интернета, не «напрямую»; кнопки «Включить» и «Если упал»",
+        len(rep) == 1 and "ждут его без интернета" in rep[0].text and "напрямую" not in rep[0].text
+        and "warp:up" in cbs and "tf" in cbs, [warp_said(mark), cbs])
+    warp.update(block=False)
     # Без health-check бот проверяет поднятый WARP сам: не отвечает — клиенты без интернета
     st6 = {"boot": "boot-B"}
     warp.update(failed=False, state="up", probe={"up": True, "health": False, "failover": False, "ok": False})
@@ -1261,7 +1272,8 @@ async def run():
                "cl:lim:alice", "cl:spd:alice", "cl:tday:alice", "cl:tsrv", "ntf", "abk",
                "diag", "diag:status", "diag:dpi", "diag:logs", "diag:log:manager", "diag:sniff",
                "bk", "bk:list", "tun", "tc::warp", "warp", "warp:backend", "xr", "t2s", "ex", "cas", "dns",
-               "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web", "ent", "cl:ent:alice"]
+               "botm", "botm:proxy", "adm", "del", "del:all", "upd", "wo", "wo:install", "web", "ent", "cl:ent:alice",
+               "rud", "rud:l:direct", "rud:l:tunnel", "tf", "diag:rt", "diag:rt:r"]
     broken = []
     for data in screens:
         sent = await press(data)
@@ -2141,6 +2153,172 @@ async def run():
     text, buttons = screen(await press("diag:log:vkblock|vk"))
     chk("журнал открывается, «Назад» — на экран VK", ("◀️ Назад", "vk") in buttons, [text, buttons])
     no_hourglass("VK и Max")
+    botapi.call = real_call_
+
+    print("РФ напрямую, если туннель упал, куда идёт адрес")
+    text, buttons = screen(await press("tun"))
+    chk("в «Туннелях» — «🇷🇺 РФ напрямую» и «🪂 Если упал», строки их состояния",
+        ("🇷🇺 РФ напрямую", "rud") in buttons and ("🪂 Если упал", "tf") in buttons and "РФ напрямую — выключено" in text
+        and "Если туннель упал — напрямую (как было)" in text, [text, buttons])
+    RUDST = {"enabled": False, "active": False, "ru": 0, "mine": 0, "excl": 0, "updated": 0, "src": "", "error": "",
+             "packets": 0, "bytes": 0, "direct": [], "tunnel": [], "xray_ru": False}
+    TF = {"warp": "direct", "xray": "direct", "t2s": "direct", "exits": "direct"}
+    TFL = {"warp": "WARP", "xray": "Xray", "t2s": "tun2socks", "exits": "Exit-ноды WG"}
+    ROUTE = {"rows": []}
+    rt_calls = []
+
+    async def rt_call(*args, **kw):
+        if args[:1] == ("rudirect",):
+            rt_calls.append((args, kw.get("timeout")))
+            a = args[1]
+            if a == "status":
+                return botapi.Result(True, data=json.loads(json.dumps(RUDST)))
+            if a == "on":
+                RUDST.update(enabled=True, active=True, ru=8673, updated=1791500000, src="ipverse", packets=12345,
+                             error="ipdeny.com: не скачался <b>")
+            if a == "off":
+                RUDST.update(enabled=False, active=False)
+            if a == "add":
+                if args[3] == "bad.example":
+                    return botapi.Result(False, error="Нужен публичный IPv4, подсеть не шире /12 или домен")
+                RUDST[args[2]].append(args[3])
+            if a == "del":
+                RUDST[args[2]] = [] if args[3] == "all" else [x for x in RUDST[args[2]] if x != args[3]]
+            return botapi.Result(True)
+        if args[:2] == ("tunnels", "fail"):
+            rt_calls.append((args, kw.get("timeout")))
+            if args[2:3] == ("set",):
+                for n in (TF if args[3] == "all" else [args[3]]):
+                    TF[n] = args[4]
+                return botapi.Result(True)
+            return botapi.Result(True, data=[{"name": n, "label": TFL[n], "mode": TF[n], "enabled": n in ("warp", "xray"),
+                                              "up": n == "warp", "held": n == "xray" and TF[n] == "block"} for n in TF])
+        if args[:2] == ("diag", "route"):
+            rt_calls.append((args, kw.get("timeout")))
+            if args[3] == "gone.example":
+                return botapi.Result(False, error="Домен gone.example не разрешается в IPv4 с этого сервера")
+            return botapi.Result(True, data={"client": args[2], "input": args[3], "ip": "10.8.1.2", "rows": ROUTE["rows"]})
+        if args[:2] == ("tunnels", "status"):
+            r = await real_call_(*args, **kw)
+            if isinstance(r.data, dict):
+                r.data.update(rudirect=RUDST["enabled"], fail_block="block" in TF.values(),
+                              held="Xray" if TF["xray"] == "block" else "")
+            return r
+        return await real_call_(*args, **kw)
+    botapi.call = rt_call
+
+    text, buttons = screen(await press("rud"))
+    chk("РФ напрямую выключено: что делает, «Включить», свои списки, «Куда идёт», журнал, назад в «Туннели»",
+        "⚪️ Выключено" in text and "мимо него" in text and ("✅ Включить", "rud:on") in buttons
+        and ("📝 Напрямую: 0", "rud:l:direct") in buttons and ("📝 В туннель: 0", "rud:l:tunnel") in buttons
+        and ("🧭 Куда идёт", "diag:rt:r") in buttons and ("📜 Журнал", "diag:log:rudirect|rud") in buttons
+        and ("◀️ Назад", "tun") in buttons and not any(d in ("rud:upd", "rud:fix") for _, d in buttons), [text, buttons])
+    n = len(rt_calls)
+    text, buttons = screen(await press("rud:on"))
+    chk("включение — с подтверждением, без вызова до него",
+        ("✅ Включить", "rud:onok") in buttons and ("✖️ Отмена", "rud") in buttons and "адреса сервера" in text
+        and not any(c[0][1:2] == ("on",) for c in rt_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("rud:onok"))
+    chk("включено: долгий вызов, сетей РФ, счётчик, источник, ошибка экранирована, «Обновить», «Починить», «Выключить»",
+        (("rudirect", "on"), 240) in rt_calls and "🟢 Включено · сетей РФ 8 673" in text and "Мимо туннеля: 12 345" in text
+        and "(ipverse)" in text and "&lt;b&gt;" in text and ("🔄 Обновить", "rud:upd") in buttons
+        and ("🛠 Починить", "rud:fix") in buttons and ("⏹ Выключить", "rud:off") in buttons, [rt_calls[-2:], text, buttons])
+    await press("rud:upd")
+    await press("rud:fix")
+    chk("обновить и починить — долгие вызовы", (("rudirect", "update"), 240) in rt_calls
+        and (("rudirect", "repair"), 240) in rt_calls, rt_calls[-3:])
+    text, buttons = screen(await press("rud:l:direct"))
+    chk("список «всегда напрямую»: что это, пусто, «Добавить», назад к РФ напрямую",
+        "Всегда напрямую" in text and "пока пусто" in text and ("➕ Добавить", "rud:a:direct") in buttons
+        and ("◀️ Назад", "rud") in buttons and not any(d.startswith("rud:x:") for _, d in buttons), [text, buttons])
+    await press("rud:a:direct")
+    text, _ = screen(await say("два слова"))
+    chk("свой адрес: с пробелом — переспрашивает, в awg2 не уходит", "⚠️" in text
+        and not any(c[0][1:2] == ("add",) for c in rt_calls), text)
+    text, _ = screen(await say("bad.example"))
+    chk("свой адрес: отказ awg2 — переспрашивает с причиной", "⚠️" in text and "публичный IPv4" in text, text)
+    text, buttons = screen(await say("https://bank.example/login"))
+    chk("свой адрес: ссылка уходит в awg2 как есть, список показан, запись можно убрать",
+        (("rudirect", "add", "direct", "https://bank.example/login"), 240) in rt_calls and "✅ Добавлено" in text
+        and ("❌ https://bank.example/login", "rud:d:d|https://bank.example/login") in buttons
+        and ("🧹 Очистить", "rud:x:direct") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:d:d|https://bank.example/login"))
+    chk("убрать запись", (("rudirect", "del", "direct", "https://bank.example/login"), 240) in rt_calls and "✅ Убрано" in text,
+        [rt_calls[-2:], text])
+    await press("rud:a:tunnel")
+    await say("77.88.8.0/24")
+    text, buttons = screen(await press("rud:x:tunnel"))
+    chk("очистить — с подтверждением", ("🧹 Очистить", "rud:xok:tunnel") in buttons and ("✖️ Отмена", "rud:l:tunnel") in buttons,
+        buttons)
+    text, buttons = screen(await press("rud:xok:tunnel"))
+    chk("очищено", (("rudirect", "del", "tunnel", "all"), 240) in rt_calls and "пока пусто" in text, text)
+    text, buttons = screen(await press("rud:off"))
+    chk("выключение — с подтверждением", ("⏹ Выключить", "rud:offok") in buttons, buttons)
+    text, buttons = screen(await press("rud:offok"))
+    chk("выключено снова", (("rudirect", "off"), None) in rt_calls and "⚪️ Выключено" in text, text)
+    text, buttons = screen(await press("diag:log:rudirect|rud"))
+    chk("журнал РФ напрямую: подпись, «Назад» — на экран РФ напрямую", "РФ напрямую" in text and ("◀️ Назад", "rud") in buttons,
+        [text, buttons])
+
+    text, buttons = screen(await press("tf"))
+    chk("если туннель упал: оба режима объяснены, четыре туннеля «напрямую», журнал, назад в «Туннели»",
+        "Напрямую" in text and "Блокировать" in text and "адрес сервера не засветится" in text
+        and [b for b in buttons if b[1].startswith("tf:t:")] == [("➡️ WARP", "tf:t:warp"), ("➡️ Xray", "tf:t:xray"),
+                                                                  ("➡️ tun2socks", "tf:t:t2s"), ("➡️ Exit-ноды WG", "tf:t:exits")]
+        and "🟢 работает" in text and "⚪️ выключен" in text and ("📜 Журнал", "diag:log:tunfail|tf") in buttons
+        and ("◀️ Назад", "tun") in buttons and not any(d == "tf:all" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("tf:t:warp"))
+    chk("работающему WARP — «блокировать» сразу, без подтверждения",
+        (("tunnels", "fail", "set", "warp", "block"), None) in rt_calls and ("🛑 WARP", "tf:t:warp") in buttons
+        and ("↪️ Всем напрямую", "tf:all") in buttons, [text, buttons])
+    n = len(rt_calls)
+    text, buttons = screen(await press("tf:t:xray"))
+    chk("включённому, но лежащему Xray — сначала подтверждение: клиенты сразу без интернета",
+        ("🛑 Блокировать", "tf:bok:xray") in buttons and ("✖️ Отмена", "tf") in buttons and "сразу останутся без интернета" in text
+        and not any(c[0][2:3] == ("set",) for c in rt_calls[n:]), [text, buttons])
+    text, buttons = screen(await press("tf:bok:xray"))
+    chk("Xray «блокировать»: удерживает клиентов — видно в строке", (("tunnels", "fail", "set", "xray", "block"), None) in rt_calls
+        and "🔴 упал — клиенты ждут его без интернета" in text, text)
+    text, buttons = screen(await press("tun"))
+    chk("в «Туннелях» видно удержание: строка и кнопка 🔴", "удерживает клиентов: Xray" in text
+        and ("🔴 Если упал", "tf") in buttons, [text, buttons])
+    text, buttons = screen(await press("tf:t:xray"))
+    chk("удержанному — «напрямую» сразу (отпустить)", (("tunnels", "fail", "set", "xray", "direct"), None) in rt_calls, rt_calls[-2:])
+    text, buttons = screen(await press("tf:all"))
+    chk("«Всем напрямую» — как было", (("tunnels", "fail", "set", "all", "direct"), None) in rt_calls
+        and all(v == "direct" for v in TF.values()) and not any(d == "tf:all" for _, d in buttons), [TF, buttons])
+    sent = await press("tf:t:nope")
+    chk("неизвестный туннель — «кнопка устарела»", any("устарела" in a for a in alerts(sent)), alerts(sent))
+    text, buttons = screen(await press("diag:log:tunfail|tf"))
+    chk("журнал «если упал»: «Назад» — туда же", "Если туннель упал" in text and ("◀️ Назад", "tf") in buttons, [text, buttons])
+
+    text, buttons = screen(await press("diag"))
+    chk("в «Диагностике» — «🧭 Куда идёт»", ("🧭 Куда идёт", "diag:rt") in buttons, buttons)
+    text, buttons = screen(await press("diag:rt:r"))
+    chk("куда идёт адрес из РФ напрямую: список клиентов, «Назад» — в РФ напрямую",
+        ("alice", "diag:rtc:alice|r") in buttons and ("◀️ Назад", "rud") in buttons, buttons)
+    text, buttons = screen(await press("diag:rtc:alice|r"))
+    chk("вопрос адреса; «Отмена» — к списку клиентов", "ya.ru" in text and ("✖️ Отмена", "diag:rt:r") in buttons, [text, buttons])
+    text, _ = screen(await say("ya ru"))
+    chk("адрес с пробелом — переспрашивает", "⚠️" in text and not any(c[0][:2] == ("diag", "route") for c in rt_calls), text)
+    text, _ = screen(await say("gone.example"))
+    chk("домен не разрешается — переспрашивает с причиной", "⚠️" in text and "не разрешается" in text, text)
+    ROUTE["rows"] = [{"ip": "1.1.1.1", "kind": "held", "dev": "", "note": "туннель лежит, режим «блокировать» <b>"},
+                     {"ip": "77.88.8.8", "kind": "rudirect", "dev": "eth0", "note": "напрямую с сервера — сеть России"},
+                     {"ip": "8.8.8.8", "kind": "warp", "dev": "warp0", "note": "через WARP"}]
+    text, buttons = screen(await say("https://ya.ru/x"))
+    chk("итог: каждый адрес с видом и пояснением (экранировано), подсказки «Если упал» и «В туннель», ещё раз и назад",
+        (("diag", "route", "alice", "https://ya.ru/x"), None) in rt_calls and "alice</b> (10.8.1.2)" in text
+        and "🔴 <code>1.1.1.1</code>" in text and "🇷🇺 <code>77.88.8.8</code>" in text and "🟢 <code>8.8.8.8</code> — через WARP" in text
+        and "&lt;b&gt;" in text and "Если упал" in text and "В туннель" in text
+        and ("🔄 Другой адрес", "diag:rtc:alice|r") in buttons and ("◀️ Назад", "rud") in buttons, [text, buttons])
+    text, buttons = screen(await press("cl:tun:alice"))
+    chk("маршрут клиента — кнопка «🧭 Куда идёт»", ("🧭 Куда идёт", "diag:rtc:alice|t") in buttons, buttons)
+    text, buttons = screen(await press("diag:rtc:alice|t"))
+    chk("из маршрута клиента: «Отмена» — обратно в маршрут", ("✖️ Отмена", "cl:tun:alice") in buttons, buttons)
+    text, buttons = screen(await say("8.8.8.8"))
+    chk("итог из маршрута клиента: «Назад» — в маршрут клиента", ("◀️ Назад", "cl:tun:alice") in buttons, buttons)
+    no_hourglass("РФ напрямую")
     botapi.call = real_call_
 
     print("Точки входа (каскад)")

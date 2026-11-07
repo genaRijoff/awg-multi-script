@@ -223,6 +223,27 @@ VKBLOCK_SRC="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blackl
 # Короче минимума — оборван, шире предела — подменён: прежний не заменяют
 VKBLOCK_MIN=50 VKBLOCK_MAX4=4194304 VKBLOCK_MAX6=4096   # 2^22 адресов IPv4; 2^12 сетей /32 IPv6
 
+# ── РФ напрямую (клиенты в туннеле — к сетям России мимо него) ──
+RUDIRECT_DIR="$STATE_DIR/rudirect"           # список РФ и состояние
+RUDIRECT_CONF="$RUDIRECT_DIR/rudirect.conf"  # ON, UPDATED, ERROR, ENTRIES, SRC
+RUDIRECT_USER="/etc/awg2/rudirect"           # свои списки (в бэкапе): direct.list, tunnel.list
+RUDIRECT_SCRIPT="/usr/local/bin/awg2-rudirect"
+RUDIRECT_LOG="/var/log/awg2-rudirect.log"
+RUDIRECT_SET="awg2-ru" RUDIRECT_TAG="awg2-rudirect"
+# Метка в старших битах: младшие заняты чужими (wg-quick — 51820)
+RUDIRECT_MARK="0x52550000/0xffff0000" RUDIRECT_PRIO=90     # приоритет раньше туннелей (100-249)
+RUDIRECT_UNIT="awg2-rudirect.service" RUDIRECT_TIMER="awg2-rudirect-update.timer"
+RUDIRECT_SRCS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
+# Настоящий список: ~8700 сетей, ~45 млн адресов IPv4. Короче или уже — оборван,
+# шире — подменён: прежний не заменяют. Своих записей — не больше 500
+RUDIRECT_MIN=2000 RUDIRECT_MINADDR=20000000 RUDIRECT_MAX4=134217728 RUDIRECT_USER_MAX=500
+
+# ── Если туннель упал (режим на каждый туннель: напрямую или блокировать) ──
+TUNFAIL_CONF="/etc/awg2/tunnel-fail.conf"    # warp=block, xray=direct… (нет строки — direct)
+TUNFAIL_SCRIPT="/usr/local/bin/awg2-tunfail"
+TUNFAIL_LOG="/var/log/awg2-tunfail.log"
+TUNFAIL_UNIT="awg2-tunfail.service" TUNFAIL_TIMER="awg2-tunfail.timer"
+
 # Интерфейсы, которые поднимает сам awg2: их адрес не может быть Endpoint
 # клиента, и маршрут через них — не аплинк сервера.
 OWN_IFACES=" awg0 warp0 xray0 tun0 wgcf wgobf0 "

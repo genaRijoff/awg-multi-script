@@ -33,8 +33,9 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   const shot = async (name) => { await page.waitForTimeout(500); await page.screenshot({ path: `${out}/${name}.png`, fullPage: true }); };
   const noNull = async () => {
     const bad = await page.evaluate(() => [...document.querySelectorAll("#app, #app *")].some((el) =>
-      [...el.childNodes].some((n) => n.nodeType === 3 && /^(null|undefined|false)$/.test(n.textContent.trim()))));
-    if (bad) throw new Error("на экране текст null/undefined");
+      [...el.childNodes].some((n) => n.nodeType === 3 && (/^(null|undefined|false)$/.test(n.textContent.trim())
+        || /\[object \w+\]/.test(n.textContent)))));
+    if (bad) throw new Error("на экране текст null/undefined/[object …]");
   };
   // Тот же адрес браузер навигацией не считает — тогда перезагружаем страницу
   const nav = async (hash, sel = "h1") => {
@@ -840,13 +841,134 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     } finally { await page.unroute(/\/api\/call$/); }
   });
 
+
+  // ── РФ напрямую, если туннель упал, куда идёт адрес ──
+  const fake = (data) => ({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data }) });
+  await step("РФ напрямую: карточка в «Туннелях», выключено, свои списки, «Включить» — с вопросом; включено — счётчик и действия", async () => {
+    await nav("/tunnels", ".kcard");
+    await page.click(".ktabs button[data-tab=tun]");
+    await page.click("[data-name='РФ напрямую'] .kc-n");
+    await page.waitForSelector("[data-name=rudirect-status] >> text=○ выключено");
+    if (await page.locator("button:has-text('Обновить список')").count()) throw new Error("«Обновить список» при выключенном");
+    await page.waitForSelector("input[aria-label='Всегда напрямую']");
+    await page.waitForSelector("input[aria-label='Всегда через туннель']");
+    const ST = { enabled: true, active: true, ru: 8673, mine: 1, excl: 0, updated: 1790000000, src: "ipverse", error: "",
+      packets: 12345, bytes: 2048, direct: ["bank.example"], tunnel: [], xray_ru: true };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "on") return route.fulfill(fake(null));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(ST));
+      return route.continue();
+    });
+    try {
+      await page.click("button:has-text('Включить')");
+      await page.waitForSelector(".toast >> text=РФ напрямую включено");
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Включить? Клиенты в туннеле"));
+      if (!asked.length || !/адреса сервера/.test(asked[0])) throw new Error("включение без подтверждения: " + JSON.stringify(asked));
+      await page.waitForSelector("[data-name=rudirect-status] >> text=● включено");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=8 673");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=12 345 пакетов");
+      await page.waitForSelector("[data-name=rudirect-status] >> text=своё «РФ напрямую»");
+      await page.waitForSelector("button:has-text('Обновить список')");
+      await page.waitForSelector("button:has-text('Починить')");
+      await page.waitForSelector("[data-name=rud-direct] >> text=bank.example");
+      await shot("23c-rudirect");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("РФ напрямую: свой адрес уходит в awg2, пробел — отказ; запись убирается с вопросом", async () => {
+    const seen = [];
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake({ enabled: true, active: true, ru: 8673,
+        direct: ["bank.example"], tunnel: [] }));
+      if (b.args && b.args[0] === "rudirect") { seen.push(b.args.join(" ")); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rud-direct]");
+      await expectAlert("Нужен один адрес", async () => {
+        await page.fill("input[aria-label='Всегда через туннель']", "77.88.8.0 /24");
+        await page.press("input[aria-label='Всегда через туннель']", "Enter");
+      });
+      await page.fill("input[aria-label='Всегда через туннель']", "77.88.8.0/24");
+      await page.press("input[aria-label='Всегда через туннель']", "Enter");
+      await page.waitForSelector(".toast >> text=Добавлено");
+      await page.click("[data-name=rud-direct] .item:has-text('bank.example')");
+      await page.waitForSelector(".toast >> text=Убрано");
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:Убрать bank.example"));
+      if (!asked) throw new Error("убрал без вопроса");
+      if (seen.join("|") !== "rudirect add tunnel 77.88.8.0/24|rudirect del direct bank.example") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("если туннель упал: карточка, четыре туннеля с режимами, работающему — сразу, лежащему — с вопросом", async () => {
+    const seen = [];
+    const rows = [{ name: "warp", label: "WARP", mode: "direct", enabled: true, up: true, held: false },
+      { name: "xray", label: "Xray", mode: "block", enabled: true, up: false, held: true },
+      { name: "t2s", label: "tun2socks", mode: "direct", enabled: true, up: false, held: false },
+      { name: "exits", label: "Exit-ноды WG", mode: "direct", enabled: false, up: false, held: false }];
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "tunnels" && b.args[1] === "fail" && b.args[2] === "list") return route.fulfill(fake(rows));
+      if (b.args && b.args[0] === "tunnels" && b.args[1] === "fail") { seen.push(b.args.slice(2).join(" ")); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels", ".kcard");
+      await page.click(".ktabs button[data-tab=tun]");
+      await page.click("[data-name='Если туннель упал'] .kc-n");
+      await page.waitForSelector("[data-name=fail-xray] >> text=упал — клиенты ждут его без интернета");
+      await page.waitForSelector("[data-name=fail-warp] >> text=● работает");
+      await page.waitForSelector("[data-name=fail-exits] >> text=○ выключен");
+      await page.waitForSelector("[data-name=fail-xray] button.on[data-v=block]");
+      await shot("33b-tunfail");
+      await page.click("[data-name=fail-warp] button[data-v=block]");
+      await page.waitForSelector(".toast >> text=WARP: блокировать");
+      let asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:") && l.includes("сразу останутся"));
+      if (asked.length) throw new Error("работающему — с вопросом");
+      await page.click("[data-name=fail-t2s] button[data-v=block]");
+      await page.waitForSelector(".toast >> text=tun2socks: блокировать");
+      asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:tun2socks сейчас не работает"));
+      if (!asked.length) throw new Error("лежащему — без вопроса");
+      await page.click("button:has-text('Всем напрямую')");
+      await page.waitForSelector(".toast >> text=Все туннели: напрямую");
+      if (seen.join("|") !== "set warp block|set t2s block|set all direct") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("куда идёт адрес: из карточки клиента, адрес — итог с видом каждого IP и подсказкой", async () => {
+    await page.evaluate(() => { S.clients = null; });
+    await nav("/client/alice", "text=Куда идёт адрес");
+    await page.click("text=🧭 Куда идёт адрес →");
+    await page.waitForSelector("select[aria-label='Клиент']");
+    if (await page.inputValue("select[aria-label='Клиент']") !== "alice") throw new Error("клиент не выбран");
+    let asked = null;
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "diag" && b.args[1] === "route") {
+        asked = b.args.join(" ");
+        return route.fulfill(fake({ client: "alice", input: b.args[3], ip: "10.8.1.2", rows: [
+          { ip: "1.1.1.1", kind: "held", dev: "", note: "туннель лежит, режим «блокировать»" },
+          { ip: "77.88.8.8", kind: "rudirect", dev: "eth0", note: "напрямую с сервера — сеть России («РФ напрямую»)" }] }));
+      }
+      return route.continue();
+    });
+    try {
+      await page.fill("input[aria-label='Адрес']", "https://ya.ru/x");
+      await page.press("input[aria-label='Адрес']", "Enter");
+      await page.waitForSelector("[data-name=route-result] [data-kind=held] >> text=1.1.1.1");
+      await page.waitForSelector("[data-name=route-result] [data-kind=rudirect] >> text=сеть России");
+      await page.waitForSelector("[data-name=route-result] button:has-text('Если туннель упал')");
+      if (asked !== "diag route alice https://ya.ru/x") throw new Error("вызов: " + asked);
+      await shot("44b-diag-route");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+
   // ── Туннели и DNS ──
   await step("туннели", async () => {
     // Экран туннелей — карточками и в «Классике»
     await nav("/tunnels", ".kcard");
     await page.click(".ktabs button[data-tab=tun]");
     const n = await page.locator(".kcard").count();
-    if (n !== 6) throw new Error("ждали 6 карточек (4 туннеля, каскад, DNS), есть " + n);
+    if (n !== 8) throw new Error("ждали 8 карточек (4 туннеля, каскад, DNS, РФ напрямую, если упал), есть " + n);
     await page.waitForSelector(".kstats >> text=Exit-ноды");
     if (await page.evaluate(() => document.documentElement.dataset.skin) !== "toolza") throw new Error("по умолчанию не «Классика»");
     await shot("30-tunnels");
@@ -1731,7 +1853,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       const routes = ("/ /add /backup /backup/restore /bot /bot/admins /bot/alerts /bot/app /bot/look /bot/proxy /bulk /client/alice "
         + "/client/alice/date /client/alice/limit /client/alice/mimicry /client/alice/note /client/alice/qr /client/alice/rename /client/alice/speed /clients "
         + "/diag /diag/dpi /diag/logs /diag/sniff /log/warp /server /server/amnezia /server/antiscan /server/create /server/endpoint /server/module "
-        + "/server/vkblock /server/entries "
+        + "/server/vkblock /server/entries /tunnels/rudirect /tunnels/fail /diag/route /diag/route/alice "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
         + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");

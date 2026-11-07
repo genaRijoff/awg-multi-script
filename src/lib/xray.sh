@@ -534,13 +534,15 @@ xray_up() {
 }
 
 xray_down() {
+  # Состояние — раньше остановки: ExecStop маршрутов в режиме «блокировать»
+  # иначе удержал бы клиентов, а ConditionPathExists не даст Xray стартовать
+  rm -f "$XRAY_STATE"
   systemctl stop "$XRAY_ROUTING_UNIT" &>/dev/null || true
   systemctl disable "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl stop "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   systemctl reset-failed "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" &>/dev/null || true
   rt_down "$XRAY_IF" "$XRAY_TABLE"
   ip link del "$XRAY_IF" &>/dev/null || true
-  rm -f "$XRAY_STATE"
   [[ "${1:-}" == quiet ]] || ok "Xray выключен — клиенты идут напрямую"
 }
 

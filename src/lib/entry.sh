@@ -239,7 +239,7 @@ _own_ip6() { ip -6 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/
 
 # Свой IPv6 как вход: IPv6 включён, адрес на месте, порт — порт AWG, AWG
 # его слушает, UFW пускает IPv6 и у сервера есть выход в интернет по IPv6.
-IPV6_SYSCTL="/proc/sys/net/ipv6/conf/all/disable_ipv6" UFW_DEFAULTS="/etc/default/ufw"
+IPV6_SYSCTL="/proc/sys/net/ipv6/conf/all/disable_ipv6"
 _entry_ipv6_self() {  # адрес порт
   local a="$1" p="$2" ls out
   [[ "$(cat "$IPV6_SYSCTL" 2>/dev/null || echo 1)" == 0 ]] \

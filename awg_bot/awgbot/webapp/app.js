@@ -2856,7 +2856,8 @@ route(/^\/client\/([^/]+)$/, async (ctx, name) => {
       const t = kind === "warp" ? "WARP" : "Xray";
       body = pick([["on", "Через " + t], ["off", "Напрямую"]], c[kind] !== false ? "on" : "off", (v) => call("tunnels", "client", kind, name, v));
     }
-    return h("div", { class: "card rcard" }, h("div", { class: "eyebrow" }, "маршрут"), body);
+    return h("div", { class: "card rcard" }, h("div", { class: "eyebrow" }, "маршрут"), body,
+      h("div", { class: "small", style: "margin-top:6px" }, linkTo("🧭 Куда идёт адрес →", `/diag/route/${enc}`)));
   }
 
   const area = (a, ...el) => h("div", { class: "a-" + a }, el);
@@ -3998,7 +3999,16 @@ async function tunnelsCards(ctx) {
     kcard({ view: "list", state: d.dns === "up" ? "on" : d.dns === "off" ? "warn" : "none", name: "Шифрованный DNS", iface: "dnscrypt-proxy",
       attrs: { "data-name": "Шифрованный DNS" }, onopen: () => go("/tunnels/dns"),
       chips: [kchip("DoH", "", "lock-keyhole"), kchip(STATE_WORD[d.dns] || "—", d.dns === "up" ? "ok" : d.dns === "off" ? "warn" : "")],
-      right: [kgear("Шифрованный DNS", () => go("/tunnels/dns"))] })];
+      right: [kgear("Шифрованный DNS", () => go("/tunnels/dns"))] }),
+    kcard({ view: "list", state: d.rudirect ? "on" : "none", name: "РФ напрямую", iface: "сайты России мимо туннеля",
+      attrs: { "data-name": "РФ напрямую" }, onopen: () => go("/tunnels/rudirect"),
+      chips: [kchip(d.rudirect ? "включено" : "выключено", d.rudirect ? "ok" : "", "map-pin")],
+      right: [kgear("РФ напрямую", () => go("/tunnels/rudirect"))] }),
+    kcard({ view: "list", state: d.held ? "bad" : d.fail_block ? "on" : "none", name: "Если туннель упал", iface: "напрямую или блокировать",
+      attrs: { "data-name": "Если туннель упал" }, onopen: () => go("/tunnels/fail"),
+      chips: [kchip(d.held ? "удерживает: " + d.held : d.fail_block ? "где-то «блокировать»" : "напрямую",
+        d.held ? "bad" : d.fail_block ? "acc" : "", d.fail_block ? "shield" : "shield-off")],
+      right: [kgear("Если туннель упал", () => go("/tunnels/fail"))] })];
 
   async function add() {
     if (tab === "nodes") return go("/tunnels/exits/add");
@@ -4497,6 +4507,137 @@ function openUrl(url) {
 const extLink = (url, text) => h("a", { href: url, onclick: (ev) => { ev.preventDefault(); openUrl(url); } }, text || url);
 
 // ── Диагностика ───────────────────────────────────────────
+// РФ напрямую: клиенты в туннеле ходят к сетям России мимо него. Список качает и проверяет awg2
+const RUD_LISTS = { direct: ["Всегда напрямую", "мимо туннеля, даже если адреса нет в сетях России"],
+  tunnel: ["Всегда через туннель", "в туннель, даже если адрес в сетях России"] };
+route(/^\/tunnels\/rudirect$/, async (ctx) => {
+  const d = (await call("rudirect", "status")) || {};
+  const on = !!d.enabled;
+  function listBox(kind) {
+    const items = d[kind] || [], [name, what] = RUD_LISTS[kind];
+    const inp = h("input", { placeholder: "1.2.3.4, 1.2.3.0/24 или bank.ru", autocapitalize: "off", autocomplete: "off",
+      "aria-label": name, style: "flex:1;min-width:0" });
+    const add = btn("➕ Добавить", (b) => {
+      const v = inp.value.trim();
+      if (!v || /\s/.test(v)) return fail(new Error("Нужен один адрес, подсеть или домен"));
+      return quick(b, "Добавлено", ["rudirect", "add", kind, v]);
+    });
+    add.style.flex = "none"; add.style.whiteSpace = "nowrap";
+    return [h("h2", {}, name + (items.length ? " · " + items.length : "")),
+      hint("Адрес, подсеть или домен (можно ссылкой) — " + what + ". Домен перечитывается раз в час: адреса сайтов меняются."),
+      items.length ? h("div", { class: "card list", "data-name": "rud-" + kind }, items.map((a) => h("div", { class: "item", onclick: (ev) =>
+        quickAsk(ev.currentTarget, `Убрать ${a} из списка «${name}»?`, "Убрано", ["rudirect", "del", kind, a]) },
+      h("div", { class: "main" }, h("div", { class: "title mono wrap" }, a)), h("div", { class: "side bad" }, icon("x"))))) : null,
+      h("div", { class: "row", style: "gap:8px;margin-top:8px" }, inp, enterTo(add, inp)),
+      items.length > 1 ? h("div", { class: "actions", style: "margin-top:8px" }, btn("🧹 Очистить", (b) => quickAsk(b,
+        `Очистить список «${name}»?`, "Список очищен", ["rudirect", "del", kind, "all"]))) : null];
+  }
+  ctx.put(title("РФ напрямую"),
+    hint("Клиенты в туннеле (WARP, Xray, tun2socks, exit-ноды) ходят к сайтам России мимо него — прямо с сервера. "
+      + "Полезно, когда сервер в России, а выход за границей: банки и госсервисы видят российский адрес, а выход не тратится на них."),
+    h("div", { class: "card", "data-name": "rudirect-status" },
+      kv("Статус", !on ? h("span", { class: "muted" }, "○ выключено") : d.active ? h("span", { class: "ok" }, "● включено")
+        : h("span", { class: "warn" }, "▲ правило не на месте")),
+      on ? kv("Сетей России", num(d.ru)) : null,
+      on ? kv("Мимо туннеля", num(d.packets) + " пакетов · " + fmtBytes(d.bytes)) : null,
+      kv("Свои", `напрямую ${(d.direct || []).length} · через туннель ${(d.tunnel || []).length}`),
+      d.updated ? kv("Список", fmtTime(d.updated) + (d.src ? " · " + d.src : "")) : null,
+      d.error ? h("div", { class: "small warn" }, "▲ " + d.error) : null,
+      d.xray_ru ? h("div", { class: "small muted" }, "У Xray своё «РФ напрямую» (по доменам) — работает вместе с этим.") : null),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      on ? btn("⏹ Выключить", (b) => quickAsk(b, "Выключить? Правило снимается — клиенты в туннеле снова пойдут через него ко всем "
+        + "сайтам. Свои списки сохранятся.", "РФ напрямую выключено", ["rudirect", "off"]))
+        : btn("✅ Включить", (b) => quickAsk(b, "Включить? Клиенты в туннеле пойдут к сайтам России с адреса сервера, а не выхода "
+          + "туннеля. Выключить можно здесь или в боте.", "РФ напрямую включено", ["rudirect", "on"]), "btn-primary"),
+      on ? btn("🔄 Обновить список", (b) => quick(b, "Список обновлён", ["rudirect", "update"])) : null,
+      on ? btn("🛠 Починить", (b) => quick(b, "Правила на месте", ["rudirect", "repair"])) : null,
+      btn("🧭 Куда идёт адрес", () => go("/diag/route")),
+      btn("📜 Журнал", () => go("/log/rudirect"))),
+    listBox("direct"), listBox("tunnel"),
+    hint("Список сетей России — ipverse (данные RIPE), обновляется раз в сутки. Клиенты без туннеля и трафик самого сервера "
+      + "не трогаются."));
+});
+
+// Если туннель упал: «напрямую» (как было) или «блокировать» — на каждый туннель
+const failState = (x) => (!x.enabled ? ["○ выключен", "muted"] : x.up ? ["● работает", "ok"]
+  : x.held ? ["▲ упал — клиенты ждут его без интернета", "bad"]
+    : ["▲ не работает" + (x.mode !== "block" ? " — клиенты идут напрямую" : ""), "warn"]);
+route(/^\/tunnels\/fail$/, async (ctx) => {
+  const rows = (await call("tunnels", "fail", "list")) || [];
+  async function set(b, x, mode) {
+    if (mode === "block" && x.enabled && !x.up && !await confirmTg(`${x.label} сейчас не работает. В режиме «блокировать» его `
+      + "клиенты сразу останутся без интернета (кроме «РФ напрямую»), пока он не поднимется. Включить?")) return;
+    await quick(b, `${x.label}: ${mode === "block" ? "блокировать" : "напрямую"}`, ["tunnels", "fail", "set", x.name, mode]);
+  }
+  ctx.put(title("🪂 Если туннель упал"),
+    hint("Что делать клиентам туннеля, когда он упал: не отвечает, служба остановилась, сервер перезагрузился, а туннель "
+      + "не поднялся."),
+    h("div", { class: "card" },
+      h("div", { class: "small", style: "padding:4px 0" }, h("b", {}, "Напрямую"),
+        " — как было: клиенты идут с адреса сервера, интернет не пропадает."),
+      h("div", { class: "small", style: "padding:4px 0" }, h("b", {}, "Блокировать"),
+        " — ждут туннель без интернета (кроме «РФ напрямую»): адрес сервера не засветится. Вернётся туннель — вернётся и интернет.")),
+    rows.map((x) => {
+      const [st, cls] = failState(x);
+      return h("div", { class: "card", "data-name": "fail-" + x.name },
+        h("div", { class: "row", style: "justify-content:space-between;gap:8px;flex-wrap:wrap" }, h("b", {}, x.label),
+          h("span", { class: "small " + cls }, st)),
+        h("div", { class: "chips rchips", style: "margin-top:8px" }, [["direct", "Напрямую"], ["block", "Блокировать"]].map(([v, l]) =>
+          h("button", { class: x.mode === v ? "on" : null, "data-v": v,
+            onclick: (ev) => (x.mode === v ? null : set(ev.currentTarget, x, v)) }, l))));
+    }),
+    h("div", { class: "actions", style: "margin-top:8px" },
+      rows.some((x) => x.mode === "block") ? btn("↪️ Всем напрямую", (b) => quickAsk(b, "Всем туннелям — «напрямую», как было? "
+        + "Удержанные клиенты сразу пойдут с адреса сервера.", "Все туннели: напрямую", ["tunnels", "fail", "set", "all", "direct"])) : null,
+      btn("📜 Журнал", () => go("/log/tunfail"))),
+    hint("Выключенный руками туннель (кнопкой или «Всё напрямую») отпускает клиентов в любом режиме. Сторож раз в минуту держит "
+      + "клиентов включённого, но не поднявшегося туннеля — в том числе после перезагрузки сервера."));
+});
+
+// Куда идёт адрес: решение ядра для клиента и адреса — туннель, напрямую,
+// «РФ напрямую», удержан упавшим туннелем, отброшен «VK и Max»
+const ROUTE_KIND = { warp: ["●", "ok"], xray: ["●", "ok"], t2s: ["●", "ok"], exit: ["●", "ok"], direct: ["○", ""],
+  rudirect: ["🇷🇺", ""], held: ["▲", "bad"], drop: ["✕", "warn"], blocked: ["⛔", "bad"], none: ["▲", "warn"] };
+route(/^\/diag\/route(?:\/([^/]+))?$/, async (ctx, who) => {
+  const names = ((await call("clients", "list")) || []).map((c) => c.name);
+  who = who ? decodeURIComponent(who) : "";
+  const sel = h("select", { "aria-label": "Клиент", style: "flex:1;min-width:0" },
+    names.map((n) => h("option", { value: n, selected: n === who ? true : null }, n)));
+  const inp = h("input", { placeholder: "1.1.1.1, ya.ru или ссылка", autocapitalize: "off", autocomplete: "off",
+    "aria-label": "Адрес", style: "flex:1;min-width:0" });
+  const out = h("div", { "data-name": "route-result" });
+  const check = btn("🧭 Проверить", (b) => {
+    const v = inp.value.trim();
+    if (!v || /\s/.test(v)) return fail(new Error("Нужен один адрес, домен или ссылка"));
+    return busy(b, async () => {
+      const d = (await call("diag", "route", sel.value, v)) || {};
+      const rows = d.rows || [], kinds = rows.map((x) => x.kind);
+      const tips = [kinds.includes("held") ? "Вернуть интернет: поднять туннель или «Если туннель упал» → Напрямую." : null,
+        kinds.includes("rudirect") ? "Пустить адрес через туннель: «РФ напрямую» → Всегда через туннель." : null,
+        rows.some((x) => x.kind === "direct" && /не в туннеле/.test(x.note || "")) ? "Пустить клиента в туннель: карточка клиента → маршрут." : null,
+        kinds.includes("blocked") ? "Клиент заблокирован: срок или лимит трафика — карточка клиента." : null].filter(Boolean);
+      out.replaceChildren(...[h("div", { class: "card" },
+        kv("Клиент", h("span", { class: "mono" }, d.client + (d.ip ? " · " + d.ip : ""))),
+        kv("Адрес", h("span", { class: "mono wrap" }, d.input || v)),
+        rows.map((x) => { const [m, cls] = ROUTE_KIND[x.kind] || ["•", ""];
+          return h("div", { style: "padding:6px 0", "data-kind": x.kind }, h("div", { class: cls }, m + " ", h("span", { class: "mono" }, x.ip)),
+            h("div", { class: "small muted wrap" }, x.note)); })),
+      ...tips.map((t) => hint(t)),
+      h("div", { class: "actions", style: "margin-top:8px" },
+        kinds.includes("held") ? btn("🪂 Если туннель упал", () => go("/tunnels/fail")) : null,
+        kinds.includes("rudirect") ? btn("🇷🇺 РФ напрямую", () => go("/tunnels/rudirect")) : null,
+        btn("👤 Карточка клиента", () => go("/client/" + encodeURIComponent(d.client || sel.value))))]);
+    });
+  });
+  check.style.flex = "none"; check.style.whiteSpace = "nowrap";
+  ctx.put(title("🧭 Куда идёт адрес"),
+    hint("Через какой туннель клиент ходит на адрес или сайт — решение самого ядра: с «РФ напрямую», удержанием упавшего туннеля и «VK и Max». Ничего не меняет."),
+    names.length ? [h("div", { class: "row", style: "gap:8px" }, sel),
+      h("div", { class: "row", style: "gap:8px;margin-top:8px" }, inp, enterTo(check, inp)), out]
+      : h("div", { class: "card empty" }, "Клиентов нет."));
+  if (!who) sel.focus(); else inp.focus();
+});
+
 route(/^\/diag$/, async (ctx) => {
   const r = await callR(["diag", "status"]);
   ctx.put(title("🩺 Диагностика"), logCard(r.log),
@@ -4506,7 +4647,8 @@ route(/^\/diag$/, async (ctx) => {
       menuItem("🌍 Домены мимикрии: мир", "какие домены пула отвечают отсюда", () => runJob(ctx, "Домены мимикрии (мир)", ["diag", "domains", "world"])),
       menuItem("📍 Домены мимикрии: Россия", "пул для серверов в РФ", () => runJob(ctx, "Домены мимикрии (Россия)", ["diag", "domains", "ru"])),
       menuItem("🎯 Тест мимикрии", "захват первых пакетов клиента", () => go("/diag/sniff")),
-      menuItem("🔍 DPI у клиента", "проверка со стороны клиента", () => go("/diag/dpi"))),
+      menuItem("🔍 DPI у клиента", "проверка со стороны клиента", () => go("/diag/dpi")),
+      menuItem("🧭 Куда идёт адрес", "через какой туннель клиент ходит на сайт", () => go("/diag/route"))),
     h("h2", {}, "Ещё"),
     h("div", { class: "card list" },
       menuItem("📜 Журналы служб", "последние строки журнала", () => go("/diag/logs")),
@@ -5303,7 +5445,7 @@ const LOGS = { manager: "awg2 — действия", install: "Компонен�
   expire: "Сроки клиентов", warp: "WARP", "warp-health": "WARP health-check", usque: "usque (WARP MASQUE)", xray: "Xray",
   "xray-routing": "Маршруты Xray", tun2socks: "tun2socks", exits: "Exit-ноды", cascade: "Каскад", dns: "dnscrypt-proxy",
   "dns-health": "DNS health-check", wgobf: "WG + обфускатор", bot: "Telegram-бот", antiscan: "Антисканер",
-  vkblock: "VK и Max мимо VPN" };
+  vkblock: "VK и Max мимо VPN", rudirect: "РФ напрямую", tunfail: "Если туннель упал" };
 
 route(/^\/log\/([a-z0-9-]+)$/, async (ctx, name) => {
   const r = await callR(["log", name, "150"]);

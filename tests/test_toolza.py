@@ -2732,6 +2732,16 @@ case "$1" in
   add) e="${*:3}"; e="${e% -exist}"; echo "$e" >> "$S/$2" ;;
   swap) [[ -f "$S/$2" && -f "$S/$3" ]] || exit 1; mv "$S/$2" "$S/.t"; mv "$S/$3" "$S/$2"; mv "$S/.t" "$S/$3" ;;
   destroy) [[ -f "$S/$2" ]] || exit 1; mv -f "$S/$2" "$IPSET_DIR/gone/$2" ;;
+  test) [[ -f "$S/$2" ]] || exit 1
+        python3 -c 'import ipaddress, sys
+ip, best = ipaddress.ip_address(sys.argv[2]), None
+for ln in open(sys.argv[1]):
+    p = ln.split()
+    if p and ip in ipaddress.ip_network(p[0], strict=False):
+        n = ipaddress.ip_network(p[0], strict=False)
+        if best is None or n.prefixlen > best[0].prefixlen:
+            best = (n, "nomatch" in p[1:])
+sys.exit(0 if best and not best[1] else 1)' "$S/$2" "$3"; exit ;;
   list) if [[ "$2" == -n ]]; then [[ -f "$S/$3" ]] && echo "$3"; [[ -f "$S/$3" ]]; exit; fi
         [[ -f "$S/$2" ]] || exit 1
         echo "Name: $2"; echo "Members:"
@@ -3173,6 +3183,424 @@ chk("включение без годного списка — отказ, вы�
     and d.get("enabled") is False and mangle(4) == [], [r, d])
 rc, out, _ = bash(ASPRE + 'vkblock_remove; ls "$VKBLOCK_DIR" "$VKBLOCK_SCRIPT" 2>&1')
 chk("удаление вместе со скриптом: каталог и скрипт убраны", out.count("No such file") == 2, out)
+
+print("\n── РФ напрямую, если туннель упал, куда идёт адрес ──")
+# ip rule / ip route — эмулятор (tests/ipemu.py): правила и таблицы в файлах,
+# route get — по приоритетам правил и меткам, как ядро; живые устройства — LINKS.
+RTBIN = os.path.join(TMP, "rtbin")
+RT_DIR = os.path.join(TMP, "rt")
+os.makedirs(RTBIN)
+shutil.copy(os.path.join(HERE, "ipemu.py"), os.path.join(RTBIN, "ip"))
+os.chmod(os.path.join(RTBIN, "ip"), 0o755)
+with open(os.path.join(RTBIN, "getent"), "w") as f:
+    f.write('#!/usr/bin/env bash\n[[ "$1" == ahostsv4 ]] || exit 2\ncase "$2" in\n'
+            '  bank.example) echo "91.200.1.5      STREAM bank.example"; echo "91.200.1.5      DGRAM" ;;\n'
+            '  two.example) echo "93.184.1.1 STREAM two.example"; echo "93.184.1.2 STREAM" ;;\n'
+            '  *) exit 2 ;;\nesac\n')
+os.chmod(os.path.join(RTBIN, "getent"), 0o755)
+RTENV = dict(ASENV, PATH=RTBIN + ":" + ASENV["PATH"], RT_DIR=RT_DIR)
+RTPRE = ASPRE + f'export PATH="{RTBIN}:$PATH" RT_DIR="{RT_DIR}"; '
+RUD = os.path.join(ROOT, "var/lib/awg2/rudirect")
+RULOG = os.path.join(ROOT, "rudirect.log")
+TFLOG = os.path.join(ROOT, "tunfail.log")
+TFCONF = os.path.join(ROOT, "etc/awg2/tunnel-fail.conf")
+MARK = "0x52550000/0xffff0000"
+
+
+def rbash(code):
+    return bash(RTPRE + code)
+
+
+def rt_rules():
+    try:
+        return sorted(json.load(open(os.path.join(RT_DIR, "rules.json"))), key=lambda x: x["prio"])
+    except (OSError, ValueError):
+        return []
+
+
+def rt_table(t):
+    try:
+        return json.load(open(os.path.join(RT_DIR, f"table.{t}.json")))
+    except (OSError, ValueError):
+        return []
+
+
+def rt_reset():
+    shutil.rmtree(RT_DIR, ignore_errors=True)
+    os.makedirs(RT_DIR)
+
+
+def links(*devs):
+    with open(LINKS, "w") as f:
+        f.write("".join(d + "\n" for d in ("awg0",) + devs))
+
+
+def route_get(src, dst, mark=""):
+    rc, out, err = rbash(f'ip -4 route get {dst} from {src} iif awg0 {"mark " + mark if mark else ""}')
+    return rc, (out + err).strip()
+
+
+def ru_list(n=2500, width=18):
+    out, step = ["# ipverse: RU"], 2 ** (24 - width)
+    for a in (77, 78, 79, 80, 81):
+        for b in range(256):
+            for c in range(0, 256, step):
+                if len(out) > n:
+                    return "\n".join(out) + "\n"
+                out.append(f"{a}.{b}.{c}.0/{width}")
+    return "\n".join(out) + "\n"
+
+
+def rud_status():
+    return api("rudirect", "status", env=RTENV).get("data") or {}
+
+
+def rud_mangle():
+    return [x for x in mangle(4) if "awg2-rudirect" in x]
+
+
+RUD_RULE = lambda dev: (f"PREROUTING -i {dev} -m set --match-set awg2-ru dst -m addrtype ! --dst-type LOCAL "
+                        f"-m comment --comment awg2-rudirect -j MARK --set-xmark {MARK}")
+rt_reset()
+links()
+rc, out, _ = bash("clients_name_ip")
+IPS = dict(ln.split("|", 1) for ln in out.split())
+A, B = IPS["alice"], IPS["bob"]
+open(f"{IPT_RULES}.iptables.mangle", "w").close()
+for fn in ("ipv4-aggregated.txt", "ru-aggregated.zone"):
+    if os.path.exists(os.path.join(ASLISTS, fn)):
+        os.remove(os.path.join(ASLISTS, fn))
+
+# ── РФ напрямую ──
+reset_calls()
+r = api("rudirect", "on", env=RTENV)
+d = rud_status()
+chk("rudirect on без списка: отказ, выключено, правил нет",
+    r.get("ok") is False and "не получен" in (r.get("error") or "") + (r.get("log") or "")
+    and d.get("enabled") is False and rud_mangle() == [] and not any(x["fwmark"] for x in rt_rules()), [r, d])
+
+with open(os.path.join(ASLISTS, "ipv4-aggregated.txt"), "w") as f:
+    f.write(ru_list())
+reset_calls()
+r = api("rudirect", "on", env=RTENV)
+ru = ipset_set("awg2-ru") or []
+chk("rudirect on: список РФ скачан, набор awg2-ru, метка в mangle для awg0 и wgobf0, правило 90 → main",
+    r.get("ok") and len(ru) == 2500 and "77.88.0.0/18" in ru
+    and rud_mangle() == [RUD_RULE("wgobf0"), RUD_RULE("awg0")]
+    and {"prio": 90, "from": "all", "fwmark": MARK, "lookup": "main"} in rt_rules()
+    and "curl https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt" in calls(),
+    [r, rud_mangle(), rt_rules(), len(ru)])
+units = os.listdir(os.path.join(ROOT, "units"))
+svc = open(os.path.join(ROOT, "units", "awg2-rudirect.service")).read()
+chk("служба при загрузке — раньше UFW, таймер раз в час; включены",
+    {"awg2-rudirect.service", "awg2-rudirect-update.service", "awg2-rudirect-update.timer"} <= set(units)
+    and "Before=network-pre.target ufw.service netfilter-persistent.service" in svc
+    and "systemctl enable --now awg2-rudirect-update.timer" in calls(), units)
+with open(f"{IPT_RULES}.iptables.mangle.cnt", "w") as f:
+    f.write("21")
+d = rud_status()
+chk("rudirect status: включено, на месте, сетей РФ, источник, счётчик, свои списки пусты",
+    d.get("enabled") is True and d.get("active") is True and d.get("ru") == 2500 and d.get("mine") == 0
+    and d.get("excl") == 0 and "ipverse" in d.get("src", "") and d.get("packets") == 42 and d.get("updated", 0) > 0
+    and d.get("error") == "" and d.get("direct") == [] and d.get("tunnel") == [], d)
+rc, out, _ = bash(ASPRE + "_api_readonly rudirect status && _api_readonly diag route alice 1.1.1.1 && echo RO")
+chk("rudirect status и diag route — чтение без очереди api", "RO" in out, out)
+
+r = api("rudirect", "add", "direct", "https://Bank.Example/login?x=1", env=RTENV)
+d = rud_status()
+chk("свой адрес «всегда напрямую»: из ссылки — домен, разрешён и в наборе",
+    r.get("ok") and d.get("direct") == ["bank.example"] and d.get("mine") == 1 and d.get("ru") == 2500
+    and "91.200.1.5/32" in (ipset_set("awg2-ru") or []), [r, d])
+r = api("rudirect", "add", "tunnel", "77.88.8.0/24", env=RTENV)
+d = rud_status()
+chk("исключение «всегда через туннель» — запись nomatch, перекрывает сеть РФ",
+    r.get("ok") and d.get("tunnel") == ["77.88.8.0/24"] and d.get("excl") == 1
+    and "77.88.8.0/24 nomatch" in (ipset_set("awg2-ru") or []), [r, d])
+r1 = api("rudirect", "add", "tunnel", "bank.example", env=RTENV)
+r2 = api("rudirect", "add", "direct", "10.0.0.1", env=RTENV)
+r3 = api("rudirect", "add", "direct", "1.0.0.0/8", env=RTENV)
+r4 = api("rudirect", "add", "direct", "не адрес!", env=RTENV)
+r5 = api("rudirect", "add", "other", "1.1.1.1", env=RTENV)
+r6 = api("rudirect", "add", "direct", "bank.example", env=RTENV)
+chk("свои списки: уже в другом, частный, шире /12, мусор, неизвестный список — отказ; повтор — без дубля",
+    all(x.get("ok") is False for x in (r1, r2, r3, r4, r5)) and r6.get("ok")
+    and rud_status().get("direct") == ["bank.example"], [r1, r2, r3, r4, r5, r6])
+r = api("rudirect", "add", "direct", "5.255.255.5", env=RTENV)
+d = rud_status()
+chk("одиночный IPv4 — без /32 в списке, в наборе /32", r.get("ok") and d.get("direct") == ["bank.example", "5.255.255.5"]
+    and "5.255.255.5/32" in (ipset_set("awg2-ru") or []), d)
+r = api("rudirect", "del", "direct", "5.255.255.5/32", env=RTENV)
+d = rud_status()
+chk("убрать по записи (с /32 тоже находит)", r.get("ok") and d.get("direct") == ["bank.example"]
+    and "5.255.255.5/32" not in (ipset_set("awg2-ru") or []), [r, d])
+r = api("rudirect", "del", "direct", "9.9.9.9", env=RTENV)
+chk("убрать то, чего нет, — отказ", r.get("ok") is False, r)
+
+# Проверка списка: оборванный, раздутый — не принимаются; запасной источник
+with open(os.path.join(ASLISTS, "ipv4-aggregated.txt"), "w") as f:
+    f.write(ru_list(500))
+api("rudirect", "update", env=RTENV)
+d = rud_status()
+chk("оборванный список (500 сетей) не принят: ошибка видна, набор прежний",
+    "не похоже на список РФ" in d.get("error", "") and d.get("ru") == 2500 and len(ipset_set("awg2-ru") or []) >= 2500, d)
+with open(os.path.join(ASLISTS, "ipv4-aggregated.txt"), "w") as f:
+    f.write(ru_list(2500, 13))
+api("rudirect", "update", env=RTENV)
+d = rud_status()
+chk("слишком широкий охват — не принят", "не похоже на список РФ" in d.get("error", "") and d.get("ru") == 2500, d)
+os.remove(os.path.join(ASLISTS, "ipv4-aggregated.txt"))
+with open(os.path.join(ASLISTS, "ru-aggregated.zone"), "w") as f:
+    f.write(ru_list(2600))
+reset_calls()
+api("rudirect", "update", env=RTENV)
+d = rud_status()
+chk("основной источник недоступен — запасной (ipdeny): принят, ошибка ушла",
+    d.get("error") == "" and d.get("ru") == 2600 and "ipdeny" in d.get("src", "")
+    and calls().count("curl https://") == 2, [d, calls()])
+log = open(RULOG).read()
+chk("журнал РФ напрямую: скачивания, отказы и применения", "не похоже на список РФ" in log
+    and "не скачался" in log and "применено: сетей РФ 2600, своих напрямую 1, через туннель 1" in log, log[-600:])
+
+# Таймер: правило сбросили — вернуть без скачивания; всё на месте — домены перечитать
+open(f"{IPT_RULES}.iptables.mangle", "w").close()
+reset_calls()
+rc, out, _ = rbash('rudirect_rules_ok || echo GONE; bash "$RUDIRECT_SCRIPT" heal; echo "rc=$?"')
+chk("правило сбросили — таймер возвращает его без скачивания",
+    "GONE" in out and "rc=0" in out and len(rud_mangle()) == 2 and "curl" not in calls(), [out, rud_mangle()])
+reset_calls()
+rc, out, _ = rbash('bash "$RUDIRECT_SCRIPT" heal; echo "rc=$?"')
+chk("всё на месте, но в списках домены — таймер пересобирает набор (адреса доменов меняются), без скачивания",
+    "rc=0" in out and "restore" in calls() and "curl" not in calls() and len(rud_mangle()) == 2, calls())
+api("rudirect", "del", "direct", "all", env=RTENV)
+reset_calls()
+rc, out, _ = rbash('bash "$RUDIRECT_SCRIPT" heal; echo "rc=$?"')
+chk("всё на месте, доменов нет — таймер только проверяет",
+    "rc=0" in out and not any(c.startswith("curl") or " -I " in c or "restore" in c for c in calls().splitlines()), calls())
+rc, out, _ = rbash('sed -i "s/^UPDATED=.*/UPDATED=1/" "$RUDIRECT_CONF"; bash "$RUDIRECT_SCRIPT" heal; grep -c "^curl" "$CALLS"')
+chk("список старше суток — таймер обновляет", out.strip().endswith("1") or out.strip().endswith("2"), out)
+os.utime(os.path.join(RUD, "heal"), (time.time() - 4 * 3600,) * 2)
+reset_calls()
+rbash("rudirect_watchdog")
+chk("сторож: таймер молчал больше трёх часов — перезапуск",
+    "systemctl start --no-block awg2-rudirect-update.service" in calls(), calls())
+rbash(f'ip rule del fwmark {MARK} lookup main priority 90')
+d = rud_status()
+r = api("rudirect", "repair", env=RTENV)
+chk("правило маршрутизации пропало — статус «не на месте», «Починить» возвращает",
+    d.get("active") is False and r.get("ok") and rud_status().get("active") is True
+    and sum(1 for x in rt_rules() if x["fwmark"]) == 1, [d, r, rt_rules()])
+
+# ── Если туннель упал ──
+with open(os.path.join(ROOT, "warp.peers"), "w") as f:
+    f.write(A + "\n")
+WSTATE = os.path.join(ROOT, "etc/wgcf/state")
+os.makedirs(os.path.dirname(WSTATE), exist_ok=True)
+open(WSTATE, "w").write("on\n")
+links("warp0")
+rt_out = lambda: rbash('rt_up warp0 200 "$WARP_PEERS"')
+rt_out()
+chk("WARP поднят (по умолчанию «напрямую»): правило клиента → 200, в таблице warp0, без «недоступно»",
+    {"prio": 200, "from": A, "fwmark": "", "lookup": "200"} in rt_rules()
+    and [x["kind"] for x in rt_table(200)] == ["dev"], [rt_rules(), rt_table(200)])
+chk("route get: клиент WARP — в warp0, не в туннеле — напрямую",
+    "dev warp0" in route_get(A, "1.1.1.1")[1] and "dev eth0" in route_get(B, "1.1.1.1")[1])
+chk("РФ напрямую: сеть России у клиента WARP — мимо туннеля (метка → main раньше правила 200)",
+    "dev eth0" in route_get(A, "77.88.0.1", "0x52550000")[1], route_get(A, "77.88.0.1", "0x52550000"))
+links()
+rbash("rt_down warp0 200")
+chk("«напрямую»: WARP упал — правила сняты, клиенты идут с адреса сервера",
+    not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == [] and "dev eth0" in route_get(A, "1.1.1.1")[1],
+    rt_rules())
+
+links("warp0")
+rt_out()
+reset_calls()
+r = api("tunnels", "fail", "set", "warp", "block", env=RTENV)
+chk("tunnels fail set warp block: режим записан, работающему WARP — «недоступно» под маршрутом, сторож установлен",
+    r.get("ok") and open(TFCONF).read() == "warp=block\n"
+    and sorted(x["kind"] for x in rt_table(200)) == ["dev", "unreachable"]
+    and os.path.exists(os.path.join(ROOT, "units", "awg2-tunfail.service"))
+    and "systemctl enable --now awg2-tunfail.timer" in calls(), [r, rt_table(200), calls()])
+chk("работающий WARP: «недоступно» не мешает — трафик в warp0", "dev warp0" in route_get(A, "1.1.1.1")[1])
+rows = api("tunnels", "fail", env=RTENV).get("data") or []
+w = next((x for x in rows if x["name"] == "warp"), {})
+chk("tunnels fail: четыре туннеля, у WARP «блокировать», включён, работает, не удержан",
+    [x["name"] for x in rows] == ["warp", "xray", "t2s", "exits"] and w.get("mode") == "block" and w.get("enabled") is True
+    and w.get("up") is True and w.get("held") is False and next(x for x in rows if x["name"] == "xray")["mode"] == "direct", rows)
+links()
+rbash("rt_down warp0 200")
+chk("«блокировать»: WARP упал — правило клиента осталось, в таблице только «недоступно»",
+    {"prio": 200, "from": A, "fwmark": "", "lookup": "200"} in rt_rules()
+    and [x["kind"] for x in rt_table(200)] == ["unreachable"], [rt_rules(), rt_table(200)])
+rc, out = route_get(A, "1.1.1.1")
+chk("route get: клиент WARP — «нет маршрута» (адрес сервера не светится), остальные — напрямую",
+    rc != 0 and "No route" in out and "dev eth0" in route_get(B, "1.1.1.1")[1], out)
+chk("…а сеть России у удержанного — напрямую (РФ напрямую раньше удержания)",
+    "dev eth0" in route_get(A, "77.88.0.1", "0x52550000")[1])
+chk("журнал «если туннель упал»: падение записано", "warp0 упал — клиенты удержаны" in open(TFLOG).read())
+w = next((x for x in api("tunnels", "fail", env=RTENV).get("data") or [] if x["name"] == "warp"), {})
+st = api("tunnels", "status", env=RTENV).get("data") or {}
+chk("статус: WARP удержан — в tunnels fail и в tunnels status (held, fail_block, rudirect)",
+    w.get("held") is True and w.get("up") is False and st.get("held") == "WARP" and st.get("fail_block") is True
+    and st.get("rudirect") is True, [w, st])
+
+# ── Куда идёт адрес ──
+def droute(name, addr):
+    return api("diag", "route", name, addr, env=RTENV)
+
+
+r = droute("alice", "1.1.1.1")
+d = r.get("data") or {}
+chk("diag route: удержанный клиент — held, с пояснением",
+    r.get("ok") and d.get("client") == "alice" and d.get("ip") == A
+    and [(x["ip"], x["kind"]) for x in d.get("rows", [])] == [("1.1.1.1", "held")] and "блокировать" in d["rows"][0]["note"], r)
+with open(os.path.join(ROOT, "ip_forward"), "w") as f:
+    f.write("0\n")
+r = droute("alice", "1.1.1.1")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("diag route: пересылка пакетов выключена — none с подсказкой, а не «удержан»",
+    row.get("kind") == "none" and "ip_forward" in row.get("note", ""), r)
+os.remove(os.path.join(ROOT, "ip_forward"))
+r = droute("alice", "77.88.0.1")
+chk("diag route: сеть России — rudirect, мимо туннеля",
+    [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["rudirect"], r)
+r = droute("alice", "77.88.8.8")
+chk("diag route: исключение «через туннель» перекрывает сеть России — held, а не rudirect",
+    [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["held"], r)
+links("warp0")
+rt_out()
+chk("WARP вернулся: route get снова в warp0, «недоступно» осталось под маршрутом",
+    "dev warp0" in route_get(A, "1.1.1.1")[1] and sorted(x["kind"] for x in rt_table(200)) == ["dev", "unreachable"])
+r = droute("alice", "https://1.1.1.1:443/dns-query")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("diag route: ссылка с портом → адрес; клиент WARP — warp, устройство warp0",
+    row.get("ip") == "1.1.1.1" and row.get("kind") == "warp" and row.get("dev") == "warp0", r)
+r = droute("bob", "1.1.1.1")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("diag route: клиент не в туннеле — direct, пояснение называет активный туннель",
+    row.get("kind") == "direct" and "WARP" in row.get("note", ""), r)
+r = droute("alice", "two.example")
+chk("diag route: домен — каждый его IPv4 отдельной строкой",
+    [x["ip"] for x in (r.get("data") or {}).get("rows", [])] == ["93.184.1.1", "93.184.1.2"], r)
+r1, r2, r3 = droute("nobody", "1.1.1.1"), droute("alice", "не адрес!"), droute("alice", "nx.example")
+chk("diag route: нет клиента, мусор, домен не разрешается — отказ",
+    all(x.get("ok") is False for x in (r1, r2, r3)), [r1, r2, r3])
+rc, out, _ = rbash('mkdir -p "$VKBLOCK_DIR"; echo ON=1 > "$VKBLOCK_CONF"; echo 95.0.0.0/22 > "$IPSET_DIR/sets/awg2-vk"; '
+                   'diag_route alice 95.0.1.1; rm -f "$VKBLOCK_CONF" "$IPSET_DIR/sets/awg2-vk"')
+chk("diag route: сеть VK при включённом «VK и Max» — drop", out.split("\t")[1:2] == ["drop"], out)
+api("client", "add", "frank", "mimicry=none")
+bash('py meta-set "$SERVER_CONF" frank expires 1; py expire-check "$SERVER_CONF" "$EXPIRE_SUSPEND_IP" "$EXPIRE_STATE_DIR" >/dev/null')
+r = droute("frank", "1.1.1.1")
+chk("diag route: заблокированный клиент — blocked", [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["blocked"], r)
+api("client", "del", "frank")
+
+# ── Сторож и переключения ──
+links()
+rbash("rt_down warp0 200")
+rt_reset()
+links()
+reset_calls()
+rc, out, _ = rbash('bash "$TUNFAIL_SCRIPT"; echo "rc=$?"')
+chk("перезагрузка, WARP включён, но не поднялся: сторож удерживает его клиентов",
+    "rc=0" in out and {"prio": 200, "from": A, "fwmark": "", "lookup": "200"} in rt_rules()
+    and [x["kind"] for x in rt_table(200)] == ["unreachable"]
+    and "WARP включён, но не работает" in open(TFLOG).read(), [out, rt_rules(), rt_table(200)])
+n_log = open(TFLOG).read().count("включён, но не работает")
+rbash('bash "$TUNFAIL_SCRIPT"')
+chk("сторож повторно — без дублей правил и записей журнала",
+    sum(1 for x in rt_rules() if x["lookup"] == "200") == 1 and open(TFLOG).read().count("включён, но не работает") == n_log,
+    rt_rules())
+links("tun0")
+rbash("rt_up tun0 100 -")
+chk("поднялся другой туннель (tun2socks) — удержание WARP снято, его правила не перехватывают клиентов",
+    not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == [] and "dev tun0" in route_get(A, "1.1.1.1")[1],
+    [rt_rules(), route_get(A, "1.1.1.1")])
+rbash('bash "$TUNFAIL_SCRIPT"')
+chk("сторож при живом другом туннеле лежащий WARP не держит", not any(x["lookup"] == "200" for x in rt_rules()), rt_rules())
+links()
+rbash("rt_down tun0 100")
+rt_reset()
+rbash('bash "$TUNFAIL_SCRIPT"')
+r = api("tunnels", "fail", "set", "warp", "direct", env=RTENV)
+chk("удержанному — «напрямую»: отпущен сразу, режим снят, файл режимов убран",
+    r.get("ok") and not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == []
+    and not os.path.exists(TFCONF) and "dev eth0" in route_get(A, "1.1.1.1")[1], [r, rt_rules()])
+
+# Выключение руками отпускает и в «блокировать»
+api("tunnels", "fail", "set", "warp", "block", env=RTENV)
+links("warp0")
+rt_out()
+links()
+rc, out, _ = rbash("warp_down")
+chk("«блокировать», но WARP выключен руками — клиенты отпущены напрямую",
+    not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == [] and not os.path.exists(WSTATE)
+    and "dev eth0" in route_get(A, "1.1.1.1")[1], [out, rt_rules(), rt_table(200)])
+rbash('bash "$TUNFAIL_SCRIPT"')
+chk("…и сторож выключенный WARP не держит", not any(x["lookup"] == "200" for x in rt_rules()), rt_rules())
+
+r = api("tunnels", "fail", "set", "all", "block", env=RTENV)
+chk("всем — «блокировать»: четыре строки", r.get("ok")
+    and sorted(open(TFCONF).read().split()) == ["exits=block", "t2s=block", "warp=block", "xray=block"], r)
+r1 = api("tunnels", "fail", "set", "foo", "block", env=RTENV)
+r2 = api("tunnels", "fail", "set", "warp", "maybe", env=RTENV)
+chk("неизвестный туннель или режим — отказ, режимы прежние", r1.get("ok") is False and r2.get("ok") is False
+    and len(open(TFCONF).read().split()) == 4, [r1, r2])
+
+# Exit-ноды: остановка службы в «блокировать» удерживает, выключение — отпускает
+rt_reset()
+EXST = os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state")
+open(EXST, "w").write("active\nmode=all\nbalancer=single\nsingle_exit=\n")
+rbash('ip route replace default dev awg-exit-n1 table 202; ip rule add from "$(server_net)" lookup 202 priority 202; '
+      f'ip route replace default dev awg-exit-n1 table 210; ip rule add from {B} lookup 210 priority 202')
+rbash("exits_routing_stop")
+chk("exit-ноды остановлены (сбой, перезапуск) в «блокировать» — правила на месте, в таблицах только «недоступно»",
+    sum(1 for x in rt_rules() if x["lookup"] in ("202", "210")) == 2
+    and [x["kind"] for x in rt_table(202)] == ["unreachable"] and [x["kind"] for x in rt_table(210)] == ["unreachable"]
+    and "exit-ноды остановлены" in open(TFLOG).read(), [rt_rules(), rt_table(202), rt_table(210)])
+rbash("exits_down quiet")
+chk("exit-ноды выключены руками — отпущены, состояние inactive",
+    not any(x["lookup"] in ("202", "210") for x in rt_rules()) and rt_table(202) == [] and rt_table(210) == []
+    and open(EXST).read().startswith("inactive"), [rt_rules(), rt_table(202)])
+
+# Аварийный сброс — все напрямую, режимы ни при чём
+open(WSTATE, "w").write("on\n")
+links("warp0")
+rt_out()
+links()
+rbash("tunnels_panic_reset quiet")
+chk("аварийный сброс в «блокировать» — все клиенты напрямую, WARP выключен",
+    not any(x["lookup"] == "200" for x in rt_rules()) and rt_table(200) == [] and not os.path.exists(WSTATE), rt_rules())
+
+reset_calls()
+rbash("tunfail_watchdog")
+chk("сторож «если упал»: таймер не работает — поставлен заново",
+    "systemctl enable --now awg2-tunfail.timer" in calls(), calls())
+r = api("tunnels", "fail", "set", "all", "direct", env=RTENV)
+chk("всем — «напрямую» (как было): файл режимов убран", r.get("ok") and not os.path.exists(TFCONF), r)
+reset_calls()
+rbash("tunfail_watchdog")
+chk("все «напрямую» — сторож ничего не ставит", "tunfail" not in calls(), calls())
+r = api("log", "tunfail", env=RTENV)
+chk("api log tunfail — журнал режимов и удержаний", r.get("ok") and "напрямую" in json.dumps(r, ensure_ascii=False), r)
+r = api("log", "rudirect", env=RTENV)
+chk("api log rudirect — журнал РФ напрямую", r.get("ok") and "применено" in json.dumps(r, ensure_ascii=False), r)
+
+# ── РФ напрямую: выключение и удаление ──
+r = api("rudirect", "off", env=RTENV)
+d = rud_status()
+chk("rudirect off: метки и правило 90 сняты, набор удалён",
+    r.get("ok") and rud_mangle() == [] and not any(x["fwmark"] for x in rt_rules()) and ipset_set("awg2-ru") is None
+    and d.get("enabled") is False and d.get("active") is False and d.get("packets") == 0, [r, d, rt_rules()])
+rc, out, _ = rbash('bash "$RUDIRECT_SCRIPT" apply; echo "rc=$?"')
+chk("выключено — служба при загрузке ничего не ставит", out.split() == ["rc=0"] and rud_mangle() == [], out)
+r = api("rudirect", "update", env=RTENV)
+chk("обновление при выключенном — отказ", r.get("ok") is False, r)
+r = api("rudirect", "add", "tunnel", "8.8.8.0/24", env=RTENV)
+chk("свой список при выключенном — сохранён, вступит при включении",
+    r.get("ok") and rud_status().get("tunnel") == ["77.88.8.0/24", "8.8.8.0/24"] and rud_mangle() == [], r)
+rc, out, _ = rbash('rudirect_remove; ls "$RUDIRECT_DIR" "$RUDIRECT_SCRIPT" 2>&1')
+chk("удаление: каталог и скрипт убраны", out.count("No such file") == 2, out)
+links()
 
 print("\n── Веб-панель: доступ по адресам и только через VPN ──")
 WFW = os.path.join(TMP, "awg2-web-fw")

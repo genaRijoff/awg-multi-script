@@ -256,7 +256,7 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             st.pop(k, None)
 
     # WARP упал: включён, а туннеля нет — клиенты WARP идут напрямую, с IP
-    # сервера. Увёл их health-check (метка failover) — сразу: он уже проверил
+    # сервера (или ждут его без интернета — режим «блокировать»). Увёл их health-check (метка failover) — сразу: он уже проверил
     # трижды; иначе две проверки подряд — перезапуск из меню или бота не тревога.
     # WARP не отвечает: warp0 поднят, а Cloudflare молчит — клиенты WARP без
     # интернета. Без health-check это проверяет бот сам (с ним — health-check)
@@ -274,7 +274,14 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             st["warp_since"] = now
         need = 1 if failed and failover else IFACE_STRIKES
         if st["warp_down"] >= need and not st.get("warp_sent") and enabled("warp"):
-            if failed:
+            if failed and t.get("warp_block"):
+                # «Если туннель упал → блокировать»: клиенты ждут WARP, а не уходят напрямую
+                await notify(bot, f"🟠 <b>{host}: WARP упал</b> — клиенты WARP ждут его без интернета "
+                                  "(режим «блокировать»), IP сервера не светится.\n"
+                                  + ("Health-check вернёт его сам, когда Cloudflare снова ответит." if health
+                                     else "Туннели → WARP → ▶️ Включить."),
+                             ui.kb(("▶️ Включить WARP", "warp:up"), ("🪂 Если упал", "tf")))
+            elif failed:
                 await notify(bot, f"🟠 <b>{host}: WARP упал</b> — клиенты WARP идут напрямую, с IP сервера.\n"
                                   + ("Health-check вернёт его сам, когда Cloudflare снова ответит." if health
                                      else "Туннели → WARP → ▶️ Включить."), ui.kb(("▶️ Включить WARP", "warp:up")))

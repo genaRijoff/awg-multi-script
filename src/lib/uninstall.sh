@@ -28,7 +28,11 @@ clients_clean() {
 # Все туннели: службы, правила и настройки. Бэкап делается до вызова.
 tunnels_remove_all() {
   local n
+  # «Блокировать» — раньше сброса: туннелей не будет, держать клиентов незачем.
+  # «РФ напрямую» без туннелей ничего не делает — уходит вместе с ними
+  tunfail_remove
   tunnels_panic_reset quiet
+  rudirect_remove
   for n in $(exits_nodes); do systemctl disable --now "awg-quick@awg-exit-$n" &>/dev/null || true; done
   remove_unit awg-warp.service awg-usque.service awg-warp-healthcheck.timer awg-warp-healthcheck.service \
     "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" awg-xray-rugeo.timer awg-xray-rugeo.service \
@@ -45,7 +49,7 @@ tunnels_remove_all() {
     "$USQUE_DIR" "$USQUE_BIN" "$USQUE_SYSCTL" "$WARPSCOUT_DIR" "$WARPSCOUT_BIN" \
     "$XRAY_DIR" "$XRAY_BIN" "$XRAY_ROUTING_SCRIPT" "$XRAY_ASSET_DIR"/geo{ip,site}.dat "$XRAY_ASSET_DIR"/geo{ip,site}_RU.dat \
     "$T2S_DIR" "$T2S_BIN" "$T2S_ROUTING_SCRIPT" "$EXITS_SCRIPT" \
-    "$DNS_PROXY_STATE" "$DNS_PERSIST_SCRIPT" "$DNS_HEALTH_SCRIPT" "$DNS_SYSCTL"
+    "$DNS_PROXY_STATE" "$DNS_PERSIST_SCRIPT" "$DNS_HEALTH_SCRIPT" "$DNS_SYSCTL" "$RUDIRECT_USER"
 }
 
 # Файлы, которые кладёт «make install» amneziawg-tools.

@@ -302,6 +302,8 @@ helpers_refresh() {
   [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
   antiscan_on && _antiscan_emit &>/dev/null
   vkblock_on && _vkblock_emit &>/dev/null
+  rudirect_on && _rudirect_emit &>/dev/null
+  tunfail_any_block && _tunfail_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
   [[ -f "$XRAY_ROUTING_SCRIPT" ]] && _xray_emit_routing
   # Xray 26.7+ без имени у входа tun поднимает utunN вместо xray0 — имя в

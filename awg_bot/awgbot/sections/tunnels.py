@@ -42,12 +42,19 @@ async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
     n = d.get("cascade", 0)
     lines = [f"{ui.state_icon(d.get(k, 'none'))} {label} — {ui.state_word(d.get(k, 'none'))}" for k, label, _ in names]
     lines.insert(4, f"{'🟢' if n else '▫️'} Каскад портов — {'правил: ' + str(n) if n else 'правил нет'}")
+    lines.append(f"{'🟢' if d.get('rudirect') else '▫️'} РФ напрямую — "
+                 + ("сайты России мимо туннеля" if d.get("rudirect") else "выключено"))
+    held = d.get("held") or ""
+    lines.append(("🔴" if held else "🛑" if d.get("fail_block") else "▫️") + " Если туннель упал — "
+                 + (f"удерживает клиентов: {esc(held)}" if held
+                    else "где-то «блокировать»" if d.get("fail_block") else "напрямую (как было)"))
     text = ("<b>🌐 Туннели и DNS</b>\n\nОдновременно работает только один туннель для клиентов."
             + (f"\nСейчас: <b>{esc(d['active'])}</b>" if d.get("active") else "")
             + "\n\n" + "\n".join(lines)
             + "\n\n<i>🚨 Всё напрямую — аварийно выключить туннели, настройки сохранятся</i>")
     buttons = [(f"{ui.state_icon(d.get(k, 'none'))} {label}", to) for k, label, to in names]
     buttons.insert(4, (f"{'🟢' if n else '▫️'} Каскад", "cas"))
+    buttons += [("🇷🇺 РФ напрямую", "rud"), (f"{'🔴' if held else '🪂'} Если упал", "tf")]
     await ui.render(cb, text, ui.kb(buttons, ("🚨 Всё напрямую", tun.data("panic")), ui.back()))
 
 
