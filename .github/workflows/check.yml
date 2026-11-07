@@ -47,6 +47,10 @@ jobs:
           set -euo pipefail
           for t in test_toolza test_meta_menu test_regress_f2f3 test_amnezia test_cps test_net test_admins test_deep_robustness test_bot test_web test_api_lock test_share_persistence test_kernel_routing; do
             echo "::group::$t"
-            python3 "tests/$t.py" "$AWG2_BUILT"
+            if [[ "$t" == test_deep_robustness ]]; then
+              python3 "tests/$t.py"  # standalone unittest: аргумент-путь к awg2 не нужен
+            else
+              python3 "tests/$t.py" "$AWG2_BUILT"
+            fi
             echo "::endgroup::"
           done
