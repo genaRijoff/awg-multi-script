@@ -225,7 +225,7 @@ function barChart(items, { def = items.length - 1, axis = null } = {}) {
     plot.append(hit);
   });
   plot.append(svg("line", { class: "base", x1: 0, x2: W, y1: H - 0.5, y2: H - 0.5 }));
-  plot.addEventListener("pointerleave", () => show(def, false));
+  plot.addEventListener("pointerleave", () => { if (n) show(def, false); });
   if (n) show(def, false);
   box.append(cap, plot, axis || h("div", { class: "ax" }, h("span", {}), h("span", {}, `макс ${fmtBytes(max)}`), h("span", {})));
   return box;
@@ -268,7 +268,7 @@ function lineChart(d, { H = 80 } = {}) {
     hit.addEventListener("click", () => show(i, true));
     plot.append(hit);
   });
-  plot.addEventListener("pointerleave", () => show(n - 1, false));
+  plot.addEventListener("pointerleave", () => { if (n) show(n - 1, false); });
   if (n) show(n - 1, false);
   box.append(cap, h("div", { class: "plotw" }, plot, n ? dot : null), dayAxis(d, max));
   return box;
@@ -5368,7 +5368,10 @@ function refreshStatus() {
 }
 
 async function webStart() {
-  try { S.me = await post("/api/me"); } catch (_) { return; }      // 401 — экран входа уже на месте
+  try { S.me = await post("/api/me"); } catch (e) {
+    if (!e.login) showLogin(e.message);       // сбой сети/API не должен оставлять вечную «Загрузку…»
+    return;                                   // 401 — экран входа уже показан в post()
+  }
   drawTop();                                                     // лента и шапка — после входа
   render();
   if (curPath() !== "/") refreshStatus();                       // обзор грузит сводку сам

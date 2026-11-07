@@ -343,6 +343,16 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (!/МБ|ГБ/.test(cap)) throw new Error("подпись дня без объёма: " + cap);
     await shot("03a-traffic");
   });
+  await step("пустые графики: уход указателя не вызывает ошибку", async () => {
+    const before = errors.length;
+    await page.evaluate(() => {
+      for (const box of [barChart([]), lineChart({ days: [], rx: [], tx: [] })]) {
+        box.querySelector("svg").dispatchEvent(new Event("pointerleave"));
+      }
+    });
+    await page.waitForTimeout(100);
+    if (errors.length !== before) throw new Error(errors.slice(before).join(" | "));
+  });
   await step("лимит трафика: готовый размер", async () => {
     await page.click(".actions button:has-text('Лимит')"); await page.waitForSelector(".sheet");
     await page.click(".sheet >> text=50 ГБ в месяц");

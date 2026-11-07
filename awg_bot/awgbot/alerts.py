@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import logging
 import os
 import shutil
@@ -76,6 +77,13 @@ SUPPORT_TEXT = ("<b>AWG Toolza</b> бесплатна и развивается 
                 "Если Тулза тебе помогает — поддержи проект: так выходят новые версии.")
 
 
+def _as_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value or default)  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
 # ── Настройки ─────────────────────────────────────────────
 def config() -> dict[str, Any]:
     data = store.load(CONFIG)
@@ -115,11 +123,11 @@ def backup_info() -> dict[str, Any]:
     (после неудачи — повтор через час)."""
     st = store.load(BACKUP_STATE)
     bk = config()["backup"]
-    last = int(st.get("last") or 0)
-    slot = int(st.get("slot") or last)
+    last = _as_int(st.get("last"))
+    slot = _as_int(st.get("slot"), last)
     nxt = None
     if bk["mode"] in BACKUP_PERIOD:
-        nxt = int(st.get("retry_at") or 0) or (slot + BACKUP_PERIOD[bk["mode"]] if slot else None)
+        nxt = _as_int(st.get("retry_at")) or (slot + BACKUP_PERIOD[bk["mode"]] if slot else None)
     return {**bk, "last": last or None, "ok": bool(st.get("ok")), "error": str(st.get("error") or ""),
             "next": nxt}
 
@@ -203,7 +211,8 @@ def update_text(d: dict[str, Any], upd: str) -> str:
 
 async def support_tick(bot: Bot, st: dict[str, Any], now: int) -> None:
     """Пятничное напоминание — владельцам: админы сервер не оплачивают."""
-    since = int(st.setdefault("support_since", now))
+    since = _as_int(st.setdefault("support_since", now), now)
+    st["support_since"] = since
     if since > now:                                 # часы уходили вперёд — отсчёт заново
         since = st["support_since"] = now
     lt = time.localtime(now)
@@ -239,7 +248,7 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
     # awg0: две проверки подряд — перезапуск из меню или бота не тревога
     s = d.get("server") or {}
     if s.get("exists") and not s.get("up"):
-        st["down"] = int(st.get("down") or 0) + 1
+        st["down"] = _as_int(st.get("down")) + 1
         if st["down"] == 1:
             st["down_since"] = now
         if st["down"] == IFACE_STRIKES and enabled("iface"):
@@ -250,7 +259,7 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
         # «Снова работает» — только если awg0 и правда поднят: сервер могли
         # удалить (сброс) — это не восстановление
         if st.get("down_sent") and s.get("exists") and s.get("up"):
-            gone = ui.fmt_dur(now - int(st.get("down_since") or now))
+            gone = ui.fmt_dur(now - _as_int(st.get("down_since"), now))
             await notify(bot, f"🟢 <b>{host}: awg0 снова работает</b>\nПростой: около {gone}")
         for k in ("down", "down_since", "down_sent"):
             st.pop(k, None)
@@ -269,7 +278,7 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             health, failover = bool(p.get("health")), bool(p.get("failover"))
             dead = not failed and p.get("up") is True and p.get("ok") is False
     if failed or dead:
-        st["warp_down"] = int(st.get("warp_down") or 0) + 1
+        st["warp_down"] = _as_int(st.get("warp_down")) + 1
         if st["warp_down"] == 1:
             st["warp_since"] = now
         need = 1 if failed and failover else IFACE_STRIKES
@@ -287,7 +296,7 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             st["warp_sent"] = True
     else:
         if st.get("warp_sent") and t.get("warp") == "up":
-            gone = ui.fmt_dur(now - int(st.get("warp_since") or now))
+            gone = ui.fmt_dur(now - _as_int(st.get("warp_since"), now))
             await notify(bot, f"🟢 <b>{host}: WARP снова работает</b>\nПростой: около {gone}")
         for k in ("warp_down", "warp_since", "warp_sent"):
             st.pop(k, None)
@@ -348,7 +357,35 @@ async def _backup_failed(bot: Bot, st: dict[str, Any], now: int, error: str) -> 
     return "fail"
 
 
+def _backup_lock():
+    """Неблокирующий общий замок бота и веб-панели на весь бэкап и отправку."""
+    path = Path(str(BACKUP_STATE) + ".lock")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    f = open(path, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        raise
+    return f
+
+
 async def backup_due(bot: Bot, force: bool = False) -> str:
+    """Не даёт ручному и фоновому запуску создать и отправить дубли."""
+    try:
+        lock = _backup_lock()
+    except BlockingIOError:
+        return "busy"
+    except OSError as e:
+        log.warning("Автобэкап не запущен: блокировка %s: %s", BACKUP_STATE, e)
+        return "busy"
+    try:
+        return await _backup_due_locked(bot, force)
+    finally:
+        lock.close()
+
+
+async def _backup_due_locked(bot: Bot, force: bool = False) -> str:
     """Бэкап, если подошёл срок. "done" — сделан и дошёл до владельцев,
     "busy" — идёт другая операция (попробую на следующей проверке),
     "fail" — не удался (повтор через час), "" — срок не подошёл."""
@@ -358,13 +395,13 @@ async def backup_due(bot: Bot, force: bool = False) -> str:
     period = BACKUP_PERIOD.get(bk["mode"], 86400)
     st = store.load(BACKUP_STATE)
     now = int(time.time())
-    slot = int(st.get("slot") or st.get("last") or 0)
+    slot = _as_int(st.get("slot") or st.get("last"))
     # Часы уходили вперёд: «будущий» слот не ждём. До 300 с вперёд — законно:
     # бэкап делается на 300 с раньше слота, и следующий слот ложится чуть впереди
     if slot > now + 300:
         slot = 0
     if not force:
-        retry = int(st.get("retry_at") or 0)
+        retry = _as_int(st.get("retry_at"))
         if retry > now + BACKUP_RETRY:      # то же для повтора
             retry = 0
         if (retry and now < retry) or (not retry and now - slot < period - 300):

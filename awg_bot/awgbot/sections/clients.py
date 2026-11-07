@@ -1182,7 +1182,7 @@ async def _bulk_n(cb: CallbackQuery, state: FSMContext, n: str) -> None:
 async def _bulk_count_answer(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
     prefix = (await state.get_data()).get("bulk_prefix")
-    if not v.isdigit() or not 1 <= int(v) <= 200:
+    if not v.isascii() or not v.isdigit() or not 1 <= int(v) <= 200:
         await ask.retry(msg, state, ctx, "Нужно число от 1 до 200")
         return
     await _bulk_expire_screen(msg, state, f"{prefix}:{int(v)}")
