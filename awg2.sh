@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.54"
+VERSION="v1.2.55"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -958,6 +958,20 @@ public_ip() {
 
 # Кэш на время одного запуска: адрес дёргается из шапки меню и генераторов.
 _PUBLIC_IP=""
+# Глобальный IPv6 сервера — для входа клиентов по IPv6: с интерфейса
+# маршрута IPv6 по умолчанию, без временных (privacy), устаревших и ULA
+# (fc00::/7) адресов. Нет — пусто. Сам IPv4 Тулзы (public_ip) не меняется.
+_PUBLIC_IP6=""
+public_ip6() {
+  local dev
+  if [[ -z "$_PUBLIC_IP6" ]]; then
+    dev=$(ip -6 route show default 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "dev") {print $(i + 1); exit}}')
+    _PUBLIC_IP6=$(ip -6 -o addr show ${dev:+dev "$dev"} scope global 2>/dev/null \
+      | awk '!/temporary|deprecated|tentative|dadfailed/ {split($4, a, "/"); if (tolower(a[1]) !~ /^f[cd]/) {print a[1]; exit}}')
+  fi
+  echo "$_PUBLIC_IP6"
+}
+
 public_ip_cached() {
   [[ -n "$_PUBLIC_IP" ]] || _PUBLIC_IP=$(public_ip || true)
   echo "$_PUBLIC_IP"
@@ -2750,7 +2764,7 @@ setup_autostart() {
 # ── Запись конфигов ───────────────────────────────────────
 # Параметры создаваемого сервера (заполняются меню или --auto).
 S_PROFILE=lite S_PROTO=2.0 S_REGION=world S_DNS="1.1.1.1, 1.0.0.1" MTU=1280
-S_NET="" S_PORT="" S_ENDPOINT_DOMAIN="" S_FIRST_CLIENT=""
+S_NET="" S_PORT="" S_ENDPOINT_DOMAIN="" S_FIRST_CLIENT="" S_ENDPOINT_V6=0
 
 _postup_lines() {
   local net="$1" dev="$2"
@@ -3033,8 +3047,14 @@ _choose_port() {
 }
 
 _choose_endpoint() {
-  local d
-  S_ENDPOINT_DOMAIN=""
+  local d v6
+  S_ENDPOINT_DOMAIN="" S_ENDPOINT_V6=0
+  v6=$(public_ip6)
+  if [[ -n "$v6" ]]; then
+    echo -e "  ${D}У сервера есть IPv6: $v6. Клиенты без IPv6 в своей сети по нему не подключатся —${N}"
+    echo -e "  ${D}тогда в их карточке вход меняется на «напрямую» (IPv4).${N}"
+    ask_yes "  Подключать новых клиентов по IPv6? [y/N]: " n && { S_ENDPOINT_V6=1; return 0; }
+  fi
   ask_yes "  Использовать в конфигах домен вместо IP (переезд без перевыдачи)? [y/N]: " n || return 0
   while true; do
     read_line d "${C}  Домен (Enter — отмена): ${N}"
@@ -3073,20 +3093,36 @@ server_create() {
     return 1
   fi
   success_box "Сервер создан: AWG $S_PROTO, клиент $S_FIRST_CLIENT"
+  (( S_ENDPOINT_V6 )) && _server_create_ipv6
   echo "Файл конфигурации: $(client_file "$S_FIRST_CLIENT")"
   mimicry_module_warnings
 }
 
+# IPv6 при создании: точка входа «IPv6», она же — для новых клиентов, и
+# первый клиент сразу на ней. Не готов IPv6 — сервер остаётся на IPv4.
+_server_create_ipv6() {
+  local log
+  mktmp log || return 0
+  if entry_add_ipv6 > "$log" && entry_default "$ENTRY_NAME" >> "$log" \
+      && client_entry_set "$S_FIRST_CLIENT" "$ENTRY_NAME" >> "$log"; then
+    ok "Клиенты подключаются по IPv6: $(client_endpoint "$S_FIRST_CLIENT")"
+    info "Клиенту без IPv6 в его сети — вход «напрямую» (IPv4) в его карточке"
+  else
+    grep -E '×|▲' "$log" || true
+    warn "IPv6 не готов — клиенты подключаются по IPv4. Разобраться: Сервер → Точки входа → IPv6 → Проверить"
+  fi
+}
+
 # Создание без вопросов: server_create_opts ключ=значение...
 #   profile=lite|pro  proto=2.0|3.1  region=world|ru  dns="1.1.1.1, 1.0.0.1"
-#   mtu=  port=  net=10.x.y.0/24  endpoint=домен  client=имя  mimicry=строка
+#   mtu=  port=  net=10.x.y.0/24  endpoint=домен|ipv6  client=имя  mimicry=строка
 # Не заданное — как у «AmneziaVPN»: версия 3.1, если компоненты её умеют.
 server_create_opts() {
   local kv k v mim=""
   server_create_ready || return 1
   [[ -n "$REBOOT_WHY" ]] && warn "$REBOOT_WHY"
   S_PROFILE=lite; S_PROTO=""; S_REGION=world; S_DNS="1.1.1.1, 1.0.0.1"; MTU=""
-  S_PORT=""; S_NET=""; S_ENDPOINT_DOMAIN=""; S_FIRST_CLIENT=""
+  S_PORT=""; S_NET=""; S_ENDPOINT_DOMAIN=""; S_FIRST_CLIENT=""; S_ENDPOINT_V6=0
   for kv in "$@"; do
     k="${kv%%=*}"; v="${kv#*=}"
     case "$k" in
@@ -3101,7 +3137,12 @@ server_create_opts() {
            v="${v%.*}.0/24"
            taken_networks | py net-overlaps "$v" >/dev/null && { err "Сеть $v пересекается с адресами сервера"; return 1; }
            S_NET="$v" ;;
-      endpoint) [[ -z "$v" ]] || valid_domain "$v" || { err "endpoint: домен"; return 1; }; S_ENDPOINT_DOMAIN="${v,,}" ;;
+      endpoint) if [[ "$v" == ipv6 ]]; then
+                  [[ -n "$(public_ip6)" ]] || { err "endpoint=ipv6: у сервера нет глобального IPv6"; return 1; }
+                  S_ENDPOINT_V6=1
+                else
+                  [[ -z "$v" ]] || valid_domain "$v" || { err "endpoint: домен или ipv6"; return 1; }; S_ENDPOINT_DOMAIN="${v,,}"
+                fi ;;
       client) _name_free "$v" || { err "Имя клиента недопустимо"; return 1; }; S_FIRST_CLIENT="$v" ;;
       mimicry) mim="$v" ;;
       *) err "Неизвестный параметр: $k"; return 1 ;;
@@ -3154,7 +3195,8 @@ do_create_server() {
   echo -e "  Версия   : ${W}AWG $S_PROTO${N}, профиль ${W}$(profile_label "$S_PROFILE")${N}"
   echo -e "  Мимикрия : ${W}$MIMICRY${N}${CPS_DOMAIN:+ ($CPS_DOMAIN)}"
   echo -e "  Подсеть  : ${W}$S_NET${N}, MTU ${W}$MTU${N}, DNS ${W}$S_DNS${N}"
-  echo -e "  Endpoint : ${W}${S_ENDPOINT_DOMAIN:-$(public_ip_cached)}:$S_PORT${N}"
+  if (( S_ENDPOINT_V6 )); then echo -e "  Endpoint : ${W}[$(public_ip6)]:$S_PORT${N} ${D}(IPv6)${N}"
+  else echo -e "  Endpoint : ${W}${S_ENDPOINT_DOMAIN:-$(public_ip_cached)}:$S_PORT${N}"; fi
   ask_yes "  Создать? [Y/n]: " y || { info "Отменено"; return 0; }
   server_create && share_config "$(client_file "$S_FIRST_CLIENT")"
 }
@@ -4298,8 +4340,13 @@ _entry_ready() {  # имя (пусто — напрямую, всегда мож
   IFS=$'\t' read -r st ts <<< "$(_entry_check_get "$1" "$a")"
   [[ "$st" == ok && "${ts:-0}" =~ ^[0-9]+$ ]] && (( $(date +%s) - ts < ENTRY_FRESH )) && return 0
   entry_check "$1" quiet && return 0
-  err "Вход «$1» не работает: через $a пакеты до сервера не доходят — клиентам его не выдаю"
-  info "Проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port), затем «Проверить»"
+  if [[ -n "$ENTRY_PROBE_WHY" ]]; then
+    err "Вход «$1» не готов: $ENTRY_PROBE_WHY — клиентам его не выдаю"
+    info "Исправь и нажми «Проверить»"
+  else
+    err "Вход «$1» не работает: через $a пакеты до сервера не доходят — клиентам его не выдаю"
+    info "Проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port), затем «Проверить»"
+  fi
   return 1
 }
 
@@ -4399,25 +4446,86 @@ entry_assign_all() {  # имя|direct — все клиенты
 # на адрес входа и ловим его на своём порту AWG (правило raw со строкой
 # метки). Простой проброс порта (DNAT) возвращает пакет сюда же.
 # 0 — дошёл, 1 — нет, 2 — проверить нельзя (адрес не найден, нет модуля string).
-ENTRY_PROBE_TAG="awg2-entry-check"
-entry_probe() {  # хост:порт
-  local host="${1%:*}" port="${1##*:}" ip mark i n rc=1
-  if valid_ip "$host"; then ip="$host"
+# Почему проверка не прошла, если причина известна точнее «пакеты не дошли».
+ENTRY_PROBE_TAG="awg2-entry-check" ENTRY_PROBE_WHY=""
+entry_probe() {  # хост:порт ([IPv6]:порт)
+  local host="${1%:*}" port="${1##*:}" ip mark i n ipt=iptables rc=1
+  ENTRY_PROBE_WHY=""
+  host="${host#[}"; host="${host%]}"
+  if [[ "$host" == *:* ]]; then
+    # Свой IPv6: клиенты придут на этот сервер напрямую, каскада нет
+    _own_ip6 "$host" && { _entry_ipv6_self "$host" "$port"; return; }
+    ip="$host"; ipt=ip6tables
+  elif valid_ip "$host"; then ip="$host"
   else ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}'); fi
   [[ -n "$ip" ]] || return 2
   mark="$ENTRY_PROBE_TAG-$(od -An -N6 -tx1 /dev/urandom | tr -d ' \n')"
-  ipt_del_grep raw "--comment \"?${ENTRY_PROBE_TAG}\"?( |$)"
-  iptables -t raw -I PREROUTING 1 -p udp --dport "$(server_port)" -m string --algo bm --string "$mark" \
+  _entry_probe_clean "$ipt"
+  "$ipt" -t raw -I PREROUTING 1 -p udp --dport "$(server_port)" -m string --algo bm --string "$mark" \
     -m comment --comment "$ENTRY_PROBE_TAG" -j ACCEPT 2>/dev/null || return 2
   for i in 1 2 3 4; do
     { printf '%s' "$mark" > "/dev/udp/$ip/$port"; } 2>/dev/null || true
     sleep 0.5
-    n=$(iptables -t raw -L PREROUTING -v -x -n 2>/dev/null | awk -v t="$ENTRY_PROBE_TAG" 'index($0, t) {print $1; exit}')
+    n=$("$ipt" -t raw -L PREROUTING -v -x -n 2>/dev/null | awk -v t="$ENTRY_PROBE_TAG" 'index($0, t) {print $1; exit}')
     [[ "$n" =~ ^[0-9]+$ ]] && (( n > 0 )) && { rc=0; break; }
   done
-  ipt_del_grep raw "--comment \"?${ENTRY_PROBE_TAG}\"?( |$)"
+  _entry_probe_clean "$ipt"
   return "$rc"
 }
+
+_entry_probe_clean() {  # iptables|ip6tables
+  local rule
+  while IFS= read -r rule; do
+    printf '%s\n' "${rule/#-A /-D }" | xargs "$1" -t raw 2>/dev/null || true
+  done < <("$1-save" -t raw 2>/dev/null | grep -E -- "^-A .*--comment \"?${ENTRY_PROBE_TAG}\"?( |$)" || true)
+}
+
+_own_ip6() { ip -6 -o addr show scope global 2>/dev/null | awk '{split($4, a, "/"); print tolower(a[1])}' | grep -qxF "${1,,}"; }
+
+# Свой IPv6 как вход: IPv6 включён, адрес на месте, порт — порт AWG, AWG
+# его слушает, UFW пускает IPv6 и у сервера есть выход в интернет по IPv6.
+IPV6_SYSCTL="/proc/sys/net/ipv6/conf/all/disable_ipv6" UFW_DEFAULTS="/etc/default/ufw"
+_entry_ipv6_self() {  # адрес порт
+  local a="$1" p="$2" ls out
+  [[ "$(cat "$IPV6_SYSCTL" 2>/dev/null || echo 1)" == 0 ]] \
+    || { ENTRY_PROBE_WHY="IPv6 на сервере выключен (net.ipv6.conf.all.disable_ipv6)"; return 1; }
+  [[ "$p" == "$(server_port)" ]] || { ENTRY_PROBE_WHY="порт $p — не порт AWG ($(server_port))"; return 1; }
+  # Сокеты AWG в ядре: есть строки, а IPv6 среди них нет — AWG IPv6 не слушает
+  ls=$(ss -lunH "sport = :$p" 2>/dev/null || true)
+  if [[ -n "$ls" ]] && ! grep -qE '\[::\]|\*:' <<< "$ls"; then
+    ENTRY_PROBE_WHY="AWG не слушает порт $p по IPv6 — перезапусти awg0"; return 1
+  fi
+  if ufw_active; then
+    grep -qiE '^[[:space:]]*IPV6[[:space:]]*=[[:space:]]*no' "$UFW_DEFAULTS" 2>/dev/null \
+      && { ENTRY_PROBE_WHY="в UFW выключен IPv6 (IPV6=no в /etc/default/ufw) — порт AWG по IPv6 закрыт"; return 1; }
+    out=$(LC_ALL=C ufw status 2>/dev/null || true)
+    grep -qE "^$p/udp \(v6\)[[:space:]]+ALLOW" <<< "$out" \
+      || { ENTRY_PROBE_WHY="в UFW порт $p/udp открыт только для IPv4"; return 1; }
+  fi
+  curl -6 -fsS --max-time 6 -o /dev/null https://api64.ipify.org 2>/dev/null \
+    || curl -6 -fsS --max-time 6 -o /dev/null https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+    || { ENTRY_PROBE_WHY="у сервера нет выхода в интернет по IPv6 — у хостера IPv6 не работает или не маршрутизируется"; return 1; }
+  return 0
+}
+
+# IPv6 этого сервера — точкой входа (по умолчанию с именем «IPv6»).
+entry_add_ipv6() {  # [имя]
+  local a have
+  server_exists || { err "Сервер не создан"; return 1; }
+  a=$(public_ip6)
+  [[ -n "$a" ]] || { err "У сервера нет глобального IPv6 — его включают у хостера"; return 1; }
+  a="[$a]:$(server_port)"
+  have=$(py entry "$SERVER_CONF" list 2>/dev/null | awk -F'\t' -v x="$a" '$2 == x {print $1; exit}')
+  if [[ -n "$have" ]]; then
+    ok "IPv6 сервера уже есть: вход «$have» ($a)"
+    entry_check "$have" soft || true
+    ENTRY_NAME="$have"
+    return 0
+  fi
+  ENTRY_NAME="${1:-IPv6}"
+  entry_add "$ENTRY_NAME" "$a"
+}
+ENTRY_NAME=""
 
 # soft — провал проверки только предупреждением; quiet — без вывода, только
 # итог (его пишет _entry_ready). Итог запоминается — по нему боту и панели
@@ -4439,9 +4547,11 @@ entry_check() {  # имя [soft|quiet]
   fi
   case "$rc" in
     0) ok "Вход работает: пакеты через $a доходят до этого сервера" ;;
-    1) m="Через $a пакеты до сервера не дошли — проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port)"
+    1) if [[ -n "$ENTRY_PROBE_WHY" ]]; then m="Вход «$1» не готов: $ENTRY_PROBE_WHY"
+       else m="Через $a пакеты до сервера не дошли — проверь проброс на сервере-входе: UDP ${a##*:} → $(public_ip_cached):$(server_port)"; fi
        if [[ "${2:-}" == soft ]]; then warn "$m"; else err "$m"; fi
-       info "Вход не простым пробросом (прокси, фильтр по адресам) проверку может не пройти и рабочим — тогда проверь клиентом" ;;
+       [[ -n "$ENTRY_PROBE_WHY" ]] \
+         || info "Вход не простым пробросом (прокси, фильтр по адресам) проверку может не пройти и рабочим — тогда проверь клиентом" ;;
     *) warn "Проверить вход не удалось (адрес не найден или нет модуля iptables string) — проверь клиентом"
        rc=0 ;;
   esac
@@ -4502,15 +4612,16 @@ do_entries_menu() {
     done < <(_entry_rows_checked)
     def=$(entry_default_get)
     echo ""
-    echo -e "  ${G}1)${N} Добавить"
+    echo -e "  ${G}1)${N} Добавить${D}$([[ -n "$(public_ip6)" ]] && echo " — или 8) IPv6 этого сервера")${N}"
     echo -e "  ${C}2)${N} Изменить адрес"
     echo -e "  ${C}3)${N} Проверить"
     echo -e "  ${C}4)${N} Вход для новых клиентов ${D}— ${def:-напрямую}${N}"
     echo -e "  ${C}5)${N} Перевести всех клиентов"
     echo -e "  ${C}6)${N} Выбрать клиентов"
     echo -e "  ${R}7)${N} Удалить"
+    [[ -n "$(public_ip6)" ]] && echo -e "  ${G}8)${N} IPv6 этого сервера ${D}— $(public_ip6)${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
+    read_choice c "${C}  Выбор [0-8]: ${N}" 0 8 0
     case "$c" in
       1) read_line n "${C}  Название (например, Каскад NL): ${N}"
          [[ -n "$n" ]] || continue
@@ -4528,6 +4639,7 @@ do_entries_menu() {
          _entry_pick_clients && { entry_assign_clients "${CHOSEN:-direct}" "$_ENTRY_PICKED" || true; } ;;
       7) _entry_pick || continue
          ask_yes "  Удалить «$CHOSEN»? Его клиенты перейдут на «напрямую» [y/N]: " n && { entry_del "$CHOSEN" || true; } ;;
+      8) entry_add_ipv6 || true ;;
       0) return 0 ;;
     esac
     pause
@@ -12979,6 +13091,8 @@ _api_server() {
         # Почему нет 3.1: components | tools | module | check (не прошла проба)
         _kv proto31_why "$([[ $rc == 0 ]] || proto_why 3.1)"
         _kv reboot "$(reboot_reason)"
+        # Глобальный IPv6 сервера — для входа клиентов по IPv6 (пусто — нет)
+        _kv ipv6 "$(public_ip6)"
         if server_exists; then
           _kv up:b "$(_b iface_up)"; _kv proto "$(server_proto)"
           _kv profile "$(server_profile)"; _kv profile_label "$(profile_label)"
@@ -13541,6 +13655,9 @@ _api_entry() {
     add)
       [[ -n "${2:-}" ]] || { _api_usage "entry add ИМЯ ХОСТ:ПОРТ"; return; }
       entry_add "$1" "$2" ;;
+    add-ipv6)
+      entry_add_ipv6 "${1:-}" || return 1
+      { _kv name "$ENTRY_NAME"; _kv addr "$(py entry "$SERVER_CONF" get "$ENTRY_NAME")"; } | api_obj ;;
     set)
       [[ -n "${2:-}" ]] || { _api_usage "entry set ИМЯ ХОСТ:ПОРТ"; return; }
       entry_set "$1" "$2" ;;
@@ -13556,7 +13673,7 @@ _api_entry() {
     all)
       [[ -n "${1:-}" ]] || { _api_usage "entry all ИМЯ|direct"; return; }
       entry_assign_all "$1" ;;
-    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct|clients ИМЯ|direct A,B" ;;
+    *) _api_usage "entry list|add ИМЯ ХОСТ:ПОРТ|add-ipv6 [ИМЯ]|set ИМЯ ХОСТ:ПОРТ|del ИМЯ|check ИМЯ|default ИМЯ|direct|all ИМЯ|direct|clients ИМЯ|direct A,B" ;;
   esac
 }
 
@@ -16033,7 +16150,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=11b3e003518e656d
+_PY_HELPER_SUM=59ddcc511b80576f
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -16237,11 +16354,24 @@ def entries_write(head, ents, default):
 
 
 def entry_addr(v):
-    """«хост:порт» точки входа: IPv4 или домен, порт 1-65535."""
+    """«хост:порт» точки входа: IPv4, домен или [IPv6], порт 1-65535."""
     v = v.strip().lower()
+    m6 = re.fullmatch(r"\[([0-9a-f:.]+)\]:(\d{1,5})", v)
+    if m6:
+        try:
+            ip = ipaddress.IPv6Address(m6.group(1))
+        except ValueError:
+            die("Неверный IPv6: %s" % _shown(m6.group(1)), 2)
+        if not ip.is_global:
+            die("IPv6 входа — глобальный адрес (не fe80::, не fd00::, не локальный)", 2)
+        if not 1 <= int(m6.group(2)) <= 65535:
+            die("Порт входа: 1-65535", 2)
+        return "[%s]:%d" % (ip.compressed, int(m6.group(2)))
+    if v.startswith("["):
+        die("Неверный IPv6-адрес входа — нужен [адрес]:порт, например [2001:db8::1]:443", 2)
     m = re.fullmatch(r"([^\s:/]+):(\d{1,5})", v)
     if not m:
-        die("Адрес входа — хост:порт, например 203.0.113.5:443 или vpn.example.com:443", 2)
+        die("Адрес входа — хост:порт, например 203.0.113.5:443, vpn.example.com:443 или [2001:db8::1]:443", 2)
     host, port = m.group(1), int(m.group(2))
     if not 1 <= port <= 65535:
         die("Порт входа: 1-65535", 2)
@@ -19191,5 +19321,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=a8738100a35b00aa
+_BUILD_SUM=3db3ce83d6c0c75c
 main "$@"
