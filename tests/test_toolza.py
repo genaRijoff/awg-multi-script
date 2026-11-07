@@ -3290,6 +3290,10 @@ chk("rudirect on: список РФ скачан, набор awg2-ru, метка
     and {"prio": 90, "from": "all", "fwmark": MARK, "lookup": "main"} in rt_rules()
     and "curl https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt" in calls(),
     [r, rud_mangle(), rt_rules(), len(ru)])
+rbash(f'iptables -t mangle -D {RUD_RULE("wgobf0")}')
+chk("пропала только метка wgobf0 — статус неисправен, таймер возвращает обе метки",
+    rud_status().get("active") is False and rbash('bash "$RUDIRECT_SCRIPT" heal')[0] == 0
+    and rud_mangle() == [RUD_RULE("wgobf0"), RUD_RULE("awg0")], rud_status())
 units = os.listdir(os.path.join(ROOT, "units"))
 svc = open(os.path.join(ROOT, "units", "awg2-rudirect.service")).read()
 chk("служба при загрузке — раньше UFW, таймер раз в час; включены",

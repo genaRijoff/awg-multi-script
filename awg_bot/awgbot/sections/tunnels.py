@@ -615,7 +615,7 @@ async def _cas_proto(cb: CallbackQuery, state: FSMContext, proto: str) -> None:
 @ask.on("cas_in")
 async def _cas_in(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1 <= int(v) <= 65535:
+    if not v.isascii() or not v.isdigit() or not 1 <= int(v) <= 65535:
         await ask.retry(msg, state, ctx, "Порт — число 1-65535")
         return
     await ask.ask(msg, state, "cas_dst", "Публичный IPv4 сервера назначения:", "cas", **ctx.data, port=v)
@@ -635,7 +635,7 @@ async def _cas_dst(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
 @ask.on("cas_out")
 async def _cas_out(msg: Message, state: FSMContext, ctx: ask.Ctx) -> None:
     v = ask.text_of(msg)
-    if not v.isdigit() or not 1 <= int(v) <= 65535:
+    if not v.isascii() or not v.isdigit() or not 1 <= int(v) <= 65535:
         await ask.retry(msg, state, ctx, "Порт — число 1-65535")
         return
     await _cas_comment(msg, state, dict(ctx.data, out=v))
