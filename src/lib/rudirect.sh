@@ -150,12 +150,15 @@ _rud_rules_down() {
   return 0
 }
 
-# Правила на месте: набор, метка для awg0, правило маршрутизации и не
-# строгий rp_filter на аплинке
+# Правила на месте: набор, метки для awg0 и wgobf0, правило маршрутизации
+# и не строгий rp_filter на аплинке
 rudirect_rules_ok() {
+  local dev
   ipset list -n "$RUDIRECT_SET" &>/dev/null || return 1
-  _rud_rule "$AWG_IF"
-  iptables -t mangle -C PREROUTING "${RUDIRECT_RULE[@]}" 2>/dev/null || return 1
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _rud_rule "$dev"
+    iptables -t mangle -C PREROUTING "${RUDIRECT_RULE[@]}" 2>/dev/null || return 1
+  done
   _rud_ip_rule_on && _rud_rpf_ok
 }
 

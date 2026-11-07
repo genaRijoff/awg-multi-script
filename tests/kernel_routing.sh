@@ -127,6 +127,10 @@ echo "── РФ напрямую на настоящих ipset, iptables и ip
 rudirect_run apply; rc=$?; ok "apply: код 0" '(( rc == 0 ))'
 ok "набор: сеть России, свой адрес, исключение nomatch" 'ipset test awg2-ru 77.1.1.1 2>/dev/null && ipset test awg2-ru 5.255.255.5 2>/dev/null && ! ipset test awg2-ru 77.88.8.8 2>/dev/null'
 ok "правила: метка для awg0 и wgobf0, правило 90" 'rudirect_rules_ok && (( $(iptables-save -t mangle | grep -c awg2-rudirect) == 2 ))'
+_rud_rule "$WGOBF_IF"; iptables -t mangle -D PREROUTING "${RUDIRECT_RULE[@]}"
+ok "без метки wgobf0 состояние неисправно" '! rudirect_rules_ok'
+rudirect_run heal >/dev/null
+ok "таймер возвращает обе метки" 'rudirect_rules_ok && (( $(iptables-save -t mangle | grep -c awg2-rudirect) == 2 ))'
 ok "сводка: $(rudirect_summary)" '[[ "$(rudirect_summary)" == "сетей РФ 1024, своих напрямую 1, через туннель 1" ]]'
 rudirect_run apply >/dev/null
 ok "повтор apply — без дублей правил" '(( $(iptables-save -t mangle | grep -c awg2-rudirect) == 2 && $(ip rule show | grep -c "fwmark 0x52550000") == 1 ))'
