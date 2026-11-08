@@ -31,6 +31,13 @@ _rud_fail() { _rud_set ERROR "$1"; _rud_log "$1"; return 1; }
 
 rudirect_on() { [[ "$(_rud_get ON)" == 1 ]]; }
 
+# «Telegram напрямую»: подсети Telegram — в тот же набор, что и сети России.
+# Нужно, когда выход туннеля Telegram не пропускает (WARP с сервера в России
+# выходит в российской точке Cloudflare): у клиентов в туннеле Telegram висит
+# на «Соединение…», а с адреса сервера работает.
+rudirect_tg_on() { [[ "$(_rud_get TG)" == 1 ]]; }
+_rud_tg_nets() { tr ' ' '\n' <<< "$RUDIRECT_TG_NETS" | _antiscan_parse 4; }
+
 # Скачать список РФ: по очереди из источников, первый прошедший проверку.
 _rud_fetch() {
   local tmp src lbl n s4 why="" keep="оставлен прежний список"
@@ -164,22 +171,25 @@ rudirect_rules_ok() {
 
 # Собрать набор из сохранённого списка и своих и поставить правила.
 _rud_apply() {
-  local d n nd nt rc=0
+  local d n nd nt nx rc=0
   # Выключили, пока качался список, — правила обратно не ставить
   [[ "$(_rud_get ON)" == 1 ]] || { rudirect_down; return 0; }
   [[ -s "$RUDIRECT_DIR/ru.list" ]] || { _rud_log "нечего применять: список РФ ещё не скачан"; return 3; }
   d=$(mktemp -d "$RUDIRECT_DIR/.apply.XXXXXX") || return 1
   _rud_user_cidrs direct | sort -u > "$d/my"
   _rud_user_cidrs tunnel | sort -u > "$d/excl"
-  { _antiscan_parse 4 < "$RUDIRECT_DIR/ru.list"; cat "$d/my"; } | sort -u > "$d/v4"
+  : > "$d/tg"
+  rudirect_tg_on && _rud_tg_nets > "$d/tg"
+  { _antiscan_parse 4 < "$RUDIRECT_DIR/ru.list"; cat "$d/my" "$d/tg"; } | sort -u > "$d/v4"
   nd=$(grep -c . "$d/my" || true); nt=$(grep -c . "$d/excl" || true)
+  nx=$(sort -u "$d/my" "$d/tg" | grep -c . || true)       # не сети России: свои и Telegram
   if ! n=$(_antiscan_load "$RUDIRECT_SET" inet "$d/v4" "$d/excl"); then
     _rud_log "ipset: набор не загрузился"; rc=5
   elif ! _rud_rules_up; then
     _rud_log "iptables или ip rule: правило не поставилось"; rc=5
   else
-    _rud_set ENTRIES "$(( n - nd )) $nd $nt"
-    _rud_log "применено: сетей РФ $(( n - nd )), своих напрямую $nd, через туннель $nt"
+    _rud_set ENTRIES "$(( n - nx )) $nd $nt"
+    _rud_log "применено: сетей РФ $(( n - nx )), своих напрямую $nd, через туннель $nt$(rudirect_tg_on && echo ", Telegram напрямую")"
   fi
   rm -rf "$d"
   return "$rc"
@@ -228,8 +238,8 @@ rudirect_run() {
 _rudirect_emit() {
   emit_script "$RUDIRECT_SCRIPT" 'rudirect_run "$@"' \
     RUDIRECT_DIR RUDIRECT_CONF RUDIRECT_USER RUDIRECT_LOG RUDIRECT_SET RUDIRECT_TAG RUDIRECT_MARK RUDIRECT_PRIO \
-    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 RUDIRECT_RPF AWG_IF WGOBF_IF OWN_IFACES \
-    write_file _rud_get _rud_set _rud_log _rud_fail _antiscan_parse _antiscan_span _antiscan_load \
+    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 RUDIRECT_RPF RUDIRECT_TG_NETS AWG_IF WGOBF_IF OWN_IFACES \
+    write_file _rud_get _rud_set _rud_log _rud_fail _antiscan_parse _antiscan_span _antiscan_load rudirect_tg_on _rud_tg_nets \
     _rud_fetch _rud_user_file _rud_user_cidrs _rud_has_domains _rud_rule _rud_ip_rule_on _rud_uplinks \
     _rud_rpf_strict _rud_rpf_ok _rud_rpf_loose _rud_rules_up \
     _rud_rules_down rudirect_rules_ok _rud_apply rudirect_down rudirect_run || return 1
@@ -343,7 +353,18 @@ rudirect_counters() {
 rudirect_summary() {
   local e
   read -r -a e <<< "$(_rud_get ENTRIES)"
-  echo "сетей РФ ${e[0]:-0}, своих напрямую ${e[1]:-0}, через туннель ${e[2]:-0}"
+  echo "сетей РФ ${e[0]:-0}, своих напрямую ${e[1]:-0}, через туннель ${e[2]:-0}$(rudirect_tg_on && echo ", Telegram напрямую")"
+}
+
+rudirect_tg_set() {  # on|off
+  case "${1:-}" in
+    on) _rud_set TG 1; _rud_log "Telegram напрямую: включено"
+        ok "Telegram напрямую: клиенты в туннеле ходят в Telegram с адреса сервера" ;;
+    off) _rud_set TG 0; _rud_log "Telegram напрямую: выключено"
+         ok "Telegram напрямую выключено: Telegram — снова через туннель" ;;
+    *) err "Telegram напрямую: on | off"; return 1 ;;
+  esac
+  _rud_reapply
 }
 
 # ── Свои списки ───────────────────────────────────────────
@@ -401,7 +422,7 @@ rudirect_list_del() {  # direct|tunnel запись|all
 }
 
 _rud_reapply() {
-  rudirect_on || { info "РФ напрямую выключено — список вступит в силу при включении"; return 0; }
+  rudirect_on || { info "РФ напрямую выключено — вступит в силу при включении"; return 0; }
   _rudirect_emit && "$RUDIRECT_SCRIPT" apply || { err "Не удалось применить — журнал «РФ напрямую»"; return 1; }
 }
 
@@ -438,6 +459,8 @@ _rudirect_show() {
   else
     echo -e "  Состояние : ${D}○ выключено${N}"
   fi
+  if rudirect_tg_on; then echo -e "  Telegram  : ${G}напрямую${N} ${D}— с адреса сервера${N}"
+  else echo -e "  Telegram  : ${D}через туннель${N}"; fi
   upd=$(_rud_get UPDATED)
   [[ -n "$upd" ]] && echo -e "  Список    : обновлён $(date -d "@$upd" '+%d.%m.%Y %H:%M' 2>/dev/null) ${D}($(_rud_get SRC))${N}"
   err=$(_rud_get ERROR)
@@ -479,8 +502,10 @@ do_rudirect_menu() {
     echo -e "  ${C}4)${N} Всегда через туннель ${D}— исключения: $(rudirect_list tunnel | grep -c . || true)${N}"
     echo -e "  ${C}5)${N} Починить ${D}— поставить правила заново${N}"
     echo -e "  ${C}6)${N} Журнал"
+    if rudirect_tg_on; then echo -e "  ${C}7)${N} Telegram — снова через туннель"
+    else echo -e "  ${C}7)${N} Telegram напрямую ${D}— если через туннель Telegram висит на «Соединение…»${N}"; fi
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-6]: ${N}" 0 6 0
+    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
     case "$c" in
       1) if rudirect_on; then rudirect_disable
          else
@@ -492,6 +517,7 @@ do_rudirect_menu() {
       4) _rudirect_list_menu tunnel; continue ;;
       5) rudirect_repair || true ;;
       6) tail -n 40 "$RUDIRECT_LOG" 2>/dev/null || info "Журнал пуст" ;;
+      7) if rudirect_tg_on; then rudirect_tg_set off || true; else rudirect_tg_set on || true; fi ;;
       0) return 0 ;;
     esac
     pause

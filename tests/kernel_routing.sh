@@ -146,6 +146,12 @@ while ip rule del lookup 300 2>/dev/null; do :; done
 echo "── Куда идёт адрес (ядро) ──"
 rudirect_on() { [[ "$(_rud_get ON)" == 1 ]]; }
 out=$(diag_route alice 77.1.1.1); ok "сеть России — rudirect: $out" '[[ "$out" == *$'"'"'\trudirect\teth0\t'"'"'* ]]'
+_rud_set TG 1; rudirect_run apply >/dev/null
+out=$(diag_route alice 149.154.167.51)
+ok "Telegram напрямую: подсети Telegram в наборе, адрес Telegram — rudirect «Telegram напрямую»: $out" \
+  'ipset test awg2-ru 149.154.167.51 2>/dev/null && [[ "$out" == *$'"'"'\trudirect\teth0\t'"'"'*"Telegram напрямую"* ]]'
+_rud_set TG 0; rudirect_run apply >/dev/null
+out=$(diag_route alice 149.154.167.51); ok "…выключили — Telegram снова через WARP" '[[ "$out" == *$'"'"'\twarp\twarp0\t'"'"'* ]]'
 out=$(diag_route alice 77.88.8.8); ok "исключение — через WARP: $out" '[[ "$out" == *$'"'"'\twarp\twarp0\t'"'"'* ]]'
 out=$(diag_route alice 1.1.1.1); ok "прочее — через WARP" '[[ "$out" == *$'"'"'\twarp\t'"'"'* ]]'
 out=$(diag_route bob 1.1.1.1); ok "клиент без туннеля — direct: $out" '[[ "$out" == *$'"'"'\tdirect\teth0\t'"'"'* ]]'

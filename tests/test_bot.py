@@ -2175,7 +2175,7 @@ async def run():
         ("🇷🇺 РФ напрямую", "rud") in buttons and ("🪂 Если упал", "tf") in buttons and "РФ напрямую — выключено" in text
         and "Если туннель упал — напрямую (как было)" in text, [text, buttons])
     RUDST = {"enabled": False, "active": False, "ru": 0, "mine": 0, "excl": 0, "updated": 0, "src": "", "error": "",
-             "packets": 0, "bytes": 0, "direct": [], "tunnel": [], "xray_ru": False}
+             "packets": 0, "bytes": 0, "direct": [], "tunnel": [], "xray_ru": False, "tg": False}
     TF = {"warp": "direct", "xray": "direct", "t2s": "direct", "exits": "direct"}
     TFL = {"warp": "WARP", "xray": "Xray", "t2s": "tun2socks", "exits": "Exit-ноды WG"}
     ROUTE = {"rows": []}
@@ -2192,6 +2192,8 @@ async def run():
                              error="ipdeny.com: не скачался <b>")
             if a == "off":
                 RUDST.update(enabled=False, active=False)
+            if a == "tg":
+                RUDST["tg"] = args[2] == "on"
             if a == "add":
                 if args[3] == "bad.example":
                     return botapi.Result(False, error="Нужен публичный IPv4, подсеть не шире /12 или домен")
@@ -2237,6 +2239,17 @@ async def run():
         (("rudirect", "on"), 240) in rt_calls and "🟢 Включено · сетей РФ 8 673" in text and "Мимо туннеля: 12 345" in text
         and "(ipverse)" in text and "&lt;b&gt;" in text and ("🔄 Обновить", "rud:upd") in buttons
         and ("🛠 Починить", "rud:fix") in buttons and ("⏹ Выключить", "rud:off") in buttons, [rt_calls[-2:], text, buttons])
+    chk("Telegram через туннель: строка и кнопка «✈️ TG напрямую», подсказка, когда она нужна",
+        "✈️ Telegram: через туннель" in text and "«Соединение…»" in text
+        and ("✈️ TG напрямую", "rud:tg:on") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:tg:on"))
+    chk("Telegram напрямую: долгий вызов, итог, кнопка вернуть в туннель, подсказка ушла",
+        (("rudirect", "tg", "on"), 240) in rt_calls and "✅ Telegram напрямую" in text
+        and "✈️ Telegram: напрямую с адреса сервера" in text and "«Соединение…»" not in text
+        and ("✈️ TG в туннель", "rud:tg:off") in buttons, [text, buttons])
+    text, buttons = screen(await press("rud:tg:off"))
+    chk("Telegram — снова через туннель", (("rudirect", "tg", "off"), 240) in rt_calls and "✅ Telegram — снова через туннель" in text
+        and ("✈️ TG напрямую", "rud:tg:on") in buttons, [text, buttons])
     await press("rud:upd")
     await press("rud:fix")
     chk("обновить и починить — долгие вызовы", (("rudirect", "update"), 240) in rt_calls
@@ -2328,10 +2341,14 @@ async def run():
         and ("🔄 Другой адрес", "diag:rtc:alice|r") in buttons and ("◀️ Назад", "rud") in buttons, [text, buttons])
     text, buttons = screen(await press("cl:tun:alice"))
     chk("маршрут клиента — кнопка «🧭 Куда идёт»", ("🧭 Куда идёт", "diag:rtc:alice|t") in buttons, buttons)
+    ROUTE["rows"] = [{"ip": "149.154.167.51", "kind": "rudirect", "dev": "eth0",
+                      "note": "напрямую с сервера — Telegram («Telegram напрямую»)"}]
     text, buttons = screen(await press("diag:rtc:alice|t"))
     chk("из маршрута клиента: «Отмена» — обратно в маршрут", ("✖️ Отмена", "cl:tun:alice") in buttons, buttons)
     text, buttons = screen(await say("8.8.8.8"))
     chk("итог из маршрута клиента: «Назад» — в маршрут клиента", ("◀️ Назад", "cl:tun:alice") in buttons, buttons)
+    chk("Telegram напрямую в итоге — подсказка вернуть Telegram в туннель, а не «В туннель»",
+        "✈️ TG в туннель" in text and "→ В туннель»" not in text, text)
     no_hourglass("РФ напрямую")
     botapi.call = real_call_
 

@@ -256,6 +256,20 @@ update_channel_set() {  # stable|beta
   ok "Канал: $(update_channel_label)"
 }
 
+# awg2 поставлен файлом из беты, а канал на сервере стабильный (так по
+# умолчанию): бот и панель из стабильного разошлись бы с awg2. Сборка новее
+# стабильной — предложить бету. Только в меню: через API канал не меняется.
+update_offer_beta() {
+  local sv
+  (( AUTO_MODE )) && return 0
+  [[ "$UPDATE_CHANNEL" == stable && -z "${AWG2_UPDATE_CHANNEL:-}" ]] || return 0
+  sv=$(update_peek 2>/dev/null) || return 0
+  (( 10#$(ver_num "$VERSION") > 10#$(ver_num "$sv") )) || return 0
+  warn "awg2 $VERSION — сборка из беты, а канал обновлений стабильный ($sv): бот оттуда не совпадёт с awg2"
+  ask_yes "  Переключить канал на бету — бот и обновления из беты? [Y/n]: " y || return 0
+  update_channel_set beta
+}
+
 do_switch_channel() {
   local to=beta
   [[ "$UPDATE_CHANNEL" == beta ]] && to=stable

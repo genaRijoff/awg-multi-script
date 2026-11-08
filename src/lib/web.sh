@@ -78,6 +78,7 @@ web_code_install() {
     bash "${src%/awg_bot}/awg-bot-install.sh" --src "$src" --web-only
     return
   fi
+  update_offer_beta
   # Свой каталог (700): рядом с установщиком он ищет awg_bot/ (см. bot_install)
   mktmp installer -d || return 1
   installer+="/awg-bot-install.sh"

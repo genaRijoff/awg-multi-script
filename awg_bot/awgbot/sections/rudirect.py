@@ -3,7 +3,7 @@
 РФ напрямую: клиенты в туннеле (WARP, Xray, tun2socks, exit-ноды) ходят к
 сетям России мимо него, прямо с сервера. Список РФ качает и проверяет awg2,
 здесь — экран: состояние, свои списки «всегда напрямую» и «всегда через
-туннель», починить, журнал.
+туннель», «Telegram напрямую», починить, журнал.
 
 Если туннель упал: на каждый туннель — «напрямую» (как было) или
 «блокировать» (клиенты ждут туннель без интернета, адрес сервера не светится).
@@ -59,6 +59,8 @@ async def screen(target: ui.Target, note: str = "") -> None:
     else:
         lines.append("⚪️ Выключено")
     lines.append(f"📝 Свои: напрямую {len(direct)}, через туннель {len(tunnel)}")
+    tg = bool(d.get("tg"))
+    lines.append("✈️ Telegram: напрямую с адреса сервера" if tg else "✈️ Telegram: через туннель")
     if d.get("updated"):
         lines.append(f"🕒 Список обновлён {ui.fmt_time(d['updated'])}" + (f" ({esc(d['src'])})"
                                                                          if d.get("src") else ""))
@@ -68,9 +70,13 @@ async def screen(target: ui.Target, note: str = "") -> None:
         lines.append("ℹ️ У Xray своё «РФ напрямую» (по доменам) — работает вместе с этим.")
     lines.append("\n<i>Список сетей России — ipverse (данные RIPE), обновляется раз в сутки. Клиенты без туннеля "
                  "и трафик самого сервера не трогаются.</i>")
+    if not tg:
+        lines.append("<i>«✈️ TG напрямую» — если через туннель Telegram висит на «Соединение…», а с сервера "
+                     "работает (WARP с сервера в России).</i>")
     buttons: list = [("⏹ Выключить", rud.data("off")) if on else ("✅ Включить", rud.data("on"))]
     if on:
         buttons += [("🔄 Обновить", rud.data("upd")), ("🛠 Починить", rud.data("fix"))]
+    buttons.append(("✈️ TG в туннель", rud.data("tg", "off")) if tg else ("✈️ TG напрямую", rud.data("tg", "on")))
     buttons += [(f"📝 Напрямую: {len(direct)}", rud.data("l", "direct")),
                 (f"📝 В туннель: {len(tunnel)}", rud.data("l", "tunnel")),
                 ("🧭 Куда идёт", "diag:rt:r"), ("📜 Журнал", "diag:log:rudirect|rud"), ui.back("tun")]
@@ -107,6 +113,16 @@ async def _upd(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     await ui.render(cb, "⏳ Обновляю список…")
     r = await api.call("rudirect", "update", timeout=TIMEOUT)
     await screen(cb, "✅ Список обновлён" if r.ok else ui.fail(r, "Обновление списка"))
+
+
+@rud("tg")
+async def _tg(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    on = arg == "on"
+    await ui.render(cb, "⏳ Применяю…")
+    r = await api.call("rudirect", "tg", "on" if on else "off", timeout=TIMEOUT)
+    note = ("✅ Telegram напрямую: клиенты в туннеле ходят в Telegram с адреса сервера" if on
+            else "✅ Telegram — снова через туннель") if r.ok else ui.fail(r, "Telegram напрямую")
+    await screen(cb, note)
 
 
 @rud("fix")

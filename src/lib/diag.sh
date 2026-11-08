@@ -239,6 +239,8 @@ diag_route() {  # клиент адрес
                  && [[ "$(ip -4 route get "$ip" from "$cip" iif "$AWG_IF" 2>/dev/null)" != *" dev $dev "* ]]; then
               # Без метки клиент идёт в туннель: обратный путь — туда же, ответ на $dev отбросят
               kind=none note="сеть России, но ответы отбросит строгий rp_filter на $dev — «РФ напрямую → Починить»"
+            elif [[ -n "$mark" ]] && rudirect_tg_on && _antiscan_covers <(_rud_tg_nets) "$ip"; then
+              kind=rudirect note="напрямую с сервера — Telegram («Telegram напрямую»)"
             elif [[ -n "$mark" ]]; then kind=rudirect note="напрямую с сервера — сеть России («РФ напрямую»)"
             elif [[ -n "$tun" ]]; then kind=direct note="напрямую с сервера — клиент не в туннеле ($tun)"
             else kind=direct note="напрямую с сервера — туннели выключены"; fi ;;

@@ -3394,6 +3394,20 @@ chk("правило маршрутизации пропало — статус �
     d.get("active") is False and r.get("ok") and rud_status().get("active") is True
     and sum(1 for x in rt_rules() if x["fwmark"]) == 1, [d, r, rt_rules()])
 
+# Telegram напрямую: подсети Telegram — в тот же набор; свои списки и счёт сетей РФ не трогаются
+TG_NETS = ["149.154.160.0/20", "91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22",
+           "91.108.20.0/22", "91.108.56.0/22", "91.105.192.0/23", "185.76.151.0/24"]
+r = api("rudirect", "tg", "on", env=RTENV)
+d, ru = rud_status(), ipset_set("awg2-ru") or []
+chk("Telegram напрямую: все подсети Telegram в наборе, сетей РФ столько же, свои списки пусты",
+    r.get("ok") and d.get("tg") is True and all(n in ru for n in TG_NETS) and d.get("ru") == 2600
+    and d.get("mine") == 0 and d.get("direct") == [] and "Telegram напрямую" in open(RULOG).read().splitlines()[-1], [r, d])
+rc, out, _ = rbash('rudirect_summary; bash "$RUDIRECT_SCRIPT" heal; echo "rc=$?"')
+chk("Telegram напрямую: в сводке; таймер пересобирает набор — подсети Telegram на месте",
+    "Telegram напрямую" in out and "rc=0" in out and all(n in (ipset_set("awg2-ru") or []) for n in TG_NETS), out)
+r1, r2 = api("rudirect", "tg", "maybe", env=RTENV), api("rudirect", "tg", env=RTENV)
+chk("Telegram напрямую: не on/off — отказ", r1.get("ok") is False and r2.get("ok") is False, [r1, r2])
+
 # ── Если туннель упал ──
 with open(os.path.join(ROOT, "warp.peers"), "w") as f:
     f.write(A + "\n")
@@ -3468,6 +3482,15 @@ os.remove(os.path.join(ROOT, "ip_forward"))
 r = droute("alice", "77.88.0.1")
 chk("diag route: сеть России — rudirect, мимо туннеля",
     [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["rudirect"], r)
+r = droute("alice", "149.154.167.51")
+row = ((r.get("data") or {}).get("rows") or [{}])[0]
+chk("diag route: Telegram при «Telegram напрямую» — rudirect с пояснением про Telegram",
+    row.get("kind") == "rudirect" and "Telegram напрямую" in row.get("note", ""), r)
+api("rudirect", "tg", "off", env=RTENV)
+r = droute("alice", "149.154.167.51")
+chk("…выключили — подсетей Telegram в наборе нет, Telegram у удержанного клиента — held",
+    rud_status().get("tg") is False and not any(n in (ipset_set("awg2-ru") or []) for n in TG_NETS)
+    and [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["held"], r)
 r = droute("alice", "77.88.8.8")
 chk("diag route: исключение «через туннель» перекрывает сеть России — held, а не rudirect",
     [x["kind"] for x in (r.get("data") or {}).get("rows", [])] == ["held"], r)
@@ -4114,6 +4137,20 @@ chk("api server create port=443 — проходит проверку, заня�
     "UDP 443 занят" in out and "rc=1" in out and "1024-65535" not in out, out[-300:])
 rc, out, _ = bash("wgobf_installed() { return 1; }; wgobf_install_opts port=1023 2>&1; echo rc=$?")
 chk("api wgobf install port=1023 — отказ с подсказкой про 443", "port: 443 или 1024-65535" in out and "rc=1" in out, out[-300:])
+
+print("\n── Установка бота: awg2 из беты, канал стабильный — предложить бету ──")
+CH = 'update_channel_apply stable; update_peek() { echo v1.0.0; }; ask_yes() { echo "ASK: $1"; return 0; }; '
+rc, out, _ = bash(CH + 'AUTO_MODE=0; update_offer_beta; echo "CH=$UPDATE_CHANNEL $(cat "$UPDATE_CHANNEL_FILE")"')
+chk("сборка новее стабильной, канал стабильный — вопрос, канал → бета (и сохранён)",
+    "ASK:" in out and "бот оттуда не совпадёт" in out and "CH=beta beta" in out, out)
+rc, out, _ = bash(CH + 'rm -f "$UPDATE_CHANNEL_FILE"; AUTO_MODE=1; update_offer_beta; echo "CH=$UPDATE_CHANNEL"')
+chk("через API (AUTO_MODE) канал не меняется и вопроса нет", "ASK:" not in out and "CH=stable" in out, out)
+rc, out, _ = bash(CH + 'rm -f "$UPDATE_CHANNEL_FILE"; AUTO_MODE=0; update_peek() { echo "$VERSION"; }; update_offer_beta; '
+                  'echo "CH=$UPDATE_CHANNEL"')
+chk("версия как в стабильном — вопроса нет", "ASK:" not in out and "CH=stable" in out, out)
+rc, out, _ = bash(CH + 'AUTO_MODE=0; update_channel_apply beta; update_offer_beta; echo "CH=$UPDATE_CHANNEL"')
+chk("канал уже бета — вопроса нет", "ASK:" not in out and "CH=beta" in out, out)
+rc, out, _ = bash('rm -f "$UPDATE_CHANNEL_FILE"')
 
 print("\n── Ctrl+C: выход от сигнала — в «awg2.sh; awg-bot-install.sh» вторая команда не запускается ──")
 rc, out, _ = bash("trap '_on_interrupt INT' INT; kill -INT $$; sleep 1; echo AFTER")

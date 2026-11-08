@@ -910,6 +910,26 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       if (seen.join("|") !== "rudirect add tunnel 77.88.8.0/24|rudirect del direct bank.example") throw new Error("вызовы: " + JSON.stringify(seen));
     } finally { await page.unroute(/\/api\/call$/); }
   });
+  await step("РФ напрямую: Telegram — через туннель или напрямую, переключение уходит в awg2", async () => {
+    const seen = [], st = { enabled: true, active: true, ru: 8673, direct: [], tunnel: [], tg: false };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(st));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "tg") { seen.push(b.args.join(" ")); st.tg = b.args[2] === "on"; return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rud-tg]");
+      await page.waitForSelector("text=висит на «Соединение…»");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=off]");
+      await page.click("[data-name=rud-tg] button[data-v=on]");
+      await page.waitForSelector(".toast >> text=Telegram напрямую");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=on]");
+      await page.click("[data-name=rud-tg] button[data-v=off]");
+      await page.waitForSelector("[data-name=rud-tg] button.on[data-v=off]");
+      if (seen.join("|") !== "rudirect tg on|rudirect tg off") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
   await step("если туннель упал: карточка, четыре туннеля с режимами, работающему — сразу, лежащему — с вопросом", async () => {
     const seen = [];
     const rows = [{ name: "warp", label: "WARP", mode: "direct", enabled: true, up: true, held: false },

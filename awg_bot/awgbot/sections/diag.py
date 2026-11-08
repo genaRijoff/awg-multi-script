@@ -190,8 +190,11 @@ def route_text(d: dict) -> str:
     hints = []
     if "held" in kinds:
         hints.append("Вернуть интернет: поднять туннель или «Туннели → 🪂 Если упал → Напрямую».")
-    if "rudirect" in kinds:
+    tg = [x for x in rows if x.get("kind") == "rudirect" and "Telegram" in (x.get("note") or "")]
+    if len(tg) < sum(1 for x in rows if x.get("kind") == "rudirect"):
         hints.append("Пустить адрес через туннель: «Туннели → 🇷🇺 РФ напрямую → В туннель».")
+    if tg:
+        hints.append("Telegram через туннель: «Туннели → 🇷🇺 РФ напрямую → ✈️ TG в туннель».")
     if "direct" in kinds and any("не в туннеле" in (x.get("note") or "") for x in rows):
         hints.append("Пустить клиента в туннель: карточка клиента → Маршрут.")
     if "blocked" in kinds:

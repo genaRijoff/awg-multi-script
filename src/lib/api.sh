@@ -718,18 +718,19 @@ _api_rudirect() {
         _kv packets:n "${p:-0}"; _kv bytes:n "${b:-0}"
         _kv direct:j "$(rudirect_list direct | py json-list)"
         _kv tunnel:j "$(rudirect_list tunnel | py json-list)"
-        _kv xray_ru:b "$(_b xray_ru_on)"; } | api_obj ;;
+        _kv xray_ru:b "$(_b xray_ru_on)"; _kv tg:b "$(_b rudirect_tg_on)"; } | api_obj ;;
     on) rudirect_enable ;;
     off) rudirect_disable ;;
     update) rudirect_update ;;
     repair) rudirect_repair ;;
+    tg) rudirect_tg_set "${1:-}" ;;
     add)
       [[ -n "${2:-}" ]] || { _api_usage "rudirect add direct|tunnel АДРЕС"; return; }
       rudirect_list_add "$1" "$2" ;;
     del)
       [[ -n "${2:-}" ]] || { _api_usage "rudirect del direct|tunnel АДРЕС|all"; return; }
       rudirect_list_del "$1" "$2" ;;
-    *) _api_usage "rudirect status|on|off|update|repair|add direct|tunnel АДРЕС|del direct|tunnel АДРЕС|all" ;;
+    *) _api_usage "rudirect status|on|off|update|repair|tg on|off|add direct|tunnel АДРЕС|del direct|tunnel АДРЕС|all" ;;
   esac
 }
 

@@ -4553,6 +4553,16 @@ route(/^\/tunnels\/rudirect$/, async (ctx) => {
       on ? btn("🛠 Починить", (b) => quick(b, "Правила на месте", ["rudirect", "repair"])) : null,
       btn("🧭 Куда идёт адрес", () => go("/diag/route")),
       btn("📜 Журнал", () => go("/log/rudirect"))),
+    h("h2", {}, "✈️ Telegram"),
+    hint("Если через туннель Telegram висит на «Соединение…», а с сервера работает (WARP с сервера в России выходит в "
+      + "российской точке Cloudflare), — «Напрямую»: клиенты в туннеле пойдут в Telegram с адреса сервера."),
+    h("div", { class: "card", "data-name": "rud-tg" },
+      h("div", { class: "chips rchips" }, [["off", "Через туннель"], ["on", "Напрямую"]].map(([v, l]) => {
+        const cur = !!d.tg === (v === "on");
+        return h("button", { class: cur ? "on" : null, "data-v": v, onclick: (ev) => (cur ? null
+          : quick(ev.currentTarget, v === "on" ? "Telegram напрямую" : "Telegram — через туннель", ["rudirect", "tg", v])) }, l);
+      })),
+      !on && d.tg ? h("div", { class: "small muted", style: "margin-top:6px" }, "Заработает, когда включишь «РФ напрямую».") : null),
     listBox("direct"), listBox("tunnel"),
     hint("Список сетей России — ipverse (данные RIPE), обновляется раз в сутки. Клиенты без туннеля и трафик самого сервера "
       + "не трогаются."));
@@ -4613,7 +4623,8 @@ route(/^\/diag\/route(?:\/([^/]+))?$/, async (ctx, who) => {
       const d = (await call("diag", "route", sel.value, v)) || {};
       const rows = d.rows || [], kinds = rows.map((x) => x.kind);
       const tips = [kinds.includes("held") ? "Вернуть интернет: поднять туннель или «Если туннель упал» → Напрямую." : null,
-        kinds.includes("rudirect") ? "Пустить адрес через туннель: «РФ напрямую» → Всегда через туннель." : null,
+        rows.some((x) => x.kind === "rudirect" && !/Telegram/.test(x.note || "")) ? "Пустить адрес через туннель: «РФ напрямую» → Всегда через туннель." : null,
+        rows.some((x) => x.kind === "rudirect" && /Telegram/.test(x.note || "")) ? "Telegram через туннель: «РФ напрямую» → Telegram → «Через туннель»." : null,
         rows.some((x) => x.kind === "direct" && /не в туннеле/.test(x.note || "")) ? "Пустить клиента в туннель: карточка клиента → маршрут." : null,
         kinds.includes("blocked") ? "Клиент заблокирован: срок или лимит трафика — карточка клиента." : null].filter(Boolean);
       out.replaceChildren(...[h("div", { class: "card" },
