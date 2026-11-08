@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.58"
+VERSION="v1.2.59"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -604,6 +604,8 @@ RUDIRECT_SET="awg2-ru" RUDIRECT_TAG="awg2-rudirect"
 # Метка в старших битах: младшие заняты чужими (wg-quick — 51820)
 RUDIRECT_MARK="0x52550000/0xffff0000" RUDIRECT_PRIO=90     # приоритет раньше туннелей (100-249)
 RUDIRECT_RPF="/proc/sys/net/ipv4/conf"                # rp_filter аплинка: строгий ломает ответы
+# «Telegram напрямую» — подсети Telegram (core.telegram.org/resources/cidr.txt)
+RUDIRECT_TG_NETS="149.154.160.0/20 91.108.4.0/22 91.108.8.0/22 91.108.12.0/22 91.108.16.0/22 91.108.20.0/22 91.108.56.0/22 91.105.192.0/23 185.76.151.0/24"
 RUDIRECT_UNIT="awg2-rudirect.service" RUDIRECT_TIMER="awg2-rudirect-update.timer"
 RUDIRECT_SRCS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/ru/ipv4-aggregated.txt https://www.ipdeny.com/ipblocks/data/aggregated/ru-aggregated.zone"
 # Настоящий список: ~8700 сетей, ~45 млн адресов IPv4. Короче или уже — оборван,
@@ -10524,6 +10526,20 @@ update_channel_set() {  # stable|beta
   ok "Канал: $(update_channel_label)"
 }
 
+# awg2 поставлен файлом из беты, а канал на сервере стабильный (так по
+# умолчанию): бот и панель из стабильного разошлись бы с awg2. Сборка новее
+# стабильной — предложить бету. Только в меню: через API канал не меняется.
+update_offer_beta() {
+  local sv
+  (( AUTO_MODE )) && return 0
+  [[ "$UPDATE_CHANNEL" == stable && -z "${AWG2_UPDATE_CHANNEL:-}" ]] || return 0
+  sv=$(update_peek 2>/dev/null) || return 0
+  (( 10#$(ver_num "$VERSION") > 10#$(ver_num "$sv") )) || return 0
+  warn "awg2 $VERSION — сборка из беты, а канал обновлений стабильный ($sv): бот оттуда не совпадёт с awg2"
+  ask_yes "  Переключить канал на бету — бот и обновления из беты? [Y/n]: " y || return 0
+  update_channel_set beta
+}
+
 do_switch_channel() {
   local to=beta
   [[ "$UPDATE_CHANNEL" == beta ]] && to=stable
@@ -10941,6 +10957,7 @@ bot_install() {
     bash "$installer" --src "$src"
     return
   fi
+  update_offer_beta
   info "Установщик бота — канал $(update_channel_label)"
   curl -fsSL "$BOT_INSTALL_URL" -o "$installer" || { err "Не скачался установщик: $BOT_INSTALL_URL"; return 1; }
   # Бот и awg2 — из одного репозитория, иначе на бете они разъедутся
@@ -11099,6 +11116,7 @@ web_code_install() {
     bash "${src%/awg_bot}/awg-bot-install.sh" --src "$src" --web-only
     return
   fi
+  update_offer_beta
   # Свой каталог (700): рядом с установщиком он ищет awg_bot/ (см. bot_install)
   mktmp installer -d || return 1
   installer+="/awg-bot-install.sh"
@@ -12615,6 +12633,13 @@ _rud_fail() { _rud_set ERROR "$1"; _rud_log "$1"; return 1; }
 
 rudirect_on() { [[ "$(_rud_get ON)" == 1 ]]; }
 
+# «Telegram напрямую»: подсети Telegram — в тот же набор, что и сети России.
+# Нужно, когда выход туннеля Telegram не пропускает (WARP с сервера в России
+# выходит в российской точке Cloudflare): у клиентов в туннеле Telegram висит
+# на «Соединение…», а с адреса сервера работает.
+rudirect_tg_on() { [[ "$(_rud_get TG)" == 1 ]]; }
+_rud_tg_nets() { tr ' ' '\n' <<< "$RUDIRECT_TG_NETS" | _antiscan_parse 4; }
+
 # Скачать список РФ: по очереди из источников, первый прошедший проверку.
 _rud_fetch() {
   local tmp src lbl n s4 why="" keep="оставлен прежний список"
@@ -12748,22 +12773,25 @@ rudirect_rules_ok() {
 
 # Собрать набор из сохранённого списка и своих и поставить правила.
 _rud_apply() {
-  local d n nd nt rc=0
+  local d n nd nt nx rc=0
   # Выключили, пока качался список, — правила обратно не ставить
   [[ "$(_rud_get ON)" == 1 ]] || { rudirect_down; return 0; }
   [[ -s "$RUDIRECT_DIR/ru.list" ]] || { _rud_log "нечего применять: список РФ ещё не скачан"; return 3; }
   d=$(mktemp -d "$RUDIRECT_DIR/.apply.XXXXXX") || return 1
   _rud_user_cidrs direct | sort -u > "$d/my"
   _rud_user_cidrs tunnel | sort -u > "$d/excl"
-  { _antiscan_parse 4 < "$RUDIRECT_DIR/ru.list"; cat "$d/my"; } | sort -u > "$d/v4"
+  : > "$d/tg"
+  rudirect_tg_on && _rud_tg_nets > "$d/tg"
+  { _antiscan_parse 4 < "$RUDIRECT_DIR/ru.list"; cat "$d/my" "$d/tg"; } | sort -u > "$d/v4"
   nd=$(grep -c . "$d/my" || true); nt=$(grep -c . "$d/excl" || true)
+  nx=$(sort -u "$d/my" "$d/tg" | grep -c . || true)       # не сети России: свои и Telegram
   if ! n=$(_antiscan_load "$RUDIRECT_SET" inet "$d/v4" "$d/excl"); then
     _rud_log "ipset: набор не загрузился"; rc=5
   elif ! _rud_rules_up; then
     _rud_log "iptables или ip rule: правило не поставилось"; rc=5
   else
-    _rud_set ENTRIES "$(( n - nd )) $nd $nt"
-    _rud_log "применено: сетей РФ $(( n - nd )), своих напрямую $nd, через туннель $nt"
+    _rud_set ENTRIES "$(( n - nx )) $nd $nt"
+    _rud_log "применено: сетей РФ $(( n - nx )), своих напрямую $nd, через туннель $nt$(rudirect_tg_on && echo ", Telegram напрямую")"
   fi
   rm -rf "$d"
   return "$rc"
@@ -12812,8 +12840,8 @@ rudirect_run() {
 _rudirect_emit() {
   emit_script "$RUDIRECT_SCRIPT" 'rudirect_run "$@"' \
     RUDIRECT_DIR RUDIRECT_CONF RUDIRECT_USER RUDIRECT_LOG RUDIRECT_SET RUDIRECT_TAG RUDIRECT_MARK RUDIRECT_PRIO \
-    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 RUDIRECT_RPF AWG_IF WGOBF_IF OWN_IFACES \
-    write_file _rud_get _rud_set _rud_log _rud_fail _antiscan_parse _antiscan_span _antiscan_load \
+    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 RUDIRECT_RPF RUDIRECT_TG_NETS AWG_IF WGOBF_IF OWN_IFACES \
+    write_file _rud_get _rud_set _rud_log _rud_fail _antiscan_parse _antiscan_span _antiscan_load rudirect_tg_on _rud_tg_nets \
     _rud_fetch _rud_user_file _rud_user_cidrs _rud_has_domains _rud_rule _rud_ip_rule_on _rud_uplinks \
     _rud_rpf_strict _rud_rpf_ok _rud_rpf_loose _rud_rules_up \
     _rud_rules_down rudirect_rules_ok _rud_apply rudirect_down rudirect_run || return 1
@@ -12927,7 +12955,18 @@ rudirect_counters() {
 rudirect_summary() {
   local e
   read -r -a e <<< "$(_rud_get ENTRIES)"
-  echo "сетей РФ ${e[0]:-0}, своих напрямую ${e[1]:-0}, через туннель ${e[2]:-0}"
+  echo "сетей РФ ${e[0]:-0}, своих напрямую ${e[1]:-0}, через туннель ${e[2]:-0}$(rudirect_tg_on && echo ", Telegram напрямую")"
+}
+
+rudirect_tg_set() {  # on|off
+  case "${1:-}" in
+    on) _rud_set TG 1; _rud_log "Telegram напрямую: включено"
+        ok "Telegram напрямую: клиенты в туннеле ходят в Telegram с адреса сервера" ;;
+    off) _rud_set TG 0; _rud_log "Telegram напрямую: выключено"
+         ok "Telegram напрямую выключено: Telegram — снова через туннель" ;;
+    *) err "Telegram напрямую: on | off"; return 1 ;;
+  esac
+  _rud_reapply
 }
 
 # ── Свои списки ───────────────────────────────────────────
@@ -12985,7 +13024,7 @@ rudirect_list_del() {  # direct|tunnel запись|all
 }
 
 _rud_reapply() {
-  rudirect_on || { info "РФ напрямую выключено — список вступит в силу при включении"; return 0; }
+  rudirect_on || { info "РФ напрямую выключено — вступит в силу при включении"; return 0; }
   _rudirect_emit && "$RUDIRECT_SCRIPT" apply || { err "Не удалось применить — журнал «РФ напрямую»"; return 1; }
 }
 
@@ -13022,6 +13061,8 @@ _rudirect_show() {
   else
     echo -e "  Состояние : ${D}○ выключено${N}"
   fi
+  if rudirect_tg_on; then echo -e "  Telegram  : ${G}напрямую${N} ${D}— с адреса сервера${N}"
+  else echo -e "  Telegram  : ${D}через туннель${N}"; fi
   upd=$(_rud_get UPDATED)
   [[ -n "$upd" ]] && echo -e "  Список    : обновлён $(date -d "@$upd" '+%d.%m.%Y %H:%M' 2>/dev/null) ${D}($(_rud_get SRC))${N}"
   err=$(_rud_get ERROR)
@@ -13063,8 +13104,10 @@ do_rudirect_menu() {
     echo -e "  ${C}4)${N} Всегда через туннель ${D}— исключения: $(rudirect_list tunnel | grep -c . || true)${N}"
     echo -e "  ${C}5)${N} Починить ${D}— поставить правила заново${N}"
     echo -e "  ${C}6)${N} Журнал"
+    if rudirect_tg_on; then echo -e "  ${C}7)${N} Telegram — снова через туннель"
+    else echo -e "  ${C}7)${N} Telegram напрямую ${D}— если через туннель Telegram висит на «Соединение…»${N}"; fi
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-6]: ${N}" 0 6 0
+    read_choice c "${C}  Выбор [0-7]: ${N}" 0 7 0
     case "$c" in
       1) if rudirect_on; then rudirect_disable
          else
@@ -13076,6 +13119,7 @@ do_rudirect_menu() {
       4) _rudirect_list_menu tunnel; continue ;;
       5) rudirect_repair || true ;;
       6) tail -n 40 "$RUDIRECT_LOG" 2>/dev/null || info "Журнал пуст" ;;
+      7) if rudirect_tg_on; then rudirect_tg_set off || true; else rudirect_tg_set on || true; fi ;;
       0) return 0 ;;
     esac
     pause
@@ -13778,6 +13822,8 @@ diag_route() {  # клиент адрес
                  && [[ "$(ip -4 route get "$ip" from "$cip" iif "$AWG_IF" 2>/dev/null)" != *" dev $dev "* ]]; then
               # Без метки клиент идёт в туннель: обратный путь — туда же, ответ на $dev отбросят
               kind=none note="сеть России, но ответы отбросит строгий rp_filter на $dev — «РФ напрямую → Починить»"
+            elif [[ -n "$mark" ]] && rudirect_tg_on && _antiscan_covers <(_rud_tg_nets) "$ip"; then
+              kind=rudirect note="напрямую с сервера — Telegram («Telegram напрямую»)"
             elif [[ -n "$mark" ]]; then kind=rudirect note="напрямую с сервера — сеть России («РФ напрямую»)"
             elif [[ -n "$tun" ]]; then kind=direct note="напрямую с сервера — клиент не в туннеле ($tun)"
             else kind=direct note="напрямую с сервера — туннели выключены"; fi ;;
@@ -14653,18 +14699,19 @@ _api_rudirect() {
         _kv packets:n "${p:-0}"; _kv bytes:n "${b:-0}"
         _kv direct:j "$(rudirect_list direct | py json-list)"
         _kv tunnel:j "$(rudirect_list tunnel | py json-list)"
-        _kv xray_ru:b "$(_b xray_ru_on)"; } | api_obj ;;
+        _kv xray_ru:b "$(_b xray_ru_on)"; _kv tg:b "$(_b rudirect_tg_on)"; } | api_obj ;;
     on) rudirect_enable ;;
     off) rudirect_disable ;;
     update) rudirect_update ;;
     repair) rudirect_repair ;;
+    tg) rudirect_tg_set "${1:-}" ;;
     add)
       [[ -n "${2:-}" ]] || { _api_usage "rudirect add direct|tunnel АДРЕС"; return; }
       rudirect_list_add "$1" "$2" ;;
     del)
       [[ -n "${2:-}" ]] || { _api_usage "rudirect del direct|tunnel АДРЕС|all"; return; }
       rudirect_list_del "$1" "$2" ;;
-    *) _api_usage "rudirect status|on|off|update|repair|add direct|tunnel АДРЕС|del direct|tunnel АДРЕС|all" ;;
+    *) _api_usage "rudirect status|on|off|update|repair|tg on|off|add direct|tunnel АДРЕС|del direct|tunnel АДРЕС|all" ;;
   esac
 }
 
@@ -20358,5 +20405,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=322a6a094f662ff1
+_BUILD_SUM=f05567d8a05dc37f
 main "$@"
