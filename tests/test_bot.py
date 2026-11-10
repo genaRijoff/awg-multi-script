@@ -2175,7 +2175,7 @@ async def run():
         ("🇷🇺 РФ напрямую", "rud") in buttons and ("🪂 Если упал", "tf") in buttons and "РФ напрямую — выключено" in text
         and "Если туннель упал — напрямую (как было)" in text, [text, buttons])
     RUDST = {"enabled": False, "active": False, "ru": 0, "mine": 0, "excl": 0, "updated": 0, "src": "", "error": "",
-             "packets": 0, "bytes": 0, "direct": [], "tunnel": [], "xray_ru": False, "tg": False}
+             "packets": 0, "bytes": 0, "direct": [], "tunnel": [], "xray_ru": False, "tg": False, "abroad": ""}
     TF = {"warp": "direct", "xray": "direct", "t2s": "direct", "exits": "direct"}
     TFL = {"warp": "WARP", "xray": "Xray", "t2s": "tun2socks", "exits": "Exit-ноды WG"}
     ROUTE = {"rows": []}
@@ -2229,6 +2229,11 @@ async def run():
         and ("📝 Напрямую: 0", "rud:l:direct") in buttons and ("📝 В туннель: 0", "rud:l:tunnel") in buttons
         and ("🧭 Куда идёт", "diag:rt:r") in buttons and ("📜 Журнал", "diag:log:rudirect|rud") in buttons
         and ("◀️ Назад", "tun") in buttons and not any(d in ("rud:upd", "rud:fix") for _, d in buttons), [text, buttons])
+    RUDST["abroad"] = "NL"
+    text, buttons = screen(await press("rud:on"))
+    chk("сервер не в России — в подтверждении включения предупреждение", "Сервер не в России (NL)" in text
+        and "блокируют как раз за это" in text and ("✅ Включить", "rud:onok") in buttons, [text, buttons])
+    RUDST["abroad"] = ""
     n = len(rt_calls)
     text, buttons = screen(await press("rud:on"))
     chk("включение — с подтверждением, без вызова до него",
@@ -2250,6 +2255,13 @@ async def run():
     text, buttons = screen(await press("rud:tg:off"))
     chk("Telegram — снова через туннель", (("rudirect", "tg", "off"), 240) in rt_calls and "✅ Telegram — снова через туннель" in text
         and ("✈️ TG напрямую", "rud:tg:on") in buttons, [text, buttons])
+    RUDST["abroad"] = "NL"
+    text, _ = screen(await press("rud"))
+    chk("включено на сервере не в России — предупреждение на экране и как поправить страну",
+        "⚠️ Сервер не в России (NL)" in text and "флагом в шапке панели" in text, text)
+    RUDST["abroad"] = ""
+    text, _ = screen(await press("rud"))
+    chk("сервер в России — без предупреждения", "не в России" not in text, text)
     await press("rud:upd")
     await press("rud:fix")
     chk("обновить и починить — долгие вызовы", (("rudirect", "update"), 240) in rt_calls

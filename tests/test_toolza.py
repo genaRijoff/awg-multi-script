@@ -3310,6 +3310,22 @@ chk("rudirect status: включено, на месте, сетей РФ, ист
 rc, out, _ = bash(ASPRE + "_api_readonly rudirect status && _api_readonly diag route alice 1.1.1.1 && echo RO")
 chk("rudirect status и diag route — чтение без очереди api", "RO" in out, out)
 
+# Сервер не в России — предупреждение: «РФ напрямую» светит адрес входа российским приложениям
+CC, CCM = os.path.join(ROOT, "var/lib/awg2/country"), os.path.join(ROOT, "var/lib/awg2/country_manual")
+chk("страна не определена — без предупреждения", rud_status().get("abroad") == "", rud_status())
+with open(CC, "w") as f:
+    f.write("NL 1791500000 2 NL=2\n")
+d = rud_status()
+rc, out, _ = rbash("_rudirect_show")
+chk("сервер в NL: в статусе abroad=NL, в меню awg2 — предупреждение и как поправить страну",
+    d.get("abroad") == "NL" and "Сервер не в России (NL)" in out and "блокируют как раз за это" in out
+    and "флагом в шапке панели" in out, [d.get("abroad"), out[-600:]])
+with open(CCM, "w") as f:
+    f.write("RU\n")
+chk("страна вручную — Россия (геобазы ошиблись): предупреждения нет", rud_status().get("abroad") == "", rud_status())
+os.remove(CC)
+os.remove(CCM)
+
 r = api("rudirect", "add", "direct", "https://Bank.Example/login?x=1", env=RTENV)
 d = rud_status()
 chk("свой адрес «всегда напрямую»: из ссылки — домен, разрешён и в наборе",

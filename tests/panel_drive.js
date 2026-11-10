@@ -873,7 +873,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     try {
       await page.click("button:has-text('Включить')");
       await page.waitForSelector(".toast >> text=РФ напрямую включено");
-      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Включить? Клиенты в туннеле"));
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:") && l.includes("Включить? Клиенты в туннеле"));
       if (!asked.length || !/адреса сервера/.test(asked[0])) throw new Error("включение без подтверждения: " + JSON.stringify(asked));
       await page.waitForSelector("[data-name=rudirect-status] >> text=● включено");
       await page.waitForSelector("[data-name=rudirect-status] >> text=8 673");
@@ -908,6 +908,23 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:Убрать bank.example"));
       if (!asked) throw new Error("убрал без вопроса");
       if (seen.join("|") !== "rudirect add tunnel 77.88.8.0/24|rudirect del direct bank.example") throw new Error("вызовы: " + JSON.stringify(seen));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+  await step("РФ напрямую на сервере не в России: предупреждение в вопросе при включении и в статусе", async () => {
+    const st = { enabled: false, active: false, ru: 0, direct: [], tunnel: [], abroad: "NL" };
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "status") return route.fulfill(fake(st));
+      if (b.args && b.args[0] === "rudirect" && b.args[1] === "on") { Object.assign(st, { enabled: true, active: true, ru: 8673 }); return route.fulfill(fake(null)); }
+      return route.continue();
+    });
+    try {
+      await nav("/tunnels/rudirect", "[data-name=rudirect-status]");
+      if (await page.locator("[data-name=rud-abroad]").count()) throw new Error("предупреждение у выключенного");
+      await page.click(".actions button:has-text('Включить')");
+      await page.waitForSelector("[data-name=rud-abroad] >> text=флагом в шапке");
+      const asked = (await page.evaluate(() => window.__log)).some((l) => l.startsWith("confirm:⚠️ Сервер не в России (NL)"));
+      if (!asked) throw new Error("в вопросе нет предупреждения");
     } finally { await page.unroute(/\/api\/call$/); }
   });
   await step("РФ напрямую: Telegram — через туннель или напрямую, переключение уходит в awg2", async () => {

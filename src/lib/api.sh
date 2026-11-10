@@ -718,7 +718,8 @@ _api_rudirect() {
         _kv packets:n "${p:-0}"; _kv bytes:n "${b:-0}"
         _kv direct:j "$(rudirect_list direct | py json-list)"
         _kv tunnel:j "$(rudirect_list tunnel | py json-list)"
-        _kv xray_ru:b "$(_b xray_ru_on)"; _kv tg:b "$(_b rudirect_tg_on)"; } | api_obj ;;
+        _kv xray_ru:b "$(_b xray_ru_on)"; _kv tg:b "$(_b rudirect_tg_on)"
+        _kv abroad "$(rudirect_abroad || true)"; } | api_obj ;;
     on) rudirect_enable ;;
     off) rudirect_disable ;;
     update) rudirect_update ;;

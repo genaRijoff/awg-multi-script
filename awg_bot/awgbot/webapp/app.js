@@ -4510,6 +4510,9 @@ const extLink = (url, text) => h("a", { href: url, onclick: (ev) => { ev.prevent
 // РФ напрямую: клиенты в туннеле ходят к сетям России мимо него. Список качает и проверяет awg2
 const RUD_LISTS = { direct: ["Всегда напрямую", "мимо туннеля, даже если адреса нет в сетях России"],
   tunnel: ["Всегда через туннель", "в туннель, даже если адрес в сетях России"] };
+// Сервер не в России: «РФ напрямую» светит адрес входа российским приложениям
+const rudAbroad = (cc) => `Сервер не в России (${cc}): российские сайты и приложения увидят адрес сервера, к которому `
+  + "подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России.";
 route(/^\/tunnels\/rudirect$/, async (ctx) => {
   const d = (await call("rudirect", "status")) || {};
   const on = !!d.enabled;
@@ -4543,11 +4546,14 @@ route(/^\/tunnels\/rudirect$/, async (ctx) => {
       kv("Свои", `напрямую ${(d.direct || []).length} · через туннель ${(d.tunnel || []).length}`),
       d.updated ? kv("Список", fmtTime(d.updated) + (d.src ? " · " + d.src : "")) : null,
       d.error ? h("div", { class: "small warn" }, "▲ " + d.error) : null,
-      d.xray_ru ? h("div", { class: "small muted" }, "У Xray своё «РФ напрямую» (по доменам) — работает вместе с этим.") : null),
+      d.xray_ru ? h("div", { class: "small muted" }, "У Xray своё «РФ напрямую» (по доменам) — работает вместе с этим.") : null,
+      on && d.abroad ? h("div", { class: "small warn", "data-name": "rud-abroad", style: "padding-top:6px" }, "▲ " + rudAbroad(d.abroad)
+        + " Страна определена неверно — выбери её флагом в шапке.") : null),
     h("div", { class: "actions", style: "margin-top:8px" },
       on ? btn("⏹ Выключить", (b) => quickAsk(b, "Выключить? Правило снимается — клиенты в туннеле снова пойдут через него ко всем "
         + "сайтам. Свои списки сохранятся.", "РФ напрямую выключено", ["rudirect", "off"]))
-        : btn("✅ Включить", (b) => quickAsk(b, "Включить? Клиенты в туннеле пойдут к сайтам России с адреса сервера, а не выхода "
+        : btn("✅ Включить", (b) => quickAsk(b, (d.abroad ? "⚠️ " + rudAbroad(d.abroad) + "\n\n" : "")
+          + "Включить? Клиенты в туннеле пойдут к сайтам России с адреса сервера, а не выхода "
           + "туннеля. Выключить можно здесь или в боте.", "РФ напрямую включено", ["rudirect", "on"]), "btn-primary"),
       on ? btn("🔄 Обновить список", (b) => quick(b, "Список обновлён", ["rudirect", "update"])) : null,
       on ? btn("🛠 Починить", (b) => quick(b, "Правила на месте", ["rudirect", "repair"])) : null,

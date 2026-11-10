@@ -36,6 +36,19 @@ rudirect_on() { [[ "$(_rud_get ON)" == 1 ]]; }
 # выходит в российской точке Cloudflare): у клиентов в туннеле Telegram висит
 # на «Соединение…», а с адреса сервера работает.
 rudirect_tg_on() { [[ "$(_rud_get TG)" == 1 ]]; }
+
+# Сервер не в России: «РФ напрямую» покажет российским сайтам и приложениям
+# адрес, к которому подключаются клиенты, — зарубежные адреса, по наблюдениям
+# осени 2026, блокируют как раз за это. Функция задумана для сервера в России.
+# Страна не определена — молчим: не гадаем.
+rudirect_abroad() {  # → код страны, если сервер не в России
+  local c
+  c=$(server_country)
+  [[ -n "$c" && "$c" != RU ]] && echo "$c"
+}
+_rud_abroad_text() {  # код страны
+  echo "Сервер не в России ($1): российские сайты и приложения увидят адрес сервера, к которому подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России"
+}
 _rud_tg_nets() { tr ' ' '\n' <<< "$RUDIRECT_TG_NETS" | _antiscan_parse 4; }
 
 # Скачать список РФ: по очереди из источников, первый прошедший проверку.
@@ -284,7 +297,7 @@ EOF
 }
 
 rudirect_enable() {
-  local rc=0
+  local rc=0 cc
   server_exists || { err "Сервер не создан"; return 1; }
   need_cmds ipset:ipset flock:util-linux || return 1
   _rud_set ON 1
@@ -305,6 +318,7 @@ rudirect_enable() {
   systemctl enable --now "$RUDIRECT_TIMER" &>/dev/null || true
   log_info "РФ напрямую: включено"
   ok "РФ напрямую включено: $(rudirect_summary)"
+  cc=$(rudirect_abroad) && warn "$(_rud_abroad_text "$cc")"
   [[ -n "$(_rud_get ERROR)" ]] && warn "$(_rud_get ERROR)"
   return 0
 }
@@ -459,6 +473,10 @@ _rudirect_show() {
   else
     echo -e "  Состояние : ${D}○ выключено${N}"
   fi
+  if rudirect_on && c=$(rudirect_abroad); then
+    echo -e "  ${Y}▲ $(_rud_abroad_text "$c").${N}"
+    echo -e "  ${D}  Страна определена неверно — выбери её флагом в шапке панели.${N}"
+  fi
   if rudirect_tg_on; then echo -e "  Telegram  : ${G}напрямую${N} ${D}— с адреса сервера${N}"
   else echo -e "  Telegram  : ${D}через туннель${N}"; fi
   upd=$(_rud_get UPDATED)
@@ -491,7 +509,7 @@ _rudirect_list_menu() {  # direct|tunnel
 }
 
 do_rudirect_menu() {
-  local c
+  local c cc
   while true; do
     echo ""
     _rudirect_show
@@ -509,6 +527,7 @@ do_rudirect_menu() {
     case "$c" in
       1) if rudirect_on; then rudirect_disable
          else
+           cc=$(rudirect_abroad) && warn "$(_rud_abroad_text "$cc")"
            echo -e "  ${D}Клиенты в туннеле пойдут к сайтам России с адреса сервера.${N}"
            ask_yes "  Включить? [y/N]: " n && { rudirect_enable || true; }
          fi ;;

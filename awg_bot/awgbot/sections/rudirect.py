@@ -32,6 +32,12 @@ def _n(v: int | None) -> str:
     return f"{int(v or 0):,}".replace(",", " ")
 
 
+def abroad_text(cc: str) -> str:
+    """Сервер не в России: «РФ напрямую» светит адрес входа российским приложениям."""
+    return (f"⚠️ Сервер не в России ({esc(cc)}): российские сайты и приложения увидят адрес сервера, к которому "
+            "подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России.")
+
+
 # ── РФ напрямую ───────────────────────────────────────────
 @rud()
 async def show(cb: CallbackQuery, state: FSMContext, arg: str = "") -> None:
@@ -56,6 +62,8 @@ async def screen(target: ui.Target, note: str = "") -> None:
         lines.append(("🟢 Включено" if d.get("active") else "🟡 Включено, правило не на месте — «Починить» или "
                       "подождать таймер") + f" · сетей РФ {_n(d.get('ru'))}")
         lines.append(f"↪️ Мимо туннеля: {_n(d.get('packets'))} пакетов (сбрасывается при перезагрузке)")
+        if d.get("abroad"):
+            lines += [abroad_text(str(d["abroad"])), "<i>Страна определена неверно — выбери её флагом в шапке панели.</i>"]
     else:
         lines.append("⚪️ Выключено")
     lines.append(f"📝 Свои: напрямую {len(direct)}, через туннель {len(tunnel)}")
@@ -85,7 +93,10 @@ async def screen(target: ui.Target, note: str = "") -> None:
 
 @rud("on")
 async def _on(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
-    await ui.confirm(cb, "Включить? Клиенты в туннеле пойдут к сайтам России с адреса сервера, а не выхода "
+    r = await api.call("rudirect", "status")
+    cc = r.data.get("abroad") if r.ok and isinstance(r.data, dict) else ""
+    await ui.confirm(cb, (abroad_text(str(cc)) + "\n\n" if cc else "")
+                     + "Включить? Клиенты в туннеле пойдут к сайтам России с адреса сервера, а не выхода "
                      "туннеля. Выключить можно здесь, в боте.", ("✅ Включить", rud.data("onok")), rud.data())
 
 
