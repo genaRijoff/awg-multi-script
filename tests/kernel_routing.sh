@@ -192,7 +192,9 @@ echo "── Сторож exit-нод: ноды — настоящие сете�
 command -v ping &>/dev/null || { echo "ПРОПУСК exits: нет ping"; exit 0; }
 EXITS_DIR="$T/exits"; mkdir -p "$EXITS_DIR"; EXITS_PEERS="$EXITS_DIR/exits_peers.list"
 EXITS_HEALTH_DIR="$T/health"; EXITS_LOCK="$T/exits.lock"; EXITS_HEALTH_LOG="$T/health.log"
-EXITS_HC_URL="http://127.0.0.1:9/"           # HTTP-проба — сразу отказ, без DNS
+# Проба — через «интернет» ноды (одна цель): живая нода отвечает на ping, без
+# интернета — отказ сразу, молчащая — ping ждёт таймаута; HTTP-проба — отказ сразу
+EXITS_HC_TARGETS="1.1.1.1"; EXITS_HC_URL="http://1.1.1.1:9/"
 awg() { :; }                                   # рукопожатий нет — «не отвечает»
 NS=()
 for n in a b; do
@@ -200,19 +202,25 @@ for n in a b; do
   : > "$EXITS_DIR/awg-exit-$n.conf"
 done
 trap 'kill "${NS[@]}" 2>/dev/null' EXIT
-node_on() {  # нода: адреса «интернета» на её стороне — проба проходит
+# «Интернет» ноды — адреса 1.1.1.1 и 8.8.8.8 на её стороне; сбой — правилами на входе
+node_fw() {  # нода правила...
   local p="${NS[$([[ $1 == a ]] && echo 0 || echo 1)]}"
-  nsenter -t "$p" -n sh -c 'ip addr add 1.1.1.1/32 dev n0 2>/dev/null; ip addr add 8.8.8.8/32 dev n0 2>/dev/null; true'
+  shift
+  nsenter -t "$p" -n sh -c "ip addr add 1.1.1.1/32 dev n0 2>/dev/null; ip addr add 8.8.8.8/32 dev n0 2>/dev/null
+    iptables -F INPUT; $*"
 }
-node_off() {
-  local p="${NS[$([[ $1 == a ]] && echo 0 || echo 1)]}"
-  nsenter -t "$p" -n sh -c 'ip addr del 1.1.1.1/32 dev n0 2>/dev/null; ip addr del 8.8.8.8/32 dev n0 2>/dev/null; true'
+node_on() { node_fw "$1" true; }                           # проба проходит
+node_off() { node_fw "$1" iptables -A INPUT -i n0 -j REJECT; }  # без интернета: отказ — проба падает сразу
+node_silent() {  # молчит: ping ждёт таймаута, как с настоящей мёртвой нодой; HTTP — отказ сразу
+  node_fw "$1" "iptables -A INPUT -i n0 -p icmp -j DROP; iptables -A INPUT -i n0 -p tcp -j REJECT --reject-with tcp-reset"
 }
 mknode() {  # нода → veth awg-exit-<нода> ↔ n0 в её пространстве
   local i=$([[ $1 == a ]] && echo 1 || echo 2) p="${NS[$([[ $1 == a ]] && echo 0 || echo 1)]}"
   ip link add "awg-exit-$1" type veth peer name n0 netns "$p"
   ip addr add "10.200.$i.1/30" dev "awg-exit-$1"; ip link set "awg-exit-$1" up
-  nsenter -t "$p" -n sh -c "ip link set lo up; ip addr add 10.200.$i.2/30 dev n0; ip link set n0 up"
+  # Без лимита ICMP-ошибок: иначе отказ на частые пробы ядро глушит и ping ждёт таймаута
+  nsenter -t "$p" -n sh -c "ip link set lo up; ip addr add 10.200.$i.2/30 dev n0; ip link set n0 up
+    sysctl -qw net.ipv4.icmp_ratelimit=0"
   node_on "$1"
 }
 mknode a; mknode b
@@ -226,7 +234,8 @@ ok "старт: общий выход — основная a, персональ
 hc 1
 ok "проба через ноду настоящим ping: обе живы — ничего не меняется, «up» у обеих" \
   '[[ "$(exits_shared_now)" == a && "$(_exits_hstate a)" == "up 0 1 "* && "$(_exits_hstate b)" == "up 0 1 "* ]]'
-node_off a; hc 2
+node_silent a; hc 1                            # молчит совсем: проба ждёт таймаутов
+node_off a; hc 1
 ok "a молчит 2 проверки — ещё основная (упала — после 3)" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]]'
 hc 1
 ok "a молчит 3 проверки — общий выход переключён на запасную b, правило клиента прежнее" \
@@ -268,6 +277,7 @@ node_on a; hc 2
 ok "a вернулась после «напрямую» — правила клиентов снова на месте, общий выход через a" \
   '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]] && ip rule show | grep -q "from 10.23.45.2 lookup 202"'
 eval "$orig_online"                           # настоящая проверка: у сервера в тесте интернета нет
+iptables -I OUTPUT -o eth0 -j REJECT          # и не ждём таймаутов — отказ сразу
 node_off a; node_off b
 hc 3
 ok "все молчат, у сервера нет интернета — ноды не трогаем" \

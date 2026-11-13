@@ -702,6 +702,7 @@ Telegram. Бот для неё не нужен.
 
 ```bash
 ./build.sh
+python3 tests/run_all.py          # все наборы разом, параллельно (6–12 мин вместо ~40); -j N, --only, --skip
 python3 tests/test_toolza.py      # awg2: параметры, конфиги, helper, служебные скрипты, API
 python3 tests/test_cps.py         # генератор I1-I5
 python3 tests/test_bot.py         # бот на живом диспетчере против awg2 api (нужен aiogram)
@@ -709,7 +710,11 @@ python3 tests/test_panel.py       # панель Mini App в Chromium (нужн�
 python3 tests/test_web.py         # веб-панель: вход, защита, файлы, вид в Chromium
 python3 tests/test_admins.py && python3 tests/test_net.py && python3 tests/test_meta_menu.py
 python3 tests/test_regress_f2f3.py && python3 tests/test_amnezia.py
+python3 tests/test_kernel_routing.py  # маршруты туннелей на настоящем ядре (unshare -rn)
 ```
+
+Панель гоняет три профиля сервера разом (`AWG_PANEL_JOBS=1` — по одному); скриншоты
+сценария — только с `AWG_PANEL_SHOTS=каталог`.
 
 ---
 

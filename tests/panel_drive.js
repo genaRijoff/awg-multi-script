@@ -30,7 +30,11 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
   page.on("console", (m) => { if (m.type() === "error" && !/telegram\.org|ERR_FAILED/.test(m.text()))
     errors.push("console: " + m.text() + ((m.location() || {}).url ? " " + m.location().url : "")); });
   const base = `https://127.0.0.1:${port}/`;
-  const shot = async (name) => { await page.waitForTimeout(500); await page.screenshot({ path: `${out}/${name}.png`, fullPage: true }); };
+  // Снимки — только когда их оставляют (AWG_PANEL_SHOTS): иначе это время впустую
+  const SHOTS = !!process.env.AWG_PANEL_SHOTS;
+  const shot = async (name) => { if (!SHOTS) return; await page.waitForTimeout(500); await page.screenshot({ path: `${out}/${name}.png`, fullPage: true }); };
+  // Сводки бот держит в кэше AWG_API_CACHE_TTL секунд: файлы поменяли мимо awg2 — ждём его
+  const CACHE_WAIT = Number(process.env.AWG_API_CACHE_TTL || 5) * 1000 + 500;
   const noNull = async () => {
     const bad = await page.evaluate(() => [...document.querySelectorAll("#app, #app *")].some((el) =>
       [...el.childNodes].some((n) => n.nodeType === 3 && (/^(null|undefined|false)$/.test(n.textContent.trim())
@@ -89,7 +93,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       : !/Страна не определена/.test(t) || !/сервер не создан/.test(t)) throw new Error("окно «О сервере»: " + t);
     // Лист снизу — снимок экрана, а не всей страницы
     await page.waitForTimeout(300);
-    await page.screenshot({ path: `${out}/01b-server-info.png` });
+    if (SHOTS) await page.screenshot({ path: `${out}/01b-server-info.png` });
     // Скрыть имя и адрес — тут же, окно остаётся открытым; и вернуть
     await page.click(`${box} button:has-text('Скрыть адрес')`);
     await page.waitForSelector(`${box} b.hid >> text=скрыто`);
@@ -433,7 +437,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (!await p2.locator("#qr[src^='data:image/png']").count() && !await p2.locator("#noqr:not([hidden])").count()) throw new Error("ни QR, ни пояснения");
     if (!/PrivateKey/.test(await p2.textContent("#text"))) throw new Error("нет текста конфига");
     if (await p2.textContent("#fname") !== "alice.conf") throw new Error("имя файла: " + await p2.textContent("#fname"));
-    await p2.screenshot({ path: `${out}/04c-share-page.png`, fullPage: true });
+    if (SHOTS) await p2.screenshot({ path: `${out}/04c-share-page.png`, fullPage: true });
     await page.click("[data-name=share] button:has-text('Отозвать')");
     await page.waitForSelector(".toast >> text=Ссылка отозвана");
     await p2.reload();
@@ -696,9 +700,10 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       // По русскому названию: Австралия раньше Австрии
       if (vis.join(",") !== "AU,AT") throw new Error("поиск «авст»: " + vis.join(","));
       await page.click("[data-name=country-pick] .cpi[data-cc=AT]");
-      await page.waitForTimeout(300);
+      // Окно закрывается после ответа awg2 — ждём его, а не фиксированные 300 мс (под нагрузкой не успевает)
+      await page.waitForSelector("[data-name=country-pick]", { state: "detached", timeout: 5000 })
+        .catch(() => { throw new Error("окно выбора не закрылось"); });
       if (!sent.some((b) => b.includes('"country","set","AT"'))) throw new Error("выбор не ушёл в awg2: " + sent.join(" | "));
-      if (await page.locator("[data-name=country-pick]").count()) throw new Error("окно выбора не закрылось");
     } finally {
       await page.unroute("**/api/call", fake);
       await page.unroute("**/api/status", st);
@@ -1102,8 +1107,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     fs.mkdirSync(hdir, { recursive: true });
     fs.writeFileSync(`${hdir}/n1`, `down 3 0 ${Math.floor(Date.now() / 1000)} nonet\n`);
     try {
-      // Сводку бот держит в кэше 5 с — нода и её здоровье появились мимо awg2
-      await page.waitForTimeout(5500);
+      // Сводку бот держит в кэше — нода и её здоровье появились мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/tunnels/exits", R + "[data-name=ex-nodes] [data-node=n2]");
       await page.waitForSelector("[data-node=n1] >> text=основная");
       await page.waitForSelector("[data-node=n1] >> text=на связи, но выхода в интернет нет");
@@ -1503,7 +1508,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
           over: document.documentElement.scrollWidth - document.documentElement.clientWidth };
       });
       if (r.lockR > r.flagL || r.flagR > r.kbarL || r.topR > width || r.over > 0) throw new Error(`шапка на ${width}px: ` + JSON.stringify(r));
-      if (width === 360) await page.screenshot({ path: `${out}/48d-beta-360.png` });
+      if (SHOTS && width === 360) await page.screenshot({ path: `${out}/48d-beta-360.png` });
     }
     // Поворот телефона / окно Telegram Desktop: название выбирает размер при отрисовке,
     // а шапку никто не вызывал — после широкого окна оно оставалось крупным и теснило флаг
@@ -1536,8 +1541,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ";
     fs.writeFileSync(f, "новое ядро 6.8.0-146 — нужна перезагрузка\n");
     try {
-      // Сводку бот держит в кэше 5 с — повод появился мимо awg2
-      await page.waitForTimeout(5500);
+      // Сводку бот держит в кэше — повод появился мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146 — нужна перезагрузка");
       await shot("04-reboot-alert");
       await nav("/server", R + "[data-name=alerts] >> text=новое ядро 6.8.0-146");
@@ -1547,7 +1552,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       if (await page.$("text=новое ядро 6.8.0-146")) throw new Error("на обзоре убранное замечание вернулось");
       // Ещё более новое ядро — другой текст: замечание снова на месте
       fs.writeFileSync(f, "новое ядро 6.8.0-150 — нужна перезагрузка\n");
-      await page.waitForTimeout(5500);
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/", R + "[data-name=alerts] >> text=новое ядро 6.8.0-150 — нужна перезагрузка");
     } finally {
       fs.unlinkSync(f);
@@ -1558,17 +1563,17 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     const fs = require("fs"), f = `${sandboxRoot}/reboot.txt`, R = "#app:not(.reloading) ", t = "обновлены пакеты — нужна перезагрузка";
     fs.writeFileSync(f, t + "\n");
     try {
-      await page.waitForTimeout(5500);
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/", R + `[data-name=alerts] >> text=${t}`);
       await page.click("[data-name=alerts] .row:has-text('обновлены пакеты') button[aria-label=Убрать]");
       await page.waitForSelector(`text=${t}`, { state: "detached" });
     } finally { fs.unlinkSync(f); }
     // Перезагрузились — повод другой (в песочнице — «модуль не загружен»); потом пакеты обновились снова: текст тот же, замечание должно вернуться
-    await page.waitForTimeout(5500);
+    await page.waitForTimeout(CACHE_WAIT);
     await nav("/", R + "[data-name=routes]");
     fs.writeFileSync(f, t + "\n");
     try {
-      await page.waitForTimeout(5500);
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/", R + `[data-name=alerts] >> text=${t}`);
     } finally { fs.unlinkSync(f); await page.evaluate(() => localStorage.removeItem("awg-hidden-alerts")); }
   });
@@ -1589,8 +1594,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     const fs = require("fs"), warpConf = `${sandboxRoot}/etc/wireguard/warp0.conf`;
     fs.writeFileSync(warpConf, "[Interface]\nPrivateKey = P\nAddress = 172.16.0.2/32\n");
     try {
-      // Сводку обфускатора бот держит в кэше 5 с — профиль WARP появился мимо awg2
-      await page.waitForTimeout(5500);
+      // Сводку обфускатора бот держит в кэше — профиль WARP появился мимо awg2
+      await page.waitForTimeout(CACHE_WAIT);
       await nav("/wgobf", R + ".rchips button[data-v=warp]");
       await page.click(".rchips button[data-v=warp]");
       await page.waitForSelector(".toast >> text=через WARP");

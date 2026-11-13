@@ -20,6 +20,7 @@ test_toolza.py — проверка собранного awg2 (dist/awg2.sh) б�
 Выход:   0 — всё прошло, 1 — есть провалы.
 """
 import base64
+import concurrent.futures
 import hashlib
 import os
 import re
@@ -33,9 +34,14 @@ from sandbox import *  # noqa: E402,F401,F403
 # ── 1. Генератор параметров ───────────────────────────────
 print("Параметры AWG")
 N = 120
+# Девять наборов независимы и только считают — генерируем разом
+GEN = [(proto, profile) for proto in ("2.0", "3.0", "3.1") for profile in ("lite", "standard", "pro")]
+with concurrent.futures.ThreadPoolExecutor(max_workers=len(GEN)) as _pool:
+    GEN = dict(zip(GEN, _pool.map(lambda pp: bash(
+        f'MTU=1280; AUTO_MODE=1; for i in $(seq {N}); do gen_awg_params {pp[1]} {pp[0]} || exit 1; echo "$AWG_PARAMS"; echo ---; done'), GEN)))
 for proto in ("2.0", "3.0", "3.1"):
     for profile in ("lite", "standard", "pro"):
-        rc, out, err = bash(f'MTU=1280; AUTO_MODE=1; for i in $(seq {N}); do gen_awg_params {profile} {proto} || exit 1; echo "$AWG_PARAMS"; echo ---; done')
+        rc, out, err = GEN[(proto, profile)]
         sets = [kv(b) for b in out.split("---") if b.strip()]
         label = f"{proto}/{profile}"
         chk(f"{label}: сгенерировано {N}", rc == 0 and len(sets) == N, err[-300:])
