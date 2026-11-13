@@ -169,6 +169,7 @@ VKBLOCK_DIR="$STATE_DIR/vkblock"; VKBLOCK_CONF="$VKBLOCK_DIR/vkblock.conf"; VKBL
 RUDIRECT_DIR="$STATE_DIR/rudirect"; RUDIRECT_CONF="$RUDIRECT_DIR/rudirect.conf"; RUDIRECT_USER="{ROOT}/etc/awg2/rudirect"
 RUDIRECT_LOG="{ROOT}/rudirect.log"; TUNFAIL_CONF="{ROOT}/etc/awg2/tunnel-fail.conf"; TUNFAIL_LOG="{ROOT}/tunfail.log"
 DIAG_FWD="{ROOT}/ip_forward"; RUDIRECT_RPF="{ROOT}/rpf"
+EXITS_HEALTH_DIR="{ROOT}/run/exits-health"; EXITS_LOCK="{ROOT}/exits.lock"; EXITS_HEALTH_LOG="{ROOT}/exits-health.log"
 AMNEZIA_STATE_DIR="$STATE_DIR/amnezia"
 AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"
 # Веб-панель: стенд (web_stand.py) передаёт свои конфиг и список адресов

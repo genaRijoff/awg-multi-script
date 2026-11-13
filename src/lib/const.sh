@@ -143,6 +143,14 @@ EXITS_PEERS="$EXITS_DIR/exits_peers.list"
 EXITS_STATE="$EXITS_DIR/exits_state"
 EXITS_UNIT="awg-exits-routing.service"
 EXITS_SCRIPT="/usr/local/bin/awg2-exits-routing.sh"
+# Сторож exit-нод: проба через ноду раз в 30 с; упала — 3 провала подряд
+# (интерфейс пропал — сразу), вернулась — 2 удачи. Состояние — в /run: после
+# перезагрузки ноды проверяются заново, а не числятся упавшими по старой памяти
+EXITS_HEALTH_DIR="/run/awg2-exits-health" EXITS_LOCK="/run/awg2-exits.lock"
+EXITS_HEALTH_LOG="/var/log/awg2-exits-health.log"
+EXITS_HEALTH_UNIT="awg2-exits-health.service" EXITS_HEALTH_TIMER="awg2-exits-health.timer"
+EXITS_HC_FAILS=3 EXITS_HC_OKS=2 EXITS_HC_TARGETS="1.1.1.1 8.8.8.8"
+EXITS_HC_URL="http://cp.cloudflare.com/generate_204"
 
 # ── Срок действия клиентов ────────────────────────────────
 EXPIRE_BIN="/usr/local/bin/awg2-expire-check"

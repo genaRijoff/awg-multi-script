@@ -3964,11 +3964,11 @@ async function tunnelsCards(ctx) {
           del ? kact("trash-2", "Удалить", (b) => quickAsk(b, ...del), "bad", lock)
             : kact("plus", "Нода", () => go("/tunnels/exits/add"))] });
   }
-  const nodeCard = (n) => kcard({ view, state: n.up ? "on" : exitsUp ? "bad" : "", name: n.name, iface: "awg-exit-" + n.name,
+  const nodeCard = (n) => kcard({ view, state: n.health === "down" ? "bad" : n.up ? "on" : exitsUp ? "bad" : "", name: n.name, iface: "awg-exit-" + n.name,
     attrs: { "data-name": "node-" + n.name }, onopen: () => go("/tunnels/exits"),
     chips: [kchip(n.proto === "awg" ? "AWG" : "WG", n.proto === "awg" ? "acc" : ""),
       E.balancer === "ecmp" ? kchip("ECMP", "", "scale") : E.single === n.name ? kchip("основная", "ok") : null,
-      n.up ? null : kchip(exitsUp ? "лежит" : "выключена", exitsUp ? "bad" : "")],
+      n.health === "down" ? kchip("не отвечает", "bad") : n.up ? null : kchip(exitsUp ? "лежит" : "выключена", exitsUp ? "bad" : "")],
     kv: [["Сервер", masked(n.endpoint || "")], ["Рукопожатие", n.up ? agoText(n.hs) : "—"]].concat(trafficKv(n.rx || 0, n.tx || 0)),
     extra: kTraffic(n.rx || 0, n.tx || 0),
     acts: [kact("users", "Клиенты", () => go("/tunnels/exits")), kact("file-text", "Журнал", () => go("/log/exits")),
@@ -4278,6 +4278,16 @@ route(/^\/tunnels\/tun2socks$/, async (ctx) => {
         ["t2s", "remove"]), "btn-danger") : null));
 });
 
+// Ноды в порядке общего выхода (основная, запасные) и их состояние у сторожа
+const exOrder = (d) => {
+  const by = Object.fromEntries((d.nodes || []).map((n) => [n.name, n]));
+  const names = (d.order || []).filter((n) => by[n]);
+  return names.concat((d.nodes || []).map((n) => n.name).filter((n) => !names.includes(n))).map((n) => by[n]);
+};
+const EX_WHY = { silent: "не отвечает", nonet: "на связи, но выхода в интернет нет", link: "интерфейс не поднят" };
+const exNodeState = (n) => (n.health === "down" ? `▲ ${EX_WHY[n.why] || "не отвечает"} с ${fmtTime(n.since)} — выпала из общего выхода`
+  : n.up ? "работает" + (n.hs ? " · рукопожатие " + agoText(n.hs) : "") : "лежит");
+
 // AWG exit-ноды: туннель вкл/выкл, кого вести (все или выбранные), выбор клиентов
 // и ноды каждому — на одном экране
 route(/^\/tunnels\/exits$/, async (ctx) => {
@@ -4364,11 +4374,21 @@ route(/^\/tunnels\/exits$/, async (ctx) => {
           : "Туннель выключен — выбор сохранится и сработает, когда его включишь.")]
         : hint("Все клиенты идут через ноды. «Выбранные» — отметить, кого вести; остальные — напрямую.")] : null,
     h("h2", {}, "Ноды"),
-    h("div", { class: "card list" }, nodes.length ? nodes.map((n) => h("div", { class: "item", onclick: () =>
-      quickAsk(null, `Удалить ноду ${n.name}? Её клиенты перейдут на общий выход.`, `Нода ${n.name} удалена`, ["exits", "del", n.name]) },
-    h("div", { class: "dot" + (n.up ? " on" : " bad") }),
-    h("div", { class: "main" }, h("div", { class: "title" }, n.name), h("div", { class: "sub" }, n.up ? "поднята" : "лежит")),
-    h("div", { class: "side bad" }, icon("trash-2")))) : h("div", { class: "empty" }, "Нод нет")),
+    up && d.active ? hint("Общий выход сейчас: " + String(d.active).replace(/\+/g, " + ") + ". Упавшая нода выпадает, "
+      + "основная снова отвечает — выход возвращается на неё.") : null,
+    up && d.watch === false ? h("div", { class: "small warn", style: "margin:0 4px 8px" },
+      "▲ Сторож exit-нод не запущен — автопереключения нет. Выключи и включи туннель.") : null,
+    h("div", { class: "card list", "data-name": "ex-nodes" }, nodes.length ? exOrder(d).map((n, i) => h("div", { class: "item", "data-node": n.name },
+      h("div", { class: "dot" + (n.health === "down" ? " bad" : n.up ? " on" : " bad") }),
+      h("div", { class: "main" }, h("div", { class: "title" }, n.name + " ",
+        h("span", { class: "small muted" }, d.balancer === "ecmp" ? "" : i === 0 ? "· основная" : `· запасная ${i}`)),
+      h("div", { class: "sub wrap" + (n.health === "down" ? " bad" : "") }, exNodeState(n))),
+      i > 0 && d.balancer !== "ecmp" ? h("button", { class: "chip", title: "Выше по порядку", "aria-label": "Выше: " + n.name,
+        onclick: (ev) => quick(ev.currentTarget, `${n.name} — ${i === 1 ? "основная" : "запасная " + (i - 1)}`,
+          ["exits", "order", ...exOrder(d).map((x) => x.name).map((x, j, a) => (j === i - 1 ? a[i] : j === i ? a[i - 1] : x))]) }, "⬆") : null,
+      h("div", { class: "side bad", role: "button", tabindex: "0", title: "Удалить ноду", "aria-label": "Удалить: " + n.name, onclick: () =>
+        quickAsk(null, `Удалить ноду ${n.name}? Её клиенты перейдут на общий выход.`, `Нода ${n.name} удалена`, ["exits", "del", n.name]) },
+      icon("trash-2")))) : h("div", { class: "empty" }, "Нод нет")),
     btn("➕ Добавить ноду", () => go("/tunnels/exits/add"), "btn-block" + (nodes.length ? "" : " btn-primary")),
     h("div", { class: "actions", style: "margin-top:8px" },
       nodes.length ? btn("⚖️ Балансировка", balance) : null,

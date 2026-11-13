@@ -61,6 +61,7 @@ SEND_MAX = 49 * 1024 * 1024                     # документ бота — 
 
 # id, подпись кнопки (полстроки в боте), полное название
 KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("warp", "WARP упал", "WARP упал или не отвечает и снова работает"),
+         ("exits", "Exit-ноды", "Exit-нода не отвечает и снова работает: общий выход переключается сам"),
          ("reboot", "Перезагрузка", "Сервер перезагрузился"),
          ("update", "Новая версия", "Новая версия Тулзы"), ("kernel", "Ядро без AWG", "Ядро без модуля AWG"),
          ("cert", "Сертификат", "Сертификат Mini App истекает"), ("disk", f"Диск {DISK_WARN}%", f"Диск заполнен на {DISK_WARN}%"),
@@ -75,6 +76,19 @@ SUPPORT_WDAY, SUPPORT_HOUR = 4, 12
 SUPPORT_GRACE = 3 * 86400
 SUPPORT_TEXT = ("<b>AWG Toolza</b> бесплатна и развивается на донаты.\n"
                 "Если Тулза тебе помогает — поддержи проект: так выходят новые версии.")
+
+
+EXIT_WHY = {"silent": "не отвечает", "nonet": "без выхода в интернет", "link": "лежит: интерфейс не поднят"}
+
+
+def exits_dead(raw: object) -> dict[str, str]:
+    """«nl1:silent,de1:nonet» из сводки awg2 → {нода: причина}."""
+    out: dict[str, str] = {}
+    for part in str(raw or "").split(","):
+        n, _, why = part.strip().partition(":")
+        if n:
+            out[n] = why or "silent"
+    return out
 
 
 def _as_int(value: object, default: int = 0) -> int:
@@ -315,6 +329,30 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             await notify(bot, update_text(d, upd),
                          ui.kb(ui.Row(("⬆️ Обновить", "upd:go"), ("📋 Что нового", "upd:notes"))))
         st["update"] = upd
+
+    # Exit-ноды: сторож awg2 признал ноду упавшей или вернувшейся — общий выход
+    # он уже переключил, здесь только сообщаем. Строка «нода:причина,…»
+    if t.get("exits") == "up":
+        dead = exits_dead(t.get("exits_dead"))
+        prev = st.get("exits_dead") if isinstance(st.get("exits_dead"), dict) else {}
+        active = str(t.get("exits_active") or "").replace("+", " + ")
+        if enabled("exits"):
+            for n, why in dead.items():
+                if n in prev:
+                    continue
+                tail = (f"Общий выход теперь: <b>{esc(active)}</b>." if active else
+                        "Живых нод не осталось — клиенты exit-нод " + ("ждут их без интернета (режим «блокировать»)."
+                                                                       if t.get("exits_block")
+                                                                       else "идут напрямую, с адреса сервера."))
+                await notify(bot, f"🔴 <b>{host}: exit-нода {esc(n)} {EXIT_WHY.get(why, EXIT_WHY['silent'])}</b>\n{tail}",
+                             ui.kb(("🚪 Exit-ноды", "ex")))
+            for n in prev:
+                if n not in dead:
+                    await notify(bot, f"🟢 <b>{host}: exit-нода {esc(n)} снова работает</b>"
+                                      + (f"\nОбщий выход: <b>{esc(active)}</b>." if active else ""))
+        st["exits_dead"] = dead
+    else:
+        st.pop("exits_dead", None)
 
     # Ядро без модуля: один раз на набор ядер
     gap = (d.get("components") or {}).get("kernel_gap") or ""

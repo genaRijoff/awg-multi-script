@@ -36,7 +36,7 @@ tunnels_remove_all() {
   for n in $(exits_nodes); do systemctl disable --now "awg-quick@awg-exit-$n" &>/dev/null || true; done
   remove_unit awg-warp.service awg-usque.service awg-warp-healthcheck.timer awg-warp-healthcheck.service \
     "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" awg-xray-rugeo.timer awg-xray-rugeo.service \
-    "$T2S_UNIT" "$EXITS_UNIT" awg-dns-persist.service awg-dns-healthcheck.timer awg-dns-healthcheck.service
+    "$T2S_UNIT" "$EXITS_UNIT" "$EXITS_HEALTH_TIMER" "$EXITS_HEALTH_UNIT" awg-dns-persist.service awg-dns-healthcheck.timer awg-dns-healthcheck.service
   cascade_uninstall quiet
   if [[ -f "$DNS_PROXY_STATE" ]]; then
     dns_rules_down

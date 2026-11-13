@@ -460,8 +460,52 @@ async def exits_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> N
         ("🎯 Выбранные", ex.data("up", "peers")) if nodes and (not up or d.get("mode") != "peers") else None,
         ("⏹ Выключить", ex.data("down")) if up else None,
         ("⚖️ Балансировка", ex.data("bal")) if nodes else None,
+        ("🪂 Порядок нод", ex.data("ord")) if len(nodes) > 1 else None,
         ("👥 Клиенты и ноды", ex.data("cl")) if nodes else None,
         ui.back("tun")))
+
+
+def _ex_node_state(n: dict) -> str:
+    if n.get("health") == "down":
+        return f"🔴 не отвечает с {ui.fmt_time(n.get('since') or 0)}"
+    return "🟢 работает" if n.get("up") else "⚪️ не поднята"
+
+
+@ex("ord")
+async def exits_order_screen(cb: CallbackQuery, state: FSMContext, arg: str = "", note: str = "") -> None:
+    d = await api.data("exits", "status", default={}) or {}
+    nodes = {n["name"]: n for n in d.get("nodes") or [] if isinstance(n, dict) and n.get("name")}
+    order = [n for n in d.get("order") or [] if n in nodes]
+    lines = ["<b>🪂 Порядок нод</b>",
+             "Общий выход — через первую живую ноду по порядку. Упала — следующая; основная снова отвечает — "
+             "выход вернётся на неё. Сторож проверяет выход в интернет через каждую ноду раз в 30 с.", ""]
+    if note:
+        lines += [note, ""]
+    for i, name in enumerate(order):
+        role = "основная" if i == 0 else f"запасная {i}"
+        lines.append(f"{i + 1}. <b>{esc(name)}</b> — {role} · {_ex_node_state(nodes[name])}")
+    if d.get("active"):
+        lines.append(f"\n➡️ Общий выход сейчас: <b>{esc(str(d['active']).replace('+', ' + '))}</b>")
+    if d.get("balancer") == "ecmp":
+        lines.append("<i>Сейчас ECMP: трафик делится между всеми живыми нодами, порядок вступит в силу "
+                     "в режиме «одна нода».</i>")
+    if d.get("up") and not d.get("watch"):
+        lines.append("▲ Сторож не запущен — автопереключения нет. Выключи и включи маршруты exit-нод.")
+    await ui.render(cb, "\n".join(lines), ui.kb(
+        [(f"⬆️ {n}", ex.data("ordup", n)) for n in order[1:]], ui.back("ex")))
+
+
+@ex("ordup")
+async def _ex_order_up(cb: CallbackQuery, state: FSMContext, name: str) -> None:
+    d = await api.data("exits", "status", default={}) or {}
+    order = [str(n) for n in d.get("order") or []]
+    if name in order and order.index(name) > 0:
+        i = order.index(name)
+        order[i - 1], order[i] = order[i], order[i - 1]
+    r = await api.call("exits", "order", *order)
+    await exits_order_screen(cb, state, note=(f"✅ {esc(name)} — " + ("основная" if order[:1] == [name] else
+                                                                     f"запасная {order.index(name)}"))
+                             if r.ok else ui.fail(r, "Порядок нод"))
 
 
 @ex("add")
@@ -525,8 +569,8 @@ async def _ex_bal(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     d = await api.data("exits", "status", default={}) or {}
     nodes = d.get("nodes") or []
     cur = "ecmp" if d.get("balancer") == "ecmp" else d.get("single") or ""
-    await ui.render(cb, "<b>⚖️ Балансировка</b>\nОдна нода — весь общий трафик через неё; "
-                        "ECMP — поровну между поднятыми нодами.",
+    await ui.render(cb, "<b>⚖️ Балансировка</b>\nОдна нода — весь общий трафик через неё (упала — через "
+                        "следующую по порядку); ECMP — поровну между живыми нодами.",
                     ui.kb([(f"{'🔘' if cur == n['name'] else '⚪️'} {n['name']}",
                             ex.data("balset", f"single|{n['name']}")) for n in nodes],
                           (f"{'🔘' if cur == 'ecmp' else '⚪️'} ECMP", ex.data("balset", "ecmp|")),

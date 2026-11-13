@@ -2,7 +2,7 @@
 # Маршрутизация туннелей на настоящем ядре: правила клиентов, «если туннель
 # упал» (unreachable под маршрутом), метка и правило «РФ напрямую», «куда идёт
 # адрес» — настоящими ip, ipset и iptables в отдельном сетевом пространстве.
-# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf
+# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits
 # (или через tests/test_kernel_routing.py — он сам пропустит, если netns нет).
 # shellcheck disable=SC2034  # пути — для функций awg2, подключённых через eval
 set -u
@@ -163,7 +163,7 @@ out=$(diag_route alice 1.1.1.1); ok "пересылка выключена — n
 echo 1 > /proc/sys/net/ipv4/ip_forward
 _rud_set ON 0; rudirect_run off
 ok "off: правила и набор сняты" '! ipset list -n awg2-ru &>/dev/null && ! iptables-save -t mangle | grep -q awg2-rudirect && ! ip rule show | grep -q fwmark'
-else
+elif [[ "$PART" == rpf ]]; then
 echo "── РФ напрямую: настоящий трафик и строгий rp_filter на аплинке ──"
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
 mkdir -p "$RUDIRECT_DIR" "$RUDIRECT_USER"
@@ -187,6 +187,91 @@ rudirect_run heal
 ok "…починен (eth0=2 сильнее all=1) — ответ есть" '[[ "$(rpf eth0)" == 2 ]] && rudirect_rules_ok && reach 77.1.1.1'
 echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
 out=$(diag_route bob 77.1.1.1); ok "клиент без туннеля при строгом — rudirect без подсказки (обратный путь и так eth0)" '[[ "$out" == *$'"'"'\trudirect\teth0\t'"'"'* ]]'
+elif [[ "$PART" == exits ]]; then
+echo "── Сторож exit-нод: ноды — настоящие сетевые пространства, проба — настоящий ping ──"
+command -v ping &>/dev/null || { echo "ПРОПУСК exits: нет ping"; exit 0; }
+EXITS_DIR="$T/exits"; mkdir -p "$EXITS_DIR"; EXITS_PEERS="$EXITS_DIR/exits_peers.list"
+EXITS_HEALTH_DIR="$T/health"; EXITS_LOCK="$T/exits.lock"; EXITS_HEALTH_LOG="$T/health.log"
+EXITS_HC_URL="http://127.0.0.1:9/"           # HTTP-проба — сразу отказ, без DNS
+awg() { :; }                                   # рукопожатий нет — «не отвечает»
+NS=()
+for n in a b; do
+  unshare -n sleep 600 & NS+=($!); sleep 0.2
+  : > "$EXITS_DIR/awg-exit-$n.conf"
+done
+trap 'kill "${NS[@]}" 2>/dev/null' EXIT
+node_on() {  # нода: адреса «интернета» на её стороне — проба проходит
+  local p="${NS[$([[ $1 == a ]] && echo 0 || echo 1)]}"
+  nsenter -t "$p" -n sh -c 'ip addr add 1.1.1.1/32 dev n0 2>/dev/null; ip addr add 8.8.8.8/32 dev n0 2>/dev/null; true'
+}
+node_off() {
+  local p="${NS[$([[ $1 == a ]] && echo 0 || echo 1)]}"
+  nsenter -t "$p" -n sh -c 'ip addr del 1.1.1.1/32 dev n0 2>/dev/null; ip addr del 8.8.8.8/32 dev n0 2>/dev/null; true'
+}
+mknode() {  # нода → veth awg-exit-<нода> ↔ n0 в её пространстве
+  local i=$([[ $1 == a ]] && echo 1 || echo 2) p="${NS[$([[ $1 == a ]] && echo 0 || echo 1)]}"
+  ip link add "awg-exit-$1" type veth peer name n0 netns "$p"
+  ip addr add "10.200.$i.1/30" dev "awg-exit-$1"; ip link set "awg-exit-$1" up
+  nsenter -t "$p" -n sh -c "ip link set lo up; ip addr add 10.200.$i.2/30 dev n0; ip link set n0 up"
+  node_on "$1"
+}
+mknode a; mknode b
+printf 'active\nmode=peers\nbalancer=single\nsingle_exit=a\norder=b\n' > "$EXITS_STATE"
+printf '10.23.45.2\n10.23.45.3|b\n' > "$EXITS_PEERS"
+echo "exits=block" > "$TUNFAIL_CONF"
+hc() { local i; for i in $(seq 1 "$1"); do exits_routing_run health; done; }
+exits_routing_run start
+ok "старт: общий выход — основная a, персональная нода клиента — b" \
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* && "$(rg 1.1.1.1 10.23.45.3)" == *"dev awg-exit-b"* ]]'
+hc 1
+ok "проба через ноду настоящим ping: обе живы — ничего не меняется, «up» у обеих" \
+  '[[ "$(exits_shared_now)" == a && "$(_exits_hstate a)" == "up 0 1 "* && "$(_exits_hstate b)" == "up 0 1 "* ]]'
+node_off a; hc 2
+ok "a молчит 2 проверки — ещё основная (упала — после 3)" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]]'
+hc 1
+ok "a молчит 3 проверки — общий выход переключён на запасную b, правило клиента прежнее" \
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-b"* && "$(ip rule show | grep -c "from 10.23.45.2 lookup 202")" == 1 ]]'
+ok "журнал: нода a не отвечает, общий выход a → b" 'grep -q "нода a: не отвечает" "$EXITS_HEALTH_LOG" && grep -q "общий выход: a → b" "$EXITS_HEALTH_LOG"'
+node_off b
+orig_online=$(declare -f _exits_server_online)
+_exits_server_online() { return 0; }          # у сервера интернет есть: молчат именно ноды
+hc 3
+ok "обе молчат, «блокировать» — клиенты удержаны: «недоступно», правила на месте" \
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* && "$(rg 1.1.1.1 10.23.45.3)" == *"No route"* ]] && ip rule show | grep -q "from 10.23.45.3 lookup 211"'
+node_on a; hc 1
+ok "a ответила 1 раз — ещё не вернулась (нужно 2)" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* ]]'
+hc 1
+ok "a вернулась — общий выход снова через неё; клиент лежащей b — через общий выход" \
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* && "$(rg 1.1.1.1 10.23.45.3)" == *"dev awg-exit-a"* ]]'
+node_on b; hc 2
+ok "b вернулась — её клиент снова через b" '[[ "$(rg 1.1.1.1 10.23.45.3)" == *"dev awg-exit-b"* ]]'
+printf 'active\nmode=peers\nbalancer=single\nsingle_exit=b\norder=a\n' > "$EXITS_STATE"
+exits_routing_run refresh
+ok "порядок поменяли (основная b) — общий выход на ходу через b" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-b"* ]]'
+ip link del awg-exit-b; hc 1
+ok "интерфейс b пропал — сразу, без трёх проверок: общий выход на a" \
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* && "$(_exits_hstate b)" == "down "*" link" ]]'
+mknode b; hc 2
+ok "b снова поднята и отвечает — основная b снова общий выход" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-b"* ]]'
+printf 'active\nmode=peers\nbalancer=ecmp\nsingle_exit=a\norder=b\n' > "$EXITS_STATE"
+exits_routing_run start
+ok "ECMP: обе живы — общий выход по обеим" '[[ "$(ip route show table 202)" == *"nexthop dev awg-exit-a"*"nexthop dev awg-exit-b"* ]]'
+node_off a; hc 3
+ok "ECMP: a упала — выпала, общий выход только через b" \
+  '[[ "$(ip route show table 202 | grep default | grep -v unreachable)" == "default dev awg-exit-b"* && "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-b"* ]]'
+node_on a; hc 2
+echo "exits=direct" > "$TUNFAIL_CONF"
+node_off a; node_off b; hc 3
+ok "обе молчат, «напрямую» — правила сняты, клиенты идут с адреса сервера" \
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]] && ! ip rule show | grep -q "lookup 202"'
+node_on a; hc 2
+ok "a вернулась после «напрямую» — правила клиентов снова на месте, общий выход через a" \
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]] && ip rule show | grep -q "from 10.23.45.2 lookup 202"'
+eval "$orig_online"                           # настоящая проверка: у сервера в тесте интернета нет
+node_off a; node_off b
+hc 3
+ok "все молчат, у сервера нет интернета — ноды не трогаем" \
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]] && grep -q "у сервера нет выхода в интернет" "$EXITS_HEALTH_LOG"'
 fi
 echo "проверок: $((pass+fail)), провалов: $fail"
 (( fail == 0 ))

@@ -652,6 +652,12 @@ with open(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_state"), "w") as f:
     f.write("active\nmode=peers\nbalancer=ecmp\nsingle_exit=\n")
 os.remove(os.path.join(ROOT, "etc/amnezia/amneziawg/exits_peers.list.wgobf"))
 run_and_check("Exit-ноды: остановка", "EXITS_SCRIPT", "stop", must_not=[r"-A "])
+run_and_check("Exit-ноды: проход сторожа — пробы через ноды, без «command not found»", "EXITS_SCRIPT", "health",
+              must=[r"ip link show awg-exit-de", r"ip link show awg-exit-nl"])
+hu = open(os.path.join(ROOT, "units", "awg2-exits-health.timer")).read()
+hs = open(os.path.join(ROOT, "units", "awg2-exits-health.service")).read()
+chk("сторож exit-нод: таймер раз в 30 с, служба зовёт «health» скрипта маршрутов",
+    "OnUnitActiveSec=30" in hu and re.search(r"(?m)^ExecStart=\S+ health$", hs), [hu, hs])
 # Клиенты WG + обфускатора в WARP: список «.wgobf» рядом со списком WARP читает тот же rt_up
 rc, out, _ = bash('echo 10.23.45.2 > "$WARP_PEERS"; printf "10.77.1.5\\n" > "$WARP_PEERS.wgobf"; echo "$WARP_PEERS"')
 run_and_check("WARP (хук usque): клиенты AWG и обфускатора — в таблицу 200, MSS и для wgobf0", "USQUE_UP_HOOK",
@@ -1836,6 +1842,61 @@ chk("api exits status не ждёт проверку выхода через н�
 r = api("exits", "status", "check")
 chk("api exits status check — с проверкой выхода в интернет через ноду", r.get("ok") and "интернет" in r.get("log", ""),
     r.get("log", "")[-300:])
+# Сторож exit-нод: порядок общего выхода, состояние нод, сводка для оповещений бота
+EXST, HD = os.path.join(AWGD, "exits_state"), os.path.join(ROOT, "run/exits-health")
+st_was = open(EXST).read() if os.path.exists(EXST) else None
+with open(os.path.join(AWGD, "awg-exit-n3.conf"), "w") as f:
+    f.write("[Interface]\nTable = off\n[Peer]\nEndpoint = 5.6.7.8:51820\n")
+with open(LINKS, "a") as f:
+    f.write("awg-exit-n3\n")
+with open(EXST, "w") as f:
+    f.write("inactive\nmode=peers\nbalancer=single\nsingle_exit=\norder=\n")
+r = api("exits", "order", "n3", "n2")
+d = api("exits", "status").get("data") or {}
+st = open(EXST).read()
+chk("exits order: первая — основная, дальше запасные; в статусе порядок и общий выход",
+    r.get("ok") and "single_exit=n3" in st and "order=n2" in st and (d.get("order") or [])[:2] == ["n3", "n2"]
+    and "Порядок общего выхода: n3 → n2" in r.get("log", ""), [r.get("log", "")[-300:], st, d.get("order")])
+r1, r2 = api("exits", "order", "zz"), api("exits", "order")
+chk("exits order: нет такой ноды или пусто — отказ, порядок прежний",
+    r1.get("ok") is False and r2.get("ok") is False
+    and ((api("exits", "status").get("data") or {}).get("order") or [])[:2] == ["n3", "n2"],
+    [r1, r2])
+os.makedirs(HD, exist_ok=True)
+with open(os.path.join(HD, "n3"), "w") as f:
+    f.write("down 3 0 1791500000 nonet\n")
+nodes = {n["name"]: n for n in (api("exits", "status").get("data") or {}).get("nodes") or []}
+rc, out, _ = bash("exits_dead_list; exits_order | paste -sd' '; exits_live_nodes | paste -sd' '")
+chk("нода упала у сторожа: в статусе health=down, с какого времени и причина; живые — без неё, порядок прежний",
+    nodes.get("n3", {}).get("health") == "down" and nodes["n3"].get("why") == "nonet" and nodes["n3"].get("since") == 1791500000
+    and nodes.get("n2", {}).get("health") == "" and out.split("\n")[0] == "n3:nonet"
+    and out.split("\n")[1].startswith("n3 n2") and out.split("\n")[2] == "n2", [nodes, out])
+rc, out, _ = bash("_exits_node_line n3")
+chk("статус ноды в журнале экрана: не отвечает с …, причина, выпала из общего выхода",
+    "не отвечает с" in out and "выхода в интернет нет" in out and "выпала из общего выхода" in out, out)
+with open(ACTIVE, "a") as f:
+    f.write("awg-exits-routing.service\nawg2-exits-health.timer\n")
+t = (api("status").get("data") or {}).get("tunnels") or {}
+rc, out, _ = bash("exits_status")
+chk("сводка для оповещений: упавшие ноды «нода:причина», общий выход сейчас — первая живая по порядку",
+    t.get("exits_dead") == "n3:nonet" and t.get("exits_active") == "n2", t)
+chk("статус exit-нод: порядок, общий выход сейчас, сторож запущен",
+    "по порядку: n3 → n2" in out and "Общий выход: " in out and "n2" in out and "Сторож" in out and "раз в 30 с" in out, out)
+reset_calls()
+r = api("exits", "order", "n2", "n3")
+chk("exits order при работающих нодах — на ходу (refresh), без перезапуска маршрутов",
+    r.get("ok") and "ip route replace default dev awg-exit-n2 table 202" in calls(), [calls()[-500:], r.get("log", "")[-300:]])
+os.remove(os.path.join(HD, "n3"))
+os.remove(os.path.join(AWGD, "awg-exit-n3.conf"))
+with open(ACTIVE) as f:
+    act = f.read()
+with open(ACTIVE, "w") as f:
+    f.write(act.replace("awg-exits-routing.service\nawg2-exits-health.timer\n", ""))
+if st_was is None:
+    os.remove(EXST)
+else:
+    with open(EXST, "w") as f:
+        f.write(st_was)
 with open(LINKS, "w") as f:
     f.write(links0)
 with open(os.path.join(ROOT, "etc/awg-cascade/rules.conf")) as f:
@@ -3943,8 +4004,8 @@ chk("правило клиента exit-ноды на месте — второ�
 open(LINKS, "w").write(links_was)
 reset_calls()
 rc, out, _ = bash(WSTUB + '_wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')
-chk("нода клиента лежит — правило на общий выход exit-нод, а не в пустоту",
-    "ip rule add from 10.66.66.3 lookup 202 priority 202" in calls(), calls())
+chk("нода клиента лежит — правило в таблицу её ноды (там общий выход или «недоступно»): вернётся — сторож вернёт маршрут",
+    re.search(r"ip rule add from 10\.66\.66\.3 lookup 21\d priority 202", calls()), calls())
 open(ACTIVE, "w").write(active_was)
 reset_calls()
 rc, out, _ = bash(WSTUB + '_wgobf_route_refresh "$(_xray_outs)" "$(sort "$EXITS_PEERS.wgobf")"')

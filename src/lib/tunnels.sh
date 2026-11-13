@@ -320,7 +320,8 @@ tunnels_panic_reset() {
   # и остановка служб иначе удержали бы клиентов включённого туннеля
   rm -f "$XRAY_STATE" "$EXITS_STATE" "$WARP_STATE"
   # Автозапуск тоже снимаем: иначе после перезагрузки туннель вернётся
-  for u in "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" "$T2S_UNIT" "$EXITS_UNIT" awg-usque.service awg-warp.service; do
+  for u in "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" "$T2S_UNIT" "$EXITS_HEALTH_TIMER" "$EXITS_UNIT" \
+           awg-usque.service awg-warp.service; do
     systemctl disable --now "$u" &>/dev/null || true
     systemctl reset-failed "$u" &>/dev/null || true
   done

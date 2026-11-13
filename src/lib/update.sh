@@ -313,7 +313,10 @@ helpers_refresh() {
   fi
   [[ -f "$T2S_ROUTING_SCRIPT" ]] && emit_script "$T2S_ROUTING_SCRIPT" 't2s_routing_run "$@"' \
     T2S_IF T2S_TABLE T2S_ADDR "${RT_FUNCS[@]}" t2s_routing_run
-  [[ -f "$EXITS_SCRIPT" ]] && _exits_write_unit
+  # Сторож exit-нод — и у тех, кто включил ноды до его появления
+  if [[ -f "$EXITS_SCRIPT" ]]; then
+    _exits_write_unit && exits_is_up && systemctl enable --now "$EXITS_HEALTH_TIMER" &>/dev/null
+  fi
   antiscan_on && _antiscan_emit &>/dev/null
   vkblock_on && _vkblock_emit &>/dev/null
   rudirect_on && _rudirect_emit &>/dev/null

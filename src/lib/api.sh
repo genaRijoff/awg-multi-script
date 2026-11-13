@@ -114,6 +114,11 @@ _api_status() {
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
+    # Для оповещений бота: упавшие ноды «имя:причина,…», общий выход сейчас
+    if exits_is_up; then
+      _kv tunnels.exits_dead "$(exits_dead_list)"; _kv tunnels.exits_active "$(exits_shared_now)"
+      _kv tunnels.exits_block:b "$(_b tunfail_block exits)"
+    fi
     _kv tunnels.cascade:n "$(cascade_count)"
     if dns_installed; then _kv tunnels.dns "$(dns_running && echo up || echo off)"
     else _kv tunnels.dns none; fi
@@ -652,7 +657,9 @@ _api_exits() {
     status)
       { _kv up:b "$(_b exits_is_up)"; _kv mode "$(exits_state_get mode)"
         _kv balancer "$(exits_state_get balancer)"; _kv single "$(exits_state_get single_exit)"
-        _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto)"; } | api_obj
+        _kv order:j "$(exits_order | py json-list)"; _kv active "$(exits_is_up && exits_shared_now)"
+        _kv watch:b "$(_b unit_active "$EXITS_HEALTH_TIMER")"; _kv block:b "$(_b tunfail_block exits)"
+        _kv nodes:j "$(exits_node_rows | py json-rows name up:b endpoint hs:n rx:n tx:n proto health since:n why)"; } | api_obj
       # Проверка выхода в интернет через каждую ноду (до 5 с на ноду) — только по
       # «exits status check», для экрана exit-нод: список клиентов, обзор и туннели
       # зовут status на каждом открытии и ждать её не должны
@@ -671,12 +678,15 @@ _api_exits() {
     balance)
       [[ -n "${1:-}" ]] || { _api_usage "exits balance single НОДА|ecmp"; return; }
       exits_balance "$1" "${2:-}" ;;
+    order)
+      [[ -n "${1:-}" ]] || { _api_usage "exits order НОДА [НОДА...]"; return; }
+      exits_set_order "$@" ;;
     mode) exits_mode "${1:-}" ;;
     client)
       # all / none без второго аргумента — все клиенты; с ним — клиент с таким именем
       [[ "${1:-}" == all || "${1:-}" == none || -n "${2:-}" ]] || { _api_usage "exits client ИМЯ off|shared|НОДА | all | none"; return; }
       exits_client "$1" "${2:-}" ;;
-    *) _api_usage "exits status [check]|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|client ИМЯ off|shared|НОДА|all|none" ;;
+    *) _api_usage "exits status [check]|add ИМЯ (stdin)|del ИМЯ|up [all|peers]|down|mode all|peers|balance single НОДА|ecmp|order НОДА...|client ИМЯ off|shared|НОДА|all|none" ;;
   esac
 }
 

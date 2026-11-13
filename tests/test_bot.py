@@ -70,7 +70,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "awg_bot"))
 from awgbot import admins, api as botapi, bot as botmod, jobs, store, ui, webapp  # noqa: E402
 
 USER_NAMED = ("cl:v:", "tc:t:", "ex:pick:", "xr:delok:", "xr:delq:", "wo:v:", "adm:rm:", "diag:sn:", "mod:tag:",
-              "ent:e:", "cl:ents:")
+              "ent:e:", "cl:ents:", "ex:ordup:")
 
 logging.getLogger("aiogram").setLevel(logging.WARNING)
 
@@ -666,6 +666,31 @@ async def run():
     text, buttons = screen(await press(node))
     chk("удаление exit-ноды переспрашивает", "n1" in text and ("🗑 Удалить", "ex:delok:n1") in buttons
         and os.path.exists(os.path.join(awg_dir, "awg-exit-n1.conf")), [text, buttons])
+    # Порядок нод: основная и запасные, ⬆️ меняет местами; упавшая нода — с меткой
+    with open(os.path.join(awg_dir, "awg-exit-n2.conf"), "w") as f:
+        f.write("[Interface]\nPrivateKey = X\nTable = off\n\n[Peer]\nEndpoint = 1.2.3.5:51820\n")
+    _, buttons = screen(await press("ex"))
+    chk("две ноды — на экране exit-нод кнопка «Порядок нод»", ("🪂 Порядок нод", "ex:ord") in buttons, buttons)
+    text, buttons = screen(await press("ex:ord"))
+    chk("порядок: n1 основная, n2 запасная, кнопка ⬆️ только у запасной",
+        "1. <b>n1</b> — основная" in text and "2. <b>n2</b> — запасная 1" in text
+        and [d for _, d in buttons if d.startswith("ex:ordup:")] == ["ex:ordup:n2"], [text, buttons])
+    text, buttons = screen(await press("ex:ordup:n2"))
+    with open(os.path.join(awg_dir, "exits_state")) as f:
+        exs = f.read()
+    chk("⬆️ n2 — основная: в состоянии single_exit=n2, n1 запасная",
+        "✅ n2 — основная" in text and "1. <b>n2</b> — основная" in text and "single_exit=n2" in exs
+        and "order=n1" in exs, [text, exs])
+    hdir = os.path.join(ROOT, "run", "exits-health")
+    os.makedirs(hdir, exist_ok=True)
+    with open(os.path.join(hdir, "n2"), "w") as f:
+        f.write("down 3 0 %d nonet\n" % int(time.time()))
+    text, _ = screen(await press("ex:ord"))
+    chk("упавшая n2 — «🔴 не отвечает с …»", "<b>n2</b> — основная · 🔴 не отвечает с" in text, text)
+    os.remove(os.path.join(hdir, "n2"))
+    os.remove(os.path.join(awg_dir, "awg-exit-n2.conf"))
+    with open(os.path.join(awg_dir, "exits_state"), "w") as f:
+        f.write("active\nmode=all\nbalancer=single\nsingle_exit=n1\n")
 
     print("Xray: свой выход клиенту")
     with open(LINKS) as f:
@@ -1012,6 +1037,53 @@ async def run():
     n = len(probes)
     await al.tick(BOT, st6)
     chk("WARP выключен — без проверок", len(probes) == n, probes[n:])
+    # Exit-ноды: сторож awg2 выкинул ноду из общего выхода — 🔴 один раз, вернулась — 🟢
+    ex = {"dead": "", "active": "de", "block": False}
+
+    async def exits_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"exits": "up", "exits_dead": ex["dead"], "exits_active": ex["active"],
+                                "exits_block": ex["block"]}}
+        return await real_data(*args, **kw)
+    al.api.data = exits_status
+    st7 = {"boot": "boot-B"}
+
+    def ex_said(mark):
+        return [t for t in said(mark) if "exit-нода" in t]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("exit-ноды живы — молчит", not ex_said(mark), ex_said(mark))
+    ex.update(dead="de:nonet", active="nl")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    rep = [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "exit-нода de" in (m.text or "")]
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("нода de без интернета — 🔴 с причиной, новым общим выходом и кнопкой «Exit-ноды»",
+        len(rep) == 1 and "без выхода в интернет" in rep[0].text and "Общий выход теперь: <b>nl</b>" in rep[0].text
+        and cbs == ["ex"], [ex_said(mark), cbs])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("пока нода лежит — молчит", not ex_said(mark), ex_said(mark))
+    ex.update(dead="de:nonet,nl:silent", active="", block=True)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("упала и вторая, живых нет, режим «блокировать» — только про nl: клиенты ждут без интернета",
+        len(ex_said(mark)) == 1 and "exit-нода nl не отвечает" in ex_said(mark)[0]
+        and "ждут их без интернета" in ex_said(mark)[0], ex_said(mark))
+    ex.update(dead="nl:silent", active="de", block=False)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("de вернулась — 🟢 «снова работает» с общим выходом, про nl молчит",
+        len(ex_said(mark)) == 1 and "exit-нода de снова работает" in ex_said(mark)[0]
+        and "Общий выход: <b>de</b>" in ex_said(mark)[0], ex_said(mark))
+    al.set_enabled("exits", False)
+    ex.update(dead="", active="de + nl".replace(" + ", "+"))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st7)
+    chk("уведомление «Exit-ноды» выключено — молчит, но состояние помнит",
+        not ex_said(mark) and st7.get("exits_dead") == {}, [ex_said(mark), st7])
+    al.set_enabled("exits", True)
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",

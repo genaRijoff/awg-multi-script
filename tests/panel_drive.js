@@ -1095,6 +1095,34 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click(".exmode button:has-text('Все клиенты')");
     await page.waitForSelector("[data-tunnel=on] >> text=включён · все клиенты");
   });
+  await step("exit-ноды: порядок нод и упавшая нода", async () => {
+    const fs = require("fs"), R = "#app:not(.reloading) ", awg = `${sandboxRoot}/etc/amnezia/amneziawg`,
+      hdir = `${sandboxRoot}/run/exits-health`;
+    fs.writeFileSync(`${awg}/awg-exit-n2.conf`, "[Interface]\nPrivateKey = X\nTable = off\n\n[Peer]\nEndpoint = 1.2.3.5:51820\n");
+    fs.mkdirSync(hdir, { recursive: true });
+    fs.writeFileSync(`${hdir}/n1`, `down 3 0 ${Math.floor(Date.now() / 1000)} nonet\n`);
+    try {
+      // Сводку бот держит в кэше 5 с — нода и её здоровье появились мимо awg2
+      await page.waitForTimeout(5500);
+      await nav("/tunnels/exits", R + "[data-name=ex-nodes] [data-node=n2]");
+      await page.waitForSelector("[data-node=n1] >> text=основная");
+      await page.waitForSelector("[data-node=n1] >> text=на связи, но выхода в интернет нет");
+      await page.waitForSelector("[data-node=n1] >> text=выпала из общего выхода");
+      await page.waitForSelector("[data-node=n2] >> text=запасная 1");
+      if (await page.$("[data-node=n1] button[aria-label^='Выше']")) throw new Error("у основной ноды есть ⬆");
+      await shot("36b-exit-order");
+      await page.click("[data-node=n2] button[aria-label='Выше: n2']");
+      await page.waitForSelector(".toast >> text=Порядок общего выхода: n2 → n1");
+      await page.waitForSelector(R + "[data-node=n2] >> text=основная");
+      const first = await page.$eval("[data-name=ex-nodes] .item", (e) => e.dataset.node);
+      if (first !== "n2") throw new Error("после ⬆ первой должна быть n2, а не " + first);
+      await page.click("[data-node=n1] button[aria-label='Выше: n1']");
+      await page.waitForSelector(".toast >> text=Порядок общего выхода: n1 → n2");
+    } finally {
+      fs.unlinkSync(`${awg}/awg-exit-n2.conf`);
+      fs.rmSync(`${hdir}/n1`, { force: true });
+    }
+  });
   await step("каскад: добавить", async () => {
     await nav("/tunnels/cascade/add", "input");
     await page.fill("input[placeholder='51820']", "5555");
@@ -1726,13 +1754,14 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot", "text=Уведомления");
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
-    if (await page.locator(".switch.on").count() !== 8) throw new Error("ждали 8 включённых уведомлений");
+    if (await page.locator(".switch.on").count() !== 9) throw new Error("ждали 9 включённых уведомлений");
+    await page.waitForSelector(".card.item:has-text('Exit-нода не отвечает и снова работает')");
     await page.waitForSelector(".card.item:has-text('WARP упал или не отвечает и снова работает')");
     await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
-    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 7);
+    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 8);
     await nav("/bot/alerts", ".switch");
-    if (await page.locator(".switch.on").count() !== 7) throw new Error("выключенное уведомление не сохранилось");
+    if (await page.locator(".switch.on").count() !== 8) throw new Error("выключенное уведомление не сохранилось");
     await shot("52a-alerts");
   });
   await step("меню бота в чат", async () => {
