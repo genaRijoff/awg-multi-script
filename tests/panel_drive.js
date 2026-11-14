@@ -1048,6 +1048,35 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (await page.textContent(sel + " .sub") !== now) throw new Error("на сервере другое: " + await page.textContent(sel + " .sub"));
   });
   await step("Xray", async () => { await nav("/tunnels/xray", "text=Установить"); await shot("33-xray"); });
+  await step("Xray: через выход трафик не идёт — что делать, на экране Xray и на главной", async () => {
+    const R = "#app:not(.reloading) ";
+    const fake = async (r) => {
+      if ((r.request().postData() || "").includes('["xray","status"]')) return r.fulfill({ contentType: "application/json", body: JSON.stringify({
+        ok: true, rc: 0, data: { installed: true, up: true, tags: ["vl1"], main: "vl1", fail: "notraffic" },
+        log: "  Туннель   : ▲ включён, но через выход трафик не идёт — клиенты Xray не в туннеле\n" }) });
+      return r.continue();
+    };
+    const st = async (r) => {
+      const resp = await r.fetch(), d = await resp.json();
+      d.tunnels = Object.assign(d.tunnels || {}, { xray_fail: "notraffic" });
+      return r.fulfill({ response: resp, body: JSON.stringify(d) });
+    };
+    await page.route("**/api/call", fake);
+    await page.route("**/api/status", st);
+    try {
+      await nav("/tunnels/xray", R + "[data-name=xray-fail]");
+      const t = await page.textContent("[data-name=xray-fail]");
+      if (!/Через выход трафик не идёт/.test(t) || !/устареть/.test(t) || !/Диагностика/.test(t) || !/Журнал/.test(t))
+        throw new Error("предупреждение: " + t);
+      await shot("33b-xray-fail");
+      await nav("/", "h1");
+      await page.evaluate(() => refreshStatus());
+      await page.waitForSelector(R + "[data-name=alerts] >> text=Xray: через выход трафик не идёт");
+    } finally {
+      await page.unroute("**/api/call", fake);
+      await page.unroute("**/api/status", st);
+    }
+  });
   await step("tun2socks", async () => {
     await nav("/tunnels/tun2socks", "input");
     await expectAlert("IP:ПОРТ", async () => { await page.fill("input", "нет"); await page.click("text=Включить"); });
@@ -1759,14 +1788,15 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await nav("/bot", "text=Уведомления");
     await page.click("text=Уведомления");
     await page.waitForSelector("h1:has-text('Уведомления')");
-    if (await page.locator(".switch.on").count() !== 9) throw new Error("ждали 9 включённых уведомлений");
+    if (await page.locator(".switch.on").count() !== 10) throw new Error("ждали 10 включённых уведомлений");
+    await page.waitForSelector(".card.item:has-text('Xray: через выход трафик не идёт и снова работает')");
     await page.waitForSelector(".card.item:has-text('Exit-нода не отвечает и снова работает')");
     await page.waitForSelector(".card.item:has-text('WARP упал или не отвечает и снова работает')");
     await page.waitForSelector(".card.item:has-text('Пятница: поддержать проект') >> text=только владельцу");
     await page.click(".card.item >> text=Диск заполнен");
-    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 8);
+    await page.waitForFunction(() => document.querySelectorAll(".switch.on").length === 9);
     await nav("/bot/alerts", ".switch");
-    if (await page.locator(".switch.on").count() !== 8) throw new Error("выключенное уведомление не сохранилось");
+    if (await page.locator(".switch.on").count() !== 9) throw new Error("выключенное уведомление не сохранилось");
     await shot("52a-alerts");
   });
   await step("меню бота в чат", async () => {

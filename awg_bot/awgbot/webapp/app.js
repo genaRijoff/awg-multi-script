@@ -2031,10 +2031,12 @@ const alertCard = (alerts) => (alerts.length ? h("div", { class: "card warn", "d
 
 // Предупреждения сервера — те же, что были на главной
 function homeAlerts(d) {
-  const s = d.server || {}, c = d.components || {};
+  const s = d.server || {}, c = d.components || {}, t = d.tunnels || {};
   forgetAlerts(d.components, c.reboot);
   return [
     s.exists && !s.up ? ["awg0 не поднят — Сервер → Починить", "/server"] : null,
+    t.xray_fail ? [t.xray_fail === "down" ? "Xray включён, но не запущен — перезапусти его"
+      : "Xray: через выход трафик не идёт — проверь ссылку выхода", "/tunnels/xray"] : null,
     c.installed && c.reboot && !alertHidden(c.reboot) ? [c.reboot, "/server/module", !/не (собран|загружен)/.test(c.reboot)] : null,
     c.kernel_gap ? [`Ядро ${c.kernel_gap} без модуля AWG — пересобрать до перезагрузки`, "/server/module"] : null,
     d.update ? [`Доступна ${d.update} — обновить`, "/update"] : null,
@@ -3923,7 +3925,8 @@ async function tunnelsCards(ctx) {
       const own = (X.clients || []).length, i = ifs.xray0 || {};
       iface = "xray0";
       chips = [kchip(`${outs.length} ${plural(outs.length, "выход", "выхода", "выходов")}`, outs.length ? "acc" : ""),
-        X.balancer && X.balancer !== "off" ? kchip(X.balancer, "", "scale") : null, X.ru ? kchip("РФ напрямую") : null];
+        X.balancer && X.balancer !== "off" ? kchip(X.balancer, "", "scale") : null, X.ru ? kchip("РФ напрямую") : null,
+        X.fail ? kchip(X.fail === "down" ? "не запущен" : "трафик не идёт", "bad") : null];
       kv = [["По умолчанию", X.main || "—"], ["Свой выход", own ? `у ${own} ${plural(own, "клиента", "клиентов", "клиентов")}` : "ни у кого"]];
       rx = i.rx || 0; tx = i.tx || 0;
       install = () => runJob(ctx, "Установка Xray", ["xray", "install"]);
@@ -3949,7 +3952,7 @@ async function tunnelsCards(ctx) {
       canOn = nodes.length > 0; why = !nodes.length ? "Сначала добавь ноду" : null;
     }
     const open = () => go("/tunnels/" + k);
-    const state = on ? "on" : !conf ? "none" : W.failed && k === "warp" ? "bad" : "";
+    const state = (k === "xray" && X.fail) || (W.failed && k === "warp") ? "bad" : on ? "on" : !conf ? "none" : "";
     const del = TUN_DEL[k];
     return kcard({ view, state, name: TUN_NAME[k], iface, chips, attrs: { "data-name": TUN_NAME[k], "data-tunnel": k }, onopen: open,
       right: [on && del ? klock("Работает — удалить можно после выключения") : null,
@@ -4212,6 +4215,10 @@ route(/^\/tunnels\/xray$/, async (ctx) => {
     if (v) await quick(b, "Балансировщик: " + v, ["xray", "balancer", v]);
   }
   ctx.put(title("🛰 Xray"), logCard(r.log),
+    d.fail === "notraffic" ? h("div", { class: "card warn", "data-name": "xray-fail" },
+      h("b", {}, "▲ Через выход трафик не идёт"), " — клиенты Xray не в туннеле. Проверь ссылку выхода: она могла устареть "
+      + "или сервер выхода недоступен. «🩺 Диагностика» ниже покажет, какой выход не отвечает; устарела — добавь новую "
+      + "ссылку, старую удали и перезапусти Xray. Подробности — «📜 Журнал».") : null,
     inst ? switchRow("🇷🇺 РФ напрямую", "российские сайты мимо Xray", d.ru,
       (on) => runJob(ctx, `РФ-сайты напрямую: ${on ? "вкл" : "выкл"}`, ["xray", "ru", on ? "on" : "off"])) : null,
     inst ? [h("h2", {}, "Выходы"),

@@ -376,6 +376,66 @@ bash(XRAY_ENV + XUP + "xray_down quiet")
 open(LINKS, "w").close()
 with open(ACTIVE, "w") as f:
     f.write(act_before)
+
+# Xray включён, а не работает: «трафик не идёт» (маршруты не дождались выхода) и «не запущен»
+XST = 'mkdir -p "$XRAY_DIR"; echo active > "$XRAY_STATE"; '
+rc, out, _ = bash('rm -f "$XRAY_STATE"; xray_fail; echo "rc=$?"')
+chk("Xray выключен — сбоя нет", out.strip() == "rc=1", out)
+rc, out, _ = bash(XST + 'xray_fail; echo "rc=$?"')
+chk("Xray включён, а не запущен (xray0 нет) — сбой «down»", out.split() == ["down", "rc=0"], out)
+with open(LINKS, "a") as f:
+    f.write("xray0\n")
+rc, out, _ = bash(XST + 'xray_fail; echo "rc=$?"')
+chk("Xray запущен, маршруты ждут или работают — не сбой", out.strip() == "rc=1", out)
+with open(ACTIVE + ".failed", "w") as f:
+    f.write("awg-xray-routing.service\n")
+rc, out, _ = bash(XST + 'xray_fail; echo "rc=$?"')
+chk("Xray запущен, а служба маршрутов не дождалась трафика — сбой «notraffic»", out.split() == ["notraffic", "rc=0"], out)
+rc, out, _ = bash(XST + 'xray_installed() { return 0; }; xray_tags() { echo vl1; }; xray_status')
+chk("статус Xray: «включён, но через выход трафик не идёт», что проверить — ссылку и «Диагностику»",
+    "через выход трафик не идёт" in out and "Проверь ссылку выхода" in out and "устареть" in out and "Диагностика" in out
+    and "Клиентов" not in out, out)
+bash(XST)
+rc, out, _ = bash("api_main status")
+t = (json.loads(out.strip().splitlines()[-1]).get("data") or {}).get("tunnels") or {}
+chk("сводка для оповещений: tunnels.xray_fail = notraffic, режим «блокировать» — нет",
+    t.get("xray_fail") == "notraffic" and t.get("xray_block") is False, t)
+rc, out, _ = bash("api_main xray status")
+r = json.loads(out.strip().splitlines()[-1])
+chk("api xray status: fail = notraffic", (r.get("data") or {}).get("fail") == "notraffic", r.get("data"))
+with open(ACTIVE, "a") as f:
+    f.write("awg-xray-routing.service\n")
+def xprobe(pre=""):
+    _, o, _ = bash(pre + "api_main xray probe")
+    try:
+        return json.loads(o.strip().splitlines()[-1]).get("data")
+    except (ValueError, IndexError):
+        return o
+
+
+chk("api xray probe: Xray и маршруты работают, ответ через SOCKS Xray есть",
+    xprobe() == {"up": True, "ok": True, "why": ""}, xprobe())
+chk("api xray probe: выход отвалился на ходу — up, но ok нет и ответ curl",
+    xprobe("socks_probe() { echo 000; return 1; }; ") == {"up": True, "ok": False, "why": "000"},
+    xprobe("socks_probe() { echo 000; return 1; }; "))
+rc, out, _ = bash('journalctl() { echo "journalctl $*"; }; _api_log xray 30')
+chk("журнал Xray в панели и боте — вместе со службой маршрутов (там «трафик не идёт»)",
+    "journalctl -u awg-xray.service -u awg-xray-routing.service -n 30 --no-pager" in out, out)
+rc, out, _ = bash('_xray_emit_routing && cat "$XRAY_ROUTING_SCRIPT"')
+chk("служба маршрутов Xray: «трафик не идёт» — с подсказкой проверить ссылку и «Диагностику»",
+    "трафик не идёт" in out and 'XRAY_CHECK_HINT="проверь ссылку выхода' in out and "Туннели → Xray → Диагностика" in out, out[-600:])
+bash(XRAY_ENV + XUP + "xray_down quiet")
+os.remove(ACTIVE + ".failed")
+open(LINKS, "w").close()
+with open(ACTIVE, "w") as f:
+    f.write(act_before)
+rc, out, _ = bash(XRAY_ENV + XUP + 'socks_probe() { echo 000; return 1; }; xray_up; echo "rc=$?"')
+chk("включение Xray: выход не пускает — не включаю и подсказка: проверь ссылку, «Диагностика»",
+    "rc=1" in out and "Через Xray трафик не идёт (ответ: 000)" in out and "Проверь ссылку выхода" in out, out[-600:])
+bash(XRAY_ENV + XUP + "xray_down quiet")
+open(LINKS, "w").close()
+with open(ACTIVE, "w") as f:
+    f.write(act_before)
 rc, out, _ = bash("XRAY_STUB_OLD=1; export XRAY_STUB_OLD; " + XRAY_ENV
                   + "xray_add_link 'hysteria2://secret@h2.example.site:443?sni=h2.example.site#H2'")
 chk("Xray без Hysteria2: выход отклонён с подсказкой обновить Xray", rc != 0 and "обнови Xray" in out, out)

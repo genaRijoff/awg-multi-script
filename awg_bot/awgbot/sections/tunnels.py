@@ -271,6 +271,9 @@ async def xray_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
     d = r.data
     inst, up, tags = d.get("installed"), d.get("up"), d.get("tags") or []
     text = "<b>🛰 Xray</b>\n" + ui.pre(r.log, 1500, tail=False)
+    if d.get("fail") == "notraffic":
+        text += ("\n⚠️ <b>Через выход трафик не идёт</b> — проверь ссылку: 🩺 Диагностика покажет, какой выход "
+                 "не отвечает. Ссылка устарела — ➕ добавь новую, старую ➖ удали, затем 🔄 перезапусти Xray.\n")
     if inst:
         text += ("\n<i>➕ Добавить выход — ссылкой vless://, vmess://, trojan://, ss://, hysteria2://\n"
                  "✅ РФ напрямую — российские сайты мимо Xray"

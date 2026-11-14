@@ -127,6 +127,8 @@ XRAY_SOCKS="127.0.0.1:10808"
 XRAY_UNIT="awg-xray.service"
 XRAY_TUN_UNIT="awg-xray-tun.service"
 XRAY_ROUTING_UNIT="awg-xray-routing.service"
+# Трафик через выход Xray не идёт — что проверить (журнал, статус, включение)
+XRAY_CHECK_HINT="проверь ссылку выхода: она могла устареть или сервер выхода недоступен — «Диагностика» покажет, какой выход не отвечает"
 XRAY_ROUTING_SCRIPT="/usr/local/bin/awg2-xray-routing.sh"
 XRAY_RUGEO_URL="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download"
 

@@ -1084,6 +1084,89 @@ async def run():
     chk("уведомление «Exit-ноды» выключено — молчит, но состояние помнит",
         not ex_said(mark) and st7.get("exits_dead") == {}, [ex_said(mark), st7])
     al.set_enabled("exits", True)
+    # Xray: включён, а через выход трафик не идёт (ссылка устарела) — 🟠 с «Диагностикой»
+    xs = {"fail": "notraffic", "xray": "up", "block": False, "probe": {"up": True, "ok": True, "why": ""}}
+    xprobes = []
+
+    async def xray_status(*args, **kw):
+        if args[:1] == ("status",):
+            return {"host": "vm1", "server": {"exists": False, "up": False},
+                    "tunnels": {"xray": xs["xray"], "xray_fail": xs["fail"], "xray_block": xs["block"]}}
+        if args[:2] == ("xray", "probe"):
+            xprobes.append(args)
+            return dict(xs["probe"])
+        return await real_data(*args, **kw)
+    al.api.data = xray_status
+    st8 = {"boot": "boot-B"}
+
+    def xr_msgs(mark):
+        return [m for n_, m in SESSION.sent[mark:] if n_ == "SendMessage" and "Xray" in (m.text or "")]
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("Xray: трафик не идёт — первая проверка молчит (перезапуск — не тревога)", not xr_msgs(mark), xr_msgs(mark))
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    rep = xr_msgs(mark)
+    cbs = [b.callback_data for row in (rep[0].reply_markup.inline_keyboard if rep else []) for b in row]
+    chk("две проверки — 🟠 «через выход трафик не идёт», клиенты напрямую, проверь ссылку; кнопки «Диагностика» и «Перезапустить»",
+        len(rep) == 1 and "через выход трафик не идёт" in rep[0].text and "напрямую, с IP сервера" in rep[0].text
+        and "Проверь ссылку выхода" in rep[0].text and "устареть" in rep[0].text and cbs == ["xr:diag", "xr:restart"]
+        and not xprobes, [[m.text for m in rep], cbs, xprobes])
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("пока Xray не работает — молчит", not xr_msgs(mark), [m.text for m in xr_msgs(mark)])
+    xs.update(fail="")
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("новая ссылка и перезапуск — 🟢 «Xray снова работает» с простоем, по ответу через выход",
+        any("Xray снова работает" in m.text and "Простой" in m.text for m in xr_msgs(mark)) and xprobes
+        and "xray_sent" not in st8, [[m.text for m in xr_msgs(mark)], xprobes])
+    # Работал и отвалился на ходу: маршруты на месте, а выход не отвечает — клиенты без интернета
+    xs["probe"] = {"up": True, "ok": False, "why": "000"}
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    await al.tick(BOT, st8)
+    rep = xr_msgs(mark)
+    chk("выход отвалился на ходу — бот проверил сам, две проверки: 🟠 «Xray не отвечает», клиенты без интернета",
+        len(rep) == 1 and "Xray не отвечает" in rep[0].text and "без интернета" in rep[0].text, [m.text for m in rep])
+    # Выключили руками, пока не работал: это не «снова работает»
+    xs.update(xray="off", probe={"up": False, "ok": False, "why": ""})
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st8)
+    chk("Xray выключили руками, пока не работал, — без ложного «снова работает»",
+        not xr_msgs(mark) and "xray_sent" not in st8, [[m.text for m in xr_msgs(mark)], st8])
+    # «Блокировать»: клиенты ждут Xray; не запущен — своя строка
+    st9 = {"boot": "boot-B"}
+    xs.update(xray="up", fail="notraffic", block=True)
+    await al.tick(BOT, st9)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st9)
+    rep = xr_msgs(mark)
+    chk("режим «блокировать»: клиенты Xray ждут его без интернета, а не напрямую",
+        len(rep) == 1 and "ждут его без интернета" in rep[0].text and "напрямую" not in rep[0].text, [m.text for m in rep])
+    st9 = {"boot": "boot-B"}
+    xs.update(xray="off", fail="down", block=False)
+    await al.tick(BOT, st9)
+    mark = len(SESSION.sent)
+    await al.tick(BOT, st9)
+    rep = xr_msgs(mark)
+    chk("Xray включён, а не запущен — 🟠 «Xray не запущен»: перезапусти, не поднимется — «Диагностика»",
+        len(rep) == 1 and "Xray не запущен" in rep[0].text and "Диагностика" in rep[0].text, [m.text for m in rep])
+    # Экран Xray: трафик не идёт — что делать, прямо на экране
+    real_call = botapi.call
+
+    async def xray_call(*args, **kw):
+        if args[:2] == ("xray", "status"):
+            return botapi.Result(True, 0, {"installed": True, "up": True, "tags": ["vl1"], "fail": "notraffic"},
+                                 "  Туннель   : ▲ включён, но через выход трафик не идёт", "")
+        return await real_call(*args, **kw)
+    botapi.call = xray_call
+    try:
+        text, _ = screen(await press("xr"))
+    finally:
+        botapi.call = real_call
+    chk("экран Xray: «Через выход трафик не идёт» — проверь ссылку: Диагностика, добавь новую, старую удали",
+        "Через выход трафик не идёт" in text and "Диагностика" in text and "добавь новую" in text, text)
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",

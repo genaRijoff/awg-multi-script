@@ -68,6 +68,11 @@ if [[ "$1" == is-active || "$1" == is-enabled ]]; then
   for a in "$@"; do grep -qxF -- "$a" "$ACTIVE" && exit 0; done
   exit 1
 fi
+# «Упавшие» юниты — по строке в $ACTIVE.failed
+if [[ "$1" == is-failed ]]; then
+  for a in "$@"; do grep -qxF -- "$a" "$ACTIVE.failed" 2>/dev/null && exit 0; done
+  exit 1
+fi
 exit 0''',
     "sysctl": r'''echo "sysctl $*" >> "$CALLS"; exit 0''',
     "awg": r'''case "$1" in

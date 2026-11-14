@@ -112,6 +112,10 @@ _api_status() {
     _kv tunnels.warp_failed:b "$(_b warp_failed)"
     _kv tunnels.warp_block:b "$(_b tunfail_block warp)"
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
+    # Для оповещений бота: Xray включён, а не работает (down|notraffic)
+    if [[ -f "$XRAY_STATE" ]]; then
+      _kv tunnels.xray_fail "$(xray_fail)"; _kv tunnels.xray_block:b "$(_b tunfail_block xray)"
+    fi
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
     # Для оповещений бота: упавшие ноды «имя:причина,…», общий выход сейчас
@@ -606,8 +610,15 @@ _api_xray() {
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         # Выходы для карточек: протокол, защита, транспорт, адрес
         _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
-        _kv ru:b "$(_b xray_ru_on)"; } | api_obj
+        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; } | api_obj
       xray_status ;;
+    # Трафик через выход работающего Xray (бот: выход отвалился на ходу).
+    # up — Xray и маршруты клиентов работают; ok — ответ через SOCKS Xray
+    probe)
+      local up=0 ok=0 why=""
+      ip link show "$XRAY_IF" &>/dev/null && unit_active "$XRAY_ROUTING_UNIT" && up=1
+      if (( up )); then why=$(socks_probe "$XRAY_SOCKS") && ok=1; fi
+      { _kv up:b "$up"; _kv ok:b "$ok"; _kv why "$why"; } | api_obj ;;
     install) xray_install update ;;
     add)
       [[ -n "${1:-}" ]] || { _api_usage "xray add ССЫЛКА"; return; }
@@ -636,7 +647,7 @@ _api_xray() {
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
+    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
   esac
 }
 
@@ -1104,7 +1115,7 @@ _api_uninstall() {
 
 # ── Журналы ───────────────────────────────────────────────
 _api_log() {
-  local name="${1:-}" n="${2:-60}" file="" unit=""
+  local name="${1:-}" n="${2:-60}" file="" unit="" u units=()
   [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= 500 )) || n=60
   case "$name" in
     manager) file="$LOG_FILE" ;;         install) file="$INSTALL_LOG" ;;
@@ -1112,7 +1123,7 @@ _api_log() {
     cascade) file="$CASCADE_LOG" ;;      warp-health) file="$WARP_HEALTH_LOG" ;;
     dns-health) file="$DNS_HEALTH_LOG" ;; usque) file="$USQUE_LOG" ;;
     awg) unit="awg-quick@$AWG_IF" ;;     warp) unit=awg-warp.service ;;
-    xray) unit="$XRAY_UNIT" ;;           xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
+    xray) unit="$XRAY_UNIT $XRAY_ROUTING_UNIT" ;; xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
@@ -1124,7 +1135,9 @@ _api_log() {
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
     tail -n "$n" "$file"
   else
-    journalctl -u "$unit" -n "$n" --no-pager 2>/dev/null || { info "Журнал $unit недоступен"; return 0; }
+    # Несколько служб (Xray и его маршруты) — одним журналом, по времени
+    for u in $unit; do units+=(-u "$u"); done
+    journalctl "${units[@]}" -n "$n" --no-pager 2>/dev/null || { info "Журнал $unit недоступен"; return 0; }
   fi
 }
 
@@ -1209,7 +1222,7 @@ _api_readonly() {
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
-    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray probe"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
     "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;

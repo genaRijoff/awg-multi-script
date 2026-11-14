@@ -61,6 +61,7 @@ SEND_MAX = 49 * 1024 * 1024                     # документ бота — 
 
 # id, подпись кнопки (полстроки в боте), полное название
 KINDS = [("iface", "awg0 упал", "awg0 упал и поднялся"), ("warp", "WARP упал", "WARP упал или не отвечает и снова работает"),
+         ("xray", "Xray не идёт", "Xray: через выход трафик не идёт и снова работает"),
          ("exits", "Exit-ноды", "Exit-нода не отвечает и снова работает: общий выход переключается сам"),
          ("reboot", "Перезагрузка", "Сервер перезагрузился"),
          ("update", "Новая версия", "Новая версия Тулзы"), ("kernel", "Ядро без AWG", "Ядро без модуля AWG"),
@@ -320,6 +321,40 @@ async def tick(bot: Bot, st: dict[str, Any]) -> bool:
             gone = ui.fmt_dur(now - _as_int(st.get("warp_since"), now))
             await notify(bot, f"🟢 <b>{host}: WARP снова работает</b>\nПростой: около {gone}")
         for k in ("warp_down", "warp_since", "warp_sent"):
+            st.pop(k, None)
+
+    # Xray: включён, а не работает — выход (ссылка) больше не пускает или Xray не запущен.
+    # notraffic — служба маршрутов не дождалась трафика через выход: клиенты Xray не в
+    # туннеле (напрямую или ждут — «блокировать»); down — Xray не запущен. Работает, но
+    # выход отвалился на ходу — проверяет бот сам (через SOCKS Xray): клиенты Xray без
+    # интернета. Две проверки подряд — перезапуск из меню или бота не тревога.
+    xfail, xdead = str(t.get("xray_fail") or ""), False
+    if not xfail and t.get("xray") == "up" and enabled("xray"):
+        p = await api.data("xray", "probe", timeout=40)
+        xdead = isinstance(p, dict) and p.get("up") is True and p.get("ok") is False
+    if xfail or xdead:
+        st["xray_down"] = _as_int(st.get("xray_down")) + 1
+        if st["xray_down"] == 1:
+            st["xray_since"] = now
+        if st["xray_down"] >= IFACE_STRIKES and not st.get("xray_sent") and enabled("xray"):
+            who = ("клиенты Xray ждут его без интернета (режим «блокировать»)" if t.get("xray_block")
+                   else "клиенты Xray идут напрямую, с IP сервера")
+            check = ("Проверь ссылку выхода: она могла устареть или сервер выхода недоступен — "
+                     "«Диагностика» покажет, какой выход не отвечает. Новая ссылка — Туннели → Xray → ➕ Добавить выход.")
+            if xfail == "down":
+                text = f"🟠 <b>{host}: Xray не запущен</b> — {who}.\nПерезапусти Xray; не поднимется — «Диагностика»."
+            elif xfail:
+                text = f"🟠 <b>{host}: Xray — через выход трафик не идёт</b>, {who}.\n{check}"
+            else:
+                text = f"🟠 <b>{host}: Xray не отвечает</b> — через выход трафик не идёт, клиенты Xray без интернета.\n{check}"
+            await notify(bot, text, ui.kb(("🩺 Диагностика", "xr:diag"), ("🔄 Перезапустить", "xr:restart")))
+            st["xray_sent"] = True
+    else:
+        # «Снова работает» — только если Xray и правда работает: выключили руками — молча
+        if st.get("xray_sent") and t.get("xray") == "up":
+            gone = ui.fmt_dur(now - _as_int(st.get("xray_since"), now))
+            await notify(bot, f"🟢 <b>{host}: Xray снова работает</b>\nПростой: около {gone}")
+        for k in ("xray_down", "xray_since", "xray_sent"):
             st.pop(k, None)
 
     # Новая версия: один раз на версию
