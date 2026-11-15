@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.61"
+VERSION="v1.2.62"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -498,6 +498,8 @@ XRAY_SOCKS="127.0.0.1:10808"
 XRAY_UNIT="awg-xray.service"
 XRAY_TUN_UNIT="awg-xray-tun.service"
 XRAY_ROUTING_UNIT="awg-xray-routing.service"
+# Трафик через выход Xray не идёт — что проверить (журнал, статус, включение)
+XRAY_CHECK_HINT="проверь ссылку выхода: она могла устареть или сервер выхода недоступен — «Диагностика» покажет, какой выход не отвечает"
 XRAY_ROUTING_SCRIPT="/usr/local/bin/awg2-xray-routing.sh"
 XRAY_RUGEO_URL="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download"
 
@@ -7098,6 +7100,16 @@ do_cascade_menu() {
 #                               трафик через Xray действительно идёт.
 
 xray_installed() { [[ -x "$XRAY_BIN" && -f "$XRAY_CONF" ]]; }
+# Сбой включённого Xray: down — Xray не запущен (xray0 нет); notraffic — запущен,
+# но служба маршрутов не дождалась трафика через выход (ссылка устарела, сервер
+# выхода лежит) — клиенты Xray не в туннеле. Пока маршруты ждут (при загрузке до
+# минуты) — не сбой. Пусто и 1 — сбоя нет или Xray выключен.
+xray_fail() {
+  [[ -f "$XRAY_STATE" ]] || return 1
+  if ! ip link show "$XRAY_IF" &>/dev/null && ! unit_active "$XRAY_UNIT"; then echo down; return 0; fi
+  systemctl is-failed --quiet "$XRAY_ROUTING_UNIT" 2>/dev/null && { echo notraffic; return 0; }
+  return 1
+}
 xray_state_get() { sed -n "s/^$1=//p" "$XRAY_STATE" 2>/dev/null | head -1; }
 xray_tags()      { [[ -f "$XRAY_CONF" ]] && py xray-tags "$XRAY_CONF" 2>/dev/null; }
 xray_ru_on()     { [[ -f "$XRAY_CONF" ]] && grep -q '"ruleTag": "ru-direct"' "$XRAY_CONF"; }
@@ -7490,13 +7502,14 @@ xray_routing_run() {
     socks_probe "$XRAY_SOCKS" >/dev/null && { rt_up "$XRAY_IF" "$XRAY_TABLE" "$XRAY_PEERS" "" "$nat"; return; }
     sleep 5
   done
-  echo "через Xray трафик не идёт — клиенты остаются на прямом маршруте" >&2
+  echo "через Xray трафик не идёт — клиенты Xray не переведены в туннель" >&2
+  echo "$XRAY_CHECK_HINT (Туннели → Xray → Диагностика)" >&2
   return 1
 }
 
 _xray_emit_routing() {
   emit_script "$XRAY_ROUTING_SCRIPT" 'xray_routing_run "$@"' XRAY_IF XRAY_TABLE XRAY_PEERS XRAY_STATE \
-    XRAY_TUN_ADDR XRAY_SOCKS socks_probe "${RT_FUNCS[@]}" xray_routing_run
+    XRAY_TUN_ADDR XRAY_SOCKS XRAY_CHECK_HINT socks_probe "${RT_FUNCS[@]}" xray_routing_run
 }
 
 _xray_write_units() {  # режим
@@ -7606,7 +7619,8 @@ xray_up() {
   info "Проверяю, идёт ли трафик через Xray..."
   if ! why=$(socks_probe "$XRAY_SOCKS"); then
     err "Через Xray трафик не идёт (ответ: $why) — туннель не включаю"
-    info "Клиенты остались на прямом маршруте. Логи: journalctl -u $XRAY_UNIT -n 30"
+    info "${XRAY_CHECK_HINT^}"
+    info "Клиенты остались на прямом маршруте"
     xray_down quiet
     return 1
   fi
@@ -7645,15 +7659,19 @@ xray_uninstall() {
 
 # ── Статус и диагностика ──────────────────────────────────
 xray_status() {
-  local tags=() n total name tag
+  local tags=() n total name tag fail
   if ! xray_installed; then echo -e "  Xray      : ${D}○ не установлен${N}"; return 0; fi
   echo -e "  Версия    : $("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')"
-  if ip link show "$XRAY_IF" &>/dev/null; then
+  fail=$(xray_fail)
+  if [[ "$fail" == notraffic ]]; then
+    echo -e "  Туннель   : ${R}▲ включён, но через выход трафик не идёт${N} — клиенты Xray не в туннеле"
+    echo -e "  ${D}  ${XRAY_CHECK_HINT^}${N}"
+  elif ip link show "$XRAY_IF" &>/dev/null; then
     echo -e "  Туннель   : ${G}● включён${N} ${D}($(xray_state_get tun_mode))${N}"
     n=$(grep -c . "$XRAY_PEERS" 2>/dev/null || true); total=$(clients_name_ip | wc -l)
     echo -e "  Клиентов  : ${W}${n:-0}${N} из $total через Xray"
   elif [[ -f "$XRAY_STATE" ]]; then
-    echo -e "  Туннель   : ${R}▲ включён, но $XRAY_IF нет${N} ${D}— journalctl -u $XRAY_UNIT${N}"
+    echo -e "  Туннель   : ${R}▲ включён, но не запущен${N} — «Перезапустить»; не поднимется — «Диагностика»"
   else
     echo -e "  Туннель   : ${D}○ выключен${N}"
   fi
@@ -14404,6 +14422,10 @@ _api_status() {
     _kv tunnels.warp_failed:b "$(_b warp_failed)"
     _kv tunnels.warp_block:b "$(_b tunfail_block warp)"
     _kv tunnels.xray "$(_api_tun xray_is_up "$XRAY_CONF")"
+    # Для оповещений бота: Xray включён, а не работает (down|notraffic)
+    if [[ -f "$XRAY_STATE" ]]; then
+      _kv tunnels.xray_fail "$(xray_fail)"; _kv tunnels.xray_block:b "$(_b tunfail_block xray)"
+    fi
     _kv tunnels.tun2socks "$(_api_tun t2s_is_up "$T2S_CONF")"
     _kv tunnels.exits "$(_api_tun exits_is_up "$EXITS_DIR"/awg-exit-*.conf)"
     # Для оповещений бота: упавшие ноды «имя:причина,…», общий выход сейчас
@@ -14898,8 +14920,15 @@ _api_xray() {
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         # Выходы для карточек: протокол, защита, транспорт, адрес
         _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
-        _kv ru:b "$(_b xray_ru_on)"; } | api_obj
+        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; } | api_obj
       xray_status ;;
+    # Трафик через выход работающего Xray (бот: выход отвалился на ходу).
+    # up — Xray и маршруты клиентов работают; ok — ответ через SOCKS Xray
+    probe)
+      local up=0 ok=0 why=""
+      ip link show "$XRAY_IF" &>/dev/null && unit_active "$XRAY_ROUTING_UNIT" && up=1
+      if (( up )); then why=$(socks_probe "$XRAY_SOCKS") && ok=1; fi
+      { _kv up:b "$up"; _kv ok:b "$ok"; _kv why "$why"; } | api_obj ;;
     install) xray_install update ;;
     add)
       [[ -n "${1:-}" ]] || { _api_usage "xray add ССЫЛКА"; return; }
@@ -14928,7 +14957,7 @@ _api_xray() {
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
+    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
   esac
 }
 
@@ -15396,7 +15425,7 @@ _api_uninstall() {
 
 # ── Журналы ───────────────────────────────────────────────
 _api_log() {
-  local name="${1:-}" n="${2:-60}" file="" unit=""
+  local name="${1:-}" n="${2:-60}" file="" unit="" u units=()
   [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= 500 )) || n=60
   case "$name" in
     manager) file="$LOG_FILE" ;;         install) file="$INSTALL_LOG" ;;
@@ -15404,7 +15433,7 @@ _api_log() {
     cascade) file="$CASCADE_LOG" ;;      warp-health) file="$WARP_HEALTH_LOG" ;;
     dns-health) file="$DNS_HEALTH_LOG" ;; usque) file="$USQUE_LOG" ;;
     awg) unit="awg-quick@$AWG_IF" ;;     warp) unit=awg-warp.service ;;
-    xray) unit="$XRAY_UNIT" ;;           xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
+    xray) unit="$XRAY_UNIT $XRAY_ROUTING_UNIT" ;; xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
@@ -15416,7 +15445,9 @@ _api_log() {
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
     tail -n "$n" "$file"
   else
-    journalctl -u "$unit" -n "$n" --no-pager 2>/dev/null || { info "Журнал $unit недоступен"; return 0; }
+    # Несколько служб (Xray и его маршруты) — одним журналом, по времени
+    for u in $unit; do units+=(-u "$u"); done
+    journalctl "${units[@]}" -n "$n" --no-pager 2>/dev/null || { info "Журнал $unit недоступен"; return 0; }
   fi
 }
 
@@ -15501,7 +15532,7 @@ _api_readonly() {
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
-    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
+    "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray probe"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
     "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
@@ -20727,5 +20758,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=d913875044c1090f
+_BUILD_SUM=3a4df4cc8aeadd6a
 main "$@"
