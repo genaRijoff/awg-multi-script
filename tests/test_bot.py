@@ -1167,6 +1167,19 @@ async def run():
         botapi.call = real_call
     chk("экран Xray: «Через выход трафик не идёт» — проверь ссылку: Диагностика, добавь новую, старую удали",
         "Через выход трафик не идёт" in text and "Диагностика" in text and "добавь новую" in text, text)
+    # WARP (wg, настроен): кнопка «Обновить скаут» и версия сканера в подсказке
+    async def warp_call(*args, **kw):
+        if args[:2] == ("warp", "status"):
+            return botapi.Result(True, 0, {"backend": "wg", "configured": True, "up": True, "scout": "0.13.2"},
+                                 "  Туннель : ● WARP FRA", "")
+        return await real_call(*args, **kw)
+    botapi.call = warp_call
+    try:
+        text, buttons = screen(await press("warp"))
+    finally:
+        botapi.call = real_call
+    chk("экран WARP: «🔄 Обновить скаут» рядом с поиском endpoint, в подсказке — версия warpscout",
+        ("🔄 Обновить скаут", "warp:scout") in buttons and "сейчас 0.13.2" in text, [text, buttons])
     al.api.data = real_data
 
     CL = {"newer": True, "sections": [{"version": "v1.2.1", "title": "2026-10-08",

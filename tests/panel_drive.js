@@ -1048,6 +1048,31 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (await page.textContent(sel + " .sub") !== now) throw new Error("на сервере другое: " + await page.textContent(sel + " .sub"));
   });
   await step("Xray", async () => { await nav("/tunnels/xray", "text=Установить"); await shot("33-xray"); });
+  await step("WARP: «Обновить скаут» — справа от «Удалить», запускает обновление warpscout", async () => {
+    const R = "#app:not(.reloading) ", sent = [];
+    const fake = async (r) => {
+      const body = r.request().postData() || "";
+      if (body.includes('["warp","status"]')) return r.fulfill({ contentType: "application/json", body: JSON.stringify({
+        ok: true, rc: 0, data: { backend: "wg", configured: true, up: true, scout: "0.13.2" }, log: "  Туннель : ● WARP FRA\n" }) });
+      if (body.includes('"scout-update"')) sent.push(body);
+      return r.continue();
+    };
+    await page.route("**/api/**", fake);
+    try {
+      await nav("/tunnels/warp", R + "button:has-text('Обновить скаут')");
+      // Порядок кнопок: «Обновить скаут» — сразу за «Удалить» (в сетке — справа от неё)
+      const order = await page.$$eval(".actions button", (bs) => bs.map((b) => b.textContent.trim()));
+      const del = order.findIndex((t) => /Удалить/.test(t));
+      if (del < 0 || !/Обновить скаут/.test(order[del + 1] || "")) throw new Error("кнопки: " + order.join(" | "));
+      await page.waitForSelector("text=сейчас 0.13.2");
+      await shot("31b-warp-scout");
+      await page.click("button:has-text('Обновить скаут')");
+      await page.waitForFunction(() => /Обновление warpscout/.test(document.body.textContent));
+      if (!sent.length) throw new Error("обновление не ушло в awg2");
+    } finally {
+      await page.unroute("**/api/**", fake);
+    }
+  });
   await step("Xray: через выход трафик не идёт — что делать, на экране Xray и на главной", async () => {
     const R = "#app:not(.reloading) ";
     const fake = async (r) => {

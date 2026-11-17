@@ -4148,9 +4148,12 @@ route(/^\/tunnels\/warp$/, async (ctx) => {
       wg && conf ? btn("🔎 Поиск endpoint", () => go("/tunnels/warp/endpoint")) : null,
       btn("🔀 Бэкенд", backend),
       btn("📜 Журнал", () => go(d.backend === "usque" ? "/log/usque" : "/log/warp")),
-      conf ? btn("🗑 Удалить", (b) => quickAsk(b, "Удалить WARP: аккаунт, профиль, службы?", "WARP удалён", ["warp", "remove"]), "btn-danger") : null),
+      conf ? btn("🗑 Удалить", (b) => quickAsk(b, "Удалить WARP: аккаунт, профиль, службы?", "WARP удалён", ["warp", "remove"]), "btn-danger") : null,
+      // Справа от «Удалить»: сканер endpoint (warpscout) Тулза ставит один раз — обновить можно здесь
+      wg && conf ? btn("🔄 Обновить скаут", () => runJob(ctx, "Обновление warpscout", ["warp", "scout-update"])) : null),
     hint(`«${conf ? "Переустановить" : "Установить"}» — зарегистрироваться в Cloudflare заново (бэкенд ${d.backend || "?"})`
-      + (wg ? " · «Импорт» — свой wgcf-profile.conf, если регистрация отсюда не проходит" : "")));
+      + (wg ? " · «Импорт» — свой wgcf-profile.conf, если регистрация отсюда не проходит" : "")
+      + (wg && conf ? ` · «Обновить скаут» — последняя версия warpscout для поиска endpoint${d.scout ? ` (сейчас ${d.scout})` : ""}` : "")));
 });
 
 route(/^\/tunnels\/warp\/key$/, async (ctx) => {

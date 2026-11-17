@@ -75,11 +75,11 @@ ok "клиент WARP — в warp0" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev warp
 ok "клиент без туннеля — eth0" '[[ "$(rg 1.1.1.1 10.23.45.3)" == *"dev eth0"* ]]'
 ok "rt_table_live видит живой маршрут" 'rt_table_live 200'
 ok "_tunfail_rule_tables читает таблицу из ip rule show" '[[ "$(_tunfail_rule_tables)" == 200 ]]'
-ok "ip rule show: «lookup 200» в конце строки (на этом держатся проверки)" 'ip rule show | grep -qE "lookup 200$"'
+ok "ip rule show: «lookup 200» в конце строки (на этом держатся проверки)" 'grep -qE "lookup 200$" <<< "$(ip rule show)"'
 ip link del warp0
 ok "WARP упал (устройство пропало): маршрут ушёл сам — клиент идёт напрямую (eth0)" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]]'
 rt_down warp0 200
-ok "rt_down в «напрямую» снимает правила" '! ip rule show | grep -q "lookup 200"'
+ok "rt_down в «напрямую» снимает правила" '! grep -q "lookup 200" <<< "$(ip rule show)"'
 
 echo "── РФ напрямую: метка и правило 90 ──"
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
@@ -94,29 +94,29 @@ echo "── блокировать ──"
 echo "warp=block" > "$TUNFAIL_CONF"
 rt_fail_route 200
 ok "«недоступно» лежит под живым маршрутом — трафик по-прежнему в warp0" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev warp0"* ]]'
-ok "ip route show: «unreachable default metric 4096» (на этом держится tunfail_held)" 'ip route show table 200 | grep -q "^unreachable default"'
+ok "ip route show: «unreachable default metric 4096» (на этом держится tunfail_held)" 'grep -q "^unreachable default" <<< "$(ip route show table 200)"'
 ip link del warp0
 r=$(rg 1.1.1.1 10.23.45.2)
 ok "WARP упал сам (устройство пропало, rt_down ещё не было) — клиент без маршрута: $r" '[[ "$r" == *"No route to host"* || "$r" == *"nreachable"* ]]'
 ok "…а сеть России у него — напрямую" '[[ "$(rg 77.88.8.8 10.23.45.2 0x52550000)" == *"dev eth0"* ]]'
 ok "клиент без туннеля не задет" '[[ "$(rg 1.1.1.1 10.23.45.3)" == *"dev eth0"* ]]'
 rt_down warp0 200
-ok "rt_down в «блокировать»: правило осталось, таблица — «недоступно»" 'ip rule show | grep -q "lookup 200" && ! rt_table_live 200 && tunfail_held warp'
+ok "rt_down в «блокировать»: правило осталось, таблица — «недоступно»" 'grep -q "lookup 200" <<< "$(ip rule show)" && ! rt_table_live 200 && tunfail_held warp'
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
 ok "WARP вернулся — клиент снова в warp0" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev warp0"* ]]'
 ok "правило клиента одно (без дублей)" '(( $(ip rule show | grep -c "lookup 200") == 1 ))'
 ip link del warp0; rt_down warp0 200
 rm -f "$WARP_STATE"; rt_down warp0 200
-ok "выключили руками (состояния нет) — отпущен напрямую" '! ip rule show | grep -q "lookup 200" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]]'
+ok "выключили руками (состояния нет) — отпущен напрямую" '! grep -q "lookup 200" <<< "$(ip rule show)" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]]'
 
 echo "── сторож после перезагрузки ──"
 touch "$WARP_STATE"; tunfail_guard_run >/dev/null
 ok "WARP включён, не поднялся — сторож удержал клиента" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* ]]'
 ip tuntap add mode tun dev tun0; ip addr add 198.18.0.1/30 dev tun0; ip link set tun0 up
 rt_up tun0 100 -
-ok "поднят tun2socks — удержание WARP снято, клиент в tun0" '! ip rule show | grep -q "lookup 200" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev tun0"* ]]'
+ok "поднят tun2socks — удержание WARP снято, клиент в tun0" '! grep -q "lookup 200" <<< "$(ip rule show)" && [[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev tun0"* ]]'
 tunfail_guard_run >/dev/null
-ok "сторож при живом tun2socks WARP не держит" '! ip rule show | grep -q "lookup 200"'
+ok "сторож при живом tun2socks WARP не держит" '! grep -q "lookup 200" <<< "$(ip rule show)"'
 elif [[ "$PART" == rudirect ]]; then
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
 mkdir -p "$RUDIRECT_DIR" "$RUDIRECT_USER"
@@ -162,7 +162,7 @@ echo 0 > /proc/sys/net/ipv4/ip_forward
 out=$(diag_route alice 1.1.1.1); ok "пересылка выключена — none с подсказкой: $out" '[[ "$out" == *$'"'"'\tnone\t'"'"'*ip_forward* ]]'
 echo 1 > /proc/sys/net/ipv4/ip_forward
 _rud_set ON 0; rudirect_run off
-ok "off: правила и набор сняты" '! ipset list -n awg2-ru &>/dev/null && ! iptables-save -t mangle | grep -q awg2-rudirect && ! ip rule show | grep -q fwmark'
+ok "off: правила и набор сняты" '! ipset list -n awg2-ru &>/dev/null && ! grep -q awg2-rudirect <<< "$(iptables-save -t mangle)" && ! grep -q fwmark <<< "$(ip rule show)"'
 elif [[ "$PART" == rpf ]]; then
 echo "── РФ напрямую: настоящий трафик и строгий rp_filter на аплинке ──"
 mkwarp; rt_up warp0 200 "$WARP_PEERS"
@@ -246,7 +246,7 @@ orig_online=$(declare -f _exits_server_online)
 _exits_server_online() { return 0; }          # у сервера интернет есть: молчат именно ноды
 hc 3
 ok "обе молчат, «блокировать» — клиенты удержаны: «недоступно», правила на месте" \
-  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* && "$(rg 1.1.1.1 10.23.45.3)" == *"No route"* ]] && ip rule show | grep -q "from 10.23.45.3 lookup 211"'
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* && "$(rg 1.1.1.1 10.23.45.3)" == *"No route"* ]] && grep -q "from 10.23.45.3 lookup 211" <<< "$(ip rule show)"'
 node_on a; hc 1
 ok "a ответила 1 раз — ещё не вернулась (нужно 2)" '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"No route"* ]]'
 hc 1
@@ -272,10 +272,10 @@ node_on a; hc 2
 echo "exits=direct" > "$TUNFAIL_CONF"
 node_off a; node_off b; hc 3
 ok "обе молчат, «напрямую» — правила сняты, клиенты идут с адреса сервера" \
-  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]] && ! ip rule show | grep -q "lookup 202"'
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev eth0"* ]] && ! grep -q "lookup 202" <<< "$(ip rule show)"'
 node_on a; hc 2
 ok "a вернулась после «напрямую» — правила клиентов снова на месте, общий выход через a" \
-  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]] && ip rule show | grep -q "from 10.23.45.2 lookup 202"'
+  '[[ "$(rg 1.1.1.1 10.23.45.2)" == *"dev awg-exit-a"* ]] && grep -q "from 10.23.45.2 lookup 202" <<< "$(ip rule show)"'
 eval "$orig_online"                           # настоящая проверка: у сервера в тесте интернета нет
 iptables -I OUTPUT -o eth0 -j REJECT          # и не ждём таймаутов — отказ сразу
 node_off a; node_off b

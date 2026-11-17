@@ -129,6 +129,9 @@ async def warp_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
         hints.append("✅ Health-check — WARP не отвечает: клиенты напрямую, а WARP он вернёт сам")
     if wg:
         hints.append("📥 Импорт — свой wgcf-profile.conf, если регистрация отсюда не проходит")
+    if wg and conf:
+        hints.append("🔄 Обновить скаут — последняя версия warpscout для поиска endpoint"
+                     + (f" (сейчас {esc(d['scout'])})" if d.get("scout") else ""))
     await ui.render(cb, "<b>☁️ WARP (Cloudflare)</b>\n" + ui.pre(r.log, 1500, tail=False)
                     + "\n<i>" + "\n".join(hints) + "</i>", ui.kb(
         ("📦 Переустановить" if conf else "📦 Установить", warp.data("install")),
@@ -140,9 +143,15 @@ async def warp_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
         ("🔑 Ключ Warp+", warp.data("key")) if wg and conf else None,
         ("📥 Импорт профиля", warp.data("import")) if wg else None,
         ("🔎 Поиск endpoint", warp.data("ep")) if wg and conf else None,
+        ("🔄 Обновить скаут", warp.data("scout")) if wg and conf else None,
         ("🔀 Сменить бэкенд", warp.data("backend")),
         ("🗑 Удалить", warp.data("rm")) if conf else None,
         ui.back("tun")))
+
+
+@warp("scout")
+async def _warp_scout(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
+    await jobs.start(cb, "Обновление warpscout", "warp", "scout-update", back_to="warp")
 
 
 @warp("install")

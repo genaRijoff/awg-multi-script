@@ -4300,4 +4300,68 @@ rc, out, _ = bash("trap '_on_interrupt INT' INT; kill -INT $$; sleep 1; echo AFT
 chk("Ctrl+C в меню — «Прервано» и смерть от SIGINT, а не exit 130", rc == -2 and "Прервано" in out and "AFTER" not in out, (rc, out))
 chk("TERM — смерть от SIGTERM", bash("trap '_on_interrupt TERM' TERM; kill -TERM $$; echo AFTER")[0] == -15)
 
+# ── warpscout: поиск endpoint WARP и обновление сканера ──────
+print("warpscout")
+WS = os.path.join(TMP, "ws")
+os.makedirs(os.path.join(WS, "bin"), exist_ok=True)
+with open(os.path.join(WS, "bin", "warpscout"), "w") as f:
+    f.write(r"""#!/bin/bash
+# Заглушка warpscout: WS_MODE — что печатает скан; версия — из файла
+case "$1" in
+  version) cat "$WS/ver" 2>/dev/null || echo 0.13.2; exit 0 ;;
+  register) echo '{}' > "${3:-warpscout-account.json}"; exit 0 ;;
+esac
+echo "$PWD" > "$WS/cwd"; : > warpscout-report-1.txt
+n=$(( $(cat "$WS/n" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$WS/n"
+case "$WS_MODE" in
+  old) printf '\033[32mENDPOINT  PING\033[0m\n162.159.193.10:2408  0.36ms\n162.159.193.10:2408\n' ;;
+  new) echo "Phase 1: probing reachable WARP ports: reachable ports [2408 500]"; echo "Phase 2: verifying tunnels (proto=awg): done"
+       echo 188.114.96.20:2408; echo "Report: warpscout-report-1.txt" ;;
+  flaky) (( n == 1 )) && { echo "Phase 2: verifying tunnels (proto=awg): done"; exit 0; }; echo 162.159.195.7:2408 ;;
+  fail) echo "Using cached WARP account" ; echo "error: account rejected by Cloudflare (401)" >&2; exit 1 ;;
+esac
+""")
+os.chmod(os.path.join(WS, "bin", "warpscout"), 0o755)
+WSPRE = (f'WS="{WS}"; export WS; WARPSCOUT_BIN="{WS}/bin/warpscout"; WARPSCOUT_DIR="{WS}/acc"; '
+         'WARPSCOUT_ACCOUNT="$WARPSCOUT_DIR/warpscout-account.json"; warp_backend() { echo wg; }; '
+         'mkdir -p "${WARP_CONF%/*}" "${WARP_PROFILE%/*}"; printf "[Peer]\nEndpoint = 1.2.3.4:2408\n" > "$WARP_CONF"; '
+         'cp "$WARP_CONF" "$WARP_PROFILE"; ')
+
+
+def ws(mode, code="warp_endpoint_best"):
+    for f in ("n", "cwd"):
+        if os.path.exists(os.path.join(WS, f)):
+            os.remove(os.path.join(WS, f))
+    return bash(WSPRE + f"export WS_MODE={mode}; {code}; echo \"rc=$?\"; grep Endpoint \"$WARP_CONF\"")
+
+
+rc, out, _ = ws("old")
+chk("warpscout 0.13: таблица и лучший адрес последней строкой — endpoint в профиле, аккаунт зарегистрирован",
+    "rc=0" in out and "Endpoint = 162.159.193.10:2408" in out and os.path.exists(os.path.join(WS, "acc", "warpscout-account.json")), out)
+rc, out, _ = ws("new")
+chk("warpscout поновее: ход скана и строка отчёта после адреса — адрес всё равно найден",
+    "rc=0" in out and "Endpoint = 188.114.96.20:2408" in out, out)
+chk("скан идёт в каталоге warpscout (не в /), его отчёты не копятся",
+    open(os.path.join(WS, "cwd")).read().strip() == os.path.join(WS, "acc")
+    and not [f for f in os.listdir(os.path.join(WS, "acc")) if f.startswith("warpscout-report")], os.listdir(os.path.join(WS, "acc")))
+rc, out, _ = ws("flaky")
+chk("первый скан пустой (сбой сети на миг) — второй, адрес применён",
+    "сканирую ещё раз" in out and "rc=0" in out and "Endpoint = 162.159.195.7:2408" in out, out)
+rc, out, _ = ws("fail")
+chk("warpscout упал — его же слова о причине, а не «UDP режут»; endpoint прежний",
+    "rc=1" in out and "account rejected by Cloudflare (401)" in out and "режут" not in out
+    and "Endpoint = 1.2.3.4:2408" in out and "Обновить скаут" in out, out)
+inst = ('curl() { local o; while (( $# )); do [[ "$1" == -o ]] && o="$2"; shift; done; '
+        'printf \'#!/bin/sh\necho 0.16.1 > "$WS/ver"\n\' > "$o"; }; ')
+rc, out, _ = ws("old", 'echo 0.13.2 > "$WS/ver"; ' + inst + "warpscout_update")
+chk("«Обновить скаут»: официальный установщик, версия было → стало", "rc=0" in out and "warpscout 0.13.2 → 0.16.1" in out, out)
+rc, out, _ = ws("old", inst + "warpscout_update")
+chk("«Обновить скаут» на последней — «уже последняя версия»", "rc=0" in out and "0.16.1 — уже последняя версия" in out, out)
+rc, out, _ = ws("old", 'curl() { return 22; }; warpscout_update')
+chk("установщик не скачался — понятная ошибка", "rc=1" in out and "Не скачался установщик warpscout" in out, out)
+rc, out, _ = bash(WSPRE + "api_main warp status")
+chk("api warp status: версия сканера (scout)", '"scout": "0.16.1"' in out, out[-300:])
+rc, out, _ = bash(WSPRE + "api_main warp")
+chk("api warp: scout-update в списке команд", "scout-update" in out, out[-300:])
+
 summary()

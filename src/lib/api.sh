@@ -557,7 +557,8 @@ _api_warp() {
         _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
         _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <("$(warp_tool)" show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
         _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
-        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
+        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"
+        _kv scout "$([[ -x "$WARPSCOUT_BIN" ]] && _warpscout_version)"; } | api_obj
       warp_status ;;
     install) if [[ "$be" == wg ]]; then warp_wg_install; else warp_usque_install; fi ;;
     up) warp_up ;;
@@ -587,11 +588,12 @@ _api_warp() {
       [[ -s "$API_IN" ]] || { err "Профиль wgcf-profile.conf передаётся через stdin"; return 1; }
       warp_import < "$API_IN" ;;
     endpoint) warp_endpoint_best "${1:-}" ;;
+    scout-update) warpscout_update ;;
     backend)
       [[ "${1:-}" =~ ^(wg|usque)$ ]] || { _api_usage "warp backend wg|usque"; return; }
       warp_set_backend "$1" ;;
     remove) warp_uninstall ;;
-    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
+    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|scout-update|backend wg|usque|remove" ;;
   esac
 }
 
