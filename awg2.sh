@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.62"
+VERSION="v1.2.63"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -5463,7 +5463,8 @@ rt_tunnel_on() {  # таблица
   esac
 }
 
-rt_table_live() { ip route show table "$1" 2>/dev/null | grep -q ' dev '; }   # в таблице есть живой маршрут
+# В таблице есть живой маршрут. Не «… | grep -q»: при pipefail ранний выход grep — SIGPIPE у ip и ложное «нет»
+rt_table_live() { grep -q ' dev ' <<< "$(ip route show table "$1" 2>/dev/null)"; }
 
 # Поднимается туннель — снять «удержание» лежащих: их правила (приоритет у
 # каждого свой) иначе перехватили бы клиентов в «недоступно».
@@ -6219,33 +6220,85 @@ warp_health_off() {
 }
 
 # ── warpscout: поиск рабочего endpoint ────────────────────
+_warpscout_version() { "$WARPSCOUT_BIN" version 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)+' | head -1; }
+
+# Последняя версия warpscout с GitHub — официальным установщиком (он же обновляет)
+_warpscout_install() {
+  local f out
+  [[ "$(go_arch)" =~ ^(amd64|arm64)$ ]] || { err "warpscout — только amd64/arm64"; return 1; }
+  mktmp f || return 1
+  curl -4 -fsSL --max-time 60 https://raw.githubusercontent.com/vernette/warpscout/master/install.sh -o "$f" \
+    || { err "Не скачался установщик warpscout (GitHub недоступен?)"; return 1; }
+  if ! out=$(INSTALL_DIR="${WARPSCOUT_BIN%/*}" sh "$f" -y 2>&1) || ! "$WARPSCOUT_BIN" version &>/dev/null; then
+    err "warpscout не установился:"
+    _warpscout_tail <<< "$out"
+    return 1
+  fi
+}
+
+# Вывод warpscout без цветов, рамок и пустых строк — последние строки, для причины сбоя
+_warpscout_tail() {
+  sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\r' | grep -vE '^[[:space:]]*$|[╭╮╰╯│─]' | tail -n 8 | sed 's/^/      /'
+}
+
 _warpscout_ready() {
   if ! "$WARPSCOUT_BIN" version &>/dev/null; then
-    [[ "$(go_arch)" =~ ^(amd64|arm64)$ ]] || { err "warpscout — только amd64/arm64"; return 1; }
     info "Ставлю warpscout..."
-    curl -4 -fsSL --max-time 60 https://raw.githubusercontent.com/vernette/warpscout/master/install.sh \
-      | INSTALL_DIR="${WARPSCOUT_BIN%/*}" sh -s -- -y >/dev/null 2>&1
-    "$WARPSCOUT_BIN" version &>/dev/null || { err "warpscout не установился"; return 1; }
+    _warpscout_install || return 1
   fi
   mkdir -p "$WARPSCOUT_DIR" && chmod 700 "$WARPSCOUT_DIR"
-  [[ -s "$WARPSCOUT_ACCOUNT" ]] || "$WARPSCOUT_BIN" register -a "$WARPSCOUT_ACCOUNT" >/dev/null 2>&1 \
-    || { err "Регистрация warpscout не удалась"; return 1; }
+  local out
+  [[ -s "$WARPSCOUT_ACCOUNT" ]] || out=$(cd "$WARPSCOUT_DIR" && HOME="${HOME:-/root}" \
+    "$WARPSCOUT_BIN" register -a "$WARPSCOUT_ACCOUNT" 2>&1 </dev/null) \
+    || { err "Регистрация warpscout не удалась:"; _warpscout_tail <<< "${out:-}"; return 1; }
+}
+
+# Обновить warpscout (кнопка «Обновить скаут»): аккаунт остаётся прежним
+warpscout_update() {
+  local was now
+  was=$(_warpscout_version)
+  info "${was:+Сейчас warpscout $was — }ставлю последнюю версию с GitHub..."
+  _warpscout_install || return 1
+  now=$(_warpscout_version)
+  if [[ -n "$was" && "$was" == "$now" ]]; then ok "warpscout $now — уже последняя версия"
+  else ok "warpscout ${was:+$was → }$now"; fi
+}
+
+# Скан warpscout: в stdout — его вывод без цветов. Каталог — свой: туда же он
+# пишет отчёт скана (иначе — в текущий, хоть в /), отчёты не копятся.
+_warpscout_scan() {
+  ( cd "$WARPSCOUT_DIR" && HOME="${HOME:-/root}" "$WARPSCOUT_BIN" scan -p awg -a "$WARPSCOUT_ACCOUNT" "$@" ) \
+    2>&1 </dev/null | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\r'
+  rm -f "$WARPSCOUT_DIR"/warpscout-report-*.txt 2>/dev/null
+  return 0
 }
 
 # Лучший endpoint по замерам warpscout → сразу в профиль. $1 — страна (DE, NL...).
+# Ответ — строка «IP:порт» (последняя такая: новые версии печатают ход скана и
+# после него). Пусто — ещё раз (сбой сети на миг), потом — его же слова о причине.
 warp_endpoint_best() {
-  local best
+  local best="" out="" try
   [[ "$(warp_backend)" == wg ]] || { err "Только для бэкенда wg"; return 1; }
   [[ -z "${1:-}" || "$1" =~ ^[A-Za-z]{2}$ ]] || { err "Страна — две буквы (DE, NL)"; return 1; }
   _warpscout_ready || return 1
-  info "Сканирую (до минуты)..."
-  best=$("$WARPSCOUT_BIN" scan -p awg -a "$WARPSCOUT_ACCOUNT" -best ${1:+-country "${1^^}"} 2>/dev/null | tail -1)
+  for try in 1 2; do
+    if (( try == 1 )); then info "Сканирую (до минуты)..."; else info "Пусто — сканирую ещё раз..."; fi
+    out=$(_warpscout_scan -best ${1:+-country "${1^^}"})
+    best=$(grep -E '^[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+$' <<< "$out" | tail -1 || true)
+    [[ -n "$best" ]] && break
+  done
+  if [[ -z "$best" ]]; then
+    err "warpscout не нашёл рабочий endpoint${1:+ в стране ${1^^}} — его вывод:"
+    _warpscout_tail <<< "$out"
+    info "WARP при этом может работать и на текущем endpoint. Не помогает — «Обновить скаут»"
+    return 1
+  fi
   warp_endpoint_set "$best"
 }
 
 warp_endpoint_set() {  # ip:порт
   local pub
-  [[ "$1" =~ ^[0-9.]+:[0-9]+$ ]] || { err "Ни один endpoint не прошёл проверку — UDP к Cloudflare, похоже, режут"; return 1; }
+  [[ "$1" =~ ^[0-9.]+:[0-9]+$ ]] || { err "Endpoint — IP:порт, а не «$1»"; return 1; }
   sed -i "s|^Endpoint = .*|Endpoint = $1|" "$WARP_CONF" "$WARP_PROFILE" 2>/dev/null
   if warp_is_up; then
     pub=$("$(warp_tool)" show "$WARP_IF" peers | head -1)
@@ -6255,7 +6308,7 @@ warp_endpoint_set() {  # ip:порт
 }
 
 warp_find_endpoint() {
-  local c country rep lines=() i
+  local c country rep lines=() i out
   [[ "$(warp_backend)" == wg ]] || { warn "Только для бэкенда wg"; return 0; }
   echo -e "  ${C}1)${N} Найти лучший и применить"
   echo -e "  ${C}2)${N} Показать список и выбрать"
@@ -6268,9 +6321,9 @@ warp_find_endpoint() {
   _warpscout_ready || return 1
   info "Сканирую (до минуты)..."
   mktmp rep || return 1
-  "$WARPSCOUT_BIN" scan -p awg -a "$WARPSCOUT_ACCOUNT" -plain -o "$rep" 2>/dev/null
-  mapfile -t lines < <(grep -oE '[0-9.]+:[0-9]+' "$rep" | sort -u)
-  (( ${#lines[@]} )) || { err "Рабочих endpoint не найдено"; return 1; }
+  out=$(_warpscout_scan -plain -o "$rep")
+  mapfile -t lines < <(grep -oE '[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+' "$rep" 2>/dev/null | sort -u)
+  (( ${#lines[@]} )) || { err "Рабочих endpoint не найдено — вывод warpscout:"; _warpscout_tail <<< "$out"; return 1; }
   for i in "${!lines[@]}"; do printf "  %2d) %s\n" "$((i + 1))" "${lines[$i]}"; done
   read_choice c "${C}  Выбор (0 — отмена): ${N}" 0 "${#lines[@]}" 0
   (( c == 0 )) && return 0
@@ -6362,11 +6415,12 @@ do_warp_menu() {
       echo -e "  ${C}6)${N} Warp+ (ключ)"
       echo -e "  ${C}7)${N} Импорт wgcf-profile.conf"
       echo -e "  ${C}8)${N} Поиск рабочего endpoint (warpscout)"
+      echo -e "  ${C}9)${N} Обновить warpscout ${D}— сканер endpoint${N}"
     fi
     echo -e "  ${C}b)${N} Сменить бэкенд (wg ↔ usque)"
     echo -e "  ${R}d)${N} Удалить WARP"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор: ${N}" 0 8 0 "b|d"
+    read_choice c "${C}  Выбор: ${N}" 0 9 0 "b|d"
     case "$c" in
       1) if [[ "$be" == wg ]]; then warp_wg_install || true; else warp_usque_install || true; fi ;;
       2) warp_up || true ;;
@@ -6376,6 +6430,7 @@ do_warp_menu() {
       6) [[ "$be" == wg ]] && { warp_license || true; } ;;
       7) [[ "$be" == wg ]] && { warp_import || true; } ;;
       8) [[ "$be" == wg ]] && { warp_find_endpoint || true; } ;;
+      9) [[ "$be" == wg ]] && { warpscout_update || true; } ;;
       b) warp_switch_backend || true ;;
       d) warp_remove || true ;;
       0) return 0 ;;
@@ -13571,7 +13626,7 @@ tunfail_held() {  # имя
   table=$(_tunfail_table "$1")
   [[ "$(rt_fail_mode "$1")" == block ]] && rt_tunnel_on "$table" && ! rt_table_live "$table" \
     && grep -qE "lookup $table\$" <<< "$(ip rule show 2>/dev/null)" \
-    && ip route show table "$table" 2>/dev/null | grep -q '^unreachable default'
+    && grep -q '^unreachable default' <<< "$(ip route show table "$table" 2>/dev/null)"
 }
 
 # ── Установка ─────────────────────────────────────────────
@@ -14867,7 +14922,8 @@ _api_warp() {
         _kv endpoint "$([[ "$be" == wg ]] && sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$WARP_CONF" 2>/dev/null | head -1)"
         _kv hs:n "$(if [[ "$be" == wg ]]; then _n awk 'NR == 1 {print $2}' < <("$(warp_tool)" show "$WARP_IF" latest-handshakes 2>/dev/null); else echo 0; fi)"
         _kv rx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/rx_bytes")"
-        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"; } | api_obj
+        _kv tx:n "$(_n cat "/sys/class/net/$WARP_IF/statistics/tx_bytes")"
+        _kv scout "$([[ -x "$WARPSCOUT_BIN" ]] && _warpscout_version)"; } | api_obj
       warp_status ;;
     install) if [[ "$be" == wg ]]; then warp_wg_install; else warp_usque_install; fi ;;
     up) warp_up ;;
@@ -14897,11 +14953,12 @@ _api_warp() {
       [[ -s "$API_IN" ]] || { err "Профиль wgcf-profile.conf передаётся через stdin"; return 1; }
       warp_import < "$API_IN" ;;
     endpoint) warp_endpoint_best "${1:-}" ;;
+    scout-update) warpscout_update ;;
     backend)
       [[ "${1:-}" =~ ^(wg|usque)$ ]] || { _api_usage "warp backend wg|usque"; return; }
       warp_set_backend "$1" ;;
     remove) warp_uninstall ;;
-    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|backend wg|usque|remove" ;;
+    *) _api_usage "warp status|install|up|down|restart|probe [ping]|health on|off|license КЛЮЧ|import (stdin)|endpoint [СТРАНА]|scout-update|backend wg|usque|remove" ;;
   esac
 }
 
@@ -20758,5 +20815,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=3a4df4cc8aeadd6a
+_BUILD_SUM=3ec1ad3b56cdbbdb
 main "$@"
