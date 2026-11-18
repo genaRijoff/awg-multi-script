@@ -2,7 +2,7 @@
 # Маршрутизация туннелей на настоящем ядре: правила клиентов, «если туннель
 # упал» (unreachable под маршрутом), метка и правило «РФ напрямую», «куда идёт
 # адрес» — настоящими ip, ipset и iptables в отдельном сетевом пространстве.
-# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits
+# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits|dns
 # (или через tests/test_kernel_routing.py — он сам пропустит, если netns нет).
 # shellcheck disable=SC2034  # пути — для функций awg2, подключённых через eval
 set -u
@@ -59,6 +59,56 @@ PY
   trap 'kill $CLI $NET $SRV 2>/dev/null' EXIT
   iptables -t nat -A POSTROUTING -s 10.23.45.0/24 -o eth0 -j MASQUERADE
   reach() { nsenter -t "$CLI" -n python3 -I "$T/cl.py" "$1"; }
+elif [[ "$PART" == dns ]]; then
+  # Шифрованный DNS: клиенты за awg0 и за wgobf0 (WG + обфускатор), «интернет» — свой
+  # netns: его DNS на 1.1.1.1 отвечает «LEAK», а dnscrypt сервера на 127.0.2.1 — «DNSCRYPT»
+  for c in nsenter python3; do command -v "$c" &>/dev/null || { echo "ПРОПУСК dns: нет $c"; exit 0; }; done
+  unshare -n sleep 600 & CA=$!; unshare -n sleep 600 & CW=$!; unshare -n sleep 600 & NET=$!; sleep 0.3
+  trap 'kill $CA $CW $NET 2>/dev/null' EXIT
+  ip link add awg0 type veth peer name c0; ip link set c0 netns "$CA"
+  ip link add eth0 type veth peer name i0; ip link set i0 netns "$NET"
+  ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
+  ip addr add 203.0.113.10/24 dev eth0; ip link set eth0 up; ip route add default via 203.0.113.1
+  sysctl -qw net.ipv4.ip_forward=1
+  nsenter -t "$CA" -n sh -c 'ip link set lo up; ip addr add 10.23.45.2/24 dev c0; ip link set c0 up; ip route add default via 10.23.45.1'
+  nsenter -t "$NET" -n sh -c 'ip link set lo up; ip addr add 203.0.113.1/24 dev i0; ip link set i0 up; ip addr add 1.1.1.1/32 dev lo'
+  iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+  wgobf_link() {  # wgobf0 и его клиент — заново (обфускатор подняли после DNS)
+    ip link del wgobf0 2>/dev/null
+    ip link add wgobf0 type veth peer name w0; ip link set w0 netns "$CW"
+    ip addr add 10.66.66.1/24 dev wgobf0; ip link set wgobf0 up
+    nsenter -t "$CW" -n sh -c 'ip link set lo up; ip addr add 10.66.66.2/24 dev w0; ip link set w0 up; ip route add default via 10.66.66.1'
+  }
+  wgobf_link
+  cat > "$T/dns.py" <<'PY'
+import socket, sys, threading
+host, tag = sys.argv[1], sys.argv[2].encode()
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind((host, 53))
+if len(sys.argv) > 3:          # «интернет»: ещё и DoT на 853
+    t = socket.socket(); t.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); t.bind((host, 853)); t.listen(8)
+    threading.Thread(target=lambda: [t.accept()[0].close() for _ in iter(int, 1)], daemon=True).start()
+while True:
+    q, a = u.recvfrom(512); u.sendto(tag + b":" + q, a)
+PY
+  cat > "$T/q.py" <<'PY'
+import socket, sys
+kind = sys.argv[1]
+try:
+    if kind == "dot":
+        socket.create_connection(("1.1.1.1", 853), timeout=2).close(); print("DOT-OPEN")
+    else:
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.settimeout(2); u.sendto(b"q", ("1.1.1.1", 53))
+        d, a = u.recvfrom(512); print(d.decode().split(":")[0], a[0])
+except OSError as e:
+    print("NO", type(e).__name__)
+PY
+  nsenter -t "$NET" -n python3 -I "$T/dns.py" 1.1.1.1 LEAK dot & S1=$!
+  python3 -I "$T/dns.py" 127.0.2.1 DNSCRYPT & S2=$!
+  trap 'kill $CA $CW $NET $S1 $S2 2>/dev/null' EXIT
+  sleep 0.5
+  q() { nsenter -t "$1" -n python3 -I "$T/q.py" "$2"; }
+  eval "$(sed -n '/^ipt_add() {/,/^}/p;/^ipt_ins() {/,/^}/p;/^ipt_del() {/,/^}/p;/^ipt_del_tagged() {/,/^}/p' "$LIB")"
+  DNS_PROXY_ADDR=127.0.2.1 DNS_PROXY_PORT=53
 else
   ip tuntap add mode tun dev awg0; ip addr add 10.23.45.1/24 dev awg0; ip link set awg0 up
   ip link add eth0 type veth peer name eth0p; ip addr add 203.0.113.10/24 dev eth0; ip link set eth0 up; ip link set eth0p up
@@ -187,6 +237,27 @@ rudirect_run heal
 ok "…починен (eth0=2 сильнее all=1) — ответ есть" '[[ "$(rpf eth0)" == 2 ]] && rudirect_rules_ok && reach 77.1.1.1'
 echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter; echo 1 > /proc/sys/net/ipv4/conf/eth0/rp_filter
 out=$(diag_route bob 77.1.1.1); ok "клиент без туннеля при строгом — rudirect без подсказки (обратный путь и так eth0)" '[[ "$out" == *$'"'"'\trudirect\teth0\t'"'"'* ]]'
+elif [[ "$PART" == dns ]]; then
+echo "── Шифрованный DNS: перехват с awg0 и wgobf0 на настоящем трафике ──"
+ok "без перехвата DNS клиента обфускатора уходит в интернет открыто, DoT открыт" \
+  '[[ "$(q "$CW" dns)" == "LEAK 1.1.1.1" && "$(q "$CW" dot)" == DOT-OPEN ]]'
+dns_rules_down; dns_rules_up
+ok "клиент AWG: запрос на 1.1.1.1 ответил dnscrypt сервера, адрес ответа — 1.1.1.1" '[[ "$(q "$CA" dns)" == "DNSCRYPT 1.1.1.1" ]]'
+ok "клиент WG + обфускатора: то же — DNS не уходит открыто" '[[ "$(q "$CW" dns)" == "DNSCRYPT 1.1.1.1" ]]'
+ok "DoT (853) закрыт у обоих" '[[ "$(q "$CA" dot)" == NO* && "$(q "$CW" dot)" == NO* ]]'
+ok "правила перехвата на месте (dns_rules_ok)" 'dns_rules_ok'
+# Старая версия: перехват был только на awg0 — сторож увидит дыру и доставит правила
+iptables -t nat -D PREROUTING -i wgobf0 -p udp --dport 53 -j DNAT --to-destination 127.0.2.1:53 -m comment --comment awg2-dns
+ok "правила wgobf0 нет (обновление со старой версии) — dns_rules_ok это видит" '! dns_rules_ok'
+dns_rules_up
+ok "dns_rules_up доставил его — снова dnscrypt, без дублей" \
+  '[[ "$(q "$CW" dns)" == "DNSCRYPT 1.1.1.1" && "$(iptables -t nat -S PREROUTING | grep -c "wgobf0.*dport 53")" == 2 ]]'
+# Обфускатор подняли уже после DNS: правила на wgobf0 стоят без интерфейса
+ip link del wgobf0; dns_rules_down; dns_rules_up; wgobf_link
+ok "wgobf0 появился после включения DNS — перехват сразу работает" '[[ "$(q "$CW" dns)" == "DNSCRYPT 1.1.1.1" && "$(q "$CW" dot)" == NO* ]]'
+dns_rules_down
+ok "выключили DNS — правила сняты, клиенты снова ходят к своему DNS" \
+  '! grep -q awg2-dns <<< "$(iptables-save)" && [[ "$(q "$CW" dns)" == "LEAK 1.1.1.1" && "$(q "$CW" dot)" == DOT-OPEN ]]'
 elif [[ "$PART" == exits ]]; then
 echo "── Сторож exit-нод: ноды — настоящие сетевые пространства, проба — настоящий ping ──"
 command -v ping &>/dev/null || { echo "ПРОПУСК exits: нет ping"; exit 0; }

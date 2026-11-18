@@ -797,8 +797,8 @@ async def dns_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> Non
         return
     d = r.data
     inst = d.get("installed")
-    await ui.render(cb, "<b>🔐 Шифрованный DNS</b>\nЗапросы клиентов идут через dnscrypt-proxy по DoH, "
-                        "DoT (853) закрыт.\n" + ui.pre(r.log, 1200, tail=False)
+    await ui.render(cb, "<b>🔐 Шифрованный DNS</b>\nЗапросы клиентов AWG и WG + обфускатора идут через "
+                        "dnscrypt-proxy по DoH, DoT (853) закрыт.\n" + ui.pre(r.log, 1200, tail=False)
                         + ("" if inst else "\n<i>⚠️ Принудительно — если на сервере уже работает свой DNS "
                                            "(Pi-hole, Unbound, bind)</i>"), ui.kb(
         ("▶️ Включить", dns.data("install")) if not inst else None,

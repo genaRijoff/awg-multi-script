@@ -4480,7 +4480,7 @@ route(/^\/tunnels\/dns$/, async (ctx) => {
       [{ label: "⏹ Выключить", value: "off" }, { label: "🗑 Удалить совсем, с dnscrypt-proxy", value: "purge", cls: "bad" }]);
     if (v) await quick(b, "DNS выключен", ["dns", "remove", ...(v === "purge" ? ["purge"] : [])]);
   }
-  ctx.put(title("🔐 Шифрованный DNS"), hint("Запросы клиентов идут через dnscrypt-proxy по DoH, DoT (853) закрыт."),
+  ctx.put(title("🔐 Шифрованный DNS"), hint("Запросы клиентов AWG и WG + обфускатора идут через dnscrypt-proxy по DoH, DoT (853) закрыт."),
     logCard(r.log),
     inst ? [h("h2", {}, "Резолверы"),
       h("div", { class: "card list" }, (d.presets || []).map((p) => h("div", { class: "item", onclick: () =>

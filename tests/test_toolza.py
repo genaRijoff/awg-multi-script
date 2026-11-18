@@ -668,11 +668,24 @@ def run_and_check(label, script, *args, must=(), must_not=()):
         f"rc={rc} err={err.strip()[-300:]} нет: {missing} лишнее: {present}")
 
 
-run_and_check("DNS: перехват и блок DoT в mangle", "DNS_PERSIST_SCRIPT",
+run_and_check("DNS: перехват и блок DoT в mangle — с awg0 и с wgobf0 (WG + обфускатор)", "DNS_PERSIST_SCRIPT",
               must=[r"-t nat -A PREROUTING -i awg0 -p udp --dport 53 -j DNAT --to-destination 127\.0\.2\.1:53 -m comment --comment awg2-dns",
                     r"-t mangle -A PREROUTING -i awg0 -p tcp --dport 853 -j DROP -m comment --comment awg2-dns",
-                    r"-t filter -I INPUT 1 -i awg0 -d 127\.0\.2\.1"])
+                    r"-t filter -I INPUT 1 -i awg0 -d 127\.0\.2\.1",
+                    r"-t nat -A PREROUTING -i wgobf0 -p udp --dport 53 -j DNAT --to-destination 127\.0\.2\.1:53 -m comment --comment awg2-dns",
+                    r"-t nat -A PREROUTING -i wgobf0 -p tcp --dport 53 -j DNAT",
+                    r"-t mangle -A PREROUTING -i wgobf0 -p udp --dport 853 -j DROP -m comment --comment awg2-dns",
+                    r"-t filter -I INPUT 1 -i wgobf0 -d 127\.0\.2\.1 -p udp --dport 53 -j ACCEPT"])
 run_and_check("DNS: health-check", "DNS_HEALTH_SCRIPT", must=[r"-t nat -A PREROUTING"])
+reset_calls()
+rc, out, _ = bash('ufw() { echo "ufw $*" >> "$CALLS"; }; ufw_active() { return 0; }; dns_ufw_allow; '
+                  'ufw_delete_matching() { :; }; command() { [[ "$2" == ufw ]] && return 0; builtin command "$@"; }; '
+                  'apt-get() { :; }; dns_uninstall')
+c = calls()
+chk("DNS и UFW: вход к dnscrypt разрешён и с wgobf0, при выключении снят с обоих интерфейсов",
+    all(f"ufw allow in on {i} to 127.0.2.1 port 53 proto {p} comment awg2-dns" in c for i in ("awg0", "wgobf0") for p in ("udp", "tcp"))
+    and all(f"ufw delete allow in on {i} to 127.0.2.1 port 53 proto {p}" in c for i in ("awg0", "wgobf0") for p in ("udp", "tcp")),
+    [l for l in c.splitlines() if l.startswith("ufw")])
 run_and_check("Каскад: только адреса сервера, туда и обратно", "CASCADE_SCRIPT",
               must=[r"-t nat -A PREROUTING -p udp --dport 443 -m addrtype --dst-type LOCAL -j DNAT --to-destination 5\.6\.7\.8:443 -m comment --comment awg-cascade:udp-443",
                     r"-I FORWARD 1 -p tcp -s 5\.6\.7\.8 --sport 443 -j ACCEPT -m comment --comment awg-cascade:tcp-8443"])

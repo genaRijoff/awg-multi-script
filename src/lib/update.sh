@@ -305,8 +305,9 @@ helpers_refresh() {
   [[ -f "$USQUE_UP_HOOK" ]] && _usque_write &>/dev/null
   if [[ -f "$DNS_PROXY_STATE" ]]; then
     _dns_emit_helpers &>/dev/null
-    # Прежние версии ставили блок DoT в FORWARD ниже ACCEPT — он не работал
-    iface_up && { dns_rules_down; dns_rules_up; }
+    # Прежние версии ставили блок DoT в FORWARD ниже ACCEPT — он не работал;
+    # перехват на wgobf0 (WG + обфускатор) — с v1.2.64
+    iface_up && { dns_rules_down; dns_rules_up; dns_ufw_allow; }
   fi
   if (( $(cascade_count) )); then
     _cascade_persist && cascade_apply_all
