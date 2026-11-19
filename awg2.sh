@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.63"
+VERSION="v1.2.64"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -431,6 +431,11 @@ _real_home() {
   echo "${home:-/root}"
 }
 BACKUP_DIR="$(_real_home)/awg_backup"
+# Пароль бэкапов: им шифруются файлы, которые уходят с сервера (бот, панель).
+# Число итераций в файле не хранится — расшифровка на компьютере берёт его из README
+BACKUP_KEY="$STATE_DIR/backup.key"           # пароль, первая строка; 600
+BACKUP_OUT="$STATE_DIR/backup-out"           # файлы на выдачу: забравший удаляет
+BACKUP_ENC_ITER=200000
 
 # ── Туннели ───────────────────────────────────────────────
 # Номера таблиц маршрутизации — общие для всех версий awg2.
@@ -621,6 +626,24 @@ RUDIRECT_SRCS="https://raw.githubusercontent.com/ipverse/rir-ip/master/country/r
 # Настоящий список: ~8700 сетей, ~45 млн адресов IPv4. Короче или уже — оборван,
 # шире — подменён: прежний не заменяют. Своих записей — не больше 500
 RUDIRECT_MIN=2000 RUDIRECT_MINADDR=20000000 RUDIRECT_MAX4=134217728 RUDIRECT_USER_MAX=500
+
+# ── РФ мимо VPN (клиенты не ходят через сервер в сети России) ──
+# Список и его проверка — те же, что у «РФ напрямую» (RUDIRECT_SRCS и границы)
+RUBLOCK_DIR="$STATE_DIR/rublock"             # список и состояние
+RUBLOCK_CONF="$RUBLOCK_DIR/rublock.conf"     # ON, UPDATED, ERROR, ENTRIES, SRC
+RUBLOCK_SCRIPT="/usr/local/bin/awg2-rublock"
+RUBLOCK_LOG="/var/log/awg2-rublock.log"
+RUBLOCK_SET="awg2-rublock" RUBLOCK_TAG="awg2-rublock"
+# Метка «RB» в тех же старших битах, что у «РФ напрямую»; правило — «prohibit»
+# раньше и его, и туннелей: клиенту сразу отказ (ICMP), а не ожидание
+RUBLOCK_MARK="0x52420000/0xffff0000" RUBLOCK_PRIO=85
+RUBLOCK_UNIT="awg2-rublock.service" RUBLOCK_TIMER="awg2-rublock-update.timer"
+
+# ── Почта: исходящий SMTP (порт 25) клиентов закрыт ──
+SMTPBLOCK_FLAG="$STATE_DIR/smtpblock"        # есть файл — включено
+SMTPBLOCK_SCRIPT="/usr/local/bin/awg2-smtpblock"
+SMTPBLOCK_TAG="awg2-smtpblock"
+SMTPBLOCK_UNIT="awg2-smtpblock.service" SMTPBLOCK_TIMER="awg2-smtpblock-heal.timer"
 
 # ── Если туннель упал (режим на каждый туннель: напрямую или блокировать) ──
 TUNFAIL_CONF="/etc/awg2/tunnel-fail.conf"    # warp=block, xray=direct… (нет строки — direct)
@@ -6441,8 +6464,10 @@ do_warp_menu() {
 
 # ═════ dns ═════
 # Шифрованный DNS: dnscrypt-proxy на 127.0.2.1:53 (systemd-сокет пакета
-# Debian/Ubuntu), DNS-запросы клиентов перехватываются DNAT'ом с awg0 и уходят
-# наружу по DoH. DNS в конфигах клиентов не меняется — перехват прозрачный.
+# Debian/Ubuntu), DNS-запросы клиентов перехватываются DNAT'ом с awg0 и wgobf0
+# (WG + обфускатор) и уходят наружу по DoH. DNS в конфигах клиентов не
+# меняется — перехват прозрачный. Правила на wgobf0 ставятся и без него:
+# iptables не требует интерфейса, обфускатор поднимут — перехват уже на месте.
 #
 # DoT (853) режется в mangle PREROUTING, а не в FORWARD: PostUp сервера
 # вставляет «FORWARD -i awg0 -j ACCEPT» первым правилом при каждом подъёме
@@ -6476,6 +6501,9 @@ DNS_POPULAR=(
 dns_installed() { command -v dnscrypt-proxy &>/dev/null && [[ -f "$DNS_PROXY_STATE" ]]; }
 dns_running()   { unit_active "$DNS_UNIT" || unit_active "$DNS_SOCKET"; }
 
+# Интерфейсы клиентов, чей DNS перехватывается
+dns_ifaces() { echo "$AWG_IF" "$WGOBF_IF"; }
+
 dns_resolves() {
   command -v dig &>/dev/null || return 0
   timeout 4 dig "@$DNS_PROXY_ADDR" -p "$DNS_PROXY_PORT" cloudflare.com +short +tries=1 +time=2 2>/dev/null \
@@ -6491,13 +6519,15 @@ dns_state_line() {
 # ── Правила ───────────────────────────────────────────────
 # Работают и в служебных скриптах (emit_script).
 dns_rules_up() {
-  local p to="$DNS_PROXY_ADDR:$DNS_PROXY_PORT"
-  # DNAT в 127.0.0.0/8 ядро пропускает только с route_localnet
+  local p i to="$DNS_PROXY_ADDR:$DNS_PROXY_PORT"
+  # DNAT в 127.0.0.0/8 ядро пропускает только с route_localnet (all — для всех интерфейсов)
   sysctl -qw net.ipv4.conf.all.route_localnet=1 2>/dev/null || true
-  for p in udp tcp; do
-    ipt_add -t nat PREROUTING -i "$AWG_IF" -p "$p" --dport 53 -j DNAT --to-destination "$to" -m comment --comment "$DNS_TAG"
-    ipt_ins INPUT -i "$AWG_IF" -d "$DNS_PROXY_ADDR" -p "$p" --dport "$DNS_PROXY_PORT" -j ACCEPT -m comment --comment "$DNS_TAG"
-    ipt_add -t mangle PREROUTING -i "$AWG_IF" -p "$p" --dport 853 -j DROP -m comment --comment "$DNS_TAG"
+  for i in $(dns_ifaces); do
+    for p in udp tcp; do
+      ipt_add -t nat PREROUTING -i "$i" -p "$p" --dport 53 -j DNAT --to-destination "$to" -m comment --comment "$DNS_TAG"
+      ipt_ins INPUT -i "$i" -d "$DNS_PROXY_ADDR" -p "$p" --dport "$DNS_PROXY_PORT" -j ACCEPT -m comment --comment "$DNS_TAG"
+      ipt_add -t mangle PREROUTING -i "$i" -p "$p" --dport 853 -j DROP -m comment --comment "$DNS_TAG"
+    done
   done
 }
 
@@ -6518,9 +6548,25 @@ dns_rules_down() {
   fi
 }
 
+# Перехват на месте на всех интерфейсах клиентов (после обновления со старой
+# версии правил wgobf0 нет — сторож их доставит)
 dns_rules_ok() {
-  iptables -t nat -C PREROUTING -i "$AWG_IF" -p udp --dport 53 -j DNAT \
-    --to-destination "$DNS_PROXY_ADDR:$DNS_PROXY_PORT" -m comment --comment "$DNS_TAG" 2>/dev/null
+  local i
+  for i in $(dns_ifaces); do
+    iptables -t nat -C PREROUTING -i "$i" -p udp --dport 53 -j DNAT \
+      --to-destination "$DNS_PROXY_ADDR:$DNS_PROXY_PORT" -m comment --comment "$DNS_TAG" 2>/dev/null || return 1
+  done
+}
+
+# UFW: вход к dnscrypt-proxy с интерфейсов клиентов (ufw allow не дублирует)
+dns_ufw_allow() {
+  local i p
+  ufw_active || return 0
+  for i in $(dns_ifaces); do
+    for p in udp tcp; do
+      ufw allow in on "$i" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto "$p" comment "$DNS_TAG" &>/dev/null || true
+    done
+  done
 }
 
 # Точка входа awg-dns-persist.service: ждёт awg0 и ставит правила.
@@ -6551,7 +6597,7 @@ dns_health_run() {
 }
 
 _dns_emit_helpers() {
-  local common=(AWG_IF DNS_TAG DNS_PROXY_ADDR DNS_PROXY_PORT ipt_add ipt_ins dns_rules_up dns_rules_ok)
+  local common=(AWG_IF WGOBF_IF DNS_TAG DNS_PROXY_ADDR DNS_PROXY_PORT ipt_add ipt_ins dns_ifaces dns_rules_up dns_rules_ok)
   emit_script "$DNS_PERSIST_SCRIPT" 'dns_persist_run' "${common[@]}" dns_persist_run || return 1
   emit_script "$DNS_HEALTH_SCRIPT" 'dns_health_run' "${common[@]}" DNS_HEALTH_LOG dns_health_run || return 1
   write_unit awg-dns-persist.service <<EOF
@@ -6670,15 +6716,12 @@ dns_install() {  # [force] — включить поверх стороннег�
   fi
   dns_rules_down
   dns_rules_up
-  if ufw_active; then
-    ufw allow in on "$AWG_IF" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto udp comment "$DNS_TAG" &>/dev/null || true
-    ufw allow in on "$AWG_IF" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto tcp comment "$DNS_TAG" &>/dev/null || true
-  fi
+  dns_ufw_allow
   echo "net.ipv4.conf.all.route_localnet=1" | write_file "$DNS_SYSCTL" 644
   _dns_emit_helpers || return 1
   printf 'enabled=true\naddr=%s\nport=%s\ninstalled_at=%s\n' "$DNS_PROXY_ADDR" "$DNS_PROXY_PORT" "$(date +%s)" \
     | write_file "$DNS_PROXY_STATE" 644
-  ok "Шифрованный DNS включён: запросы клиентов идут по DoH, DoT (853) закрыт"
+  ok "Шифрованный DNS включён: запросы клиентов (AWG и WG + обфускатор) идут по DoH, DoT (853) закрыт"
   info "Проверка с клиента: https://1.1.1.1/help → «Using DNS over HTTPS: Yes»"
   log_info "dnscrypt-proxy включён"
 }
@@ -6699,7 +6742,7 @@ dns_status() {
   if ! dns_running; then echo -e "  Статус    : ${D}○ служба остановлена${N}"
   elif dns_resolves; then echo -e "  Статус    : ${G}● работает${N} ${D}($DNS_PROXY_ADDR:$DNS_PROXY_PORT)${N}"
   else echo -e "  Статус    : ${Y}▲ служба запущена, но не резолвит${N}"; fi
-  if dns_rules_ok; then echo -e "  Перехват  : ${G}● DNS клиентов идёт через DoH, DoT закрыт${N}"
+  if dns_rules_ok; then echo -e "  Перехват  : ${G}● DNS клиентов AWG и WG + обфускатора — через DoH, DoT закрыт${N}"
   elif dns_installed; then echo -e "  Перехват  : ${R}▲ правил нет — Перезапустить (2)${N}"
   else echo -e "  Перехват  : ${D}○ выключен${N}"; fi
   unit_active awg-dns-healthcheck.timer && echo -e "  Health    : ${G}● раз в 2 минуты${N}"
@@ -6771,14 +6814,16 @@ dns_remove() {
 }
 
 dns_uninstall() {  # [purge] — удалить и пакет
-  local purge="${1:-}"
+  local purge="${1:-}" i
   remove_unit awg-dns-healthcheck.timer awg-dns-healthcheck.service awg-dns-persist.service
   rm -f "$DNS_HEALTH_SCRIPT" "$DNS_PERSIST_SCRIPT" "$DNS_SYSCTL"
   dns_rules_down
   if command -v ufw &>/dev/null; then
     ufw_delete_matching "$DNS_TAG"
-    ufw delete allow in on "$AWG_IF" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto udp &>/dev/null || true
-    ufw delete allow in on "$AWG_IF" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto tcp &>/dev/null || true
+    for i in $(dns_ifaces); do
+      ufw delete allow in on "$i" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto udp &>/dev/null || true
+      ufw delete allow in on "$i" to "$DNS_PROXY_ADDR" port "$DNS_PROXY_PORT" proto tcp &>/dev/null || true
+    done
   fi
   sysctl -qw net.ipv4.conf.all.route_localnet=0 2>/dev/null || true
   systemctl disable --now "$DNS_UNIT" "$DNS_SOCKET" &>/dev/null || true
@@ -10155,13 +10200,104 @@ backup_create() {
 }
 
 _restore_list() {  # → строки «путь» (новые сверху)
-  find "$BACKUP_DIR" -maxdepth 1 \( -type d -name 'awg2_backup_*' -o -type f -name '*.tar.gz' \) \
+  find "$BACKUP_DIR" -maxdepth 1 \( -type d -name 'awg2_backup_*' -o -type f \( -name '*.tar.gz' -o -name '*.tar.gz.enc' \) \) \
     -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-
+}
+
+# ── Пароль бэкапов ────────────────────────────────────────
+# Файлы бэкапа, которые уходят с сервера (в чат бота, автобэкап, скачивание в
+# панели), шифруются: AES-256-CBC, ключ из пароля — PBKDF2-SHA256. Формат —
+# обычный «openssl enc»: файл открывается на любом компьютере с openssl. Бэкапы
+# в ~/awg_backup остаются как есть: они и так только у root. Пароль лежит на
+# сервере (иначе не зашифровать автобэкап) — защищает копии вне сервера.
+# Пароль никогда не идёт аргументом команды (его видно в ps): только файлом.
+backup_key_on() { [[ -s "$BACKUP_KEY" ]]; }
+
+_backup_openssl() {  # [-d] из в файл_пароля
+  local d=()
+  [[ "$1" == -d ]] && { d=(-d); shift; }
+  openssl enc ${d[@]+"${d[@]}"} -aes-256-cbc -pbkdf2 -iter "$BACKUP_ENC_ITER" -md sha256 -salt \
+    -in "$1" -out "$2" -pass "file:$3" 2>/dev/null
+}
+
+# Зашифрован ли файл: «openssl enc -salt» пишет в начало «Salted__»
+# (нули из заголовка gzip убираются: иначе bash ругается на них в $(...))
+backup_encrypted() { [[ -f "$1" && "$(head -c 8 "$1" 2>/dev/null | tr -d '\0')" == Salted__ ]]; }
+
+# Расшифровать и проверить: битый файл и неверный пароль — не архив
+_backup_decrypt() {  # из в файл_пароля
+  [[ -s "$3" ]] || return 1
+  if _backup_openssl -d "$1" "$2" "$3" && gzip -t "$2" 2>/dev/null; then return 0; fi
+  rm -f "$2"
+  return 1
+}
+
+# Пароль — первой строкой stdin: 8–128 символов, латиница, цифры, знаки
+# (так он одинаково вводится на любом компьютере), без пробелов по краям
+# (Telegram их обрезает).
+backup_key_set() {
+  local pw="" re='^[[:graph:]]([[:print:]]*[[:graph:]])?$' good=0
+  IFS= read -r pw || [[ -n "$pw" ]] || { err "Пароль не передан"; return 1; }
+  pw="${pw%$'\r'}"
+  # Классы символов — в локали C (только ASCII); проверка — без запуска
+  # других программ: пароль не должен попасть в их аргументы
+  ( LC_ALL=C; [[ "$pw" =~ $re ]] ) && good=1
+  if (( ${#pw} < 8 || ${#pw} > 128 )); then err "Пароль — от 8 до 128 символов"; return 1; fi
+  (( good )) || { err "В пароле — только латиница, цифры и знаки, без пробелов по краям"; return 1; }
+  need_cmds openssl:openssl || return 1
+  mkdir -p "$STATE_DIR" && chmod 700 "$STATE_DIR"
+  printf '%s\n' "$pw" | write_file "$BACKUP_KEY" 600 || { err "Пароль не записан"; return 1; }
+  log_info "бэкапы: пароль задан"
+  ok "Пароль задан: файлы бэкапов, которые уходят с сервера, теперь зашифрованы. Запиши его — без него их не открыть"
+}
+
+backup_key_clear() {
+  rm -f "$BACKUP_KEY"
+  log_info "бэкапы: пароль убран"
+  ok "Пароль убран: файлы бэкапов уходят с сервера без шифрования"
+}
+
+# Бэкап из списка — на выдачу (бот, панель): каталог полного — в tar.gz, с
+# паролем — зашифрован. Отдельный файл в BACKUP_OUT: забравший удаляет его,
+# забытые старше часа удаляются здесь же. Выдаётся только бэкап из списка —
+# иначе это чтение любого файла сервера.
+PACK_PATH="" PACK_ENC=0
+backup_pack() {  # путь
+  local src="$1" p found=0 out name
+  PACK_PATH="" PACK_ENC=0
+  while IFS= read -r p; do [[ "$p" == "$src" ]] && { found=1; break; }; done < <(_restore_list)
+  (( found )) || { err "Такого бэкапа нет: ${src##*/}"; return 1; }
+  mkdir -p "$BACKUP_OUT" && chmod 700 "$BACKUP_OUT" || return 1
+  find "$BACKUP_OUT" -mindepth 1 -maxdepth 1 -mmin +60 -exec rm -rf {} + 2>/dev/null || true
+  out=$(mktemp -d "$BACKUP_OUT/XXXXXX") || { err "Нет места для файла бэкапа"; return 1; }
+  name="${src##*/}"
+  if [[ -d "$src" ]]; then
+    name+=".tar.gz"
+    (umask 077 && tar -czf "$out/$name" -C "${src%/*}" "${src##*/}") \
+      || { rm -rf "$out"; err "Архив бэкапа не записан — проверь место на диске"; return 1; }
+  else
+    cp "$src" "$out/$name" || { rm -rf "$out"; err "Бэкап не скопирован — проверь место на диске"; return 1; }
+  fi
+  chmod 600 "$out/$name"
+  if backup_encrypted "$out/$name"; then
+    PACK_ENC=1
+  elif backup_key_on; then
+    need_cmds openssl:openssl || { rm -rf "$out"; return 1; }
+    if ! _backup_openssl "$out/$name" "$out/$name.enc" "$BACKUP_KEY"; then
+      rm -rf "$out"; err "Бэкап не зашифрован — файл не выдан"; return 1
+    fi
+    rm -f "$out/$name"
+    name+=".enc"; PACK_ENC=1
+    chmod 600 "$out/$name"
+  fi
+  PACK_PATH="$out/$name"
 }
 
 # Каталог с awg0.conf из любого бэкапа: каталог полного бэкапа, его архив,
 # авто-бэкап (пути от корня) или архив бота прежних версий (awg0.conf + clients/).
-RESTORE_SRC=""
+# Зашифрованный — пароль из файла RESTORE_PASS (присланный), затем свой; не
+# подошёл — код 4.
+RESTORE_SRC="" RESTORE_PASS=""
 _restore_prepare() {
   local src="$1" tmp d
   RESTORE_SRC=""
@@ -10171,6 +10307,14 @@ _restore_prepare() {
   fi
   [[ -f "$src" ]] || { err "Нет файла $src"; return 1; }
   mktmp tmp -d || return 1
+  if backup_encrypted "$src"; then
+    need_cmds openssl:openssl || return 1
+    if [[ -n "$RESTORE_PASS" ]] && _backup_decrypt "$src" "$tmp/dec.tar.gz" "$RESTORE_PASS"; then :
+    elif backup_key_on && _backup_decrypt "$src" "$tmp/dec.tar.gz" "$BACKUP_KEY"; then :
+    elif [[ -n "$RESTORE_PASS" ]]; then err "Пароль не подходит к бэкапу (или файл повреждён)"; return 4
+    else err "Бэкап зашифрован — нужен пароль"; return 4; fi
+    src="$tmp/dec.tar.gz"
+  fi
   py safe-untar "$src" "$tmp/x" || { err "Архив не распаковался"; return 1; }
   if [[ -f "$tmp/x/awg0.conf" ]]; then d="$tmp/x"
   elif [[ -f "$tmp/x$SERVER_CONF" ]]; then d="$tmp/x"; cp -a "$tmp/x$SERVER_CONF" "$d/awg0.conf"
@@ -10327,6 +10471,50 @@ _restore_hooks() {  # конфиг [разрешённые команды…]
   warn "Команды убраны из ${conf##*/}"
 }
 
+# Подготовить бэкап; зашифрованный без подходящего пароля — спросить его
+# (до трёх раз). Пароль — во временный файл (RESTORE_PASS), не в аргументы.
+_restore_ask_pass() {  # путь
+  local rc=0 try pw f
+  _restore_prepare "$1" || rc=$?
+  (( rc == 4 )) || return "$rc"
+  mktmp f || return 1
+  for try in 1 2 3; do
+    IFS= read -rs -p "  Пароль бэкапа (Enter — отмена): " pw; echo ""
+    [[ -n "$pw" ]] || return 1
+    printf '%s\n' "$pw" > "$f"
+    RESTORE_PASS="$f"; rc=0
+    _restore_prepare "$1" || rc=$?
+    (( rc == 4 )) || return "$rc"
+  done
+  return 4
+}
+
+do_backup_key() {
+  local c pw pw2
+  echo ""
+  hdr "Пароль бэкапов"
+  echo -e "  ${D}Файлы бэкапов, которые уходят с сервера (в Telegram, скачивание в панели),"
+  echo -e "  шифруются паролем (AES-256). Бэкапы на сервере остаются как есть. На этом сервере"
+  echo -e "  восстановление без ввода пароля; на другом — спросит его. На компьютере:"
+  echo -e "  openssl enc -d -aes-256-cbc -pbkdf2 -iter $BACKUP_ENC_ITER -md sha256 -in ФАЙЛ.enc -out бэкап.tar.gz${N}"
+  echo ""
+  if backup_key_on; then echo -e "  Пароль : ${G}● задан${N}"; else echo -e "  Пароль : ${D}○ не задан${N}"; fi
+  echo ""
+  echo -e "  ${C}1)${N} $(backup_key_on && echo "Сменить" || echo "Задать") пароль"
+  backup_key_on && echo -e "  ${C}2)${N} Убрать пароль"
+  echo -e "  ${W}0)${N} ← Назад"
+  read_choice c "${C}  Выбор: ${N}" 0 "$(backup_key_on && echo 2 || echo 1)" 0
+  case "$c" in
+    1) IFS= read -rs -p "  Новый пароль (8–128 символов): " pw; echo ""
+       [[ -n "$pw" ]] || return 0
+       # Ввод не виден: опечатка — и зашифрованные бэкапы не открыть
+       IFS= read -rs -p "  Ещё раз: " pw2; echo ""
+       [[ "$pw" == "$pw2" ]] || { err "Пароли не совпали — пароль не изменён"; return 1; }
+       printf '%s\n' "$pw" | backup_key_set ;;
+    2) backup_key_clear ;;
+  esac
+}
+
 do_restore() {
   local list=() i c src name opts=() bad
   mapfile -t list < <(_restore_list)
@@ -10339,7 +10527,7 @@ do_restore() {
   read_choice c "${C}  Бэкап (Enter = 1, 0 — отмена): ${N}" 0 "${#list[@]}" 1
   (( c )) || return 0
   src="${list[$((c - 1))]}"
-  _restore_prepare "$src" || return 1
+  _restore_ask_pass "$src" || return 1
   bad=$(py meta-check "$RESTORE_SRC/awg0.conf" 2>/dev/null | awk -F'\t' '{printf "%s%s (%s)", (NR > 1 ? ", " : ""), $1, $2}')
   [[ -n "$bad" ]] && warn "В бэкапе у клиентов повреждены метки: $bad — срок или лимит: клиент будет заблокирован до исправления"
   read_confirm "${R}  Текущий сервер будет заменён. Продолжить? (введи yes): ${N}" || return 0
@@ -10354,7 +10542,7 @@ backup_restore() {
   local src="$1" label="${1##*/}" port f bad
   shift
   command -v awg-quick &>/dev/null || { err "Нет awg-quick — сначала установи компоненты (Сервер → Установить компоненты)"; return 1; }
-  _restore_prepare "$src" || return 1
+  _restore_prepare "$src" || return $?
   src="$RESTORE_SRC"
   awg-quick down "$SERVER_CONF" &>/dev/null || ip link del "$AWG_IF" &>/dev/null || true
   [[ -f "$SERVER_CONF" ]] && cp -a "$SERVER_CONF" "$SERVER_CONF.pre_restore.$(date +%s)"
@@ -10937,8 +11125,9 @@ helpers_refresh() {
   [[ -f "$USQUE_UP_HOOK" ]] && _usque_write &>/dev/null
   if [[ -f "$DNS_PROXY_STATE" ]]; then
     _dns_emit_helpers &>/dev/null
-    # Прежние версии ставили блок DoT в FORWARD ниже ACCEPT — он не работал
-    iface_up && { dns_rules_down; dns_rules_up; }
+    # Прежние версии ставили блок DoT в FORWARD ниже ACCEPT — он не работал;
+    # перехват на wgobf0 (WG + обфускатор) — с v1.2.64
+    iface_up && { dns_rules_down; dns_rules_up; dns_ufw_allow; }
   fi
   if (( $(cascade_count) )); then
     _cascade_persist && cascade_apply_all
@@ -10951,6 +11140,8 @@ helpers_refresh() {
   fi
   antiscan_on && _antiscan_emit &>/dev/null
   vkblock_on && _vkblock_emit &>/dev/null
+  rublock_on && _rublock_emit &>/dev/null
+  smtpblock_on && _smtpblock_emit &>/dev/null
   rudirect_on && _rudirect_emit &>/dev/null
   tunfail_any_block && _tunfail_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)
@@ -12964,6 +13155,543 @@ vkblock_remove() {
   rm -rf "$VKBLOCK_DIR" "$VKBLOCK_SCRIPT" "$VKBLOCK_LOG"
 }
 
+# ═════ rublock ═════
+# РФ мимо VPN: клиенты VPN (awg0 и WG + обфускатор) не ходят через сервер в
+# сети России. Российские сайты и приложения на телефоне с VPN не видят адрес
+# сервера и не могут сдать его как VPN — нужно зарубежному серверу. Российские
+# сервисы у клиентов через VPN не откроются — их пускают мимо туннеля
+# (раздельное туннелирование в приложении VPN). Противоположно «РФ напрямую»:
+# включено может быть что-то одно.
+#
+# Как устроено: набор ipset сетей России (список и проверка — те же, что у «РФ
+# напрямую»), пакеты клиентов к ним помечаются в mangle PREROUTING, а правило
+# ip rule «prohibit» с приоритетом 85 — раньше «РФ напрямую» (90) и туннелей
+# (100-249) — отвечает отказом (ICMP «запрещено»): соединение у клиента сразу
+# обрывается, а не висит до таймаута, как при DROP. Частоту ICMP ядро
+# ограничивает (на клиента ~1 в секунду после запаса) — при шквале соединений
+# часть получит отказ через 1-3 с повторов; системный лимит не трогаем.
+# Правила маршрутизации от порядка в FORWARD не зависят. Свой трафик сервера и
+# пакеты к его адресам не трогаются.
+#
+# Служба ставит набор и правила при загрузке, таймер раз в час лечит их, раз в
+# сутки обновляет список. Без сети — на сохранённом.
+
+_rublock_get() { sed -n "s/^$1=//p" "$RUBLOCK_CONF" 2>/dev/null | tail -1; }
+
+_rublock_set() {  # КЛЮЧ ЗНАЧЕНИЕ
+  local v="${2//[$'\n\r']/ }"
+  mkdir -p "$RUBLOCK_DIR" && chmod 700 "$RUBLOCK_DIR"
+  { grep -v "^$1=" "$RUBLOCK_CONF" 2>/dev/null; printf '%s=%s\n' "$1" "$v"; } | write_file "$RUBLOCK_CONF" 600
+}
+
+_rublock_log() { mkdir -p "$(dirname "$RUBLOCK_LOG")"; echo "[$(date '+%F %T')] $*" >> "$RUBLOCK_LOG"; }
+
+_rublock_fail() { _rublock_set ERROR "$1"; _rublock_log "$1"; return 1; }
+
+rublock_on() { [[ "$(_rublock_get ON)" == 1 ]]; }
+
+# Скачать список РФ: по очереди из источников «РФ напрямую», первый прошедший
+# ту же проверку. Не прошёл — остаётся прежний.
+_rublock_fetch() {
+  local tmp src lbl n s4 why="" keep="оставлен прежний список"
+  mkdir -p "$RUBLOCK_DIR" && chmod 700 "$RUBLOCK_DIR"
+  [[ -s "$RUBLOCK_DIR/ru.list" ]] || keep="список не принят"
+  tmp=$(mktemp "$RUBLOCK_DIR/.dl.XXXXXX") || return 1
+  for src in $RUDIRECT_SRCS; do
+    lbl="${src#https://}"
+    if [[ "$lbl" == raw.githubusercontent.com/* ]]; then lbl="${lbl#*/}"; lbl="${lbl%%/*}"
+    else lbl="${lbl%%/*}"; lbl="${lbl#www.}"; fi
+    if ! curl -fsS --proto '=https' --max-time 60 --max-filesize 5000000 -o "$tmp" "$src" 2>/dev/null; then
+      _rublock_log "${src#https://}: не скачался"; why+="${why:+; }$lbl: не скачался"; continue
+    fi
+    read -r n s4 _ < <(_antiscan_parse 4 < "$tmp" | _antiscan_span)
+    if (( n < RUDIRECT_MIN || n > 100000 || s4 < RUDIRECT_MINADDR || s4 > RUDIRECT_MAX4 )); then
+      _rublock_log "${src#https://}: $n сетей, $s4 адресов — не похоже на список РФ"
+      why+="${why:+; }$lbl: $n сетей, $s4 адресов — не похоже на список РФ"; continue
+    fi
+    chmod 600 "$tmp" && mv -f "$tmp" "$RUBLOCK_DIR/ru.list" || return 1
+    _rublock_set ERROR ""
+    _rublock_set UPDATED "$(date +%s)"
+    _rublock_set SRC "$lbl"
+    _rublock_log "список РФ: $n сетей, $s4 адресов (${src#https://})"
+    return 0
+  done
+  rm -f "$tmp"
+  _rublock_fail "список РФ не получен (${why:-нет источников}) — $keep"
+}
+
+_rublock_rule() {  # интерфейс → RUBLOCK_RULE
+  RUBLOCK_RULE=(-i "$1" -m set --match-set "$RUBLOCK_SET" dst -m addrtype ! --dst-type LOCAL
+                -m comment --comment "$RUBLOCK_TAG" -j MARK --set-xmark "$RUBLOCK_MARK")
+}
+
+# Без «ip rule show | grep -q»: при pipefail ранний выход grep — SIGPIPE у ip
+_rublock_ip_rule_on() { [[ "$(ip rule show 2>/dev/null)" == *"fwmark ${RUBLOCK_MARK} prohibit"* ]]; }
+
+_rublock_rules_up() {
+  local dev
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _rublock_rule "$dev"
+    iptables -t mangle -C PREROUTING "${RUBLOCK_RULE[@]}" 2>/dev/null \
+      || iptables -t mangle -I PREROUTING 1 "${RUBLOCK_RULE[@]}" || return 1
+  done
+  _rublock_ip_rule_on || ip rule add fwmark "$RUBLOCK_MARK" prohibit priority "$RUBLOCK_PRIO" || return 1
+  ip route flush cache 2>/dev/null || true
+}
+
+_rublock_rules_down() {
+  local dev guard
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _rublock_rule "$dev"; guard=0
+    while (( guard++ < 32 )) && iptables -t mangle -D PREROUTING "${RUBLOCK_RULE[@]}" 2>/dev/null; do :; done
+  done
+  guard=0
+  while (( guard++ < 32 )) && ip rule del fwmark "$RUBLOCK_MARK" prohibit priority "$RUBLOCK_PRIO" 2>/dev/null; do :; done
+  return 0
+}
+
+# Правила на месте: набор, метки для awg0 и wgobf0, правило «prohibit»
+rublock_rules_ok() {
+  local dev
+  ipset list -n "$RUBLOCK_SET" &>/dev/null || return 1
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _rublock_rule "$dev"
+    iptables -t mangle -C PREROUTING "${RUBLOCK_RULE[@]}" 2>/dev/null || return 1
+  done
+  _rublock_ip_rule_on
+}
+
+# Собрать набор из сохранённого списка и поставить правила.
+_rublock_apply() {
+  local d n rc=0
+  # Выключили, пока качался список, — правила обратно не ставить
+  [[ "$(_rublock_get ON)" == 1 ]] || { rublock_down; return 0; }
+  [[ -s "$RUBLOCK_DIR/ru.list" ]] || { _rublock_log "нечего применять: список РФ ещё не скачан"; return 3; }
+  d=$(mktemp -d "$RUBLOCK_DIR/.apply.XXXXXX") || return 1
+  _antiscan_parse 4 < "$RUBLOCK_DIR/ru.list" | sort -u > "$d/v4"
+  : > "$d/none"
+  if ! n=$(_antiscan_load "$RUBLOCK_SET" inet "$d/v4" "$d/none"); then
+    _rublock_log "ipset: набор не загрузился"; rc=5
+  elif ! _rublock_rules_up; then
+    _rublock_log "iptables или ip rule: правило не поставилось"; rc=5
+  else
+    _rublock_set ENTRIES "$n"
+    _rublock_log "применено: сетей РФ $n"
+  fi
+  rm -rf "$d"
+  return "$rc"
+}
+
+rublock_down() {
+  local s
+  _rublock_rules_down
+  command -v ipset &>/dev/null || return 0
+  for s in "$RUBLOCK_SET" "$RUBLOCK_SET-new"; do ipset destroy "$s" 2>/dev/null || true; done
+  ip route flush cache 2>/dev/null || true
+  return 0
+}
+
+# Точка входа службы и таймера (и awg2): apply | update | heal | off.
+rublock_run() {
+  local mode="${1:-heal}" rc=0 upd
+  mkdir -p "$RUBLOCK_DIR" && chmod 700 "$RUBLOCK_DIR"
+  exec 9>"$RUBLOCK_DIR/.lock"
+  flock -w 180 9 || { _rublock_log "$mode: занято другой операцией"; return 75; }
+  if [[ "$mode" == off || "$(_rublock_get ON)" != 1 ]]; then
+    rublock_down
+    return 0
+  fi
+  case "$mode" in
+    update) _rublock_fetch || true; _rublock_apply || rc=$? ;;
+    apply) _rublock_apply || rc=$? ;;
+    heal)
+      touch "$RUBLOCK_DIR/heal"
+      upd=$(_rublock_get UPDATED)
+      if (( $(date +%s) - ${upd:-0} > 86400 )); then
+        _rublock_fetch || true
+        _rublock_apply || rc=$?
+      elif ! rublock_rules_ok; then
+        _rublock_log "правило пропало — применяю заново"
+        _rublock_apply || rc=$?
+      fi ;;
+    *) echo "использование: ${0##*/} apply|update|heal|off" >&2; return 2 ;;
+  esac
+  return "$rc"
+}
+
+# ── Установка ─────────────────────────────────────────────
+_rublock_emit() {
+  emit_script "$RUBLOCK_SCRIPT" 'rublock_run "$@"' \
+    RUBLOCK_DIR RUBLOCK_CONF RUBLOCK_LOG RUBLOCK_SET RUBLOCK_TAG RUBLOCK_MARK RUBLOCK_PRIO \
+    RUDIRECT_SRCS RUDIRECT_MIN RUDIRECT_MINADDR RUDIRECT_MAX4 AWG_IF WGOBF_IF \
+    write_file _rublock_get _rublock_set _rublock_log _rublock_fail _antiscan_parse _antiscan_span _antiscan_load \
+    _rublock_fetch _rublock_rule _rublock_ip_rule_on _rublock_rules_up _rublock_rules_down rublock_rules_ok \
+    _rublock_apply rublock_down rublock_run || return 1
+  write_unit "$RUBLOCK_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — РФ мимо VPN: клиенты не ходят через сервер в сети России
+DefaultDependencies=no
+Wants=network-pre.target local-fs.target
+After=local-fs.target systemd-modules-load.service
+Before=network-pre.target ufw.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$RUBLOCK_SCRIPT apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_unit "${RUBLOCK_TIMER%.timer}.service" <<EOF
+[Unit]
+Description=AWG Toolza — РФ мимо VPN: правила на месте, список раз в сутки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$RUBLOCK_SCRIPT heal
+EOF
+  write_unit "$RUBLOCK_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — РФ мимо VPN: проверка раз в час
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+# Сервер в России: российские сайты и так видят российский адрес — режим не нужен
+_rublock_home_text() {
+  echo "Сервер в России: российские сайты и так видят российский адрес. «РФ мимо VPN» нужен зарубежному серверу; серверу в России — «РФ напрямую»"
+}
+
+rublock_enable() {
+  local rc=0
+  server_exists || { err "Сервер не создан"; return 1; }
+  if rudirect_on; then
+    err "Включено «РФ напрямую» — это противоположный режим: там сети России идут мимо туннеля прямо с сервера. Сначала выключи его"
+    return 1
+  fi
+  need_cmds ipset:ipset flock:util-linux || return 1
+  _rublock_set ON 1
+  _rublock_emit || { _rublock_set ON 0; err "Не удалось записать службу"; return 1; }
+  info "Скачиваю и проверяю список сетей России..."
+  "$RUBLOCK_SCRIPT" update || rc=$?
+  if (( rc )); then
+    _rublock_set ON 0
+    "$RUBLOCK_SCRIPT" off &>/dev/null || true
+    case $rc in
+      3) err "Список сетей России не получен: $(_rublock_get ERROR)" ;;
+      75) err "Занято другой операцией — повтори через минуту" ;;
+      *) err "Не удалось поставить правила (код $rc) — журнал: $RUBLOCK_LOG" ;;
+    esac
+    return 1
+  fi
+  systemctl enable "$RUBLOCK_UNIT" &>/dev/null || true
+  systemctl enable --now "$RUBLOCK_TIMER" &>/dev/null || true
+  log_info "РФ мимо VPN: включено"
+  ok "РФ мимо VPN включено: $(rublock_summary)"
+  [[ "$(server_country)" == RU ]] && warn "$(_rublock_home_text)"
+  [[ -n "$(_rublock_get ERROR)" ]] && warn "$(_rublock_get ERROR)"
+  return 0
+}
+
+rublock_disable() {
+  local held=0
+  _rublock_set ON 0
+  remove_unit "$RUBLOCK_TIMER" "${RUBLOCK_TIMER%.timer}.service" "$RUBLOCK_UNIT"
+  # Замок прохода таймера: проход, уже увидевший ON=1, иначе поставил бы правила
+  # обратно после нас. Не дольше 20 с — качающий проход сам увидит ON=0
+  mkdir -p "$RUBLOCK_DIR" && chmod 700 "$RUBLOCK_DIR"
+  exec 9>"$RUBLOCK_DIR/.lock"
+  flock -w 20 9 && held=1
+  rublock_down
+  (( held )) || _rublock_log "выключение: замок занят дольше 20 с — снято без него"
+  exec 9>&-
+  log_info "РФ мимо VPN: выключено"
+  ok "Сети России снова доступны клиентам через VPN — правила и набор сняты"
+}
+
+rublock_update() {
+  rublock_on || { err "РФ мимо VPN — выключено"; return 1; }
+  _rublock_emit || return 1
+  "$RUBLOCK_SCRIPT" update || { err "Не удалось применить список — журнал: $RUBLOCK_LOG"; return 1; }
+  if [[ -n "$(_rublock_get ERROR)" ]]; then warn "$(_rublock_get ERROR)"; fi
+  ok "Список обновлён: $(rublock_summary)"
+}
+
+# Отказано пакетам в сети России с установки правил (перезагрузка сбрасывает)
+rublock_blocked() {
+  iptables-save -c -t mangle 2>/dev/null \
+    | awk -v tag="$RUBLOCK_TAG" 'index($0, "--comment " tag) && /^\[/ {
+        split(substr($1, 2), c, ":"); n += c[1] } END { printf "%.0f\n", n }'
+}
+
+rublock_summary() { echo "сетей России $(_rublock_get ENTRIES || true)"; }
+
+# ── Меню ──────────────────────────────────────────────────
+_rublock_show() {
+  local upd err
+  hdr "РФ мимо VPN"
+  echo -e "  ${D}Клиенты VPN не ходят через сервер в сети России. Российские сайты и приложения"
+  echo -e "  не видят адрес сервера и не могут сдать его как VPN — для зарубежного сервера."
+  echo -e "  Российские сервисы у клиентов через VPN сразу получат отказ — в приложении VPN"
+  echo -e "  их пускают мимо туннеля.${N}"
+  echo ""
+  if rublock_on; then
+    if rublock_rules_ok; then echo -e "  Состояние : ${G}● включено${N} — $(rublock_summary)"
+    else echo -e "  Состояние : ${Y}▲ включено, правило не на месте${N} — вернёт таймер или «Обновить список»"; fi
+    echo -e "  Отказано  : ${W}$(rublock_blocked)${N} ${D}пакетов в сети России (сбрасывается при перезагрузке)${N}"
+    [[ "$(server_country)" == RU ]] && echo -e "  ${Y}▲ $(_rublock_home_text)${N}"
+  else
+    echo -e "  Состояние : ${D}○ выключено${N}"
+    rudirect_on && echo -e "  ${D}Сейчас включено «РФ напрямую» — противоположный режим${N}"
+  fi
+  upd=$(_rublock_get UPDATED)
+  [[ -n "$upd" ]] && echo -e "  Список    : обновлён $(date -d "@$upd" '+%d.%m.%Y %H:%M' 2>/dev/null)"
+  err=$(_rublock_get ERROR)
+  [[ -n "$err" ]] && echo -e "  ${Y}▲ $err${N}"
+  return 0
+}
+
+do_rublock_menu() {
+  local c
+  while true; do
+    echo ""
+    _rublock_show
+    echo ""
+    if rublock_on; then echo -e "  ${C}1)${N} Выключить"; else echo -e "  ${C}1)${N} Включить"; fi
+    echo -e "  ${C}2)${N} Обновить список сейчас"
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+    case "$c" in
+      1) if rublock_on; then rublock_disable
+         else
+           echo -e "  ${Y}Российские сайты и приложения у клиентов через VPN перестанут открываться —"
+           echo -e "  в приложении VPN их надо пустить мимо туннеля.${N}"
+           ask_yes "  Включить? [y/N]: " n && { rublock_enable || true; }
+         fi ;;
+      2) rublock_update || true ;;
+      0) return 0 ;;
+    esac
+    pause
+  done
+}
+
+# Таймер молчит дольше трёх часов (сброшен, заглох) — перезапустить
+rublock_watchdog() {
+  local age
+  rublock_on || return 0
+  [[ -f "$RUBLOCK_DIR/heal" ]] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y "$RUBLOCK_DIR/heal" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$RUBLOCK_DIR/heal"
+  timer_heal "$RUBLOCK_TIMER"
+  systemctl start --no-block "${RUBLOCK_TIMER%.timer}.service" &>/dev/null || true
+}
+
+rublock_remove() {
+  remove_unit "$RUBLOCK_TIMER" "${RUBLOCK_TIMER%.timer}.service" "$RUBLOCK_UNIT"
+  rublock_down
+  rm -rf "$RUBLOCK_DIR" "$RUBLOCK_SCRIPT" "$RUBLOCK_LOG"
+}
+
+# ═════ smtpblock ═════
+# Почта: клиенты VPN (awg0 и WG + обфускатор) не открывают соединения на
+# порт 25 — SMTP между почтовыми серверами. Через сервер не уйдёт спам, и
+# хостер не заблокирует сервер за рассылку. Почтовые приложения отправляют
+# письма через 465 и 587 — они работают как раньше. Соединения к адресам самого
+# сервера и свой трафик сервера не трогаются.
+#
+# Как устроено: DROP в mangle PREROUTING по входящему интерфейсу — раньше
+# FORWARD, где PostUp сервера ставит свой ACCEPT первым (см. dns.sh). Правило
+# на wgobf0 стоит и без интерфейса. Служба ставит правила при загрузке (раньше
+# UFW и netfilter-persistent), таймер раз в час возвращает, если их сбросили.
+
+smtpblock_on() { [[ -f "$SMTPBLOCK_FLAG" ]]; }
+
+_smtpblock_rule() {  # интерфейс → SMTPBLOCK_RULE
+  SMTPBLOCK_RULE=(-i "$1" -p tcp --dport 25 -m addrtype ! --dst-type LOCAL
+                  -m comment --comment "$SMTPBLOCK_TAG" -j DROP)
+}
+
+# Правила на месте (IPv4: у клиентов внутри туннеля только он)
+smtpblock_rules_ok() {
+  local dev
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _smtpblock_rule "$dev"
+    iptables -t mangle -C PREROUTING "${SMTPBLOCK_RULE[@]}" 2>/dev/null || return 1
+  done
+}
+
+# IPv6 — тем же правилом, если ядро умеет: появится у клиентов адрес IPv6 —
+# порт 25 и по нему закрыт. Не вышло — не ошибка, IPv6 у клиентов нет.
+smtpblock_up() {
+  local dev
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _smtpblock_rule "$dev"
+    iptables -t mangle -C PREROUTING "${SMTPBLOCK_RULE[@]}" 2>/dev/null \
+      || iptables -t mangle -I PREROUTING 1 "${SMTPBLOCK_RULE[@]}" || return 1
+    if command -v ip6tables &>/dev/null; then
+      ip6tables -t mangle -C PREROUTING "${SMTPBLOCK_RULE[@]}" 2>/dev/null \
+        || ip6tables -t mangle -I PREROUTING 1 "${SMTPBLOCK_RULE[@]}" 2>/dev/null || true
+    fi
+  done
+}
+
+smtpblock_down() {
+  local dev t guard
+  for dev in "$AWG_IF" "$WGOBF_IF"; do
+    _smtpblock_rule "$dev"
+    for t in iptables ip6tables; do
+      command -v "$t" &>/dev/null || continue
+      guard=0
+      while (( guard++ < 32 )) && "$t" -t mangle -D PREROUTING "${SMTPBLOCK_RULE[@]}" 2>/dev/null; do :; done
+    done
+  done
+  return 0
+}
+
+# Точка входа службы и таймера: apply | heal | off. Выключено — правил нет.
+smtpblock_run() {
+  case "${1:-heal}" in
+    off) smtpblock_down ;;
+    apply) if smtpblock_on; then smtpblock_up; else smtpblock_down; fi ;;
+    heal)
+      [[ -d "${SMTPBLOCK_FLAG%/*}" ]] && touch "${SMTPBLOCK_FLAG%/*}/.smtpblock-heal" 2>/dev/null
+      if ! smtpblock_on; then smtpblock_down
+      elif ! smtpblock_rules_ok; then smtpblock_up; fi ;;
+    *) echo "использование: ${0##*/} apply|heal|off" >&2; return 2 ;;
+  esac
+}
+
+# Отбито соединений на порт 25 с установки правил (перезагрузка сбрасывает)
+smtpblock_dropped() {
+  { iptables-save -c -t mangle 2>/dev/null; ip6tables-save -c -t mangle 2>/dev/null; } \
+    | awk -v tag="$SMTPBLOCK_TAG" 'index($0, "--comment " tag) && /^\[/ {
+        split(substr($1, 2), c, ":"); n += c[1] } END { printf "%.0f\n", n }'
+}
+
+# ── Установка ─────────────────────────────────────────────
+_smtpblock_emit() {
+  emit_script "$SMTPBLOCK_SCRIPT" 'smtpblock_run "$@"' SMTPBLOCK_FLAG SMTPBLOCK_TAG AWG_IF WGOBF_IF \
+    smtpblock_on _smtpblock_rule smtpblock_rules_ok smtpblock_up smtpblock_down smtpblock_run || return 1
+  write_unit "$SMTPBLOCK_UNIT" <<EOF
+[Unit]
+Description=AWG Toolza — почта: клиенты VPN не отправляют через сервер на порт 25
+DefaultDependencies=no
+Wants=network-pre.target local-fs.target
+After=local-fs.target systemd-modules-load.service
+Before=network-pre.target ufw.service netfilter-persistent.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$SMTPBLOCK_SCRIPT apply
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  write_unit "${SMTPBLOCK_TIMER%.timer}.service" <<EOF
+[Unit]
+Description=AWG Toolza — почта: правила на месте
+
+[Service]
+Type=oneshot
+ExecStart=$SMTPBLOCK_SCRIPT heal
+EOF
+  write_unit "$SMTPBLOCK_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — почта: проверка правил раз в час
+
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+smtpblock_enable() {
+  mkdir -p "${SMTPBLOCK_FLAG%/*}"
+  date +%s | write_file "$SMTPBLOCK_FLAG" 600
+  _smtpblock_emit || { rm -f "$SMTPBLOCK_FLAG"; err "Не удалось записать службу"; return 1; }
+  if ! "$SMTPBLOCK_SCRIPT" apply || ! smtpblock_rules_ok; then
+    rm -f "$SMTPBLOCK_FLAG"
+    "$SMTPBLOCK_SCRIPT" off &>/dev/null || true
+    err "Правила не поставились — iptables: $(iptables -V 2>/dev/null || echo нет)"
+    return 1
+  fi
+  systemctl enable "$SMTPBLOCK_UNIT" &>/dev/null || true
+  systemctl enable --now "$SMTPBLOCK_TIMER" &>/dev/null || true
+  log_info "почта (порт 25): закрыта для клиентов"
+  ok "Порт 25 закрыт для клиентов VPN: спам через сервер не уйдёт. Почтовые приложения работают через 465 и 587"
+}
+
+smtpblock_disable() {
+  rm -f "$SMTPBLOCK_FLAG"
+  remove_unit "$SMTPBLOCK_TIMER" "${SMTPBLOCK_TIMER%.timer}.service" "$SMTPBLOCK_UNIT"
+  smtpblock_down
+  log_info "почта (порт 25): открыта для клиентов"
+  ok "Порт 25 снова открыт для клиентов VPN"
+}
+
+smtpblock_status() {
+  if ! smtpblock_on; then echo -e "  Состояние : ${D}○ выключено — клиенты могут слать почту на порт 25${N}"
+  elif smtpblock_rules_ok; then echo -e "  Состояние : ${G}● порт 25 закрыт для клиентов${N}"
+  else echo -e "  Состояние : ${Y}▲ включено, правила не на месте${N} — вернёт таймер или «Выключить» и «Включить»"; fi
+  smtpblock_on && echo -e "  Отбито    : ${W}$(smtpblock_dropped)${N} ${D}попыток на порт 25 (сбрасывается при перезагрузке)${N}"
+  return 0
+}
+
+do_smtpblock_menu() {
+  local c
+  while true; do
+    echo ""
+    hdr "Почта: порт 25"
+    echo -e "  ${D}Клиенты VPN не отправляют почту через сервер на порт 25 — спам с сервера не уйдёт,"
+    echo -e "  хостер не заблокирует сервер. Почтовые приложения шлют через 465 и 587 — работают.${N}"
+    echo ""
+    smtpblock_status
+    echo ""
+    if smtpblock_on; then echo -e "  ${C}1)${N} Открыть порт 25"; else echo -e "  ${C}1)${N} Закрыть порт 25"; fi
+    echo -e "  ${W}0)${N} ← Назад"
+    read_choice c "${C}  Выбор [0-1]: ${N}" 0 1 0
+    case "$c" in
+      1) if smtpblock_on; then smtpblock_disable; else smtpblock_enable || true; fi ;;
+      0) return 0 ;;
+    esac
+    pause
+  done
+}
+
+# Таймер молчит дольше трёх часов (сброшен, заглох) — перезапустить
+smtpblock_watchdog() {
+  local f="${SMTPBLOCK_FLAG%/*}/.smtpblock-heal" age
+  smtpblock_on || return 0
+  [[ -f "$f" ]] || return 0
+  age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$f"
+  timer_heal "$SMTPBLOCK_TIMER"
+  systemctl start --no-block "${SMTPBLOCK_TIMER%.timer}.service" &>/dev/null || true
+}
+
+smtpblock_remove() {
+  remove_unit "$SMTPBLOCK_TIMER" "${SMTPBLOCK_TIMER%.timer}.service" "$SMTPBLOCK_UNIT"
+  smtpblock_down
+  rm -f "$SMTPBLOCK_FLAG" "${SMTPBLOCK_FLAG%/*}/.smtpblock-heal" "$SMTPBLOCK_SCRIPT"
+}
+
 # ═════ rudirect ═════
 # РФ напрямую для всех туннелей: клиенты, уведённые в туннель (WARP, Xray,
 # tun2socks, exit-ноды), ходят к сетям России мимо него — прямо с сервера.
@@ -13014,7 +13742,7 @@ rudirect_abroad() {  # → код страны, если сервер не в Р
   [[ -n "$c" && "$c" != RU ]] && echo "$c"
 }
 _rud_abroad_text() {  # код страны
-  echo "Сервер не в России ($1): российские сайты и приложения увидят адрес сервера, к которому подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России"
+  echo "Сервер не в России ($1): российские сайты и приложения увидят адрес сервера, к которому подключаются клиенты, — зарубежные адреса блокируют как раз за это. «РФ напрямую» — для сервера в России; зарубежному — «РФ мимо VPN» (Сервер)"
 }
 _rud_tg_nets() { tr ' ' '\n' <<< "$RUDIRECT_TG_NETS" | _antiscan_parse 4; }
 
@@ -13266,6 +13994,10 @@ EOF
 rudirect_enable() {
   local rc=0 cc
   server_exists || { err "Сервер не создан"; return 1; }
+  if rublock_on; then
+    err "Включено «РФ мимо VPN» — это противоположный режим: там клиентам отказано в сетях России. Сначала выключи его (Сервер → РФ мимо VPN)"
+    return 1
+  fi
   need_cmds ipset:ipset flock:util-linux || return 1
   _rud_set ON 1
   _rudirect_emit || { err "Не удалось записать службу"; return 1; }
@@ -13920,10 +14652,12 @@ uninstall_all() {
   if web_installed; then info "Веб-панель оставлена — сервера AWG в ней больше нет"; web_vpn_changed; fi
   # Антисканер и «VK и Max мимо VPN» работают через свои скрипты и без awg2,
   # но управлять ими без awg2 нечем — уходят вместе со скриптом, иначе остаются
-  if [[ "$del_self" == y ]]; then antiscan_remove; vkblock_remove
+  if [[ "$del_self" == y ]]; then antiscan_remove; vkblock_remove; rublock_remove; smtpblock_remove
   else
     if antiscan_on; then info "Антисканер оставлен и продолжит работать"; fi
     if vkblock_on; then info "VK и Max мимо VPN оставлено и продолжит работать"; fi
+    if rublock_on; then info "РФ мимо VPN оставлено и продолжит работать"; fi
+    if smtpblock_on; then info "Порт 25 для клиентов остаётся закрытым"; fi
   fi
   if [[ "$del_bot" == y ]]; then
     bot_uninstall quiet
@@ -14174,6 +14908,8 @@ diag_route() {  # клиент адрес
       kind=blocked note="клиент заблокирован (срок или лимит трафика) — его трафик не идёт никуда"
     elif vkblock_on && ipset test "$VKBLOCK_SET" "$ip" &>/dev/null; then
       kind=drop note="сеть VK — отбрасывается («VK и Max мимо VPN»)"
+    elif rublock_on && ipset test "$RUBLOCK_SET" "$ip" &>/dev/null; then
+      kind=drop note="сеть России — клиенту отказ («РФ мимо VPN»): её пускают мимо туннеля"
     else
       rudirect_on && ipset test "$RUDIRECT_SET" "$ip" &>/dev/null && mark="${RUDIRECT_MARK%%/*}"
       if ! ip link show "$AWG_IF" &>/dev/null; then
@@ -14279,8 +15015,10 @@ do_server_menu() {
     echo -e "  ${C}9)${N} Антисканер ${D}— $(antiscan_on && echo "включён" || echo "сети сканеров РКН")${N}"
     echo -e "  ${C}10)${N} Перенос из Amnezia ${D}— сервер из Docker-контейнера, клиенты без перевыдачи${N}"
     echo -e "  ${C}11)${N} VK и Max мимо VPN ${D}— $(vkblock_on && echo "включено" || echo "клиенты VPN не ходят в сети VK")${N}"
+    echo -e "  ${C}12)${N} РФ мимо VPN ${D}— $(rublock_on && echo "включено" || echo "клиенты VPN не ходят в сети России")${N}"
+    echo -e "  ${C}13)${N} Почта: порт 25 ${D}— $(smtpblock_on && echo "закрыт для клиентов" || echo "открыт для клиентов")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-11]: ${N}" 0 11 0
+    read_choice c "${C}  Выбор [0-13]: ${N}" 0 13 0
     case "$c" in
       1) do_install || true ;;
       2) do_create_server || true ;;
@@ -14293,6 +15031,8 @@ do_server_menu() {
       9) do_antiscan_menu || true; continue ;;
       10) do_amnezia_menu || true ;;
       11) do_vkblock_menu || true; continue ;;
+      12) do_rublock_menu || true; continue ;;
+      13) do_smtpblock_menu || true; continue ;;
       0) return 0 ;;
     esac
     pause
@@ -14306,11 +15046,13 @@ do_backup_menu() {
     hdr "Бэкапы ${D}($BACKUP_DIR)${N}"
     echo -e "  ${C}1)${N} Создать бэкап"
     echo -e "  ${C}2)${N} Восстановить"
+    echo -e "  ${C}3)${N} Пароль бэкапов ${D}— $(backup_key_on && echo "задан" || echo "файлы с сервера без шифрования")${N}"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор [0-2]: ${N}" 0 2 0
+    read_choice c "${C}  Выбор [0-3]: ${N}" 0 3 0
     case "$c" in
       1) do_backup || true ;;
       2) do_restore || true ;;
+      3) do_backup_key || true ;;
       0) return 0 ;;
     esac
     pause
@@ -14401,7 +15143,15 @@ _api_usage() { err "Использование: awg2 api $*"; return 2; }
 
 # stdin читается только командами, которым он нужен: иначе вызов из
 # скрипта с открытым, но пустым stdin ждал бы его конца вечно.
-_api_wants_stdin() { [[ "$1 ${2:-}" == "exits add" || "$1 ${2:-}" == "warp import" ]]; }
+_api_wants_stdin() {
+  case "$1 ${2:-}" in
+    "exits add"|"warp import") return 0 ;;
+    # Пароль бэкапа — только когда его явно передают словом «pass»
+    "backup inspect"|"backup restore") [[ " ${*:3} " == *" pass "* ]] ;;
+    "backup key") [[ "${3:-}" == set ]] ;;
+    *) return 1 ;;
+  esac
+}
 _api_stdin() {
   (( API_STDIN_READ )) && return 0
   API_STDIN_READ=1
@@ -14845,18 +15595,43 @@ _api_backup() {
           "$(stat -c %Y "$p")" "$(du -sb "$p" 2>/dev/null | cut -f1)"
       done < <(_restore_list) | api_rows path name full:b time:n size:n ;;
     inspect)
-      [[ -n "${1:-}" ]] || { _api_usage "backup inspect ПУТЬ"; return; }
-      _restore_prepare "$1" || return 1
-      { _kv clients:n "$(find "$RESTORE_SRC" -maxdepth 1 -name '*_awg[23].conf' | grep -c . || true)"
+      [[ -n "${1:-}" ]] || { _api_usage "backup inspect ПУТЬ [pass] (pass — пароль в stdin)"; return; }
+      _api_backup_pass "$@"
+      _restore_prepare "$1" || return $?
+      { _kv encrypted:b "$(_b backup_encrypted "$1")"
+        _kv clients:n "$(find "$RESTORE_SRC" -maxdepth 1 -name '*_awg[23].conf' | grep -c . || true)"
         _kv wgobf:b "$(_b test -d "$RESTORE_SRC/wgobf/etc")"
         _kv tunnels:b "$(_b test -f "$RESTORE_SRC/tunnels.tar.gz")"
         _kv warp:b "$(_b test -d "$RESTORE_SRC/warp")"
         _kv meta:f "$RESTORE_SRC/backup_meta.txt"; } | api_obj ;;
     restore)
-      [[ -n "${1:-}" ]] || { _api_usage "backup restore ПУТЬ [wgobf] [tunnels]"; return; }
+      [[ -n "${1:-}" ]] || { _api_usage "backup restore ПУТЬ [wgobf] [tunnels] [pass] (pass — пароль в stdin)"; return; }
+      _api_backup_pass "$@"
       backup_restore "$@" ;;
-    *) _api_usage "backup create [auto [ХРАНИТЬ]]|list|inspect ПУТЬ|restore ПУТЬ [wgobf] [tunnels]" ;;
+    pack)
+      [[ -n "${1:-}" ]] || { _api_usage "backup pack ПУТЬ"; return; }
+      backup_pack "$1" || return 1
+      { _kv path "$PACK_PATH"; _kv name "${PACK_PATH##*/}"; _kv size:n "$(stat -c %s "$PACK_PATH")"
+        _kv encrypted:b "$PACK_ENC"; } | api_obj ;;
+    key)
+      case "${1:-}" in
+        ""|status) { _kv set:b "$(_b backup_key_on)"; _kv iter:n "$BACKUP_ENC_ITER"; } | api_obj ;;
+        set) _api_stdin; backup_key_set < "$API_IN" ;;
+        clear) backup_key_clear ;;
+        *) _api_usage "backup key [status]|set (пароль — stdin)|clear" ;;
+      esac ;;
+    *) _api_usage "backup create [auto [ХРАНИТЬ]]|list|inspect ПУТЬ [pass]|restore ПУТЬ [wgobf] [tunnels] [pass]|pack ПУТЬ|key [status|set|clear]" ;;
   esac
+}
+
+# Пароль к зашифрованному бэкапу — первой строкой stdin, если среди слов
+# команды есть «pass» (без него stdin не читается: вызов из скрипта с
+# открытым stdin ждал бы его конца)
+_api_backup_pass() {  # слова команды
+  [[ " ${*:2} " == *" pass "* ]] || return 0
+  _api_stdin
+  [[ -s "$API_IN" ]] && RESTORE_PASS="$API_IN"
+  return 0
 }
 
 # ── Туннели ───────────────────────────────────────────────
@@ -15443,6 +16218,43 @@ _api_vkblock() {
   esac
 }
 
+# ── РФ мимо VPN ───────────────────────────────────────────
+_api_rublock() {
+  local a="${1:-status}" on=0
+  shift || true
+  case "$a" in
+    status)
+      rublock_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b rublock_rules_ok || echo 0)"
+        _kv nets:n "$(_rublock_get ENTRIES)"
+        _kv updated:n "$(_rublock_get UPDATED)"; _kv src "$(_rublock_get SRC)"; _kv error "$(_rublock_get ERROR)"
+        _kv blocked:n "$( (( on )) && rublock_blocked || echo 0)"
+        _kv rudirect:b "$(_b rudirect_on)"
+        _kv home:b "$(_b test "$(server_country)" = RU)"
+      } | api_obj ;;
+    on) rublock_enable ;;
+    off) rublock_disable ;;
+    update) rublock_update ;;
+    *) _api_usage "rublock status|on|off|update" ;;
+  esac
+}
+
+# ── Почта: порт 25 ────────────────────────────────────────
+_api_smtpblock() {
+  local a="${1:-status}" on=0
+  shift || true
+  case "$a" in
+    status)
+      smtpblock_on && on=1
+      { _kv enabled:b "$on"; _kv active:b "$( (( on )) && _b smtpblock_rules_ok || echo 0)"
+        _kv dropped:n "$( (( on )) && smtpblock_dropped || echo 0)"
+      } | api_obj ;;
+    on) smtpblock_enable ;;
+    off) smtpblock_disable ;;
+    *) _api_usage "smtpblock status|on|off" ;;
+  esac
+}
+
 # ── Перенос из Amnezia (Docker) ───────────────────────────
 # Страна сервера (флаг в шапке панели): вручную или снова по геосервисам;
 # refresh — спросить геосервисы сейчас, не дожидаясь суток
@@ -15495,8 +16307,9 @@ _api_log() {
     dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
     antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
+    rublock) file="$RUBLOCK_LOG" ;;
     rudirect) file="$RUDIRECT_LOG" ;;   tunfail) file="$TUNFAIL_LOG" ;;
-    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock|rudirect|tunfail [строк]"; return ;;
+    *) _api_usage "log manager|install|module|expire|cascade|warp-health|dns-health|usque|awg|warp|xray|xray-routing|tun2socks|exits|dns|wgobf|bot|web|antiscan|vkblock|rublock|rudirect|tunfail [строк]"; return ;;
   esac
   if [[ -n "$file" ]]; then
     [[ -f "$file" ]] || { info "Журнала $file нет"; return 0; }
@@ -15584,15 +16397,15 @@ _api_readonly() {
   [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
   case "$a $b $c" in
     "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get"|\
-    "tunnels fail "|"tunnels fail list") return 0 ;;
+    "tunnels fail "|"tunnels fail list"|"backup key "|"backup key status") return 0 ;;
   esac
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
-    "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"tunnels "|"tunnels status"|\
+    "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"backup pack"|"tunnels "|"tunnels status"|\
     "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray probe"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
     "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
-    "amnezia scan"|"vkblock "|"vkblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
+    "amnezia scan"|"vkblock "|"vkblock status"|"rublock "|"rublock status"|"smtpblock "|"smtpblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
   esac
   return 1
 }
@@ -15643,6 +16456,8 @@ api_dispatch() {
     web) _api_web "$@" ;;
     antiscan) _api_antiscan "$@" ;;
     vkblock) _api_vkblock "$@" ;;
+    rublock) _api_rublock "$@" ;;
+    smtpblock) _api_smtpblock "$@" ;;
     amnezia) _api_amnezia "$@" ;;
     country) _api_country "$@" ;;
     uninstall) _api_uninstall "$@" ;;
@@ -15650,7 +16465,7 @@ api_dispatch() {
     job) _api_job "$@" ;;
     help)
       echo "Разделы: status server module clients client mimicry traffic diag backup tunnels warp xray t2s"
-      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock rudirect amnezia country uninstall log job version"
+      echo "         exits cascade entry dns wgobf update bot cert web antiscan vkblock rublock smtpblock rudirect amnezia country uninstall log job version"
       echo "Подсказка по разделу: awg2 api РАЗДЕЛ" ;;
     *) err "Неизвестная команда: $cmd — awg2 api help"; return 2 ;;
   esac
@@ -15661,7 +16476,8 @@ _api_job_prepare() {
   local dir="$API_JOBS/${1:-}"
   [[ "${1:-}" =~ ^[0-9]{8}-[0-9]{6}-[0-9a-f]{4}$ && -f "$dir/cmd" ]] || return 1
   mapfile -d '' -t API_ARGS < "$dir/cmd"
-  [[ -f "$dir/stdin" ]] && cp "$dir/stdin" "$API_IN"
+  # stdin задачи (там бывает пароль бэкапа) — один раз: прочитан и удалён
+  [[ -f "$dir/stdin" ]] && cp "$dir/stdin" "$API_IN" && rm -f "$dir/stdin"
   API_STDIN_READ=1
   API_LOG="$dir/log"
   API_RESULT="$dir/result.json"
@@ -15695,6 +16511,8 @@ api_main() {
     expire_watchdog || true
     antiscan_watchdog || true
     vkblock_watchdog || true
+    rublock_watchdog || true
+    smtpblock_watchdog || true
     rudirect_watchdog || true
     tunfail_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
@@ -20815,5 +21633,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=3ec1ad3b56cdbbdb
+_BUILD_SUM=0b19066ed8931ae0
 main "$@"
