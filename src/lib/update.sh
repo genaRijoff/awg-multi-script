@@ -320,6 +320,8 @@ helpers_refresh() {
   fi
   antiscan_on && _antiscan_emit &>/dev/null
   vkblock_on && _vkblock_emit &>/dev/null
+  rublock_on && _rublock_emit &>/dev/null
+  smtpblock_on && _smtpblock_emit &>/dev/null
   rudirect_on && _rudirect_emit &>/dev/null
   tunfail_any_block && _tunfail_emit &>/dev/null
   # Маршруты Xray: с v1.2.0 перед inbound tun нет NAT (свой выход клиенту)

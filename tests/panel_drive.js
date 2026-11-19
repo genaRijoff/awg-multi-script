@@ -856,6 +856,68 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     } finally { await page.unroute(/\/api\/call$/); }
   });
 
+  await step("РФ мимо VPN: выключено, при «РФ напрямую» — подсказка; «Включить» — с вопросом; включено — сети и счётчик", async () => {
+    const ST = { enabled: false, active: false, nets: 0, updated: 0, src: "", error: "", blocked: 0, rudirect: true, home: false };
+    const ON = { enabled: true, active: true, nets: 8712, updated: 1790000000, src: "ipverse", error: "", blocked: 1234,
+      rudirect: false, home: true };
+    let st = ST;
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      const ok = (data) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data }) });
+      if (b.args && b.args[0] === "rublock" && b.args[1] === "on") { st = ON; return ok(null); }
+      if (b.args && b.args[0] === "rublock" && b.args[1] === "status") return ok(st);
+      return route.continue();
+    });
+    try {
+      await nav("/server", "text=РФ мимо VPN");
+      await page.click("text=РФ мимо VPN");
+      await page.waitForSelector("[data-name=rublock-status] >> text=○ выключено");
+      await page.waitForSelector("[data-name=rublock-status] >> text=противоположный режим");
+      if (await page.locator("button:has-text('Обновить список')").count()) throw new Error("«Обновить список» при выключенном");
+      await page.click("button:has-text('Включить')");
+      await page.waitForSelector(".toast >> text=РФ мимо VPN включено");
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Включить? Российские"));
+      if (!asked.length || !/мимо туннеля/.test(asked[0])) throw new Error("включение без подтверждения: " + JSON.stringify(asked));
+      await page.waitForSelector("[data-name=rublock-status] >> text=● включено");
+      await page.waitForSelector("[data-name=rublock-status] >> text=8 712");
+      await page.waitForSelector("[data-name=rublock-status] >> text=1 234 пакетов");
+      await page.waitForSelector("[data-name=rublock-status] >> text=Сервер в России");
+      await page.waitForSelector("button:has-text('Обновить список')");
+      await page.waitForSelector("button:has-text('Журнал')");
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
+
+  await step("Почта: порт 25 — открыт, «Закрыть» сразу; закрыт — счётчик, «Открыть» — с вопросом", async () => {
+    let st = { enabled: false, active: false, dropped: 0 };
+    const calls = [];
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      const ok = (data) => route.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data }) });
+      if (b.args && b.args[0] === "smtpblock") {
+        calls.push(b.args.join(" "));
+        if (b.args[1] === "on") { st = { enabled: true, active: true, dropped: 56789 }; return ok(null); }
+        if (b.args[1] === "off") { st = { enabled: false, active: false, dropped: 0 }; return ok(null); }
+        return ok(st);
+      }
+      return route.continue();
+    });
+    try {
+      await nav("/server", "text=Почта: порт 25");
+      await page.click("text=Почта: порт 25");
+      await page.waitForSelector("[data-name=smtpblock-status] >> text=○ открыт");
+      await page.click("button:has-text('Закрыть порт 25')");
+      await page.waitForSelector(".toast >> text=Порт 25 закрыт");
+      await page.waitForSelector("[data-name=smtpblock-status] >> text=● закрыт для клиентов");
+      await page.waitForSelector("[data-name=smtpblock-status] >> text=56 789 попыток");
+      const before = (await page.evaluate(() => window.__log)).length;
+      await page.click("button:has-text('Открыть порт 25')");
+      await page.waitForSelector(".toast >> text=Порт 25 открыт");
+      const asked = (await page.evaluate(() => window.__log)).slice(before).filter((l) => l.startsWith("confirm:Открыть порт 25?"));
+      if (!asked.length) throw new Error("открытие без подтверждения");
+      await page.waitForSelector("[data-name=smtpblock-status] >> text=○ открыт");
+      if (!calls.includes("smtpblock on") || !calls.includes("smtpblock off")) throw new Error("вызовы: " + JSON.stringify(calls));
+    } finally { await page.unroute(/\/api\/call$/); }
+  });
 
   // ── РФ напрямую, если туннель упал, куда идёт адрес ──
   const fake = (data) => ({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data }) });
@@ -1469,6 +1531,60 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.setInputFiles("input[type=file]", { name: "photo.tar.gz", mimeType: "application/gzip", buffer: Buffer.from("not a tar") });
     await page.waitForSelector("text=Архив не распаковался");
     await page.waitForSelector("text=это не архив tar.gz");
+  });
+  const BPW = "S3cret-pass!", bkey = `${sandboxRoot}/var/lib/awg2/backup.key`;
+  await step("пароль бэкапов: плохой — отказ; задан — файл в чат зашифрован; убран", async () => {
+    await nav("/backup", "[data-name=backup-key]");
+    await page.waitForSelector("[data-name=backup-key] >> text=не задан");
+    const inp = "[data-name=backup-key] input[aria-label='Пароль бэкапов']";
+    const inp2 = "[data-name=backup-key] input[aria-label='Пароль бэкапов ещё раз']";
+    await page.fill(inp, "short1");
+    await page.fill(inp2, "short1");
+    await expectAlert("от 8 до 128", () => page.click("[data-name=backup-key] button:has-text('Задать')"));
+    await page.fill(inp, BPW);
+    await page.fill(inp2, BPW + "x");
+    await expectAlert("Пароли не совпадают", () => page.click("[data-name=backup-key] button:has-text('Задать')"));
+    if (fs.existsSync(bkey)) throw new Error("плохой пароль записан");
+    await page.fill(inp2, BPW);
+    await page.press(inp2, "Enter");
+    await page.waitForSelector(".toast >> text=Пароль задан");
+    await page.waitForSelector("[data-name=backup-key] >> text=задан");
+    if (fs.readFileSync(bkey, "utf8") !== BPW + "\n") throw new Error("пароль не записан");
+    if (await page.inputValue(inp) !== "" || await page.inputValue(inp2) !== "") throw new Error("пароль остался в поле");
+    await page.click("button:has-text('Создать')");
+    await page.waitForSelector("text=Зашифрован паролем бэкапов", { timeout: 90000 });
+    await nav("/backup", "[data-name=backup-key]");
+    await page.click("[data-name=backup-key] button:has-text('Убрать пароль')");
+    await page.waitForSelector(".toast >> text=Пароль убран");
+    const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Убрать пароль?"));
+    if (!asked.length) throw new Error("убрать — без подтверждения");
+    if (fs.existsSync(bkey)) throw new Error("пароль не убран");
+    await page.waitForSelector("[data-name=backup-key] >> text=не задан");
+  });
+  await step("зашифрованный бэкап с телефона: пароль спрашивается, неверный — причина, верный — восстановление", async () => {
+    const dir = `${sandboxRoot}/awg_backup`;
+    const archive = fs.readdirSync(dir).find((f) => f.endsWith(".tar.gz"));
+    const enc = `${sandboxRoot}/phone-backup.tar.gz.enc`;
+    require("child_process").execFileSync("openssl", ["enc", "-aes-256-cbc", "-pbkdf2", "-iter", "200000", "-md", "sha256",
+      "-salt", "-in", `${dir}/${archive}`, "-out", enc, "-pass", "pass:" + BPW]);
+    await nav("/backup", "[data-name=backup-key]");
+    await page.setInputFiles("input[type=file]", enc);
+    await page.waitForURL(/#\/backup\/restore$/);
+    await page.waitForSelector("[data-name=backup-pass] >> text=Бэкап зашифрован");
+    const inp = "[data-name=backup-pass] input[type=password]";
+    await page.fill(inp, "wrong-password");
+    await page.click("[data-name=backup-pass] button:has-text('Открыть')");
+    await page.waitForSelector("[data-name=backup-pass] >> text=не подходит");
+    await page.fill(inp, BPW);
+    await page.press(inp, "Enter");
+    await page.waitForSelector("[data-name=backup-inspect] >> text=Клиентов");
+    await page.waitForSelector("[data-name=backup-inspect] >> text=🔐");
+    await shot("45b-restore-enc");
+    await page.click("button:has-text('Восстановить')");
+    await page.waitForSelector("h1:has-text('Восстановление из бэкапа') + .jobhead .pill.ok", { timeout: 90000 });
+    // eslint-disable-next-line no-undef
+    const left = await page.evaluate(() => JSON.stringify(S.restore));
+    if ((left || "").includes(BPW)) throw new Error("пароль остался в памяти страницы: " + left);
   });
 
   // ── Обновление ──
