@@ -136,6 +136,12 @@ XRAY_ROUTING_UNIT="awg-xray-routing.service"
 XRAY_CHECK_HINT="проверь ссылку выхода: она могла устареть или сервер выхода недоступен — «Диагностика» покажет, какой выход не отвечает"
 XRAY_ROUTING_SCRIPT="/usr/local/bin/awg2-xray-routing.sh"
 XRAY_RUGEO_URL="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download"
+# Подписка Xray: адрес и состояние (адрес — секрет, в нём ключ доступа), имена серверов
+XRAY_SUB_CONF="$XRAY_DIR/sub.conf"; XRAY_SUB_LIST="$XRAY_DIR/sub.list"; XRAY_SUB_TIMER="awg-xray-sub.timer"
+# Клиент подписки представляется v2rayN: так панели (3x-ui, Marzban, Remnawave)
+# отдают список ссылками; ответ больше 2 МБ — не подписка; без заголовка
+# profile-update-interval — раз в 6 часов
+XRAY_SUB_UA="v2rayN/7.0" XRAY_SUB_MAX=2097152 XRAY_SUB_EVERY=6
 
 T2S_BIN="/usr/local/bin/tun2socks"
 T2S_DIR="/etc/tun2socks"

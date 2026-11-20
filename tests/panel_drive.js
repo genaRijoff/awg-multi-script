@@ -919,6 +919,64 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     } finally { await page.unroute(/\/api\/call$/); }
   });
 
+  await step("подписка Xray: адрес — задачей через stdin, не аргументом; http — с вопросом; состояние и кнопки", async () => {
+    let st = { set: false, site: "", insecure: false, title: "", count: 0, skipped: 0, updated: 0, checked: 0, error: "",
+      every: 6, next: 0, up: 0, down: 0, total: 0, expire: 0 };
+    const jobsSeen = [];
+    const ok = (data) => ({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data }) });
+    await page.route(/\/api\/call$/, (route) => {
+      const b = JSON.parse(route.request().postData() || "{}");
+      if (b.args && b.args[0] === "xray" && b.args[1] === "sub") return route.fulfill(ok(st));
+      return route.continue();
+    });
+    await page.route("**/api/job", (r) => {
+      jobsSeen.push(JSON.parse(r.request().postData() || "{}"));
+      r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data: { id: "fakesub" } }) });
+    });
+    await page.route("**/api/job/status", (r) => r.fulfill({ contentType: "application/json", body: JSON.stringify({ ok: true, data:
+      { state: "done", log: "√ Подписка: серверов 4\n", offset: 1, ok: true, data: null } }) }));
+    try {
+      await nav("/tunnels/xray/sub", "[data-name=xray-sub] >> text=не задана");
+      const inp = "input[aria-label='Адрес подписки']";
+      await page.fill(inp, "не адрес");
+      await expectAlert("Нужен адрес подписки", () => page.click("button:has-text('Задать подписку')"));
+      if (jobsSeen.length) throw new Error("не адрес — задача всё равно запущена");
+      await page.fill(inp, " https://sub.example.org/sub/SECRETTOKEN42 ");
+      await page.press(inp, "Enter");
+      await page.waitForSelector(".jobhead .pill.ok");
+      const j = jobsSeen[0] || {};
+      if (JSON.stringify(j.args) !== JSON.stringify(["xray", "sub", "set"]) || j.stdin !== "https://sub.example.org/sub/SECRETTOKEN42\n")
+        throw new Error("задача: " + JSON.stringify(j));
+      await nav("/tunnels/xray/sub", "[data-name=xray-sub]");
+      if (await page.inputValue(inp) !== "") throw new Error("адрес остался в поле");
+      await page.fill(inp, "http://plain.example.org/sub/HTTPTOKEN");
+      await page.click("button:has-text('Задать подписку')");
+      await page.waitForSelector(".jobhead .pill.ok");
+      const asked = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Адрес по http"));
+      const j2 = jobsSeen[1] || {};
+      if (!asked.length || JSON.stringify(j2.args) !== JSON.stringify(["xray", "sub", "set", "insecure"])) throw new Error("http: " + JSON.stringify([asked, j2]));
+      st = Object.assign(st, { set: true, site: "sub.example.org", title: "Мой VPN", count: 4, skipped: 1, updated: 1790000000,
+        every: 12, up: 5 * 2 ** 30, down: 5 * 2 ** 30, total: 10 * 2 ** 30, expire: Math.floor(Date.now() / 1000) + 86400,
+        error: "Подписка не скачалась: сервер ответил ошибкой 404" });
+      await nav("/tunnels/xray/sub", "[data-name=xray-sub] >> text=sub.example.org · Мой VPN");
+      await page.waitForSelector("[data-name=xray-sub] >> text=4 (пропущено 1)");
+      await page.waitForSelector("[data-name=xray-sub] >> text=раз в 12 ч");
+      await page.waitForSelector("[data-name=xray-sub] .warn >> text=ошибкой 404");
+      await page.waitForSelector("[data-name=xray-sub] span.warn >> text=/ГБ из/");
+      if ((await page.textContent("#app")).includes("SECRETTOKEN42")) throw new Error("адрес подписки на экране");
+      await page.click("button:has-text('Обновить сейчас')");
+      await page.waitForSelector(".jobhead .pill.ok");
+      await nav("/tunnels/xray/sub", "[data-name=xray-sub]");
+      await page.click("button:has-text('Убрать')");
+      await page.waitForSelector(".jobhead .pill.ok");
+      const asked2 = (await page.evaluate(() => window.__log)).filter((l) => l.startsWith("confirm:Убрать подписку?"));
+      const seq = jobsSeen.map((x) => (x.args || []).join(" "));
+      if (!asked2.length || seq[2] !== "xray sub update" || seq[3] !== "xray sub off") throw new Error("задачи: " + JSON.stringify(seq));
+    } finally {
+      await page.unroute(/\/api\/call$/); await page.unroute("**/api/job"); await page.unroute("**/api/job/status");
+    }
+  });
+
   // ── РФ напрямую, если туннель упал, куда идёт адрес ──
   const fake = (data) => ({ contentType: "application/json", body: JSON.stringify({ ok: true, log: "", error: "", data }) });
   await step("РФ напрямую: карточка в «Туннелях», выключено, свои списки, «Включить» — с вопросом; включено — счётчик и действия", async () => {

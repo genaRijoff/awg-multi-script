@@ -4280,15 +4280,19 @@ route(/^\/tunnels\/xray$/, async (ctx) => {
     inst ? [h("h2", {}, "Выходы"),
       h("div", { class: "card list" }, tags.length ? tags.map((t) => {
         const own = (d.clients || []).filter((c) => c.out === t).map((c) => c.name);
+        // Сервер подписки — с именем из неё, тег — строкой ниже
+        const name = ((d.outs || []).find((o) => o.tag === t) || {}).name || "";
         return h("div", { class: "item", "data-name": "xo-" + t, onclick: () => outbound(t) },
-          h("div", { class: "main" }, h("div", { class: "title" }, t, d.main === t ? " " : null, d.main === t ? pill("по умолчанию", "ok") : null),
+          h("div", { class: "main" }, h("div", { class: "title" }, name || t, d.main === t ? " " : null, d.main === t ? pill("по умолчанию", "ok") : null),
+            name ? h("div", { class: "sub" }, "📡 из подписки · " + t) : null,
             own.length ? h("div", { class: "sub" }, "свой выход: " + own.join(", ")) : null),
           h("div", { class: "side" }, icon("chevron-right")));
-      }) : h("div", { class: "empty" }, "Выходов нет — добавь ссылкой")),
+      }) : h("div", { class: "empty" }, "Выходов нет — добавь ссылкой или подпиской")),
       tags.length > 1 ? hint(d.per_client ? "Клиенту можно закрепить свой выход: Клиенты → клиент → Маршрут. "
         + "Остальные идут через выход по умолчанию или балансировщик."
         : "Свой выход клиенту — только с inbound tun в самом Xray: обнови Xray.") : null,
       btn("➕ Добавить выход", () => go("/tunnels/xray/add"), "btn-block" + (tags.length ? "" : " btn-primary")),
+      btn(d.sub ? "📡 Подписка ✅" : "📡 Подписка", () => go("/tunnels/xray/sub"), "btn-block"),
       tags.length > 1 ? btn(`⚖️ Балансировщик: ${d.balancer || "off"}`, balancer, "btn-block") : null,
       h("h2", {}, "Управление")] : null,
     inst ? null : [hint("Клиенты выходят в интернет через твой сервер VLESS, VMess, Trojan, Shadowsocks или Hysteria2 — "
@@ -4318,6 +4322,47 @@ route(/^\/tunnels\/xray\/add$/, async (ctx) => {
       if (!/^(vless|vmess|trojan|ss|hysteria2|hy2):\/\//.test(v)) return fail(new Error("Это не ссылка Xray"));
       return quick(b, "Выход добавлен", ["xray", "add", v], () => back());
     }, "btn-primary btn-block"));
+});
+
+// Подписка Xray: серверы по адресу подписки провайдера — выходы, обновляются сами.
+// Адрес — секрет (в нём ключ доступа): уходит в awg2 через stdin, на экране — только сайт
+route(/^\/tunnels\/xray\/sub$/, async (ctx) => {
+  const s = (await call("xray", "sub", "status")) || {};
+  const url = h("input", { type: "url", autocomplete: "off", autocapitalize: "off", spellcheck: "false",
+    placeholder: "https://…", "aria-label": "Адрес подписки" });
+  const here = { onBack: () => replace("/tunnels/xray/sub") };
+  const save = btn(s.set ? "✏️ Сменить адрес" : "📡 Задать подписку", async () => {
+    const v = url.value.replace(/\s+/g, "");
+    if (!/^https?:\/\//i.test(v) || v.length > 2048 || /["\\]/.test(v)) return fail(new Error("Нужен адрес подписки: https://…"));
+    let extra = [];
+    if (/^http:\/\//i.test(v)) {
+      if (!await confirmTg("Адрес по http: подписку могут подменить по дороге и подсунуть свои серверы. Лучше адрес "
+        + "https. Всё равно использовать?")) return;
+      extra = ["insecure"];
+    }
+    url.value = "";
+    await runJob(ctx, "Подписка Xray", ["xray", "sub", "set", ...extra], null, Object.assign({ stdin: v + "\n" }, here));
+  }, "btn-primary btn-block");
+  const used = (+s.up || 0) + (+s.down || 0), left = (+s.expire || 0) - Date.now() / 1000;
+  ctx.put(title("📡 Подписка Xray"),
+    hint("Серверы из подписки провайдера (3x-ui, Marzban, Remnawave…) становятся выходами Xray и обновляются сами. "
+      + "Свои выходы (ссылкой) не трогаются; клиенту можно закрепить сервер подписки, как обычный выход."),
+    h("div", { class: "card", "data-name": "xray-sub" },
+      kv("Подписка", s.set ? h("span", { class: "ok" }, "● " + s.site + (s.title ? " · " + s.title : "")) : h("span", { class: "muted" }, "○ не задана")),
+      s.set ? kv("Серверов", String(s.count || 0) + (s.skipped ? ` (пропущено ${s.skipped})` : "")) : null,
+      s.set && s.updated ? kv("Обновлена", fmtTime(s.updated) + ` · сама — раз в ${s.every || 6} ч`) : null,
+      s.set && s.total ? kv("Трафик", h("span", { class: used >= 0.9 * s.total ? "warn" : "" }, fmtBytes(used) + " из " + fmtBytes(s.total))) : null,
+      s.set && s.expire ? kv("Действует до", h("span", { class: left < 3 * 86400 ? "warn" : "" },
+        new Date(s.expire * 1000).toLocaleDateString("ru-RU") + (left <= 0 ? " — истекла" : ""))) : null,
+      s.set && s.insecure ? h("div", { class: "small warn" }, "▲ По http — подписку могут подменить по дороге") : null,
+      s.error ? h("div", { class: "small warn" }, "▲ " + s.error) : null),
+    s.set ? h("div", { class: "actions", style: "margin-top:8px" },
+      btn("🔄 Обновить сейчас", () => runJob(ctx, "Обновление подписки", ["xray", "sub", "update"], null, here)),
+      btn("🗑 Убрать", () => jobAsk(ctx, "Убрать подписку? Её серверы уйдут из выходов Xray, клиенты, закреплённые за ними, — "
+        + "на выход по умолчанию. Свои выходы останутся.", "Подписка убирается", ["xray", "sub", "off"]), "btn-danger")) : null,
+    h("h2", {}, s.set ? "Сменить адрес" : "Адрес подписки"), url, h("div", { style: "margin-top:8px" }, enterTo(save, url)),
+    hint("Ссылка «для приложения» из панели провайдера. Адрес — секрет (в нём ключ доступа): Тулза хранит его только "
+      + "на сервере, на экранах показывает только сайт."));
 });
 
 // tun2socks

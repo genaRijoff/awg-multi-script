@@ -42,6 +42,8 @@ _api_wants_stdin() {
     # Пароль бэкапа — только когда его явно передают словом «pass»
     "backup inspect"|"backup restore") [[ " ${*:3} " == *" pass "* ]] ;;
     "backup key") [[ "${3:-}" == set ]] ;;
+    # Адрес подписки — секрет: через stdin, не в аргументах (их видно в ps)
+    "xray sub") [[ "${3:-}" == set ]] ;;
     *) return 1 ;;
   esac
 }
@@ -644,8 +646,9 @@ _api_xray() {
         _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         # Выходы для карточек: протокол, защита, транспорт, адрес
-        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
-        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; } | api_obj
+        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" "$XRAY_SUB_LIST" 2>/dev/null; } \
+                      | py json-rows tag proto sec net host port:n name)"
+        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; _kv sub:b "$(_b xray_sub_on)"; } | api_obj
       xray_status ;;
     # Трафик через выход работающего Xray (бот: выход отвалился на ходу).
     # up — Xray и маршруты клиентов работают; ok — ответ через SOCKS Xray
@@ -679,10 +682,37 @@ _api_xray() {
       [[ "${1:-}" =~ ^(on|off)$ ]] || { _api_usage "xray ru on|off"; return; }
       xray_ru_set "$1" ;;
     ru-update) xray_ru_update ;;
+    sub) _api_xray_sub "$@" ;;
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
+    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|sub …|diag|fix|remove" ;;
+  esac
+}
+
+# Подписка Xray. set — адрес первой строкой stdin; insecure — согласие на http
+_api_xray_sub() {
+  local a="${1:-status}" url=""
+  shift || true
+  case "$a" in
+    status)
+      local upd every; upd=$(_xsub_num UPDATED); every=$(xray_sub_every)
+      { _kv set:b "$(_b xray_sub_on)"; _kv site "$(xray_sub_on && xray_sub_site)"
+        _kv insecure:b "$( [[ "$(_xsub_get INSECURE)" == 1 ]] && echo 1 || echo 0)"
+        _kv title "$(_xsub_get TITLE)"; _kv count:n "$(_xsub_num COUNT)"; _kv skipped:n "$(_xsub_num SKIPPED)"
+        _kv updated:n "$upd"; _kv checked:n "$(_xsub_num CHECKED)"; _kv error "$(_xsub_get ERROR)"
+        _kv every:n "$every"; _kv next:n "$( (( upd )) && echo $(( upd + every * 3600 )) || echo 0)"
+        _kv up:n "$(_xsub_num UP)"; _kv down:n "$(_xsub_num DOWN)"; _kv total:n "$(_xsub_num TOTAL)"
+        _kv expire:n "$(_xsub_num EXPIRE)"; } | api_obj ;;
+    set)
+      _api_stdin
+      IFS= read -r url < "$API_IN" || true
+      url="${url%$'\r'}"; url="${url#"${url%%[![:space:]]*}"}"; url="${url%"${url##*[![:space:]]}"}"
+      [[ -n "$url" ]] || { err "Адрес подписки передаётся первой строкой stdin"; return 1; }
+      xray_sub_set "$url" "${1:-}" ;;
+    update) xray_sub_update "${1:-}" ;;
+    off) xray_sub_off ;;
+    *) _api_usage "xray sub [status]|set [insecure] (адрес — stdin)|update|off" ;;
   esac
 }
 
@@ -1290,7 +1320,7 @@ _api_readonly() {
   [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
   case "$a $b $c" in
     "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get"|\
-    "tunnels fail "|"tunnels fail list"|"backup key "|"backup key status") return 0 ;;
+    "tunnels fail "|"tunnels fail list"|"backup key "|"backup key status"|"xray sub "|"xray sub status") return 0 ;;
   esac
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
@@ -1406,6 +1436,7 @@ api_main() {
     vkblock_watchdog || true
     rublock_watchdog || true
     smtpblock_watchdog || true
+    xray_sub_watchdog || true
     rudirect_watchdog || true
     tunfail_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then

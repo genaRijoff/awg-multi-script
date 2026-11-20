@@ -285,12 +285,14 @@ async def xray_screen(cb: CallbackQuery, state: FSMContext, arg: str = "") -> No
                  "не отвечает. Ссылка устарела — ➕ добавь новую, старую ➖ удали, затем 🔄 перезапусти Xray.\n")
     if inst:
         text += ("\n<i>➕ Добавить выход — ссылкой vless://, vmess://, trojan://, ss://, hysteria2://\n"
+                 "📡 Подписка — серверы по адресу подписки провайдера, обновляются сами\n"
                  "✅ РФ напрямую — российские сайты мимо Xray"
                  + (f"\n⚖️ — как делить трафик между выходами (сейчас {esc(d.get('balancer') or '?')})"
                     if len(tags) > 1 else "") + "</i>")
     await ui.render(cb, text, ui.kb(
         (f"📦 {'Обновить' if inst else 'Установить'}", xr.data("install")),
         ("➕ Добавить выход", xr.data("add")) if inst else None,
+        (f"📡 Подписка{' ✅' if d.get('sub') else ''}", "xs") if inst else None,
         ("➖ Удалить выход", xr.data("del")) if tags else None,
         ("⚖️ Балансировщик", xr.data("bal")) if len(tags) > 1 else None,
         ("▶️ Включить", xr.data("up")) if inst and tags and not up else None,

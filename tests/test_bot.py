@@ -2531,6 +2531,73 @@ async def run():
     os.remove(ENC)
     no_hourglass("Пароль бэкапов")
 
+    print("Подписка Xray")
+    XS = {"set": False, "site": "", "insecure": False, "title": "", "count": 0, "skipped": 0, "updated": 0, "checked": 0,
+          "error": "", "every": 6, "next": 0, "up": 0, "down": 0, "total": 0, "expire": 0}
+    xs_jobs = []
+
+    async def xs_call(*args, **kw):
+        if args[:3] == ("xray", "sub", "status"):
+            return botapi.Result(True, data=json.loads(json.dumps(XS)))
+        if args[:2] == ("xray", "status"):
+            return botapi.Result(True, log="  Версия    : 26.3.27", data={"installed": True, "up": False, "tags": ["sub_a_443"],
+                                                                         "sub": XS["set"], "balancer": "off", "outs": []})
+        return await real_call_(*args, **kw)
+
+    async def xs_job(*args, stdin=None):
+        xs_jobs.append((args, stdin))
+        return botapi.Result(False, 1, error="тест: задача не запускается")
+    botapi.call = xs_call
+    real_job_start = botapi.job_start
+    botapi.job_start = xs_job
+    text, buttons = screen(await press("xr"))
+    chk("Xray: кнопка «📡 Подписка» и подсказка", ("📡 Подписка", "xs") in buttons and "Подписка — серверы" in text, buttons)
+    text, buttons = screen(await press("xs"))
+    chk("подписки нет: что это, «➕ Задать адрес», назад в Xray",
+        "⚪️ Подписка не задана" in text and ("➕ Задать адрес", "xs:set") in buttons and ("◀️ Назад", "xr") in buttons
+        and not any(d in ("xs:upd", "xs:off") for _, d in buttons), [text, buttons])
+    await press("xs:set")
+    TOKEN = "https://sub.example.org/sub/SECRETTOKEN42"
+    text, _ = screen(await say("не адрес"))
+    chk("не адрес — переспрашивает", "Нужен адрес подписки" in text and not xs_jobs, text)
+    sent = await say(TOKEN)
+    said = LAST_SAID[0]
+    chk("адрес подписки: сообщение удалено, в awg2 — задачей, адрес через stdin, не аргументом",
+        said in SESSION.deleted and xs_jobs and xs_jobs[-1][0] == ("xray", "sub", "set") and xs_jobs[-1][1] == TOKEN + "\n",
+        xs_jobs)
+    chk("адреса подписки нет ни в одном сообщении бота",
+        not any("SECRETTOKEN42" in (getattr(m, "text", None) or "") for _, m in SESSION.sent), "")
+    await press("xs:set")
+    xs_jobs.clear()
+    sent = await say("http://plain.example.org/sub/HTTPTOKEN")
+    text, buttons = screen(sent)
+    chk("адрес по http — сперва предупреждение, задача не запущена", "http" in text and ("⚠️ Использовать http", "xs:http") in buttons
+        and not xs_jobs and LAST_SAID[0] in SESSION.deleted, [text, buttons])
+    await press("xs:http")
+    fsm = await DP.storage.get_data(key=StorageKey(bot_id=BOT.id, chat_id=OWNER.id, user_id=OWNER.id))
+    chk("подтвердил http — задача с insecure, адрес через stdin; в памяти бота не остался",
+        xs_jobs == [(("xray", "sub", "set", "insecure"), "http://plain.example.org/sub/HTTPTOKEN\n")]
+        and "HTTPTOKEN" not in json.dumps(fsm, ensure_ascii=False), [xs_jobs, fsm])
+    XS.update(set=True, site="sub.example.org", title="Мой <VPN>", count=4, skipped=1, updated=1791500000, every=12,
+              up=5 * 2 ** 30, down=5 * 2 ** 30, total=10 * 2 ** 30, expire=int(time.time()) + 86400,
+              error="Подписка не скачалась: сервер ответил ошибкой 404")
+    text, buttons = screen(await press("xs"))
+    chk("подписка есть: сайт, название (экранировано), серверов и пропущено, обновление, трафик и срок с ⚠️, ошибка",
+        "sub.example.org" in text and "Мой &lt;VPN&gt;" in text and "серверов 4 (пропущено 1)" in text
+        and "раз в 12 ч" in text and "Трафик: 10.0 ГБ из 10.0 ГБ ⚠️" in text and "Действует до" in text and "⚠️" in text
+        and "ответил ошибкой 404" in text and "SECRETTOKEN42" not in text, text)
+    chk("кнопки: обновить, сменить адрес, балансировщик (серверов несколько), убрать",
+        [d for _, d in buttons] == ["xs:upd", "xs:set", "xr:bal", "xs:off", "xr"], buttons)
+    xs_jobs.clear()
+    await press("xs:upd")
+    text, buttons = screen(await press("xs:off"))
+    chk("убрать — с подтверждением", ("🗑 Убрать", "xs:offok") in buttons and ("xray", "sub", "off") not in [j[0] for j in xs_jobs],
+        buttons)
+    await press("xs:offok")
+    chk("обновить и убрать — задачами", [j[0] for j in xs_jobs] == [("xray", "sub", "update"), ("xray", "sub", "off")], xs_jobs)
+    botapi.call = real_call_
+    botapi.job_start = real_job_start
+
     print("РФ напрямую, если туннель упал, куда идёт адрес")
     text, buttons = screen(await press("tun"))
     chk("в «Туннелях» — «🇷🇺 РФ напрямую» и «🪂 Если упал», строки их состояния",
