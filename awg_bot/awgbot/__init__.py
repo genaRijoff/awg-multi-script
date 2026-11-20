@@ -1,2 +1,2 @@
 """Telegram-бот AWG Toolza: каждый пункт меню awg2 — кнопкой."""
-__version__ = "3.4.57"
+__version__ = "3.4.58"

@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.64"
+VERSION="v1.2.65"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -507,6 +507,12 @@ XRAY_ROUTING_UNIT="awg-xray-routing.service"
 XRAY_CHECK_HINT="проверь ссылку выхода: она могла устареть или сервер выхода недоступен — «Диагностика» покажет, какой выход не отвечает"
 XRAY_ROUTING_SCRIPT="/usr/local/bin/awg2-xray-routing.sh"
 XRAY_RUGEO_URL="https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download"
+# Подписка Xray: адрес и состояние (адрес — секрет, в нём ключ доступа), имена серверов
+XRAY_SUB_CONF="$XRAY_DIR/sub.conf"; XRAY_SUB_LIST="$XRAY_DIR/sub.list"; XRAY_SUB_TIMER="awg-xray-sub.timer"
+# Клиент подписки представляется v2rayN: так панели (3x-ui, Marzban, Remnawave)
+# отдают список ссылками; ответ больше 2 МБ — не подписка; без заголовка
+# profile-update-interval — раз в 6 часов
+XRAY_SUB_UA="v2rayN/7.0" XRAY_SUB_MAX=2097152 XRAY_SUB_EVERY=6
 
 T2S_BIN="/usr/local/bin/tun2socks"
 T2S_DIR="/etc/tun2socks"
@@ -7390,6 +7396,7 @@ xray_del_tag() {  # тег
   n=$(_xray_peers_untag "$1")
   _xray_prepare
   ok "Выход $1 удалён"
+  [[ "$1" == sub_* ]] && xray_sub_on && info "Это сервер подписки — при её обновлении он вернётся"
   (( ${n:-0} )) && info "Его клиенты ($n) — теперь на выходе по умолчанию"
   xray_is_up && xray_restart
   return 0
@@ -7586,6 +7593,308 @@ xray_ru_set() {
   return 0
 }
 
+# ── Подписка ──────────────────────────────────────────────
+# Адрес подписки — секрет (в нём ключ доступа к серверам провайдера): лежит в
+# sub.conf (600), в аргументы команд и журналы не попадает — curl получает
+# его конфигом через stdin, на экранах только сайт. Серверы подписки — выходы
+# с тегами sub_…: обновление заменяет только их, свои выходы (ссылкой) не
+# трогает. Каждый сервер проверяется на самом Xray; конфиг, который Xray не
+# принял, и подписка, через новые серверы которой не пошёл трафик, —
+# откатываются к прежним выходам. Таймер раз в час смотрит срок и идёт через
+# замок API — не мешает правкам из бота и панели.
+XSUB_WHY=""
+_xsub_get() { sed -n "s/^$1=//p" "$XRAY_SUB_CONF" 2>/dev/null | tail -1; }
+# Число из sub.conf (файл мог прийти из чужого бэкапа — в арифметику только цифры)
+_xsub_num() { local v; v=$(_xsub_get "$1"); [[ "$v" =~ ^[0-9]{1,20}$ ]] && echo "$v" || echo 0; }
+
+_xsub_set() {  # КЛЮЧ=ЗНАЧЕНИЕ...
+  local kv keys=()
+  mkdir -p "$XRAY_DIR"
+  for kv in "$@"; do keys+=("${kv%%=*}"); done
+  { grep -vE "^($(IFS='|'; echo "${keys[*]}"))=" "$XRAY_SUB_CONF" 2>/dev/null
+    for kv in "$@"; do printf '%s\n' "${kv//[$'\n\r']/ }"; done; } | write_file "$XRAY_SUB_CONF" 600
+}
+
+_xsub_fail() { XSUB_WHY="$1"; err "$1"; return 1; }
+
+xray_sub_on() { [[ -n "$(_xsub_get URL)" ]]; }
+
+# Сайт подписки для показа — адрес целиком секрет
+xray_sub_site() {  # [адрес]
+  local a="${1:-$(_xsub_get URL)}"
+  a="${a#*://}"; a="${a%%[/?#]*}"; echo "${a##*@}"
+}
+
+# Адрес: https (http — только с подтверждением insecure: его могут подменить
+# по дороге), без пробелов, кавычек и обратной косой — он уходит в конфиг curl
+_xsub_url_ok() {  # адрес 0|1
+  local u="$1" site
+  if (( ${#u} > 2048 )) || [[ -z "$u" || "$u" == *[[:space:]]* || "$u" == *[[:cntrl:]]* || "$u" == *'"'* || "$u" == *'\'* ]]; then
+    _xsub_fail "Адрес подписки: без пробелов и кавычек, не длиннее 2048 знаков"; return 1
+  fi
+  case "$u" in
+    https://*) ;;
+    http://*) [[ "$2" == 1 ]] || { _xsub_fail "Подписка по http: её могут подменить по дороге — нужен https или подтверждение"; return 3; } ;;
+    *) _xsub_fail "Адрес подписки начинается с https://"; return 1 ;;
+  esac
+  site=$(xray_sub_site "$u")
+  [[ -n "${site%%:*}" && "$site" != :* ]] || { _xsub_fail "В адресе подписки нет сайта"; return 1; }
+}
+
+# Скачать подписку в каталог: body и headers. Ответ больше XRAY_SUB_MAX — отказ.
+_xsub_fetch() {  # адрес 0|1 каталог
+  local url="$1" dir="$3" proto='=https' rc size why
+  [[ "$2" == 1 ]] && proto='=https,http'
+  printf 'url = "%s"\n' "$url" \
+    | curl -K - -sS -f -L --max-redirs 3 --proto "$proto" --proto-redir "$proto" --connect-timeout 15 \
+        --max-time 60 -A "$XRAY_SUB_UA" -D "$dir/headers" -o - 2>"$dir/err" \
+    | head -c $((XRAY_SUB_MAX + 1)) > "$dir/body"
+  rc=${PIPESTATUS[1]}
+  size=$(stat -c %s "$dir/body" 2>/dev/null || echo 0)
+  (( size > XRAY_SUB_MAX )) && { _xsub_fail "Подписка больше 2 МБ — это не список серверов"; return 1; }
+  (( rc == 0 )) && return 0
+  why=$(tail -1 "$dir/err" 2>/dev/null | sed 's/^curl: ([0-9]*) //')
+  why="${why//"$url"/$(xray_sub_site "$url")}"
+  case "$rc" in
+    1) why="перенаправление на другой протокол — запрещено" ;;
+    6) why="сайт подписки не найден (DNS)" ;;
+    7) why="сайт подписки недоступен" ;;
+    22) why="сервер подписки ответил ошибкой ${why##*error: }" ;;
+    28) why="сервер подписки не ответил за 60 с" ;;
+    47) why="слишком много перенаправлений" ;;
+  esac
+  _xsub_fail "Подписка не скачалась: ${why:-curl $rc}"
+}
+
+_xsub_count() { python3 -I -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["items"]))' "$1"; }
+
+# Серверы подписки, которых этот Xray не принимает, — убрать (печатает их имена).
+# Сначала все разом; не принят конфиг — по одному.
+_xsub_probe() {  # parsed.json
+  local probe n i bad=()
+  probe=$(mktemp --suffix=.json /tmp/awg2.XXXXXX) || return 1
+  if py xray-sub-probe "$1" "$probe" && xray_test "$probe" >/dev/null; then rm -f "$probe"; return 0; fi
+  n=$(_xsub_count "$1") || { rm -f "$probe"; return 1; }
+  for ((i = 0; i < n; i++)); do
+    { py xray-sub-probe "$1" "$probe" "$i" && xray_test "$probe" >/dev/null; } || bad+=("$i")
+  done
+  rm -f "$probe"
+  (( ${#bad[@]} )) && py xray-sub-drop "$1" "${bad[@]}"
+  return 0
+}
+
+_xsub_rollback() {  # каталог копий
+  local f
+  cp -a "$1/config.json" "$XRAY_CONF"
+  if [[ -f "$1/sub.list" ]]; then cp -a "$1/sub.list" "$XRAY_SUB_LIST"; else rm -f "$XRAY_SUB_LIST"; fi
+  for f in "$XRAY_PEERS" "$XRAY_PEERS.wgobf"; do [[ -f "$1/${f##*/}" ]] && cp -a "$1/${f##*/}" "$f"; done
+  return 0
+}
+
+# Туннель Xray включён (работает или должен работать)
+_xray_enabled() { [[ -f "$XRAY_STATE" ]] || xray_is_up; }
+
+# Скачать, разобрать, проверить и применить подписку; записать её сведения.
+# Работающий туннель перезапускается, только если серверы поменялись.
+_xray_sub_sync() {  # адрес 0|1
+  local d res changed gone=() n bad moved="" why meta=() f
+  XSUB_WHY=""
+  mktmp d -d || return 1
+  _xsub_fetch "$1" "$2" "$d" || return 1
+  if ! py xray-sub-parse "$d/body" "$d/parsed.json" 2>"$d/perr"; then
+    _xsub_fail "Подписка: $(tail -1 "$d/perr")"; return 1
+  fi
+  bad=$(_xsub_probe "$d/parsed.json") || { _xsub_fail "Серверы подписки не проверены"; return 1; }
+  [[ -n "$bad" ]] && warn "Этот Xray не принимает серверы: $(paste -sd, <<< "$bad" | sed 's/,/, /g')"
+  n=$(_xsub_count "$d/parsed.json") || n=0
+  (( n > 0 )) || { _xsub_fail "Ни один сервер подписки не принят этим Xray — обнови Xray (Установить / обновить)"; return 1; }
+  mkdir -p "$d/bak" && cp -a "$XRAY_CONF" "$d/bak/config.json" || return 1
+  for f in "$XRAY_SUB_LIST" "$XRAY_PEERS" "$XRAY_PEERS.wgobf"; do [[ -f "$f" ]] && cp -a "$f" "$d/bak/"; done
+  if ! res=$(py xray-sub-apply "$XRAY_CONF" "$d/parsed.json" "$XRAY_SUB_LIST"); then
+    _xsub_rollback "$d/bak"; _xsub_fail "Конфиг Xray не записан"; return 1
+  fi
+  changed=$(python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); print(int(d["changed"])); print("\n".join(d["gone"]))' "$res")
+  mapfile -t gone < <(tail -n +2 <<< "$changed" | grep .)
+  changed=$(head -1 <<< "$changed")
+  (( ${#gone[@]} )) && moved=$(_xray_peers_untag "${gone[@]}")
+  if ! _xray_prepare || ! why=$(xray_test); then
+    _xsub_rollback "$d/bak"
+    _xsub_fail "Xray не принял конфиг с подпиской — оставлены прежние выходы${why:+: $(head -1 <<< "$why")}"; return 1
+  fi
+  if (( changed )) && _xray_enabled; then
+    info "Серверы подписки поменялись — перезапускаю туннель"
+    if ! xray_restart; then
+      _xsub_rollback "$d/bak"; _xray_prepare || true
+      warn "Туннель с новыми серверами не поднялся — возвращаю прежние"
+      xray_up || true
+      _xsub_fail "Туннель с серверами подписки не поднялся (через них не идёт трафик) — оставлены прежние"; return 1
+    fi
+  fi
+  mapfile -t meta < <(py xray-sub-meta "$d/headers")
+  _xsub_set "${meta[@]}" "COUNT=$n" "SKIPPED=$(python3 -I -c 'import json,sys; print(int(json.load(open(sys.argv[1])).get("skipped", 0)))' "$d/parsed.json")" \
+    "UPDATED=$(date +%s)" "CHECKED=$(date +%s)" "ERROR="
+  ok "Подписка: серверов $n$( (( changed )) || echo ", без изменений")"
+  (( ${moved:-0} )) && info "Клиенты ушедших серверов ($moved) — на выходе по умолчанию"
+  return 0
+}
+
+# Задать подписку (сменить адрес): сразу скачивается и применяется; не вышло —
+# прежняя подписка остаётся как была.
+xray_sub_set() {  # адрес [insecure]
+  local url="$1" ins=0 rc=0
+  [[ "${2:-}" == insecure ]] && ins=1
+  xray_installed || { err "Сначала установи Xray"; return 1; }
+  _xsub_url_ok "$url" "$ins" || return $?
+  (( ins )) && warn "Подписка по http: её могут подменить по дороге"
+  _xray_sub_sync "$url" "$ins" || return 1
+  _xsub_set "URL=$url" "INSECURE=$ins"
+  _xray_sub_timer on
+  touch "$XRAY_DIR/.sub-heal" 2>/dev/null || true
+  log_info "xray: подписка $(xray_sub_site "$url")"
+  info "Обновляется сама раз в $(xray_sub_every) ч"
+  return "$rc"
+}
+
+xray_sub_every() {
+  local h; h=$(_xsub_num INTERVAL)
+  (( h >= 1 && h <= 24 )) && echo "$h" || echo "$XRAY_SUB_EVERY"
+}
+
+# Срок: прошёл интервал с удачного обновления; не чаще раза в час (и после неудачи)
+_xsub_due() {
+  local now; now=$(date +%s)
+  (( now - $(_xsub_num CHECKED) >= 3300 )) || return 1
+  (( now - $(_xsub_num UPDATED) >= $(xray_sub_every) * 3600 - 300 ))
+}
+
+xray_sub_update() {  # [auto] — auto: только если подошёл срок (таймер)
+  local url ins
+  xray_installed || { err "Xray не установлен"; return 1; }
+  if ! xray_sub_on; then [[ "${1:-}" == auto ]] && return 0; err "Подписка не задана"; return 1; fi
+  if [[ "${1:-}" == auto ]]; then
+    touch "$XRAY_DIR/.sub-heal" 2>/dev/null || true
+    _xsub_due || return 0
+  fi
+  url=$(_xsub_get URL); ins=0; [[ "$(_xsub_get INSECURE)" == 1 ]] && ins=1
+  if _xsub_url_ok "$url" "$ins" && _xray_sub_sync "$url" "$ins"; then return 0; fi
+  _xsub_set "CHECKED=$(date +%s)" "ERROR=${XSUB_WHY:-не обновилась}"
+  log_info "xray: подписка не обновилась — ${XSUB_WHY:-?}"
+  return 1
+}
+
+# Убрать подписку и её серверы. Если туннель держится только на них — отказ.
+xray_sub_off() {
+  local res changed gone=() subs=() moved=""
+  xray_installed || { err "Xray не установлен"; return 1; }
+  xray_sub_on || [[ -s "$XRAY_SUB_LIST" ]] || { info "Подписки нет"; return 0; }
+  if ! xray_tags | grep -qv '^sub_' && _xray_enabled; then
+    err "Туннель Xray работает только на серверах подписки — сначала выключи его или добавь свой выход ссылкой"
+    return 1
+  fi
+  res=$(py xray-sub-apply "$XRAY_CONF" - "$XRAY_SUB_LIST") || { err "Конфиг Xray не записан"; return 1; }
+  changed=$(python3 -I -c 'import json,sys; d=json.loads(sys.argv[1]); print(int(d["changed"])); print("\n".join(d["gone"]))' "$res")
+  mapfile -t gone < <(tail -n +2 <<< "$changed" | grep .)
+  changed=$(head -1 <<< "$changed")
+  # Клиенты на любом сервере подписки (и уже удалённом руками) — на выход по умолчанию
+  mapfile -t subs < <(cat "$XRAY_PEERS" "$XRAY_PEERS.wgobf" 2>/dev/null | awk -F'|' '$2 ~ /^sub_/ {print $2}' | sort -u)
+  (( ${#subs[@]} )) && moved=$(_xray_peers_untag "${subs[@]}")
+  _xray_prepare || true
+  rm -f "$XRAY_SUB_CONF" "$XRAY_SUB_LIST" "$XRAY_DIR/.sub-heal"
+  _xray_sub_timer off
+  log_info "xray: подписка убрана"
+  ok "Подписка убрана${gone[*]:+, её серверов: ${#gone[@]}}"
+  (( ${moved:-0} )) && info "Клиенты её серверов ($moved) — на выходе по умолчанию"
+  if (( changed )) && _xray_enabled; then info "Перезапускаю туннель"; xray_restart || true; fi
+  return 0
+}
+
+_xray_sub_timer() {  # on|off
+  if [[ "$1" == off ]]; then remove_unit "$XRAY_SUB_TIMER" "${XRAY_SUB_TIMER%.timer}.service"; return 0; fi
+  write_unit "${XRAY_SUB_TIMER%.timer}.service" <<EOF
+[Unit]
+Description=AWG Toolza — подписка Xray: обновить, если подошёл срок
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=API_LOCK_WAIT=900
+TimeoutStartSec=1200
+ExecStart=$SCRIPT_PATH api xray sub update auto
+EOF
+  write_unit "$XRAY_SUB_TIMER" <<'EOF'
+[Unit]
+Description=AWG Toolza — подписка Xray: проверка раз в час
+
+[Timer]
+OnBootSec=300
+OnUnitActiveSec=3600
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl enable --now "$XRAY_SUB_TIMER" &>/dev/null || warn "Таймер подписки не включился"
+}
+
+# Сторож: таймера нет (восстановили бэкап, Xray переустановлен) — поставить;
+# молчит больше трёх часов — перезапустить
+xray_sub_watchdog() {
+  local f="$XRAY_DIR/.sub-heal" age
+  xray_sub_on && xray_installed || return 0
+  if ! unit_enabled "$XRAY_SUB_TIMER"; then _xray_sub_timer on; touch "$f" 2>/dev/null; return 0; fi
+  [[ -f "$f" ]] || { touch "$f" 2>/dev/null; return 0; }
+  age=$(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) ))
+  (( age < 10800 )) && return 0
+  touch "$f"
+  timer_heal "$XRAY_SUB_TIMER"
+}
+
+xray_sub_status() {
+  local upd err tot exp
+  if ! xray_sub_on; then echo -e "  Подписка  : ${D}○ не задана${N}"; return 0; fi
+  upd=$(_xsub_num UPDATED); err=$(_xsub_get ERROR)
+  echo -e "  Подписка  : ${W}$(xray_sub_site)${N}$([[ -n "$(_xsub_get TITLE)" ]] && echo " ${D}($(_xsub_get TITLE))${N}") — серверов $(_xsub_num COUNT)"
+  (( upd )) && echo -e "  ${D}  обновлена $(date -d "@$upd" '+%d.%m %H:%M'), раз в $(xray_sub_every) ч${N}"
+  tot=$(_xsub_num TOTAL); exp=$(_xsub_num EXPIRE)
+  (( tot )) && echo -e "  ${D}  трафик $(fmt_bytes $(( $(_xsub_num UP) + $(_xsub_num DOWN) ))) из $(fmt_bytes "$tot")${N}"
+  (( exp )) && echo -e "  ${D}  действует до $(date -d "@$exp" '+%d.%m.%Y')${N}"
+  [[ -n "$err" ]] && echo -e "  ${Y}  ▲ $err${N}"
+  return 0
+}
+
+do_xray_sub_menu() {
+  local c url
+  xray_installed || { err "Сначала установи Xray"; return 1; }
+  echo ""
+  hdr "Подписка Xray"
+  echo -e "  ${D}Адрес подписки провайдера (3x-ui, Marzban, Remnawave…): её серверы становятся выходами"
+  echo -e "  Xray и обновляются сами. Свои выходы (ссылкой) не трогаются.${N}"
+  echo ""
+  xray_sub_status
+  echo ""
+  echo -e "  ${C}1)${N} $(xray_sub_on && echo "Сменить адрес" || echo "Задать адрес")"
+  xray_sub_on && echo -e "  ${C}2)${N} Обновить сейчас"
+  xray_sub_on && echo -e "  ${C}3)${N} Убрать подписку ${D}(и её серверы)${N}"
+  echo -e "  ${W}0)${N} ← Назад"
+  read_choice c "${C}  Выбор: ${N}" 0 "$(xray_sub_on && echo 3 || echo 1)" 0
+  case "$c" in
+    1) read_line url "${C}  Адрес подписки (https://…): ${N}"
+       url="${url//[[:space:]]/}"
+       [[ -n "$url" ]] || return 0
+       if [[ "$url" == http://* ]]; then
+         warn "Адрес по http: подписку могут подменить по дороге"
+         ask_yes "  Всё равно использовать? [y/N]: " n || return 0
+         xray_sub_set "$url" insecure
+       else
+         xray_sub_set "$url"
+       fi ;;
+    2) xray_sub_update ;;
+    3) read_confirm "${R}  Убрать подписку и её серверы? (введи yes): ${N}" || return 0
+       xray_sub_off ;;
+  esac
+}
+
 # ── Маршрутизация (awg-xray-routing.service) ──────────────
 xray_routing_run() {
   local i nat=""
@@ -7751,7 +8060,8 @@ xray_remove() {
 
 xray_uninstall() {
   xray_down quiet
-  remove_unit "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" awg-xray-rugeo.timer awg-xray-rugeo.service
+  remove_unit "$XRAY_ROUTING_UNIT" "$XRAY_TUN_UNIT" "$XRAY_UNIT" awg-xray-rugeo.timer awg-xray-rugeo.service \
+    "$XRAY_SUB_TIMER" "${XRAY_SUB_TIMER%.timer}.service"
   rm -rf "$XRAY_DIR" "$XRAY_BIN" "$XRAY_ROUTING_SCRIPT" \
     "$XRAY_ASSET_DIR"/geoip.dat "$XRAY_ASSET_DIR"/geosite.dat "$XRAY_ASSET_DIR"/geo{ip,site}_RU.dat
   ok "Xray удалён"
@@ -7783,6 +8093,7 @@ xray_status() {
     echo -e "  ${D}  $name → $tag$(xray_tags | grep -qxF "$tag" || echo " (выхода нет — по умолчанию)")${N}"
   done
   xray_ru_on && echo -e "  РФ-сайты  : ${G}напрямую${N}"
+  xray_sub_on && xray_sub_status
   return 0
 }
 
@@ -7844,6 +8155,7 @@ do_xray_menu() {
     echo ""
     echo -e "  ${C}1)${N} Установить / обновить"
     echo -e "  ${C}2)${N} Добавить выход (ссылка)"
+    echo -e "  ${C}s)${N} Подписка $(xray_sub_on && echo -e "${G}● $(xray_sub_site)${N}" || echo -e "${D}○ нет${N}")"
     echo -e "  ${C}3)${N} Удалить выход"
     echo -e "  ${C}4)${N} Балансировщик"
     echo -e "  ${C}m)${N} Выход по умолчанию"
@@ -7856,10 +8168,11 @@ do_xray_menu() {
     echo -e "  ${C}r)${N} РФ-сайты напрямую $(xray_ru_on && echo -e "${G}● вкл${N}" || echo -e "${D}○ выкл${N}")"
     echo -e "  ${R}d)${N} Удалить Xray"
     echo -e "  ${W}0)${N} ← Назад"
-    read_choice c "${C}  Выбор: ${N}" 0 9 0 "r|d|m|o"
+    read_choice c "${C}  Выбор: ${N}" 0 9 0 "r|d|m|o|s"
     case "$c" in
       1) xray_install || true ;;
       2) xray_add_outbound || true ;;
+      s) do_xray_sub_menu || true ;;
       3) xray_del_outbound || true ;;
       4) xray_balancer_menu || true ;;
       m) xray_main_menu || true ;;
@@ -15149,6 +15462,8 @@ _api_wants_stdin() {
     # Пароль бэкапа — только когда его явно передают словом «pass»
     "backup inspect"|"backup restore") [[ " ${*:3} " == *" pass "* ]] ;;
     "backup key") [[ "${3:-}" == set ]] ;;
+    # Адрес подписки — секрет: через stdin, не в аргументах (их видно в ps)
+    "xray sub") [[ "${3:-}" == set ]] ;;
     *) return 1 ;;
   esac
 }
@@ -15751,8 +16066,9 @@ _api_xray() {
         _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         # Выходы для карточек: протокол, защита, транспорт, адрес
-        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" 2>/dev/null; } | py json-rows tag proto sec net host port:n)"
-        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; } | api_obj
+        _kv outs:j "$({ xray_installed && py xray-outs "$XRAY_CONF" "$XRAY_SUB_LIST" 2>/dev/null; } \
+                      | py json-rows tag proto sec net host port:n name)"
+        _kv ru:b "$(_b xray_ru_on)"; _kv fail "$(xray_fail)"; _kv sub:b "$(_b xray_sub_on)"; } | api_obj
       xray_status ;;
     # Трафик через выход работающего Xray (бот: выход отвалился на ходу).
     # up — Xray и маршруты клиентов работают; ok — ответ через SOCKS Xray
@@ -15786,10 +16102,37 @@ _api_xray() {
       [[ "${1:-}" =~ ^(on|off)$ ]] || { _api_usage "xray ru on|off"; return; }
       xray_ru_set "$1" ;;
     ru-update) xray_ru_update ;;
+    sub) _api_xray_sub "$@" ;;
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|diag|fix|remove" ;;
+    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|sub …|diag|fix|remove" ;;
+  esac
+}
+
+# Подписка Xray. set — адрес первой строкой stdin; insecure — согласие на http
+_api_xray_sub() {
+  local a="${1:-status}" url=""
+  shift || true
+  case "$a" in
+    status)
+      local upd every; upd=$(_xsub_num UPDATED); every=$(xray_sub_every)
+      { _kv set:b "$(_b xray_sub_on)"; _kv site "$(xray_sub_on && xray_sub_site)"
+        _kv insecure:b "$( [[ "$(_xsub_get INSECURE)" == 1 ]] && echo 1 || echo 0)"
+        _kv title "$(_xsub_get TITLE)"; _kv count:n "$(_xsub_num COUNT)"; _kv skipped:n "$(_xsub_num SKIPPED)"
+        _kv updated:n "$upd"; _kv checked:n "$(_xsub_num CHECKED)"; _kv error "$(_xsub_get ERROR)"
+        _kv every:n "$every"; _kv next:n "$( (( upd )) && echo $(( upd + every * 3600 )) || echo 0)"
+        _kv up:n "$(_xsub_num UP)"; _kv down:n "$(_xsub_num DOWN)"; _kv total:n "$(_xsub_num TOTAL)"
+        _kv expire:n "$(_xsub_num EXPIRE)"; } | api_obj ;;
+    set)
+      _api_stdin
+      IFS= read -r url < "$API_IN" || true
+      url="${url%$'\r'}"; url="${url#"${url%%[![:space:]]*}"}"; url="${url%"${url##*[![:space:]]}"}"
+      [[ -n "$url" ]] || { err "Адрес подписки передаётся первой строкой stdin"; return 1; }
+      xray_sub_set "$url" "${1:-}" ;;
+    update) xray_sub_update "${1:-}" ;;
+    off) xray_sub_off ;;
+    *) _api_usage "xray sub [status]|set [insecure] (адрес — stdin)|update|off" ;;
   esac
 }
 
@@ -16397,7 +16740,7 @@ _api_readonly() {
   [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
   case "$a $b $c" in
     "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get"|\
-    "tunnels fail "|"tunnels fail list"|"backup key "|"backup key status") return 0 ;;
+    "tunnels fail "|"tunnels fail list"|"backup key "|"backup key status"|"xray sub "|"xray sub status") return 0 ;;
   esac
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
@@ -16513,6 +16856,7 @@ api_main() {
     vkblock_watchdog || true
     rublock_watchdog || true
     smtpblock_watchdog || true
+    xray_sub_watchdog || true
     rudirect_watchdog || true
     tunfail_watchdog || true
     if _api_readonly "${API_ARGS[@]}"; then
@@ -18462,7 +18806,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=59ddcc511b80576f
+_PY_HELPER_SUM=8e9b32b08f2c7c2c
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -20119,7 +20463,9 @@ def _ss_outbound(link):
             "settings": {"servers": [{"address": host, "port": port, "method": method, "password": password}]}}
 
 
-def cmd_xray_link(link):
+def link_outbound(link):
+    """Ссылка → outbound Xray (dict). Ошибка — die(); замечания (NOTE:,
+    UNSUPPORTED:) — в stderr."""
     link = link.strip()
     if link.startswith("vless://"):
         u = urllib.parse.urlparse(link)
@@ -20168,16 +20514,18 @@ def cmd_xray_link(link):
                                         "password": password}]},
               "streamSettings": {"network": get("type") or "tcp", "security": get("security") or "tls"}}
     elif link.startswith("ss://"):
-        print(json.dumps(_ss_outbound(link)))
-        return
+        return _ss_outbound(link)
     elif link.startswith(("hysteria2://", "hy2://")):
-        print(json.dumps(_hy2_outbound(link)))
-        return
+        return _hy2_outbound(link)
     else:
         die("поддерживаются vless://, vmess://, trojan://, ss://, hysteria2://")
     apply_transport(ob["streamSettings"], ob["streamSettings"]["network"], get)
     apply_tls(ob["streamSettings"], get, host)
-    print(json.dumps(ob))
+    return ob
+
+
+def cmd_xray_link(link):
+    print(json.dumps(link_outbound(link)))
 
 
 def cmd_xray_default(path):
@@ -20286,9 +20634,11 @@ def cmd_xray_tags(path):
         print(t)
 
 
-def cmd_xray_outs(path):
-    """Выходы для карточек панели: тег, протокол, защита, транспорт, адрес, порт (TSV)."""
+def cmd_xray_outs(path, names=""):
+    """Выходы для карточек панели: тег, протокол, защита, транспорт, адрес, порт,
+    имя (у выходов подписки — из неё) (TSV)."""
     clean = lambda v: str(v).replace("\t", " ").replace("\n", " ")  # noqa: E731
+    known = _sub_names(names) if names else {}
     for o in jload(path).get("outbounds", []):
         if not o.get("tag") or o.get("protocol") in SKIP_PROTO:
             continue
@@ -20297,7 +20647,307 @@ def cmd_xray_outs(path):
         port = srv.get("port") or 0
         print("\t".join(clean(v) for v in (o["tag"], o.get("protocol", ""), st.get("security") or "none",
                                           st.get("network") or "tcp", srv.get("address", ""),
-                                          port if isinstance(port, int) else 0)))
+                                          port if isinstance(port, int) else 0, known.get(o["tag"], ""))))
+
+
+# ── Подписка ──────────────────────────────────────────────
+# Подписка — адрес, по которому провайдер отдаёт список серверов. Форматы:
+# base64 строк-ссылок (v2rayN, 3x-ui, Marzban), те же ссылки открытым
+# текстом, JSON — массив готовых конфигов Xray (Remnawave, Marzban «v2ray-json»).
+# Clash/sing-box и веб-страница — отказ с понятной причиной.
+#
+# Подписка — чужие данные, а Xray работает от root, поэтому в конфиг идёт
+# только выход: протокол, settings, streamSettings без sockopt (метка
+# пакетов, привязка к интерфейсу, цепочки dialerProxy поменяли бы маршруты
+# сервера), mux. Адрес сервера — внешний: 127.0.0.1, частные и служебные
+# сети отбрасываются (иначе Xray ходил бы во внутренние службы сервера).
+SUB_TAG = "sub_"
+SUB_MAX = 100                                  # серверов из одной подписки
+SUB_PROTO = ("vless", "vmess", "trojan", "shadowsocks", "hysteria")
+SUB_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "hysteria2://", "hy2://")
+
+
+def _sub_name(text, n=64):
+    """Имя из подписки: без управляющих символов и обратной косой (warn печатает через echo -e)."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(text or "")).replace("\\", "/").strip()[:n]
+
+
+def _sub_link_name(link):
+    if link.startswith("vmess://"):
+        raw = link[8:]
+        try:
+            data = json.loads(base64.b64decode(raw + "=" * (-len(raw) % 4)).decode("utf-8"))
+            return _sub_name(data.get("ps") if isinstance(data, dict) else "")
+        except (ValueError, UnicodeDecodeError):
+            return ""
+    return _sub_name(urllib.parse.unquote(link.split("#", 1)[1]) if "#" in link else "")
+
+
+def _sub_servers(ob):
+    """(адрес, порт) всех серверов выхода: vnext/servers или адрес в settings."""
+    st = ob.get("settings") if isinstance(ob.get("settings"), dict) else {}
+    lst = st.get("vnext") or st.get("servers") or [st]
+    out = []
+    for srv in lst if isinstance(lst, list) else []:
+        if isinstance(srv, dict):
+            out.append((str(srv.get("address") or ""), srv.get("port")))
+    return out
+
+
+def _sub_addr_ok(host):
+    """Внешний адрес: домен или глобальный IP. Не 127.0.0.1, не частные сети."""
+    h = (host or "").strip().strip("[]").lower().rstrip(".")
+    if not h or h == "localhost" or h.endswith(".localhost") or len(h) > 253:
+        return False
+    try:
+        return ipaddress.ip_address(h).is_global
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9.]+", h):                 # «1.2.3» и подобное — не адрес
+        return False
+    return bool(re.fullmatch(r"[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?(\.[a-z0-9_]([a-z0-9_-]{0,61}[a-z0-9_])?)*", h))
+
+
+def _sub_strip(obj):
+    """Без sockopt и dialerProxy на любой глубине (xhttp extra тоже несёт streamSettings)."""
+    if isinstance(obj, dict):
+        return {k: _sub_strip(v) for k, v in obj.items() if k not in ("sockopt", "dialerProxy")}
+    if isinstance(obj, list):
+        return [_sub_strip(v) for v in obj]
+    return obj
+
+
+def _sub_clean(ob):
+    """Только выход: протокол, settings, streamSettings (без sockopt), mux. None — не годится."""
+    if not isinstance(ob, dict) or ob.get("protocol") not in SUB_PROTO or not isinstance(ob.get("settings"), dict):
+        return None
+    out = {"protocol": ob["protocol"], "settings": _sub_strip(ob["settings"])}
+    for k in ("streamSettings", "mux"):
+        if isinstance(ob.get(k), dict):
+            out[k] = _sub_strip(ob[k])
+    return out
+
+
+def _sub_b64(text):
+    t = re.sub(r"\s+", "", text)
+    if not t or not re.fullmatch(r"[A-Za-z0-9+/_=-]+", t):
+        return None
+    t = t.rstrip("=")
+    try:
+        raw = base64.urlsafe_b64decode(t.replace("+", "-").replace("/", "_") + "=" * (-len(t) % 4))
+        return raw.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def _sub_from_json(data):
+    """Массив конфигов Xray (или один конфиг) → [(имя, outbound)]."""
+    confs = data if isinstance(data, list) else [data]
+    found = []
+    for i, c in enumerate(confs, 1):
+        if not isinstance(c, dict):
+            continue
+        outs = c.get("outbounds")
+        if not isinstance(outs, list):
+            continue
+        if any(isinstance(o, dict) and "type" in o and "protocol" not in o for o in outs):
+            die("это подписка sing-box — нужна подписка ссылками (v2rayN) или JSON Xray")
+        proxies = [o for o in outs if isinstance(o, dict) and o.get("protocol") in SUB_PROTO]
+        name = _sub_name(c.get("remarks")) or "сервер %d" % i
+        for j, o in enumerate(proxies):
+            found.append((name if len(proxies) == 1 else "%s · %s" % (name, _sub_name(o.get("tag"), 20) or j + 1), o))
+    return found
+
+
+def cmd_xray_sub_parse(body, out):
+    """Тело подписки → JSON {format, items: [{name, ob}], skipped, notes}."""
+    import contextlib
+    import io
+    raw = open(body, "rb").read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        die("ответ подписки — не текст")
+    head = text.lstrip()[:512].lower()
+    if not head:
+        die("подписка пустая")
+    if head.startswith("<") or "<html" in head:
+        die("по адресу — веб-страница, а не подписка: нужен адрес подписки (ссылка «для приложения»)")
+    if re.match(r"(proxies|proxy-groups|port|mixed-port)\s*:", head) or "\nproxies:" in text[:4096]:
+        die("это подписка Clash — нужна подписка ссылками (v2rayN) или JSON Xray")
+    pairs, skipped, notes, fmt = [], 0, [], ""
+    if head[0] in "[{":
+        try:
+            data = json.loads(text)
+        except ValueError:
+            die("ответ подписки — сломанный JSON")
+        pairs, fmt = _sub_from_json(data), "json"
+        lines = []
+    else:
+        lines = text.splitlines()
+        if not any("://" in ln for ln in lines):
+            dec = _sub_b64(text)
+            if dec is None or "://" not in dec:
+                die("ответ подписки не разобран: ни ссылок, ни base64 со ссылками")
+            lines, fmt = dec.splitlines(), "base64"
+        else:
+            fmt = "links"
+    for ln in lines:
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        if not ln.startswith(SUB_SCHEMES):
+            skipped += 1
+            if "://" in ln and len(notes) < 5:
+                notes.append("пропущено: %s://…" % _sub_name(ln.split("://", 1)[0], 16))
+            continue
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                ob = link_outbound(ln)
+        except SystemExit:
+            skipped += 1
+            if len(notes) < 5:
+                why = (err.getvalue().strip().splitlines() or ["не разобрана"])[-1]
+                notes.append("%s: %s" % (_sub_link_name(ln) or "ссылка", _sub_name(why, 80)))
+            continue
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+            skipped += 1
+            continue
+        if "UNSUPPORTED:" in err.getvalue():
+            skipped += 1
+            continue
+        pairs.append((_sub_link_name(ln), ob))
+    items, seen = [], set()
+    for name, ob in pairs:
+        ob = _sub_clean(ob)
+        servers = _sub_servers(ob) if ob else []
+        if not ob or not servers or not all(_sub_addr_ok(h) for h, _ in servers):
+            skipped += 1
+            if ob and len(notes) < 5:
+                notes.append("%s: адрес сервера внутренний или пустой" % (name or "сервер"))
+            continue
+        key = json.dumps(ob, sort_keys=True)
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(items) >= SUB_MAX:
+            notes.append("серверов больше %d — взяты первые %d" % (SUB_MAX, SUB_MAX))
+            break
+        items.append({"name": name, "ob": ob})
+    if not items:
+        die("в подписке нет серверов, которые понимает Xray" + (" (пропущено: %d)" % skipped if skipped else ""))
+    taken = set()
+    for it in items:
+        host, port = _sub_servers(it["ob"])[0]
+        base = SUB_TAG + re.sub(r"[^A-Za-z0-9]", "_", host.strip("[]"))[:40] + "_" + re.sub(r"[^0-9]", "", str(port))[:5]
+        tag, i = base, 2
+        while tag in taken:
+            tag, i = "%s_%d" % (base, i), i + 1
+        taken.add(tag)
+        it["ob"]["tag"] = it["tag"] = tag
+        it["name"] = it["name"] or "%s:%s" % (host, port)
+    jsave(out, {"format": fmt, "items": items, "skipped": skipped, "notes": notes})
+
+
+def _sub_header(text, name):
+    """Последнее значение заголовка (после редиректов — последний ответ)."""
+    blocks = re.split(r"\r?\n\r?\n", text.strip())
+    for line in (blocks[-1] if blocks else "").splitlines():
+        k, sep, v = line.partition(":")
+        if sep and k.strip().lower() == name:
+            return v.strip()
+    return ""
+
+
+def cmd_xray_sub_meta(headers):
+    """Заголовки ответа → строки КЛЮЧ=значение: трафик и срок (subscription-userinfo),
+    интервал обновления в часах (profile-update-interval), название (profile-title)."""
+    text = read(headers) if os.path.exists(headers) else ""
+    info = {}
+    for part in _sub_header(text, "subscription-userinfo").split(";"):
+        k, _, v = part.strip().partition("=")
+        if k.strip().lower() in ("upload", "download", "total", "expire") and re.fullmatch(r"\s*\d{1,20}(\.\d+)?\s*", v):
+            info[k.strip().lower()] = int(float(v))
+    iv = _sub_header(text, "profile-update-interval")
+    hours = int(iv) if re.fullmatch(r"\d{1,4}", iv) else 0
+    title = _sub_header(text, "profile-title")
+    if title.lower().startswith("base64:"):
+        title = _sub_b64(title[7:]) or ""
+    print("UP=%d" % info.get("upload", 0))
+    print("DOWN=%d" % info.get("download", 0))
+    print("TOTAL=%d" % info.get("total", 0))
+    print("EXPIRE=%d" % info.get("expire", 0))
+    print("INTERVAL=%d" % (min(max(hours, 1), 24) if hours else 0))
+    print("TITLE=%s" % _sub_name(title, 48))
+
+
+def cmd_xray_sub_probe(parsed, out, idx=""):
+    """Конфиг для `xray run -test`: все выходы подписки или один (номер с 0)."""
+    items = jload(parsed)["items"]
+    obs = [it["ob"] for it in items] if idx == "" else [items[int(idx)]["ob"]]
+    jsave(out, {"log": {"loglevel": "none"},
+                "inbounds": [{"listen": "127.0.0.1", "port": 10808, "protocol": "socks",
+                              "tag": "probe-in", "settings": {"auth": "noauth"}}],
+                "outbounds": obs + [{"protocol": "freedom", "tag": "direct"}]})
+
+
+def cmd_xray_sub_drop(parsed, *idxs):
+    """Убрать выходы, которых этот Xray не принимает (номера с 0); печатает их имена."""
+    data = jload(parsed)
+    bad = {int(i) for i in idxs}
+    for i in sorted(bad):
+        print(_sub_name(data["items"][i]["name"], 40))
+    data["items"] = [it for i, it in enumerate(data["items"]) if i not in bad]
+    data["skipped"] = data.get("skipped", 0) + len(bad)
+    jsave(parsed, data)
+
+
+def cmd_xray_sub_apply(path, parsed, names):
+    """Выходы подписки (теги sub_…) — заменить новыми; parsed «-» — убрать все.
+    Остальные выходы не трогаются. Выход по умолчанию, ушедший из подписки, —
+    первый новый; балансировщик и замеры — по всем выходам. Печатает JSON:
+    changed, gone (ушедшие теги), count."""
+    conf = jload(path)
+    items = jload(parsed)["items"] if parsed != "-" else []
+    outs = [o for o in conf.get("outbounds") or [] if isinstance(o, dict)]
+    old = [o for o in outs if str(o.get("tag") or "").startswith(SUB_TAG)]
+    new = [it["ob"] for it in items]
+    keep = [o for o in outs if not str(o.get("tag") or "").startswith(SUB_TAG)]
+    at = next((i for i, o in enumerate(keep) if o.get("protocol") == "freedom"), len(keep))
+    keep[at:at] = new
+    conf["outbounds"] = keep
+    new_tags = [o["tag"] for o in new]
+    gone = sorted({o.get("tag") for o in old} - set(new_tags))
+    routing = conf.setdefault("routing", {})
+    rules = routing.setdefault("rules", [])
+    tags = proxy_tags(conf)
+    main = _xray_main_rule(rules)
+    if main is not None and not main.get("balancerTag") and main.get("outboundTag") not in tags and new_tags:
+        main["outboundTag"] = new_tags[0]
+    for b in routing.get("balancers") or []:
+        if isinstance(b, dict):
+            b["selector"] = list(tags)
+    if isinstance(conf.get("observatory"), dict):
+        conf["observatory"]["subjectSelector"] = list(tags)
+    changed = json.dumps(old, sort_keys=True) != json.dumps(new, sort_keys=True)
+    if changed:
+        jsave(path, conf)
+    write_atomic(names, "".join("%s\t%s\n" % (it["tag"], _sub_name(it["name"]).replace("\t", " "))
+                                for it in items), 0o600)
+    print(json.dumps({"changed": changed, "gone": gone, "count": len(new)}))
+
+
+def _sub_names(path):
+    names = {}
+    try:
+        for line in open(path, encoding="utf-8", errors="replace"):
+            tag, sep, name = line.rstrip("\n").partition("\t")
+            if sep:
+                names[tag] = name
+    except OSError:
+        pass
+    return names
 
 
 def probe_conf(outbound):
@@ -21608,6 +22258,8 @@ COMMANDS = {
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
     "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
+    "xray-sub-parse": cmd_xray_sub_parse, "xray-sub-meta": cmd_xray_sub_meta, "xray-sub-probe": cmd_xray_sub_probe,
+    "xray-sub-drop": cmd_xray_sub_drop, "xray-sub-apply": cmd_xray_sub_apply,
     "pcap-analyze": cmd_pcap_analyze, "safe-untar": cmd_safe_untar,
     "cert-find": cmd_cert_find, "changelog-json": cmd_changelog_json,
     "entry": cmd_entry, "json-kv": cmd_json_kv, "json-rows": cmd_json_rows, "dns-check": cmd_dns_check, "json-list": cmd_json_list,
@@ -21633,5 +22285,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=0b19066ed8931ae0
+_BUILD_SUM=ab5d17b7bf0d5129
 main "$@"
