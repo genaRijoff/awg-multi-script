@@ -47,7 +47,7 @@ from urllib.parse import urlsplit
 
 from aiohttp import web
 
-from . import __version__, api, assets, panel, share
+from . import __version__, api, assets, instlink, panel, share
 
 log = logging.getLogger("awgbot.web")
 
@@ -429,7 +429,7 @@ class WebPanel:
     @staticmethod
     async def headers(request: web.Request, resp: web.StreamResponse) -> None:
         resp.headers["Server"] = "awg"
-        if share.is_share_path(request.path):
+        if share.is_share_path(request.path) or instlink.is_path(request.path):
             return                      # у ссылок на конфиг свои заголовки, строже
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["X-Frame-Options"] = "DENY"
@@ -623,6 +623,8 @@ class WebPanel:
         app.on_response_prepare.append(self.headers)
         sub = web.Application(client_max_size=64 * 1024)
         sub["bot"] = None                       # отправки в Telegram — только из бота
+        # Самоподписанный сертификат — curl по ссылке установки нужен -k
+        sub["tls_insecure"] = lambda: getattr(self, "cert_kind", "self") == "self"
         sub.router.add_get("/", self.index)
         sub.router.add_get("/web.js", self.web_js)
         sub.router.add_get(r"/{file:(app|icons)\.js}", self.static)
@@ -645,6 +647,7 @@ class WebPanel:
         # Ссылки на конфиг — в корне, не под секретным путём: путь панели в них не попадает.
         # Доступ по адресам (guard_mw) действует и на них: панель «только через VPN» их не отдаст
         share.setup(app)
+        instlink.setup(app)
         app.add_subapp(self.base.rstrip("/"), sub)
         return app
 

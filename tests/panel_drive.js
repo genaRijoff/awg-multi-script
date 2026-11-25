@@ -1887,6 +1887,77 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (await page.locator("[data-name=kn1]").count()) throw new Error("старое имя осталось в списке");
     await rename("kn2", "kn1");
   });
+  await step("обфускатор: ссылка установки — браузер видит подсказку, curl берёт скрипт один раз, AWG Manager — архив", async () => {
+    const make = async () => {
+      await nav("/wgobf/client/kn1", "text=Ссылка для Keenetic");
+      await page.click("button:has-text('Ссылка установки')");
+      await page.waitForSelector("[data-name=install-cmd]");
+      const cmd = await page.textContent("[data-name=install-cmd]");
+      const m = cmd.match(new RegExp("^curl -fsSL (https://127\\.0\\.0\\.1:" + port + "/api/install/[A-Za-z0-9_-]{32}) \\| sudo bash$"));
+      if (!m) throw new Error("команда: " + cmd);
+      return m[1];
+    };
+    const url = await make();
+    await shot("51d-wgobf-install-link");
+    const p2 = await ctx.newPage();
+    await p2.goto(url);
+    await p2.waitForSelector("text=Установка клиента kn1");
+    if (await p2.locator("text=PrivateKey").count()) throw new Error("конфиг в браузере");
+    await p2.close();
+    const curl = { headers: { "User-Agent": "curl/8.5.0" } };
+    let r = await ctx.request.get(url, curl);
+    const body = await r.text();
+    if (r.status() !== 200 || !body.startsWith("#!/bin/bash") || !/main "\$@"\s*$/.test(body) || !/\[main\]/.test(body))
+      throw new Error("скрипт: " + r.status() + " " + body.slice(0, 200));
+    r = await ctx.request.get(url, curl);
+    if (r.status() !== 404) throw new Error("второй раз ссылка сработала: " + r.status());
+    // AWG Manager: …/package.tar.gz; предпросмотр Telegram ссылку не тратит
+    const url2 = await make();
+    r = await ctx.request.get(url2 + "/package.tar.gz", { headers: { "User-Agent": "TelegramBot (like TwitterBot)" } });
+    if (r.status() !== 404) throw new Error("предпросмотр получил архив: " + r.status());
+    r = await ctx.request.get(url2 + "/package.tar.gz", { headers: { "User-Agent": "Go-http-client/1.1" } });
+    const tar = require("zlib").gunzipSync(await r.body()).toString("latin1");
+    if (r.status() !== 200 || tar.slice(0, 8) !== "kn1.conf" || !tar.includes("[instance]") || !tar.includes("idle-timeout = "))
+      throw new Error("архив: " + r.status() + " " + tar.slice(0, 120));
+    if ((await ctx.request.get(url2, curl)).status() !== 404) throw new Error("после архива скрипт ещё отдаётся");
+    // Отозвать
+    const url3 = await make();
+    await page.click("[data-name=wgobf-install-link] button:has-text('Отозвать')");
+    await page.waitForSelector(".toast >> text=Ссылка отозвана");
+    if ((await ctx.request.get(url3, curl)).status() !== 404) throw new Error("отозванная ссылка работает");
+  });
+  await step("обфускатор: профили — список, IPv6 без IPv6 у сервера, max-dummy основного, профиль клиента, новый профиль", async () => {
+    await nav("/wgobf", "[data-name=preset-media]");
+    await page.waitForSelector("[data-name=preset-main]");
+    await page.waitForSelector("[data-name=wgobf-ipv6] >> text=нет IPv6");
+    if (await page.locator("[data-name=wgobf-ipv6] button").count()) throw new Error("кнопка IPv6 без IPv6 у сервера");
+    await shot("52-wgobf-presets");
+    await nav("/wgobf/preset/main", "[data-name=preset-dummy]");
+    await page.fill("[data-name=preset-dummy]", "40");
+    await page.click("button:has-text('Сохранить')");
+    await page.waitForSelector(".toast >> text=max-dummy 40");
+    await nav("/wgobf/preset/main", "[data-name=preset-dummy]");
+    if (await page.inputValue("[data-name=preset-dummy]") !== "40") throw new Error("max-dummy не сохранился");
+    await nav("/wgobf/client/kn1", "[data-name=wgobf-client-preset]");
+    await page.click("[data-name=wgobf-client-preset] button:has-text('media')");
+    await page.waitForSelector(".toast >> text=новый комплект готов");
+    await page.waitForSelector("[data-name=wgobf-status] >> text=media");
+    await page.waitForSelector("pre >> text=masking = MEDIA");
+    await page.waitForSelector("pre >> text=obfuscate-bytes = 16");
+    await shot("52b-wgobf-client-preset");
+    await nav("/wgobf/preset-add", "[data-name=preset-name]");
+    await page.fill("[data-name=preset-name]", "stun2");
+    await page.click(".seg button:has-text('STUN')");
+    await page.click("button:has-text('Создать')");
+    await page.waitForSelector("button:has-text('Профиль stun2')", { timeout: 60000 });
+    await page.click("button:has-text('Профиль stun2')");
+    await page.waitForSelector("[data-name=preset-info] >> text=ClusterM");
+    await page.click("button:has-text('Удалить профиль')");
+    await page.waitForSelector(".toast >> text=Профиль stun2 удалён");
+    await nav("/wgobf", "[data-name=preset-main]");
+    if (await page.locator("[data-name=preset-stun2]").count()) throw new Error("удалённый профиль в списке");
+    await nav("/wgobf/client/kn1", "text=Ссылка для Keenetic");
+  });
   await step("обфускатор: удалить клиента", async () => {
     await page.click("button:has-text('Удалить клиента')");
     await page.waitForURL(/#\/wgobf$/);
@@ -2166,7 +2237,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
         + "/server/vkblock /server/entries /tunnels/rudirect /tunnels/fail /diag/route /diag/route/alice "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
-        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1").split(" ");
+        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1 /wgobf/preset/main /wgobf/preset/media /wgobf/preset-add").split(" ");
       const bad = [];
       for (const [skin, w, hgt] of [["toolza", 390, 844], ["cards", 390, 844], ["toolza", 320, 640]]) {
         const c = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: hgt } });

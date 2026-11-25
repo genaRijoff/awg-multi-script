@@ -11,7 +11,9 @@ awg2 $VERSION — AmneziaWG 2.0 / 3.1 для Ubuntu 24.04+ и Debian 12+
                                 Т: warp | xray | tun2socks | exits | dns
   awg2 --xray-balancer С        С: random | roundRobin | leastPing | leastLoad | off
   awg2 --xray-ru-update         обновить РФ-базы Xray
-  awg2 --wgobf add|del|bundle ИМЯ | rotate-key | restart
+  awg2 --wgobf add ИМЯ [ПРОФИЛЬ] | del|bundle ИМЯ | rotate-key [ПРОФИЛЬ] | restart
+  awg2 --wgobf preset add|set ИМЯ [masking=] [obfb=] [dummy=] [idle=] | preset del|default ИМЯ
+  awg2 --wgobf assign КЛИЕНТ ПРОФИЛЬ | ipv6 on|off
   awg2 --status                 сводка состояния
   awg2 api КОМАНДА              JSON-интерфейс для Telegram-бота (awg2 api help)
   awg2 --version
@@ -90,7 +92,7 @@ main() {
       xray_ru_update || exit 1
       info "Новые базы подхватятся при перезапуске туннеля Xray"
       exit 0 ;;
-    --wgobf) AUTO_MODE=1; wgobf_cli "${2:-}" "${3:-}" "${4:-}" && exit 0 || exit 1 ;;
+    --wgobf) AUTO_MODE=1; wgobf_cli "${@:2}" && exit 0 || exit 1 ;;
     "") [[ "${AUTOINSTALL:-}" == 1 ]] && { AUTO_MODE=1; do_autoinstall; exit; } ;;
     *) err "Неизвестный аргумент: $1"; info "awg2 --help — список аргументов"; exit 1 ;;
   esac

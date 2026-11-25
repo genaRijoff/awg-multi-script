@@ -195,6 +195,16 @@ WGOBF_UNIT="awg-wgobf.service"
 WGOBF_CLIENTS="/root/wgobf"
 WGOBF_TAG="awg-wgobf"
 WGOBF_MTU=1380
+# Профили обфускации с MEDIA или obfuscate-bytes — форк wg-obfuscator из
+# Phobos (GPL-3.0; github.com/Ground-Zerro/Phobos): собирается из
+# закреплённого коммита, качается только его каталог src/phobos-obfuscator
+WGOBF_PH_REPO="https://github.com/Ground-Zerro/Phobos.git"
+WGOBF_PH_COMMIT="22aedefda053062dc58c036072d2da6e216d5a34"
+WGOBF_PH_SRC="src/phobos-obfuscator"
+WGOBF_PH_VERSION="1.4.1"
+WGOBF_PH_BIN="$WGOBF_LIB/phobos-obfuscator"
+WGOBF_PRESETS_MAX=8            # профилей сверх основного
+WGOBF_BUNDLE_V=2               # формат комплекта клиента: старее — пересобирается при показе
 
 # ── Telegram-бот ──────────────────────────────────────────
 BOT_CONF="/etc/awg-bot.conf"

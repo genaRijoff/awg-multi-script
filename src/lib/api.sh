@@ -893,11 +893,12 @@ _api_dns() {
 }
 
 _api_wgobf() {
-  local a="${1:-}" name dir f dump now pub ip hs rx tx u=""
+  local a="${1:-}" name dir f dump now pub ip hs rx tx u="" uout=""
   shift || true
   case "$a" in
     status)
-      wgobf_installed && u=$(ufw_port_state "$(wgobf_get PORT)/udp")
+      # ufw медленный (Python) — один вызов на все порты
+      wgobf_installed && { uout=$(ufw_status_text); u=$(ufw_port_state "$(wgobf_get PORT)/udp" "$uout"); }
       { _kv installed:b "$(_b wgobf_installed)"; _kv running:b "$(_b wgobf_running)"
         _kv version "$WGOBF_VERSION"
         if wgobf_installed; then
@@ -913,23 +914,42 @@ _api_wgobf() {
           _kv xray_tags:j "$({ xray_installed && xray_tun_supported && xray_tags; } | py json-list)"
           _kv exits "$(if [[ -z "$(exits_nodes)" ]]; then echo none; elif exits_is_up; then echo up; else echo off; fi)"
           _kv exit_nodes:j "$(exits_nodes | py json-list)"
+          # Основной профиль (max-dummy, idle-timeout), профили, профиль новых и IPv6 в туннеле
+          _wgobf_preset main; _kv dummy:n "$PP_DUMMY"; _kv idle:n "$PP_IDLE"
+          _kv default "$(wgobf_default_preset)"; _kv ph_version "$WGOBF_PH_VERSION"
+          _kv presets:j "$(_api_wgobf_presets "$uout" | py json-rows name port:n masking obfb:n dummy:n idle:n engine running:b clients:n ufw)"
+          _kv ipv6:b "$([[ "$(wgobf_get IPV6)" == 1 ]] && echo 1 || echo 0)"; _kv net6 "$(wgobf_get NET6)"
+          _kv ipv6_why "$(wgobf_ipv6_why 2>/dev/null || true)"
         fi; } | api_obj
-      wgobf_installed && wgobf_status "$u"
+      wgobf_installed && wgobf_status "$u" "$uout"
       return 0 ;;
     install) wgobf_install_opts "$@" ;;
+    presets)
+      wgobf_installed || { echo '[]' > "$API_DATA"; return 0; }
+      _api_wgobf_presets "$(ufw_status_text)" | api_rows name port:n masking obfb:n dummy:n idle:n engine running:b clients:n ufw ;;
+    preset)
+      a="${1:-}"; shift || true
+      case "$a" in
+        add) wgobf_preset_add "$@" ;; set) wgobf_preset_set "$@" ;;
+        del) wgobf_preset_del "${1:-}" ;; default) wgobf_preset_default "${1:-}" ;;
+        key) wgobf_rotate_key "${1:-}" ;;
+        *) _api_usage "wgobf preset add|set ИМЯ [port=] [masking=STUN|NONE|MEDIA] [obfb=] [dummy=] [idle=]|del|default|key ИМЯ" ;;
+      esac ;;
+    assign) wgobf_assign "${1:-}" "${2:-}" ;;
+    ipv6) wgobf_ipv6 "${1:-}" ;;
     clients)
       wgobf_installed || { echo '[]' > "$API_DATA"; return 0; }
       dump=$(wg show "$WGOBF_IF" dump 2>/dev/null | tail -n +2 || true); now=$(date +%s)
       while IFS= read -r name; do
-        pub=$(awk -v t="# client=$name" '$0 == t {f = 1; next} f && /^PublicKey = / {print $3; exit}' "$WGOBF_WG_CONF")
-        ip=$(awk -v t="# client=$name" '$0 == t {f = 1; next} f && /^AllowedIPs = / {print $3; exit}' "$WGOBF_WG_CONF")
+        pub=$(wgobf_client_pub "$name"); ip=$(wgobf_client_ip "$name")
         # Рукопожатие и трафик с подъёма wgobf0 (счётчики WireGuard)
         hs="" rx="" tx=""          # у нового клиента строки в dump нет: прошлый не тянется
         read -r hs rx tx < <(awk -v k="$pub" '$1 == k {print $5, $6, $7; exit}' <<< "$dump") || true
         [[ "${hs:-}" =~ ^[0-9]+$ ]] && (( hs > 0 )) && hs=$((now - hs)) || hs=""
         [[ "${rx:-}" =~ ^[0-9]+$ ]] || rx=0; [[ "${tx:-}" =~ ^[0-9]+$ ]] || tx=0
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "${ip%/32}" "$hs" "$rx" "$tx" "$(wgobf_route_of "${ip%/32}")"
-      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n route ;;
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$name" "$ip" "$hs" "$rx" "$tx" "$(wgobf_route_of "$ip")" \
+          "$(wgobf_client_preset "$name")" "$pub" "$(wgobf_client_ip6 "$name")"
+      done < <(wgobf_clients) | api_rows name ip ago:n rx:n tx:n route preset pub ip6 ;;
     route) wgobf_route_set "${1:-}" "${2:-}" ;;
     rename)
       [[ -n "${1:-}" && -n "${2:-}" ]] || { _api_usage "wgobf rename СТАРОЕ НОВОЕ"; return; }
@@ -940,13 +960,14 @@ _api_wgobf() {
       [[ -n "$name" ]] || { _api_usage "wgobf $a ИМЯ"; return; }
       wgobf_installed || { err "WG + обфускатор не установлен"; return 1; }
       case "$a" in
-        add) wgobf_add_client "$name" || return 1 ;;
+        add) wgobf_add_client "$name" "${2:-}" || return 1 ;;
         del) wgobf_delete_client "$name"; return ;;
-        bundle) wgobf_clients | grep -qxF "$name" || { err "Клиента $name нет"; return 1; } ;;
+        bundle) grep -qxF -- "$name" <<< "$(wgobf_clients)" || { err "Клиента $name нет"; return 1; } ;;
       esac
       dir="$WGOBF_CLIENTS/$name"
-      [[ -f "$dir/phobos-link.txt" && -f "$dir/keenetic.txt" ]] || wgobf_write_bundle "$name" || return 1
+      wgobf_bundle_fresh "$name" || return 1
       { _kv name "$name"; _kv dir "$dir"; _kv phobos:f "$dir/phobos-link.txt"
+        _kv preset "$(wgobf_client_preset "$name")"; _kv pub "$(wgobf_client_pub "$name")"
         _kv files:j "$(for f in wg.conf obfuscator.conf wg-direct.conf phobos.conf keenetic.txt README.txt install-linux.sh; do
                           [[ -f "$dir/$f" ]] && printf '%s\t%s\n' "$f" "$dir/$f"
                         done | py json-rows name path)"; } | api_obj ;;
@@ -956,8 +977,21 @@ _api_wgobf() {
     clean) wgobf_set_clean "${1:-}" ;;
     rotate-key) wgobf_rotate_key ;;
     remove) wgobf_remove quiet ;;
-    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add|del|bundle ИМЯ|rename СТАРОЕ НОВОЕ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|remove" ;;
+    *) _api_usage "wgobf status|install [ключ=значение...]|clients|add ИМЯ [ПРОФИЛЬ]|del|bundle ИМЯ|rename СТАРОЕ НОВОЕ|route ИМЯ|all direct|warp|xray[:выход]|exits[:нода]|restart|masking STUN|NONE|clean 0|1|rotate-key|presets|preset ...|assign КЛИЕНТ ПРОФИЛЬ|ipv6 on|off|remove" ;;
   esac
+}
+
+# Профили: основной первым — имя, порт, маскировка, obfuscate-bytes (в конфигах),
+# max-dummy, idle, движок, служба работает, клиентов, порт в UFW (off|open|closed)
+_api_wgobf_presets() {  # вывод ufw status
+  local p u
+  for p in main $(wgobf_presets); do
+    _wgobf_preset "$p" || continue
+    if [[ "$p" == main ]]; then u="$WGOBF_UNIT"; else u=$(_wgobf_preset_unit "$p"); fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$PP_PORT" "$PP_MASK" "$PP_EOBFB" "$PP_DUMMY" "$PP_IDLE" \
+      "$(_wgobf_engine "$PP_MASK" "$PP_OBFB")" "$(_b unit_active "$u")" "$(_wgobf_preset_clients "$p" | grep -c . || true)" \
+      "$(ufw_port_state "$PP_PORT/udp" "${1:-}")"
+  done
 }
 
 # ── Обновление, бот, удаление ─────────────────────────────
@@ -1334,7 +1368,7 @@ _api_readonly() {
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
     "client conf"|"traffic daily"|"traffic now"|"backup list"|"backup inspect"|"backup pack"|"tunnels "|"tunnels status"|\
     "tunnels clients"|"warp status"|"warp probe"|"xray status"|"xray probe"|"xray diag"|"t2s status"|"exits status"|"cascade list"|\
-    "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"update status"|"update check"|"update changelog"|\
+    "cascade diag"|"dns status"|"wgobf status"|"wgobf clients"|"wgobf presets"|"update status"|"update check"|"update changelog"|\
     "bot status"|"cert "|"cert status"|"cert find"|"web status"|"antiscan status"|"amnezia "|"amnezia status"|\
     "amnezia scan"|"vkblock "|"vkblock status"|"rublock "|"rublock status"|"smtpblock "|"smtpblock status"|"entry "|"entry list"|"rudirect "|"rudirect status"|"diag route") return 0 ;;
   esac

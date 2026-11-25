@@ -1637,6 +1637,69 @@ async def run():
     text, _ = screen(await say("clus"))
     chk("и обратно — карточка clus", "<b>🛡 clus</b>" in text and store.monitored("wgobf:clus"), text)
 
+    # Профили обфускации, профиль клиента, IPv6, ссылка установки
+    from awgbot import instlink
+    from awgbot.sections import wgobf as wgobfmod
+    with open(ACTIVE, "a") as f:
+        f.write("awg-wgobf.service\n")
+    text, buttons = screen(await press("wo"))
+    chk("обфускатор: кнопки «Профили» и «IPv6»", ("🎛 Профили (1)", "wo:pl") in buttons and ("⬜️ IPv6", "wo:v6:on") in buttons,
+        buttons)
+    text, buttons = screen(await press("wo:pl"))
+    chk("профили: основной в списке, кнопка «Новый профиль»", "основной" in text and "45888/udp · STUN" in text
+        and any(d == "wo:pv:main" for _, d in buttons) and ("➕ Новый профиль", "wo:pa") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:pv:main"))
+    datas = [d for _, d in buttons]
+    chk("основной профиль: маскировка → NONE (без MEDIA), max-dummy, idle, ключ; без obfuscate-bytes и удаления",
+        "wo:pm:main|NONE" in datas and "wo:pm:main|MEDIA" not in datas and "wo:pd:main" in datas and "wo:pi:main" in datas
+        and "wo:pk:main" in datas and "wo:pob:main" not in datas and "wo:pdel:main" not in datas
+        and "max-dummy: 4" in text, [text, buttons])
+    await press("wo:pd:main")
+    text, _ = screen(await say("016"))
+    chk("max-dummy: ведущий ноль — повторный вопрос", "без ведущих нулей" in text, text)
+    text, buttons = screen(await say("40"))
+    with open(os.path.join(ROOT, "etc/awg-wgobf/state")) as f:
+        wst = f.read()
+    chk("max-dummy основного сохранён — экран профиля", "max-dummy: 40" in text and "DUMMY=40" in wst, [text, wst])
+    await press("wo:pi:main")
+    text, _ = screen(await say("5"))
+    chk("idle-timeout 5 — отказ awg2, вопрос заново", "10-86400" in text, text)
+    text, buttons = screen(await press("wo:cp:clus"))
+    chk("профиль клиента: список профилей, текущий отмечен", "Сейчас: <b>основной</b>" in text
+        and ("🔘 основной", "wo:cps:clus|0") in buttons, [text, buttons])
+    await press("wo:cps:clus|7")                      # устаревшая кнопка — без изменений
+    text, buttons = screen(await press("wo:v:clus"))
+    chk("карточка: профиль, «Ссылка установки» и «Профиль»", "Профиль: основной" in text
+        and ("🔗 Ссылка установки", "wo:il:clus") in buttons and ("🎛 Профиль", "wo:cp:clus") in buttons, [text, buttons])
+    text, buttons = screen(await press("wo:il:clus"))
+    chk("ссылка установки без Mini App и открытой веб-панели — объяснение", "Включи Mini App" in text, text)
+    real_base = wgobfmod.install_base
+
+    async def fake_base():
+        return "https://vpn.example:8443/", False
+    wgobfmod.install_base = fake_base
+    try:
+        text, buttons = screen(await press("wo:il:clus"))
+    finally:
+        wgobfmod.install_base = real_base
+    m = re.search(r"curl -fsSL https://vpn\.example:8443/api/install/([A-Za-z0-9_-]{32}) \| sudo bash", text)
+    rid = next((d.split("|")[1] for _, d in buttons if d.startswith("wo:ilx:clus|")), "")
+    chk("ссылка установки: команда curl | sudo bash, ссылка для AWG Manager, срок и «Отозвать»",
+        m and f"<code>https://vpn.example:8443/api/install/{m.group(1)}</code>" in text and "один раз" in text
+        and instlink._peek(m.group(1)) and instlink._peek(m.group(1))["pub"] == "CPUB=" and rid, [text, buttons])
+    if m:
+        await press(f"wo:ilx:clus|{rid}")
+        chk("ссылка установки отозвана", instlink._peek(m.group(1)) is None)
+    text, buttons = screen(await press("wo:v6:on"))
+    chk("IPv6: у сервера нет IPv6 — причина, без кнопки включения", "нет IPv6" in text
+        and not any(d == "wo:v6ok:on" for _, d in buttons), [text, buttons])
+    text, buttons = screen(await press("wo:pa"))
+    text, _ = screen(await say("main"))
+    chk("новый профиль: имя main — повторный вопрос", "заняты" in text, text)
+    text, buttons = screen(await say("media"))
+    chk("новый профиль: выбор маскировки MEDIA, STUN, NONE", ("🎭 MEDIA", "wo:pam:media|MEDIA") in buttons
+        and ("🎭 STUN", "wo:pam:media|STUN") in buttons and "минута-две" in text, [text, buttons])
+
     text, buttons = screen(await press("wo:install"))
     chk("установка обфускатора: DNS по умолчанию Cloudflare", "DNS клиентов: Cloudflare" in text, text)
     text, buttons = screen(await press("wo:iopt:dns"))
