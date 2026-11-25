@@ -105,6 +105,10 @@ _api_status() {
     _kv components.tools_update "$(tools_update_available)"
     _kv components.reboot "$(reboot_reason)"
     _kv components.kernel_gap "$(kernel_gap_line)"
+    _kv components.kernel_new "$(kernel_ready_new)"
+    _kv components.kernel_auto:b "$(_b kfix_on)"
+    _kv components.kernel_fix "$(kfix_failed && echo fail)"
+    _kv components.kernel_fix_why "$(kfix_failed && _kfix_get WHY)"
     _kv server.exists:b "$(_b server_exists)"
     if server_exists; then
       _kv server.up:b "$(_b iface_up)"
@@ -232,6 +236,8 @@ _api_module() {
         _kv module_latest "$(upstream_latest mod)"; _kv tools_latest "$(upstream_latest tools)"
         _kv reboot "$(reboot_reason)"; _kv secure_boot:b "$(_b secure_boot_on)"
         _kv kernel_gap "$(kernel_gap_line)"
+        _kv kernel_new "$(kernel_ready_new)"; _kv kernel_auto:b "$(_b kfix_on)"
+        _kv kernel_fix "$(kfix_failed && echo fail)"; _kv kernel_fix_why "$(kfix_failed && _kfix_get WHY)"
         _kv backups:n "$(mod_backups | grep -c . || true)"
       } | api_obj
       components_report ;;
@@ -252,13 +258,15 @@ _api_module() {
     all) components_update_flow ;;
     reload) mod_reload ;;
     rebuild) mod_rebuild_all ;;
+    # Таймер: ядро без модуля — заголовки и сборка (force — без паузы после неудачи)
+    autofix) mod_autofix "${1:-}" ;;
     backups)
       while IFS= read -r f; do printf '%s\t%s\t%s\n' "$f" "${f##*/}" "$(stat -c %Y "$f")"; done < <(mod_backups) \
         | api_rows path name time:n ;;
     rollback)
       [[ -n "${1:-}" ]] || { _api_usage "module rollback ФАЙЛ"; return; }
       mod_rollback "$1" ;;
-    *) _api_usage "module report|check|tags|update [ТЕГ] [force]|tools [force]|all|reload|rebuild|backups|rollback ФАЙЛ" ;;
+    *) _api_usage "module report|check|tags|update [ТЕГ] [force]|tools [force]|all|reload|rebuild|autofix [force]|backups|rollback ФАЙЛ" ;;
   esac
 }
 
@@ -1436,6 +1444,7 @@ api_main() {
     vkblock_watchdog || true
     rublock_watchdog || true
     smtpblock_watchdog || true
+    kfix_watchdog || true
     xray_sub_watchdog || true
     rudirect_watchdog || true
     tunfail_watchdog || true

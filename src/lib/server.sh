@@ -91,7 +91,7 @@ do_install() {
     fi
   fi
 
-  if [[ -d "/lib/modules/$running/build" ]]; then
+  if [[ -d "$KMODS_DIR/$running/build" ]]; then
     cur=$(mod_tag)
     tag=$(resolve_tag mod)
     if [[ "${cur#≈}" == "$tag" ]] && mod_built_for "$running"; then

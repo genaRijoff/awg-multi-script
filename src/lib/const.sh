@@ -13,6 +13,8 @@ AWG_IF="awg0"
 CLIENT_DIR="/root"                 # клиенты: /root/<имя>_awg2.conf | _awg3.conf
 AUTOSTART_DROPIN="/etc/systemd/system/awg-quick@awg0.service.d"
 MODULES_LOAD_FILE="/etc/modules-load.d/amneziawg.conf"
+KMODS_DIR="/lib/modules"             # модули и заголовки ядер (build) — по ядру в каталоге
+DKMS_DIR="/var/lib/dkms"             # сборки DKMS и их журналы (make.log)
 SYSCTL_FORWARD_FILE="/etc/sysctl.d/99-awg2.conf"
 
 # Компоненты собираются из исходников апстрима через git + DKMS.
@@ -25,6 +27,10 @@ MOD_TAG_FILE="$STATE_DIR/module_tag"
 TOOLS_TAG_FILE="$STATE_DIR/tools_tag"
 MOD_BACKUP_DIR="/var/backups/awg-mod"
 MOD_LOG="/var/log/awg-mod-update.log"
+# Автосборка модуля под новые ядра: итог последней попытки, отметка «включена»
+# (и «жива» — для сторожа таймера), повтор неудачи с теми же ядрами — через 6 ч
+KFIX_STATE="$STATE_DIR/kernel-fix"; KFIX_ON="$STATE_DIR/kernel-fix.on"; KFIX_HEAL="$STATE_DIR/kernel-fix.heal"
+KFIX_TIMER="awg2-kernel-fix.timer" KFIX_RETRY=21600
 MOD_FALLBACK_TAG="v3.1.20260906"
 TOOLS_FALLBACK_TAG="v3.1.20260812"
 UPSTREAM_CACHE="$STATE_DIR/upstream_tags"

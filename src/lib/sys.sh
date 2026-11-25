@@ -92,18 +92,18 @@ headers_candidates() {
 # Ставит заголовки под ядро $1. 0 — каталог build для него появился.
 ensure_headers() {
   local k="$1" pkg
-  [[ -d "/lib/modules/$k/build" ]] && return 0
+  [[ -d "$KMODS_DIR/$k/build" ]] && return 0
   while read -r pkg; do
     apt_install "$pkg" >/dev/null 2>&1 || continue
-    [[ -d "/lib/modules/$k/build" ]] && return 0
+    [[ -d "$KMODS_DIR/$k/build" ]] && return 0
   done < <(headers_candidates "$k")
-  [[ -d "/lib/modules/$k/build" ]]
+  [[ -d "$KMODS_DIR/$k/build" ]]
 }
 
 # Установленные ядра (есть vmlinuz), от старых к новым — по версии, не по алфавиту.
 installed_kernels() {
   local k
-  for k in /lib/modules/*/; do
+  for k in "$KMODS_DIR"/*/; do
     k=${k%/}; k=${k##*/}
     [[ -e "/boot/vmlinuz-$k" ]] && echo "$k"
   done | sort -V

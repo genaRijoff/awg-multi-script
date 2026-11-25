@@ -2598,6 +2598,64 @@ async def run():
     botapi.call = real_call_
     botapi.job_start = real_job_start
 
+    print("Новое ядро: автосборка модуля и перезагрузка")
+    KC = {"kernel_gap": "", "kernel_new": "", "kernel_auto": True, "kernel_fix": "", "kernel_fix_why": ""}
+    k_real_data = al.api.data
+
+    async def k_data(*args, **kw):
+        if args[:1] == ("status",):
+            return {"version": "v1.2.66", "host": "vm1", "components": dict(KC), "server": {"exists": True, "up": True}}
+        return await k_real_data(*args, **kw)
+    al.api.data = k_data
+    kst = {}
+
+    def kmsgs(mark):
+        return [(m.text, [b.callback_data for row in (m.reply_markup.inline_keyboard if m.reply_markup else []) for b in row])
+                for n, m in SESSION.sent[mark:] if n == "SendMessage" and m.chat_id == 111 and "ядро" in (m.text or "")]
+
+    async def ktick():
+        mark = len(SESSION.sent)
+        await al.tick(BOT, kst)
+        return kmsgs(mark)
+    KC.update(kernel_gap="6.8.0-149-generic")
+    got = await ktick()
+    chk("ядро без модуля, автосборка включена — сразу не пишет: awg2 соберёт сам", not got, got)
+    KC.update(kernel_gap="", kernel_new="6.8.0-149-generic")
+    got = await ktick()
+    chk("модуль собран — одно напоминание перезагрузиться, с кнопкой «Перезагрузить»",
+        len(got) == 1 and "новое ядро 6.8.0-149-generic — модуль AWG к нему готов" in got[0][0]
+        and "Перезагрузи сервер, когда удобно" in got[0][0] and got[0][1] == ["srv:reboot"], got)
+    got = await ktick()
+    chk("повторно о том же ядре — молчит", not got, got)
+    text, buttons = screen(await press("srv:reboot"))
+    chk("кнопка ведёт к подтверждению перезагрузки, без перезагрузки сразу", ("♻️ Перезагрузить", "srv:rebootok") in buttons, buttons)
+    KC.update(kernel_new="")
+    got = await ktick()
+    chk("перезагрузились в новое ядро — молчит", not got and kst.get("kernel_new") == "", got)
+    KC.update(kernel_gap="6.8.0-150-generic", kernel_fix="fail",
+              kernel_fix_why="6.8.0-150-generic: сборка не удалась — socket.c:42:5: error: <b>implicit</b>")
+    got = await ktick()
+    chk("автосборка не справилась — сразу, с причиной (экранирована) и кнопками «Пересобрать» и «Модуль ядра»",
+        len(got) == 1 and "ядро 6.8.0-150-generic без модуля AWG" in got[0][0] and "Автосборка не справилась" in got[0][0]
+        and "&lt;b&gt;implicit" in got[0][0] and got[0][1] == ["mod:rebuild", "mod"], got)
+    got = await ktick()
+    chk("о том же ядре — один раз", not got, got)
+    KC.update(kernel_gap="6.8.0-151-generic", kernel_fix="", kernel_fix_why="")
+    await ktick()
+    kst["kernel_seen"]["at"] -= 4 * 3600
+    got = await ktick()
+    chk("автосборка молчит больше трёх часов — сообщает и без её отчёта", len(got) == 1 and "6.8.0-151-generic" in got[0][0]
+        and "Пересобери модуль заранее" in got[0][0], got)
+    KC.update(kernel_gap="6.8.0-152-generic", kernel_auto=False)
+    got = await ktick()
+    chk("старый awg2 без автосборки — сразу, как раньше", len(got) == 1 and "6.8.0-152-generic" in got[0][0], got)
+    KC.update(kernel_gap="", kernel_new="6.8.0-152-generic")
+    al.set_enabled("kernel", False)
+    got = await ktick()
+    chk("уведомление выключено — молчит", not got, got)
+    al.set_enabled("kernel", True)
+    al.api.data = k_real_data
+
     print("РФ напрямую, если туннель упал, куда идёт адрес")
     text, buttons = screen(await press("tun"))
     chk("в «Туннелях» — «🇷🇺 РФ напрямую» и «🪂 Если упал», строки их состояния",
