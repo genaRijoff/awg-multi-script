@@ -5256,6 +5256,7 @@ route(/^\/wgobf$/, async (ctx) => {
       return ecard({ state: wgobfOnline(c) ? "on" : "", name: c.name, attrs: { "data-name": c.name },
         onopen: () => go(`/wgobf/client/${enc}`), right: wgobfSeen(c),
         lines: [c.ip + (c.rx || c.tx ? ` · ↓ ${fmtBytes(c.rx)} ↑ ${fmtBytes(c.tx)}` : "")
+          + (c.preset && c.preset !== "main" ? " · профиль " + c.preset : "")
           + ((c.route || "direct") !== "direct" ? " · " + wgobfRouteLabel(c.route) : "")],
         acts: [act("file-text", "Комплект", () => go(`/wgobf/client/${enc}`)), act(WEB ? "download" : "send", TO("В чат", "Файл"), (b) => sendWgobf(b, c.name, "wgobf")),
           act("trash-2", "Удалить", (b) => quickAsk(b, `Удалить клиента ${c.name}?`, "Клиент удалён", ["wgobf", "del", c.name]), "bad")] });

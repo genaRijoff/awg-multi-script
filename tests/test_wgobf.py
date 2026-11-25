@@ -499,6 +499,9 @@ except ValueError:
 chk("api wgobf bundle: профиль, ключ клиента (привязка ссылки установки), установщик среди файлов",
     b.get("preset") == "media" and b.get("pub") == rows.get("c1", {}).get("pub")
     and any(f.get("name") == "install-linux.sh" for f in b.get("files") or []), out[-400:])
+rc, out, _ = sh('journalctl() { echo "journalctl $*"; }; _api_log wgobf 20')
+chk("журнал обфускатора — основной и службы профилей одним журналом",
+    "-u awg-wgobf.service -u awg-wgobf-p-media.service -n 20" in out, out)
 rc, out, _ = sh('_api_readonly wgobf presets && echo RO; _api_readonly wgobf preset add x || echo RW; '
                 '_api_readonly wgobf ipv6 on || echo RW2; _api_readonly wgobf assign c1 main || echo RW3')
 chk("api: wgobf presets — чтение без очереди; preset, ipv6, assign — через замок", out.split() == ["RO", "RW", "RW2", "RW3"], out)

@@ -1269,7 +1269,9 @@ _api_log() {
     awg) unit="awg-quick@$AWG_IF" ;;     warp) unit=awg-warp.service ;;
     xray) unit="$XRAY_UNIT $XRAY_ROUTING_UNIT" ;; xray-routing) unit="$XRAY_ROUTING_UNIT" ;;
     tun2socks) unit="$T2S_UNIT" ;;       exits) unit="$EXITS_UNIT" ;;
-    dns) unit="$DNS_UNIT" ;;             wgobf) unit="$WGOBF_UNIT" ;;
+    dns) unit="$DNS_UNIT" ;;
+    # Обфускатор — основной и службы профилей одним журналом
+    wgobf) unit="$WGOBF_UNIT"; for u in $(wgobf_presets); do unit+=" $(_wgobf_preset_unit "$u")"; done ;;
     bot) unit="$BOT_UNIT" ;;             web) file="$WEB_LOG" ;;
     antiscan) file="$ANTISCAN_LOG" ;;   vkblock) file="$VKBLOCK_LOG" ;;
     rublock) file="$RUBLOCK_LOG" ;;

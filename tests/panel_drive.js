@@ -1945,6 +1945,8 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.waitForSelector("pre >> text=masking = MEDIA");
     await page.waitForSelector("pre >> text=obfuscate-bytes = 16");
     await shot("52b-wgobf-client-preset");
+    await nav("/wgobf", "[data-name=kn1]");
+    await page.waitForSelector("[data-name=kn1] >> text=профиль media");
     await nav("/wgobf/preset-add", "[data-name=preset-name]");
     await page.fill("[data-name=preset-name]", "stun2");
     await page.click(".seg button:has-text('STUN')");

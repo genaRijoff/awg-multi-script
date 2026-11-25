@@ -301,6 +301,7 @@ async def _list(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
     page = min(page, pages - 1)
     lines = [f"{dot(r)} <b>{esc(r['name'])}</b> <code>{esc(r['ip'])}</code>"
              + (f" · {ui.fmt_dur(r['ago'])} назад" if r.get("ago") is not None else "")
+             + (f" · 🎛 {esc(r['preset'])}" if (r.get("preset") or "main") != "main" else "")
              + (f" · 🌐 {esc(route_label(r['route']))}" if (r.get("route") or "direct") != "direct" else "")
              for r in rows[page * 20:(page + 1) * 20]]
     await ui.render(cb, "<b>👥 Клиенты WG + обфускатор</b>"
