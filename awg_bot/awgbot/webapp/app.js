@@ -4254,10 +4254,16 @@ route(/^\/tunnels\/warp\/endpoint$/, async (ctx) => {
 // Xray
 const BALANCERS = [["random", "случайный выход"], ["roundRobin", "по очереди"], ["leastPing", "наименьший пинг"],
   ["leastLoad", "наименьшая нагрузка"], ["off", "выключить"]];
+const OBS_URLS = [["Google", "https://www.google.com/generate_204"],
+  ["Gstatic", "https://www.gstatic.com/generate_204"],
+  ["Cloudflare", "http://cp.cloudflare.com/generate_204"]];
+const OBS_INTERVALS = ["10s", "15s", "30s", "1m", "2m"];
 
 route(/^\/tunnels\/xray$/, async (ctx) => {
   const r = await callR(["xray", "status"]);
   const d = r.data || {}, inst = d.installed, tags = d.tags || [];
+  const obs = d.obs && typeof d.obs === "object" ? d.obs : {};
+  const obsOn = obs.on && (d.balancer === "leastPing" || d.balancer === "leastLoad");
   async function outbound(t) {
     const v = await sheet("Выход " + t, [
       ...(d.main !== t ? [{ label: "⭐ Сделать выходом по умолчанию", value: "main" }] : []),
@@ -4294,6 +4300,8 @@ route(/^\/tunnels\/xray$/, async (ctx) => {
       btn("➕ Добавить выход", () => go("/tunnels/xray/add"), "btn-block" + (tags.length ? "" : " btn-primary")),
       btn(d.sub ? "📡 Подписка ✅" : "📡 Подписка", () => go("/tunnels/xray/sub"), "btn-block"),
       tags.length > 1 ? btn(`⚖️ Балансировщик: ${d.balancer || "off"}`, balancer, "btn-block") : null,
+      obsOn ? btn(`🔭 Проверка: ${obs.probeInterval || "1m"}`
+        + (obs.enableConcurrency ? " · параллельно" : ""), () => go("/tunnels/xray/observatory"), "btn-block") : null,
       h("h2", {}, "Управление")] : null,
     inst ? null : [hint("Клиенты выходят в интернет через твой сервер VLESS, VMess, Trojan, Shadowsocks или Hysteria2 — "
       + "выходы добавляются ссылками. Можно несколько, с балансировкой."),
@@ -4321,6 +4329,58 @@ route(/^\/tunnels\/xray\/add$/, async (ctx) => {
       const v = link.value.trim();
       if (!/^(vless|vmess|trojan|ss|hysteria2|hy2):\/\//.test(v)) return fail(new Error("Это не ссылка Xray"));
       return quick(b, "Выход добавлен", ["xray", "add", v], () => back());
+    }, "btn-primary btn-block"));
+});
+
+// Проверка выходов (observatory): URL / интервал / параллельно при leastPing или leastLoad
+route(/^\/tunnels\/xray\/observatory$/, async (ctx) => {
+  const r = await callR(["xray", "status"]);
+  const d = r.data || {}, obs = d.obs && typeof d.obs === "object" ? d.obs : {};
+  if (d.balancer !== "leastPing" && d.balancer !== "leastLoad") {
+    ctx.put(title("🔭 Проверка выходов"),
+      hint("Только при балансировщике leastPing или leastLoad."),
+      btn("⚖️ К балансировщику", () => go("/tunnels/xray"), "btn-block"));
+    return;
+  }
+  async function setUrl(b) {
+    const v = await sheet("🔗 URL проверки выходов", [
+      ...OBS_URLS.map(([n, u]) => ({ label: `${obs.probeUrl === u ? "🔘" : "⚪️"} ${n} — ${u}`, value: u })),
+      { label: "✏️ Свой URL…", value: "custom" }]);
+    if (!v) return;
+    if (v === "custom") return go("/tunnels/xray/observatory/url");
+    await quick(b, "URL проверки: " + v, ["xray", "observatory", "url", v]);
+  }
+  async function setInterval(b) {
+    const v = await sheet("⏱ Интервал проверки", OBS_INTERVALS.map((i) =>
+      ({ label: `${obs.probeInterval === i ? "🔘" : "⚪️"} ${i}`, value: i })));
+    if (v) await quick(b, "Интервал: " + v, ["xray", "observatory", "interval", v]);
+  }
+  ctx.put(title("🔭 Проверка выходов"),
+    hint("Для leastPing / leastLoad. Слишком частый интервал — лишний трафик."),
+    h("div", { class: "card list" },
+      h("div", { class: "item", onclick: (e) => setUrl(e.currentTarget) },
+        h("div", { class: "main" }, h("div", { class: "title" }, "URL проверки"),
+          h("div", { class: "sub" }, obs.probeUrl || "—")),
+        h("div", { class: "side" }, icon("chevron-right"))),
+      h("div", { class: "item", onclick: (e) => setInterval(e.currentTarget) },
+        h("div", { class: "main" }, h("div", { class: "title" }, "Интервал"),
+          h("div", { class: "sub" }, obs.probeInterval || "1m")),
+        h("div", { class: "side" }, icon("chevron-right")))),
+    switchRow("Параллельная проверка", "все выходы сразу", !!obs.enableConcurrency,
+      (on) => quick(null, `Параллельно: ${on ? "on" : "off"}`,
+        ["xray", "observatory", "concurrency", on ? "on" : "off"])));
+});
+
+route(/^\/tunnels\/xray\/observatory\/url$/, async (ctx) => {
+  const url = h("input", { placeholder: "https://www.google.com/generate_204", autocapitalize: "off",
+    autocomplete: "off", inputmode: "url" });
+  ctx.put(title("✏️ Свой URL проверки"),
+    hint("http:// или https://, без пробелов."),
+    h("label", {}, "URL"), url,
+    btn("Сохранить", (b) => {
+      const v = url.value.trim();
+      if (!/^https?:\/\/\S{3,500}$/.test(v)) return fail(new Error("Нужен http(s)://… без пробелов"));
+      return quick(b, "URL проверки: " + v, ["xray", "observatory", "url", v], () => go("/tunnels/xray/observatory"));
     }, "btn-primary btn-block"));
 });
 

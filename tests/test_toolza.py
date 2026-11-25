@@ -296,6 +296,56 @@ chk("Xray: два выхода, балансировщик, РФ напряму�
     and [r.get("ruleTag") for r in rules if str(r.get("ruleTag")).startswith("ru-direct")] == ["ru-direct", "ru-direct-ip"]
     and rules[-1].get("balancerTag") == "balancer"
     and all(i.get("protocol") != "tun" for i in xc["inbounds"]), err or out[:300])
+obs = xc.get("observatory") or {}
+chk("Xray: leastPing ставит observatory по умолчанию",
+    obs.get("probeUrl") == "https://www.google.com/generate_204"
+    and obs.get("probeInterval") == "1m" and "enableConcurrency" not in obs
+    and set(obs.get("subjectSelector") or []) == {o["tag"] for o in xc["outbounds"] if o["protocol"] == "vless"},
+    obs)
+
+# Observatory: URL / интервал / concurrency; смена стратегии least* не затирает
+rc, out, err = bash(f'''
+py xray-observatory-set "{XC}" url "https://www.gstatic.com/generate_204"
+py xray-observatory-set "{XC}" interval 30s
+py xray-observatory-set "{XC}" concurrency on
+py xray-observatory-get "{XC}"
+''')
+og = json.loads(out.strip().splitlines()[-1]) if rc == 0 else {}
+chk("Xray: observatory url/interval/concurrency",
+    rc == 0 and og.get("on") is True and og.get("probeUrl") == "https://www.gstatic.com/generate_204"
+    and og.get("probeInterval") == "30s" and og.get("enableConcurrency") is True, err or out)
+rc, out, _ = bash(f'''
+py xray-balancer "{XC}" leastLoad
+py xray-observatory-get "{XC}"
+cat "{XC}"
+''')
+lines = out.strip().splitlines()
+og2 = json.loads(lines[0]) if lines else {}
+xc2 = json.loads("\n".join(lines[1:])) if len(lines) > 1 else {}
+chk("Xray: смена leastPing→leastLoad сохраняет observatory",
+    og2.get("probeUrl") == "https://www.gstatic.com/generate_204"
+    and og2.get("probeInterval") == "30s" and og2.get("enableConcurrency") is True
+    and (xc2.get("observatory") or {}).get("probeUrl") == "https://www.gstatic.com/generate_204",
+    [og2, (xc2.get("observatory") or {})])
+rc, out, err = bash(f'''
+py xray-observatory-set "{XC}" url "not-a-url" ; echo rc_url=$?
+py xray-observatory-set "{XC}" interval 7s ; echo rc_int=$?
+py xray-observatory-set "{XC}" concurrency maybe ; echo rc_c=$?
+py xray-balancer "{XC}" random
+py xray-observatory-set "{XC}" interval 1m ; echo rc_off=$?
+''')
+chk("Xray: observatory — отказ на плохой URL/интервал/concurrency и без least*",
+    "rc_url=1" in out and "rc_int=1" in out and "rc_c=1" in out and "rc_off=1" in out, err or out)
+# После random observatory сброшен: снова leastPing — дефолты
+rc, out, _ = bash(f'''
+py xray-balancer "{XC}" leastPing
+py xray-observatory-get "{XC}"
+''')
+og3 = json.loads(out.strip().splitlines()[-1]) if rc == 0 else {}
+chk("Xray: снова leastPing — observatory снова по умолчанию (после random)",
+    og3.get("on") is True and og3.get("probeUrl") == "https://www.google.com/generate_204"
+    and og3.get("probeInterval") == "1m" and og3.get("enableConcurrency") is False, out)
+
 rc, out, _ = bash(f'py xray-del "{XC}" proxy_two_example_com; py xray-prepare "{XC}" native; cat "{XC}"')
 xc = json.loads(out)
 chk("Xray: удаление выхода чинит балансировщик", not xc["routing"].get("balancers")
