@@ -204,7 +204,7 @@ WGOBF_PH_SRC="src/phobos-obfuscator"
 WGOBF_PH_VERSION="1.4.1"
 WGOBF_PH_BIN="$WGOBF_LIB/phobos-obfuscator"
 WGOBF_PRESETS_MAX=8            # профилей сверх основного
-WGOBF_BUNDLE_V=2               # формат комплекта клиента: старее — пересобирается при показе
+WGOBF_BUNDLE_V=3               # формат комплекта клиента: старее — пересобирается при показе
 
 # ── Telegram-бот ──────────────────────────────────────────
 BOT_CONF="/etc/awg-bot.conf"

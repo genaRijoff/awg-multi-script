@@ -612,33 +612,100 @@ _wgobf_write_readme() {
   } | write_file "$dir/README.txt" 600
 }
 
+# Ответы на входящие подключения клиента Linux — мимо туннеля. Туннель берёт
+# «весь интернет, кроме сервера» маршрутами в main, и ответ SSH ушёл бы в него:
+# сессия рвётся, на сервере — пропадает доступ. С адресов аплинка — своя таблица
+# с прежним шлюзом и сетями аплинка; исходящие (адрес не выбран) — в туннель.
+# Служба — после wg-quick: её правило встаёт раньше правил wg-quick для ::/0.
+_wgobf_keep_script() {
+  cat <<'EOF'
+#!/bin/bash
+# AWG Toolza: ответы на входящие подключения (SSH и др.) — прежним путём, мимо туннеля
+T=51819
+down() {
+  local f i
+  for f in -4 -6; do
+    for i in $(seq 64); do ip "$f" rule del table "$T" 2>/dev/null || break; done
+    ip "$f" route flush table "$T" 2>/dev/null || true
+  done
+}
+up() {
+  local f r dev via a
+  down
+  for f in -4 -6; do
+    r=$(ip "$f" route show table main default 2>/dev/null | head -1)
+    dev=$(awk '{for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit }}' <<< "$r")
+    via=$(awk '{for (i = 1; i < NF; i++) if ($i == "via") { print $(i + 1); exit }}' <<< "$r")
+    [[ -n "$dev" ]] || continue
+    if [[ "$f" == -4 ]]; then
+      ip -4 route show table main dev "$dev" scope link 2>/dev/null | awk '{print $1}'
+    else
+      ip -6 route show table main dev "$dev" 2>/dev/null | awk '$1 != "default" && !/ via / {print $1}'
+    fi | while read -r a; do ip "$f" route replace "$a" dev "$dev" table "$T" 2>/dev/null || true; done
+    if [[ "$f" == -4 ]]; then
+      ip -4 route replace default ${via:+via "$via" onlink} dev "$dev" table "$T" 2>/dev/null || continue
+    else
+      ip -6 route replace default ${via:+via "$via"} dev "$dev" table "$T" 2>/dev/null || continue
+    fi
+    for a in $(ip "$f" -o addr show dev "$dev" scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); print $4}'); do
+      ip "$f" rule add from "$a" table "$T" 2>/dev/null || true
+    done
+  done
+}
+case "${1:-}" in
+  up) up ;;
+  down) down ;;
+  *) echo "keep-in.sh up|down"; exit 1 ;;
+esac
+exit 0
+EOF
+}
+
 # Самостоятельный установщик клиента для Debian/Ubuntu: собирает обфускатор
 # профиля (ClusterM или форк Phobos) из закреплённого коммита, кладёт конфиги
 # и включает автозапуск. Тело — в функции: через «curl … | sudo bash» bash
 # читает скрипт целиком до запуска, и apt не съест его остаток со stdin.
+# На сервере AWG Toolza не ставится: туннель увёл бы и его клиентов.
 _wgobf_write_installer() {
-  local name="$1" dir="$2" preset="$3" eng="$4"
+  local name="$1" dir="$2" preset="$3" eng="$4" ep
+  ep=$(wgobf_get ENDPOINT)
   {
     cat <<EOF
 #!/bin/bash
-# AWG Toolza — клиент «WG + обфускатор» ($name, $(_wgobf_preset_label "$preset")) для Debian/Ubuntu.
+# AWG Toolza — VPN-клиент «WG + обфускатор» ($name, $(_wgobf_preset_label "$preset")) для Debian/Ubuntu.
+# Ставится на устройство, которому нужен VPN (компьютер, ноутбук, Linux-роутер): весь его
+# интернет пойдёт через сервер $ep. Входящие подключения (SSH и др.) — прежним путём.
 # Установка: sudo bash install-linux.sh   (или ссылкой: curl -fsSL <ссылка> | sudo bash)
-# Удаление:  sudo bash install-linux.sh --remove
+# Удаление:  sudo bash install-linux.sh --remove   (или sudo bash /usr/local/lib/wgobf-$name/uninstall.sh)
 set -euo pipefail
 main() {
 [[ \$EUID -eq 0 ]] || { echo "Запусти от root: sudo bash"; exit 1; }
-TAG="wgobf-$name"
-LIB="/usr/local/lib/\$TAG"; CONF_DIR="/etc/\$TAG"; UNIT="\$TAG-obfuscator.service"
+TAG="wgobf-$name"; SERVER="$ep"
+LIB="/usr/local/lib/\$TAG"; CONF_DIR="/etc/\$TAG"; UNIT="\$TAG-obfuscator.service"; KEEP="\$TAG-keep.service"
 WG_IF="\$TAG"; [[ \${#WG_IF} -le 15 ]] || WG_IF="wgobf-cli"
-
-if [[ "\${1:-}" == --remove ]]; then
-  systemctl disable --now "wg-quick@\$WG_IF" "\$UNIT" 2>/dev/null || true
-  rm -rf "/etc/systemd/system/\$UNIT" "/etc/wireguard/\$WG_IF.conf" "\$LIB" "\$CONF_DIR"
+EOF
+    cat <<'EOF'
+uninstall() {
+  systemctl disable --now "wg-quick@$WG_IF" "$KEEP" "$UNIT" 2>/dev/null || true
+  rm -rf "/etc/systemd/system/$UNIT" "/etc/systemd/system/$KEEP" "/etc/wireguard/$WG_IF.conf" "$LIB" "$CONF_DIR"
   systemctl daemon-reload
-  echo "Клиент удалён"; exit 0
-fi
+  echo "Клиент $TAG удалён"
+}
+if [[ "${1:-}" == --remove ]]; then uninstall; exit 0; fi
 
+EOF
+    cat <<EOF
+if [[ -f "$SERVER_CONF" || -f "$WGOBF_WG_CONF" ]]; then
+  echo "Здесь стоит сервер AWG Toolza — клиент сюда не ставится: туннель увёл бы через"
+  echo "другой сервер весь трафик этой машины и её VPN-клиентов."
+  echo "Клиент — для устройства, которому нужен VPN: компьютер, ноутбук, Linux-роутер."
+  echo "Связать два сервера — awg2 → Туннели → Exit-ноды. Ссылка уже сработала: для"
+  echo "другого устройства попроси новую."
+  exit 1
+fi
 command -v apt-get >/dev/null || { echo "Нужен Debian/Ubuntu. На другой системе — см. README.txt"; exit 1; }
+echo "VPN-клиент «$name»: весь интернет этого устройства пойдёт через сервер \$SERVER."
+echo "Входящие подключения (SSH и др.) останутся прежним путём."
 need=()
 for b in wg:wireguard-tools wg-quick:wireguard-tools git:git make:make gcc:gcc; do
   command -v "\${b%%:*}" >/dev/null || need+=("\${b#*:}")
@@ -684,42 +751,67 @@ EOF
     echo "OBF_EOF"
     echo "cat > \"/etc/wireguard/\$WG_IF.conf\" <<'WG_EOF'"
     cat "$dir/wg.conf"
-    cat <<EOF
-WG_EOF
-chmod 600 "\$CONF_DIR/obfuscator.conf" "/etc/wireguard/\$WG_IF.conf"
+    echo "WG_EOF"
+    echo "cat > \"\$LIB/keep-in.sh\" <<'KEEP_EOF'"
+    _wgobf_keep_script
+    echo "KEEP_EOF"
+    cat <<'EOF'
+chmod 755 "$LIB/keep-in.sh"
+{ echo '#!/bin/bash'; declare -p TAG LIB CONF_DIR UNIT KEEP WG_IF; declare -f uninstall; echo uninstall; } > "$LIB/uninstall.sh"
+chmod 700 "$LIB/uninstall.sh"
+chmod 600 "$CONF_DIR/obfuscator.conf" "/etc/wireguard/$WG_IF.conf"
 # DNS в wg-quick требует resolvconf; IPv6 (::/0 и адрес клиента) — включённого IPv6
-command -v resolvconf >/dev/null || { sed -i '/^DNS = /d' "/etc/wireguard/\$WG_IF.conf"; echo "resolvconf нет — DNS остаётся системный"; }
-if [[ "\$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == 1 ]]; then
-  sed -i -e 's#, ::/0##' -e 's#^\(Address = [^,]*\),.*#\1#' "/etc/wireguard/\$WG_IF.conf"
+command -v resolvconf >/dev/null || { sed -i '/^DNS = /d' "/etc/wireguard/$WG_IF.conf"; echo "resolvconf нет — DNS остаётся системный"; }
+if [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo 1)" == 1 ]]; then
+  sed -i -e 's#, ::/0##' -e 's#^\(Address = [^,]*\),.*#\1#' "/etc/wireguard/$WG_IF.conf"
 fi
 
-cat > "/etc/systemd/system/\$UNIT" <<UNIT_EOF
+cat > "/etc/systemd/system/$UNIT" <<UNIT_EOF
 [Unit]
-Description=wg-obfuscator (клиент \$TAG)
+Description=wg-obfuscator (клиент $TAG)
 After=network-online.target
 Wants=network-online.target
-Before=wg-quick@\$WG_IF.service
+Before=wg-quick@$WG_IF.service
 
 [Service]
-ExecStart=\$LIB/wg-obfuscator -c \$CONF_DIR/obfuscator.conf
+ExecStart=$LIB/wg-obfuscator -c $CONF_DIR/obfuscator.conf
 Restart=always
 RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 UNIT_EOF
+# Ответы на входящие (SSH) — мимо туннеля: стартует сразу за wg-quick, гаснет с ним
+cat > "/etc/systemd/system/$KEEP" <<UNIT_EOF
+[Unit]
+Description=Входящие подключения мимо туннеля $WG_IF
+After=wg-quick@$WG_IF.service
+PartOf=wg-quick@$WG_IF.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$LIB/keep-in.sh up
+ExecStop=$LIB/keep-in.sh down
+
+[Install]
+WantedBy=wg-quick@$WG_IF.service
+UNIT_EOF
 systemctl daemon-reload
-systemctl enable "\$UNIT" >/dev/null 2>&1
-systemctl restart "\$UNIT"
-systemctl enable "wg-quick@\$WG_IF" >/dev/null 2>&1
-if ! systemctl restart "wg-quick@\$WG_IF"; then
-  echo "WireGuard не поднялся: journalctl -u wg-quick@\$WG_IF -n 20"
+systemctl enable "$UNIT" "$KEEP" >/dev/null 2>&1
+systemctl restart "$UNIT"
+systemctl enable "wg-quick@$WG_IF" >/dev/null 2>&1
+if ! systemctl restart "wg-quick@$WG_IF"; then
+  echo "WireGuard не поднялся: journalctl -u wg-quick@$WG_IF -n 20"
   echo "Частая причина («File exists») — на устройстве уже поднят другой VPN на весь трафик."
   exit 1
 fi
-echo "Готово. Проверка: wg show \$WG_IF (строка latest handshake)"
+systemctl is-active -q "$KEEP" || systemctl restart "$KEEP" \
+  || echo "Внимание: входящие подключения (SSH) могут не работать — journalctl -u $KEEP"
+echo "Готово: интернет этого устройства идёт через $SERVER. Проверка: wg show $WG_IF (строка latest handshake)"
+echo "Выключить: systemctl stop wg-quick@$WG_IF · удалить: bash $LIB/uninstall.sh"
 }
-main "\$@"
+main "$@"
 EOF
   } | write_file "$dir/install-linux.sh" 700
 }
@@ -969,8 +1061,33 @@ wgobf_route_menu() {
       *) who="${names[$((c - 1))]}" ;;
     esac
     _wgobf_route_pick || continue
-    wgobf_route_set "$who" "$CHOSEN" || true
+    wgobf_route_set "$who" "$CHOSEN" && _wgobf_route_offer_on "$CHOSEN"
   done
+}
+
+# Туннель выбранного выхода настроен, но выключен — включить сразу. Одновременно
+# работает один туннель: другой — с подтверждением выключается
+_wgobf_route_offer_on() {  # маршрут
+  local k="${1%%:*}" name c m=""
+  case "$k" in
+    warp) warp_configured && ! warp_is_up || return 0; name=WARP ;;
+    xray) xray_installed && ! xray_is_up || return 0; name=Xray ;;
+    exits) [[ -n "$(exits_nodes)" ]] && ! exits_is_up || return 0; name="exit-ноды"
+      m=$(exits_state_get mode); [[ "$m" == peers ]] || m=all ;;
+    *) return 0 ;;
+  esac
+  [[ "$m" == all ]] && info "Режим exit-нод «все клиенты»: через них пойдут и клиенты AWG"
+  c=$(tunnel_conflict "$k")
+  if [[ -n "$c" ]]; then
+    ask_yes "  Сейчас работает $c, а одновременно — один туннель. Выключить и включить $name? [y/N]: " n || return 0
+    if [[ "$k" != warp ]] && warp_is_up; then warp_down; fi
+    if [[ "$k" != xray ]] && xray_is_up; then xray_down; fi
+    if t2s_is_up; then t2s_down; fi
+    if [[ "$k" != exits ]] && exits_is_up; then exits_down; fi
+  else
+    ask_yes "  $name выключен — включить сейчас? [Y/n]: " y || return 0
+  fi
+  case "$k" in warp) warp_up ;; xray) xray_up ;; exits) exits_up "$m" ;; esac || true
 }
 
 # ── Клиенты ───────────────────────────────────────────────

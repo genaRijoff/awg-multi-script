@@ -437,6 +437,9 @@ async def _rt(cb: CallbackQuery, state: FSMContext, who: str) -> None:
     tun = active_tunnel(d)
     buttons = [(f"{'🔘' if route == cur else '⚪️'} {label}", act.data("rs", f"{who}|{code}"))
                for code, route, label in route_options(d)]
+    kind = cur.partition(":")[0]
+    if kind in TUN_NAME and d.get(kind) == "off":       # туннель выхода выключен — включить отсюда
+        buttons.append((f"▶️ Включить {TUN_NAME[kind]}", act.data("ton", who)))
     await ui.render(cb, f"<b>🌐 Выход: {title}</b>\n\nСейчас: <b>{esc(route_label(cur))}</b>{route_idle(cur, d)}\n"
                         + (f"Работает туннель: {tun}.\n" if tun else "Туннели выключены — все идут напрямую.\n")
                         + "\n<i>Одновременно работает один туннель: клиенты другого идут напрямую, "
@@ -458,6 +461,80 @@ async def _rs(cb: CallbackQuery, state: FSMContext, arg: str) -> None:
         await ui.render(cb, ui.fail(r, "Выход клиентов"), ui.kb(ui.back(act.data("rt", who))))
         return
     await _rt(cb, state, who)
+
+
+# Включить туннель выхода из экрана выхода. Одновременно работает один туннель:
+# другой — с подтверждением выключается (как на экране «Туннели»)
+TUN_DOWN = {"warp": ("warp", "down"), "xray": ("xray", "down"), "tun2socks": ("t2s", "down"), "exits": ("exits", "down")}
+TUN_ANY = {**TUN_NAME, "tun2socks": "tun2socks"}
+
+
+async def _route_kind(who: str) -> str:
+    """Туннель текущего выхода (warp | xray | exits), если он настроен и выключен."""
+    d = await api.data("wgobf", "status", default={}) or {}
+    if who == "*":
+        cur = d.get("route") or "direct"
+    else:
+        rows = await api.data("wgobf", "clients", default=[]) or []
+        cur = next((r.get("route") or "direct" for r in rows if r.get("name") == who), "direct")
+    kind = cur.partition(":")[0]
+    return kind if kind in TUN_NAME and d.get(kind) == "off" else ""
+
+
+async def _tun_plan(kind: str) -> tuple[list[str], str]:
+    """(работающие другие туннели, режим exit-нод)."""
+    t = await api.data("tunnels", "status", default={}) or {}
+    mode = ""
+    if kind == "exits":
+        e = await api.data("exits", "status", default={}) or {}
+        mode = "peers" if e.get("mode") == "peers" else "all"
+    return [k for k in TUN_DOWN if k != kind and t.get(k) == "up"], mode
+
+
+async def _tun_start(cb: CallbackQuery, kind: str, mode: str, back: str) -> None:
+    if kind == "exits":
+        await jobs.start(cb, "Маршруты через exit-ноды", "exits", "up", mode, back_to=back)
+    else:
+        await jobs.start(cb, f"Включение {TUN_NAME[kind]}", kind, "up", back_to=back)
+
+
+@act("ton")
+async def _ton(cb: CallbackQuery, state: FSMContext, who: str) -> None:
+    back = act.data("rt", who)
+    if who != "*" and not NAME_RE.match(who):
+        await cb.answer("Кнопка устарела — открой раздел заново", show_alert=True)
+        return
+    kind = await _route_kind(who)
+    if not kind:
+        await _rt(cb, state, who)            # туннель уже работает или выход сменили
+        return
+    other, mode = await _tun_plan(kind)
+    note = " Режим exit-нод «все клиенты»: через них пойдут и клиенты AWG." if mode == "all" else ""
+    if not other and not note:
+        await _tun_start(cb, kind, mode, back)
+        return
+    names = ", ".join(TUN_ANY[k] for k in other)
+    text = (f"Сейчас работает <b>{esc(names)}</b>, а одновременно — только один туннель. Выключить его и включить "
+            f"<b>{TUN_NAME[kind]}</b>? Кто идёт через {esc(names)}, пойдёт напрямую, пока его не включат."
+            if other else f"Включить <b>{TUN_NAME[kind]}</b>?") + note
+    await ui.confirm(cb, text, ("✅ " + ("Переключить" if other else "Включить"), act.data("tsw", who)), back)
+
+
+@act("tsw")
+async def _tsw(cb: CallbackQuery, state: FSMContext, who: str) -> None:
+    back = act.data("rt", who)
+    kind = await _route_kind(who) if who == "*" or NAME_RE.match(who) else ""
+    if not kind:
+        await _rt(cb, state, who)
+        return
+    other, mode = await _tun_plan(kind)
+    for k in other:
+        await ui.render(cb, f"⏳ Выключаю {esc(TUN_ANY[k])}…")
+        r = await api.call(*TUN_DOWN[k])
+        if not r.ok:
+            await ui.render(cb, ui.fail(r, f"Выключение {TUN_ANY[k]}"), ui.kb(ui.back(back)))
+            return
+    await _tun_start(cb, kind, mode, back)
 
 
 @act("mask")
@@ -755,7 +832,11 @@ async def install_base() -> tuple[str, bool]:
 
 
 def install_text(name: str, url: str, exp: int, insecure: bool) -> str:
-    return (f"<b>🔗 Ссылка установки {esc(name)}</b>\nСрабатывает один раз, действует сутки — до "
+    return (f"<b>🔗 Ссылка установки {esc(name)}</b>\n"
+            "Ставит клиента на устройство одной командой, без пересылки файлов: компьютер или ноутбук с Linux, "
+            "роутер Keenetic. Весь интернет устройства пойдёт через этот сервер, входящие подключения (SSH) — "
+            "как раньше. На сервер с AWG Toolza не ставится.\n\n"
+            f"Срабатывает один раз, действует сутки — до "
             f"{time.strftime('%d.%m %H:%M', time.localtime(exp))}.\n\n"
             f"<b>Linux</b> (Debian, Ubuntu) — в терминале:\n<code>curl -fsSL{'k' if insecure else ''} {esc(url)} | sudo bash</code>\n"
             + ("<i>-k — сертификат веб-панели самоподписанный; надёжнее — ссылка из Mini App.</i>\n" if insecure else "")

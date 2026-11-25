@@ -206,7 +206,9 @@ PAGE = """<!doctype html><html lang="ru"><head><meta charset="utf-8">
 code,pre{{font:13px/1.45 ui-monospace,Menlo,Consolas,monospace}}pre{{white-space:pre-wrap;word-break:break-all;padding:10px;
 border:1px solid #8884;border-radius:10px}}.muted{{opacity:.7;font-size:14px}}</style></head>
 <body><main><h1>Установка клиента {name}</h1>
-<p>Это ссылка установки WG + обфускатора. Она срабатывает <b>один раз</b> — откройте её не в браузере, а так:</p>
+<p>Это ссылка установки VPN-клиента (WG + обфускатор) на компьютер с Linux или роутер Keenetic: весь интернет
+устройства пойдёт через VPN-сервер, входящие подключения (SSH) — как раньше. Она срабатывает <b>один раз</b> —
+откройте её не в браузере, а так:</p>
 <p><b>Linux (Debian, Ubuntu)</b> — в терминале:</p><pre>curl -fsSL {url} | sudo bash</pre>
 <p><b>Keenetic</b> — AWG Manager → Новый туннель → «Phobos» → поле «Ссылка установки Phobos»: эта ссылка целиком.</p>
 <p class="muted">Ссылка — это доступ к VPN: не пересылайте её никому.</p></main></body></html>

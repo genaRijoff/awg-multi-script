@@ -1731,6 +1731,41 @@ const wgobfRouteOpts = (d) => {
 };
 const wgobfPick = (d, cur, apply) => h("div", { class: "chips rchips" }, wgobfRouteOpts(d).map(([v, l]) => h("button", {
   class: v === cur ? "on" : null, "data-v": v, title: l, onclick: (ev) => (v === cur ? null : apply(ev.currentTarget, v)) }, l)));
+// Туннель выхода выключен (настроен) — кнопка «Включить» прямо под выбором
+const wgobfOnBtn = (ctx, route, d, all) => {
+  const k = wgobfSplit(route)[0];
+  return WG_TUN[k] && d[k] === "off" ? btn("▶️ Включить " + TUN_NAME[k], (b) => wgobfTunnelOn(ctx, b, k, all), "btn-block") : null;
+};
+// Выход выбран: туннель маршрута выключен — включить его отсюда же. Одновременно
+// работает только один туннель: другой — спросить и выключить (как на экране «Туннели»)
+async function wgobfRouteGo(ctx, b, who, v, d) {
+  const k = wgobfSplit(v)[0], all = who === "all";
+  const ok = await busy(b, async () => {
+    if (v.indexOf("xray") === 0 && d.xray === "up") toast("Перенастраиваю Xray…", 4000);
+    await callR(["wgobf", "route", who, v]);
+    haptic(); toast(`${all ? "Клиенты обфускатора" : "Выход " + who}: ${wgobfRouteLabel(v)}`); return true;
+  });
+  if (!ok || !WG_TUN[k] || d[k] !== "off") return ok && render();
+  return wgobfTunnelOn(ctx, b, k, all);
+}
+async function wgobfTunnelOn(ctx, b, k, all) {
+  const [t, e] = await Promise.all([call("tunnels", "status").catch(() => null),
+    k === "exits" ? call("exits", "status").catch(() => null) : null]);
+  const other = Object.keys(TUN_DOWN).filter((x) => x !== k && (t || {})[x] === "up");
+  const name = TUN_NAME[k], was = other.map((x) => TUN_NAME[x]).join(", ");
+  // Exit-ноды — в их режиме, как на экране «Туннели»: «все» уводит и клиентов AWG
+  const mode = (e || {}).mode === "peers" ? "peers" : "all";
+  const now = `${name} ${k === "exits" ? "выключены" : "выключен"} — ${all ? "клиенты пока идут" : "клиент пока идёт"} напрямую.`
+    + (k === "exits" && mode === "all" ? " Режим exit-нод «все клиенты»: через них пойдут и клиенты AWG." : "");
+  if (!await confirmTg(other.length ? `${now} Сейчас работает ${was}, а одновременно — только один туннель. Выключить ${was} `
+    + `и включить ${name}? Кто идёт через ${was}, пойдёт напрямую, пока его не включат.` : `${now} Включить ${name}?`)) return render();
+  if (!await busy(b, async () => { for (const x of other) await callR(TUN_DOWN[x]); return true; })) return render();
+  if (k !== "exits") return runJob(ctx, "Включение " + name, [k, "up"]);
+  return busy(b, async () => {
+    const r = await callR(["exits", "up", mode]);
+    haptic(); toast("✅ " + outcome(r.log, "Exit-ноды включены"), 3500); render();
+  });
+}
 
 // Схема: клиенты → сервер → выходы. Клиентов много — показаны самые активные.
 // opt — та же схема для WG + обфускатора: свой узел (hub), куда ведут нажатия
@@ -5300,10 +5335,8 @@ route(/^\/wgobf$/, async (ctx) => {
     // Выход всех клиентов (и новых): напрямую или через туннель — тот же, что у клиентов AWG;
     // своему клиенту — в его карточке
     h("label", { "data-name": "wgobf-route" }, "Выход клиентов"),
-    wgobfPick(d, route, (b, v) => {
-      if (v.indexOf("xray") === 0) toast("Перенастраиваю Xray…", 4000);
-      return quick(b, "Клиенты обфускатора — " + wgobfRouteLabel(v), ["wgobf", "route", "all", v]);
-    }),
+    wgobfPick(d, route, (b, v) => wgobfRouteGo(ctx, b, "all", v, d)),
+    wgobfOnBtn(ctx, route, d, true),
     hint((idle ? idle + " — клиенты пока идут напрямую и уйдут туда, когда он включится. "
       : rk === "warp" ? "Через WARP — сайты видят адрес Cloudflare, а не сервера. "
         : rk !== "direct" ? "Сайты видят адрес выхода, а не сервера. " : "")
@@ -5428,7 +5461,10 @@ route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
     const cmd = `curl -fsSL${r.insecure ? "k" : ""} ${r.url} | sudo bash`;
     const until = new Date(r.exp * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
     linkBox.replaceChildren(h("div", { class: "card" },
-      h("div", { class: "muted small" }, `Срабатывает один раз, действует до ${until}. Ссылка — это доступ к VPN.`),
+      h("div", { class: "small" }, "Ставит этого клиента на устройство одной командой, без пересылки файлов: компьютер "
+        + "или ноутбук с Linux, роутер Keenetic. Весь интернет устройства пойдёт через этот сервер, входящие подключения "
+        + "(SSH) — как раньше. На сервер с AWG Toolza не ставится."),
+      h("div", { class: "muted small", style: "margin-top:4px" }, `Срабатывает один раз, действует до ${until}. Ссылка — это доступ к VPN.`),
       h("label", {}, "Linux (Debian, Ubuntu) — в терминале"), h("pre", { "data-name": "install-cmd" }, cmd),
       r.insecure ? hint("-k — у веб-панели самоподписанный сертификат; надёжнее — ссылка из Mini App.") : null,
       copyBtn("Скопировать команду", cmd),
@@ -5436,7 +5472,8 @@ route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
       h("div", { class: "mono small", style: "overflow-wrap:anywhere" }, r.url),
       copyBtn("Скопировать ссылку", r.url),
       btn("🚫 Отозвать", (b) => busy(b, async () => {
-        await post("/api/wgobf/install-link/revoke", { id: r.id }); haptic(); toast("Ссылка отозвана"); linkBox.replaceChildren();
+        const x = await post("/api/wgobf/install-link/revoke", { id: r.id }); haptic();
+        toast(x.revoked ? "Ссылка отозвана" : "Ссылка уже не действует: сработала или истекла"); linkBox.replaceChildren();
       }), "btn-block")));
   };
   ctx.put(title(name, pill("обфускатор", "accent")),
@@ -5453,11 +5490,9 @@ route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
       hint("Клиент получит новый комплект; прежний работает, пока есть его профиль.")) : null,
     // Свой выход клиенту — прямо здесь: настроенные туннели, их выходы и ноды
     c && ws ? h("div", { class: "card rcard", "data-name": "wgobf-client-route" }, h("div", { class: "eyebrow" }, "маршрут"),
-      wgobfPick(ws, c.route || "direct", (b, v) => busy(b, async () => {
-        if (v.indexOf("xray") === 0) toast("Перенастраиваю Xray…", 4000);
-        await call("wgobf", "route", name, v); haptic(); toast(`Выход ${name}: ${wgobfRouteLabel(v)}`); render();
-      })),
-      wgobfIdle(c.route, ws) ? hint(wgobfIdle(c.route, ws) + " — клиент пока идёт напрямую.") : null) : null,
+      wgobfPick(ws, c.route || "direct", (b, v) => wgobfRouteGo(ctx, b, name, v, ws)),
+      wgobfIdle(c.route, ws) ? hint(wgobfIdle(c.route, ws) + " — клиент пока идёт напрямую.") : null,
+      wgobfOnBtn(ctx, c.route, ws, false)) : null,
     d.error ? h("div", { class: "card warn small" }, "Комплект клиента не собрался: " + d.error) : null,
     switchRow("Мониторинг", "сообщу в чат, когда клиент пропал (5 минут без связи) и когда вернулся", !!d.mon,
       (on) => post("/api/wgobf/mon", { name, on })),

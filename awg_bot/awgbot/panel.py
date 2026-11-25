@@ -450,7 +450,8 @@ def setup(app: web.Application, user_of: UserOf) -> None:
 
     @route("/api/wgobf/install-link/revoke")
     async def _wgobf_install_revoke(request: web.Request, user: dict, body: dict) -> web.Response:
-        return web.json_response({"ok": instlink.revoke(str(body.get("id") or "")[:16])})
+        # Уже сработала или истекла — не ошибка: отзывать нечего
+        return web.json_response({"ok": True, "revoked": instlink.revoke(str(body.get("id") or "")[:16])})
 
     # ── Бот: админы, оформление, сервер панели ──
     @route("/api/bot/info")

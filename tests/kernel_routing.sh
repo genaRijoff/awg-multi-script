@@ -2,7 +2,7 @@
 # Маршрутизация туннелей на настоящем ядре: правила клиентов, «если туннель
 # упал» (unreachable под маршрутом), метка и правило «РФ напрямую», «куда идёт
 # адрес» — настоящими ip, ipset и iptables в отдельном сетевом пространстве.
-# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits|dns|blocks
+# Запуск: unshare -rn bash tests/kernel_routing.sh dist/awg2.sh КАТАЛОГ tunnels|rudirect|rpf|exits|dns|blocks|wgobf6|wgobfcli
 # (или через tests/test_kernel_routing.py — он сам пропустит, если netns нет).
 # shellcheck disable=SC2034  # пути — для функций awg2, подключённых через eval
 set -u
@@ -388,6 +388,25 @@ ok "down — ни одного правила обфускатора ни в ipt
 sed -i '/^IPV6=/d' "$WGOBF_STATE"; wgobf_fw_run up 2>/dev/null
 ok "IPv6 в туннеле выключен — в ip6tables только закрытый порт WireGuard" \
   '[[ "$(ip6tables-save | grep -c awg-wgobf)" == 1 ]] && [[ "$(iptables-save | grep -c awg-wgobf)" == 4 ]]'
+elif [[ "$PART" == wgobfcli ]]; then
+echo "── Клиент обфускатора на Linux: ответы на входящие (SSH) — мимо туннеля, настоящие ip rule ──"
+_wgobf_keep_script > "$T/keep.sh"
+# Аплинк — общий eth0 (203.0.113.10/24, шлюз .1). Туннель «весь интернет, кроме сервера» — маршрутами в main, как у wg-quick
+ip link add wgc type veth peer name wgc1; ip link set wgc up; ip link set wgc1 up; ip addr add 10.70.1.2/32 dev wgc
+ip route add 0.0.0.0/1 dev wgc; ip route add 128.0.0.0/1 dev wgc
+ok "без службы ответ SSH с адреса аплинка ушёл бы в туннель (сессия рвётся)" \
+  '[[ "$(ip -4 route get 198.51.100.7 from 203.0.113.10)" == *"dev wgc"* ]]'
+bash "$T/keep.sh" up
+ok "ответ с адреса аплинка — прежним шлюзом, соседям по сети — напрямую" \
+  '[[ "$(ip -4 route get 198.51.100.7 from 203.0.113.10)" == *"via 203.0.113.1 dev eth0"* ]] \
+   && r=$(ip -4 route get 203.0.113.50 from 203.0.113.10) && [[ "$r" == *"dev eth0"* && "$r" != *via* ]]'
+ok "исходящие (адрес не выбран) — по-прежнему в туннель" '[[ "$(ip -4 route get 198.51.100.7)" == *"dev wgc"* ]]'
+bash "$T/keep.sh" up
+ok "повторный up — правило одно" '[[ "$(ip -4 rule show | grep -c "lookup 51819")" == 1 ]]'
+bash "$T/keep.sh" down
+ok "down — ни правил, ни таблицы; ответ снова как без службы" \
+  '! ip -4 rule show | grep -q 51819 && [[ -z "$(ip -4 route show table 51819 2>/dev/null)" ]] \
+   && [[ "$(ip -4 route get 198.51.100.7 from 203.0.113.10)" == *"dev wgc"* ]]'
 elif [[ "$PART" == exits ]]; then
 echo "── Сторож exit-нод: ноды — настоящие сетевые пространства, проба — настоящий ping ──"
 command -v ping &>/dev/null || { echo "ПРОПУСК exits: нет ping"; exit 0; }

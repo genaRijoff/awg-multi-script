@@ -1825,10 +1825,17 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       // Сводку обфускатора бот держит в кэше — профиль WARP появился мимо awg2
       await page.waitForTimeout(CACHE_WAIT);
       await nav("/wgobf", R + ".rchips button[data-v=warp]");
+      // Туннель выхода выключен — сразу вопрос «включить?»; работают exit-ноды — «выключить их и включить WARP».
+      // Здесь — «Нет»: выход сохранён, туннели как были
+      await page.evaluate(() => { window.Telegram.WebApp.showConfirm = (t, cb) => { window.__log.push("confirm:" + t); cb(false); }; });
       await page.click(".rchips button[data-v=warp]");
       await page.waitForSelector(".toast >> text=через WARP");
+      await page.waitForFunction(() => window.__log.some((l) => l.startsWith("confirm:WARP выключен — клиенты пока идут напрямую. "
+        + "Сейчас работает Exit-ноды WG, а одновременно — только один туннель.")));
       await page.waitForSelector(R + ".rchips button[data-v=warp].on");
       await page.waitForSelector("text=WARP выключен — клиенты пока идут напрямую");
+      await page.waitForSelector("button:has-text('Включить WARP')");
+      if (!await page.locator(R + ".rchips button[data-v=exits]").count()) throw new Error("exit-ноды пропали после «Нет»");
       await page.waitForSelector("[data-name=ob1] >> text=через WARP");
       await nav("/wgobf/client/ob1", "[data-name=wgobf-status]");
       await page.waitForSelector("[data-name=wgobf-status] >> text=WARP выключен — пока напрямую");
@@ -1849,7 +1856,10 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
       await page.waitForSelector(".toast >> text=напрямую");
       await page.waitForSelector(R + ".rchips button[data-v=direct].on");
       await nav("/wgobf/client/ob1", R + "[data-name=wgobf-client-route] button[data-v=direct].on");
-    } finally { fs.unlinkSync(warpConf); }
+    } finally {
+      fs.unlinkSync(warpConf);
+      await page.evaluate(() => { window.Telegram.WebApp.showConfirm = (t, cb) => { window.__log.push("confirm:" + t); cb(true); }; });
+    }
   });
   await step("обфускатор: клиент и комплект", async () => {
     await nav("/wgobf/add", "input");
@@ -1925,6 +1935,14 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await page.click("[data-name=wgobf-install-link] button:has-text('Отозвать')");
     await page.waitForSelector(".toast >> text=Ссылка отозвана");
     if ((await ctx.request.get(url3, curl)).status() !== 404) throw new Error("отозванная ссылка работает");
+    // Ссылка уже сработала — «Отозвать» не ошибка («HTTP 200»), а честное «уже не действует»
+    const url4 = await make();
+    if (!(await page.textContent("[data-name=wgobf-install-link]")).includes("Весь интернет устройства пойдёт через этот сервер"))
+      throw new Error("нет описания, для чего ссылка");
+    if ((await ctx.request.get(url4, curl)).status() !== 200) throw new Error("ссылка не сработала");
+    await page.click("[data-name=wgobf-install-link] button:has-text('Отозвать')");
+    await page.waitForSelector(".toast >> text=Ссылка уже не действует");
+    if (await page.locator("text=HTTP 200").count()) throw new Error("ошибка HTTP 200 при отзыве");
   });
   await step("обфускатор: профили — список, IPv6 без IPv6 у сервера, max-dummy основного, профиль клиента, новый профиль", async () => {
     await nav("/wgobf", "[data-name=preset-media]");

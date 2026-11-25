@@ -4257,6 +4257,20 @@ chk("«все клиенты AWG» и синхронизация списка WA
 rc, out, _ = bash('_wgobf_sync() { :; }; wgobf_write_bundle() { :; }; wgobf_add_client wc >/dev/null 2>&1; cat "$WARP_PEERS.wgobf"; '
                   'wgobf_delete_client wa >/dev/null 2>&1; echo "--"; cat "$WARP_PEERS.wgobf"')
 chk("новый клиент — туда же, куда все (WARP); удалённый — из списка", out.split() == ["10.66.66.2", "10.66.66.4", "--", "10.66.66.4"], out)
+OFFER = ('xray_installed() { :; }; xray_is_up() { return 1; }; t2s_is_up() { return 1; }; exits_is_up() { return 1; }; '
+         'warp_down() { echo DOWN-warp; }; xray_up() { echo UP-xray; }; exits_up() { echo "UP-exits $1"; }; '
+         'exits_nodes() { echo n1; }; ')
+rc, out, _ = bash(OFFER + 'warp_is_up() { :; }; tunnel_conflict() { echo WARP; }; ask_yes() { echo "Q:$1"; }; '
+                  '_wgobf_route_offer_on xray:out1')
+rc2, out2, _ = bash(OFFER + 'warp_is_up() { return 1; }; tunnel_conflict() { :; }; ask_yes() { echo "Q:$1"; }; _wgobf_route_offer_on xray')
+rc3, out3, _ = bash(OFFER + 'warp_is_up() { :; }; tunnel_conflict() { echo WARP; }; ask_yes() { return 1; }; _wgobf_route_offer_on xray; '
+                    'xray_is_up() { :; }; _wgobf_route_offer_on xray; _wgobf_route_offer_on direct; echo END')
+rc4, out4, _ = bash(OFFER + 'warp_is_up() { return 1; }; tunnel_conflict() { :; }; ask_yes() { :; }; exits_state_get() { echo peers; }; '
+                    '_wgobf_route_offer_on exits:n1')
+chk("меню awg2: выход через выключенный Xray — включить сразу; работает WARP — спросить, выключить его, затем включить Xray",
+    "Сейчас работает WARP" in out and out.index("DOWN-warp") < out.index("UP-xray")
+    and "Xray выключен — включить сейчас?" in out2 and "UP-xray" in out2 and "DOWN" not in out2
+    and out3.split() == ["END"] and "UP-exits peers" in out4 and "все клиенты" not in out4, [out, out2, out3, out4])
 rc, out, _ = bash('_wgobf_routes_clear; [[ -e "$WARP_PEERS.wgobf" ]] && echo LEFT || echo GONE')
 chk("удаление или новая установка обфускатора — список выходов прежних клиентов убран", out.strip() == "GONE", out)
 os.remove(os.path.join(ROOT, "etc/wireguard/warp0.conf"))

@@ -1538,6 +1538,11 @@ async def run():
     chk("«Через WARP» — адреса клиентов обфускатора в списке WARP, экран: выбрано, WARP выключен",
         os.path.exists(wl) and open(wl).read().split() == ["10.77.1.2"] and ("🔘 Через WARP", "wo:rs:*|w") in buttons
         and "через WARP</b> — WARP выключен, пока напрямую" in text, [text, buttons])
+    chk("WARP выключен — кнопка «Включить WARP» прямо на экране выхода", ("▶️ Включить WARP", "wo:ton:*") in buttons, buttons)
+    text, buttons = screen(await press("wo:ton:*"))
+    chk("работают exit-ноды — сначала вопрос: одновременно один туннель, выключить их и включить WARP",
+        "Сейчас работает <b>exit-ноды</b>" in text and "одновременно — только один туннель" in text
+        and ("✅ Переключить", "wo:tsw:*") in buttons and any(d == "wo:rt:*" for _, d in buttons), [text, buttons])
     text, buttons = screen(await press("wo"))
     chk("главный экран: «через WARP — WARP выключен, пока напрямую»",
         "через WARP</b> — WARP выключен, пока напрямую" in text, text)

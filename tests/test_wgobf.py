@@ -270,10 +270,32 @@ for who, eng in (("alice", "clusterm"), ("bob", "phobos")):
         r.returncode == 0 and want and body.rstrip().endswith('main "$@"') and "apt-get update -q </dev/null" in body
         and 'systemctl restart "$UNIT"' in body and 'systemctl stop "$UNIT"' in body
         and "masking = " + ("MEDIA" if eng == "phobos" else "STUN") in body, r.stderr + body[:300])
-chk("версия комплекта записана (.v)", bundle("alice", ".v").strip() == "2", bundle("alice", ".v"))
+inst_b = bundle("bob", "install-linux.sh")
+keep = inst_b.split("<<'KEEP_EOF'\n", 1)[-1].split("\nKEEP_EOF\n", 1)[0]
+rc, out, _ = sh("_wgobf_keep_script")
+r = subprocess.run(["bash", "-n"], input=keep, capture_output=True, text=True)
+chk("установщик: ответы на входящие (SSH) — служба сразу за wg-quick, гаснет с ним; скрипт — тот же, синтаксис цел",
+    keep.strip() == out.strip() and r.returncode == 0 and "T=51819" in keep
+    and "After=wg-quick@$WG_IF.service\nPartOf=wg-quick@$WG_IF.service" in inst_b
+    and "WantedBy=wg-quick@$WG_IF.service" in inst_b and 'systemctl enable "$UNIT" "$KEEP"' in inst_b
+    and "declare -f uninstall" in inst_b and 'systemctl disable --now "wg-quick@$WG_IF" "$KEEP" "$UNIT"' in inst_b,
+    [r.stderr, inst_b[-1500:]])
+# На сервере AWG Toolza (wgobf0.conf песочницы есть) — отказ до apt и сборки
+stub = os.path.join(TMP, "inst-bin")
+os.makedirs(stub, exist_ok=True)
+for b in ("apt-get", "git", "make", "systemctl"):
+    with open(os.path.join(stub, b), "w") as f:
+        f.write(f"#!/bin/sh\necho CALLED-{b}\nexit 1\n")
+    os.chmod(os.path.join(stub, b), 0o755)
+r = subprocess.run(["bash", "-c", inst_b.replace("[[ $EUID -eq 0 ]] ||", "true ||")], capture_output=True, text=True,
+                   env=dict(os.environ, PATH=stub + ":" + os.environ.get("PATH", "")))
+chk("установщик на сервере AWG Toolza: отказ с объяснением, ни apt, ни сборки",
+    r.returncode == 1 and "Здесь стоит сервер AWG Toolza" in r.stdout and "Exit-ноды" in r.stdout
+    and "CALLED-" not in r.stdout + r.stderr, r.stdout + r.stderr)
+chk("версия комплекта записана (.v)", bundle("alice", ".v").strip() == "3", bundle("alice", ".v"))
 os.remove(os.path.join(CL, "alice", ".v"))
 rc, out, _ = sh('wgobf_bundle_fresh alice && cat "$WGOBF_CLIENTS/alice/.v"; wgobf_bundle_fresh alice && echo again')
-chk("комплект старого формата (без .v) — пересобирается при показе", out.split() == ["2", "again"], out)
+chk("комплект старого формата (без .v) — пересобирается при показе", out.split() == ["3", "again"], out)
 
 # Назначение профиля, переименование, удаление
 rc, out, _ = sh('wgobf_assign alice media 2>&1; echo "rc=$?"; wgobf_assign bob main >/dev/null 2>&1; '
