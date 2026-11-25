@@ -266,7 +266,7 @@ for who, eng in (("alice", "clusterm"), ("bob", "phobos")):
     want = ("--branch \"v1.6\"" in body and "Ground-Zerro" not in body) if eng == "clusterm" else (
         "fetch -q --depth 1 --filter=blob:none origin \"22aedefda053062dc58c036072d2da6e216d5a34\"" in body
         and "!%s/bin/" in body and 'build="$src/s/src/phobos-obfuscator"' in body)
-    chk(f"установщик {who} ({eng}): синтаксис, тело в main (curl | bash), apt без stdin, обфускатор перезапускается",
+    chk(f"установщик {who} ({eng}): синтаксис, тело в main, apt без stdin, обфускатор перезапускается",
         r.returncode == 0 and want and body.rstrip().endswith('main "$@"') and "apt-get update -q </dev/null" in body
         and 'systemctl restart "$UNIT"' in body and 'systemctl stop "$UNIT"' in body
         and "masking = " + ("MEDIA" if eng == "phobos" else "STUN") in body, r.stderr + body[:300])
@@ -289,8 +289,9 @@ for b in ("apt-get", "git", "make", "systemctl"):
     os.chmod(os.path.join(stub, b), 0o755)
 r = subprocess.run(["bash", "-c", inst_b.replace("[[ $EUID -eq 0 ]] ||", "true ||")], capture_output=True, text=True,
                    env=dict(os.environ, PATH=stub + ":" + os.environ.get("PATH", "")))
-chk("установщик на сервере AWG Toolza: отказ с объяснением, ни apt, ни сборки",
+chk("установщик на сервере AWG Toolza: отказ с объяснением, ни apt, ни сборки; про ссылку установки — ни слова",
     r.returncode == 1 and "Здесь стоит сервер AWG Toolza" in r.stdout and "Exit-ноды" in r.stdout
+    and "curl" not in inst_b and "сылк" not in r.stdout and "curl" not in bundle("bob", "README.txt")
     and "CALLED-" not in r.stdout + r.stderr, r.stdout + r.stderr)
 chk("версия комплекта записана (.v)", bundle("alice", ".v").strip() == "3", bundle("alice", ".v"))
 os.remove(os.path.join(CL, "alice", ".v"))

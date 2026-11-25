@@ -333,7 +333,7 @@ async def _view(cb: ui.Target, state: FSMContext, name: str) -> None:
                         f"Мониторинг: {'🔔 вкл' if mon else '🔕 выкл'}\n\n"
                         "<i>📄 Конфиг — ссылка и конфиг текстом, плюс один файл .conf со всеми данными\n"
                         "📦 Архив — wg.conf, obfuscator.conf и установщик для Linux\n"
-                        "🔗 Ссылка установки — одноразовая: curl | bash на Linux, AWG Manager на Keenetic\n"
+                        "🔗 Ссылка установки — одноразовая, для AWG Manager на Keenetic\n"
                         "🔔 Мониторинг — сообщу, когда клиент пропал (5 минут без связи) и вернулся</i>",
                     ui.kb(("📄 Конфиг", act.data("bundle", name)),
                           ("📦 Архив", act.data("zip", name)),
@@ -820,28 +820,23 @@ async def _v6_ok(cb: CallbackQuery, state: FSMContext, want: str) -> None:
 
 
 # ── Ссылка установки ──────────────────────────────────────
-async def install_base() -> tuple[str, bool]:
-    """Адрес для ссылки и нужен ли curl -k: Mini App (сертификат настоящий), без
-    неё — веб-панель, если открыта всем (без сертификата Тулзы — самоподписанный)."""
+async def install_base() -> str:
+    """Адрес для ссылки: Mini App, без неё — веб-панель, если открыта всем."""
     if webapp.SERVER.running and webapp.SERVER.url:
-        return webapp.SERVER.url, False
+        return webapp.SERVER.url
     w = await api.data("web", "status", default={}) or {}
     if w.get("active") and w.get("access") == "all" and w.get("url"):
-        return str(w["url"]), not w.get("cert")
-    return "", False
+        return str(w["url"])
+    return ""
 
 
-def install_text(name: str, url: str, exp: int, insecure: bool) -> str:
+def install_text(name: str, url: str, exp: int) -> str:
     return (f"<b>🔗 Ссылка установки {esc(name)}</b>\n"
-            "Ставит клиента на устройство одной командой, без пересылки файлов: компьютер или ноутбук с Linux, "
-            "роутер Keenetic. Весь интернет устройства пойдёт через этот сервер, входящие подключения (SSH) — "
-            "как раньше. На сервер с AWG Toolza не ставится.\n\n"
-            f"Срабатывает один раз, действует сутки — до "
-            f"{time.strftime('%d.%m %H:%M', time.localtime(exp))}.\n\n"
-            f"<b>Linux</b> (Debian, Ubuntu) — в терминале:\n<code>curl -fsSL{'k' if insecure else ''} {esc(url)} | sudo bash</code>\n"
-            + ("<i>-k — сертификат веб-панели самоподписанный; надёжнее — ссылка из Mini App.</i>\n" if insecure else "")
-            + f"\n<b>Keenetic</b> — AWG Manager → Новый туннель → «Phobos» → верхнее поле «Ссылка установки Phobos»:\n"
-            f"<code>{esc(url)}</code>\n\nСсылка — это доступ к VPN: отправляй только тому, кому он предназначен.")
+            "Для роутера Keenetic: AWG Manager настроит туннель сам, без файлов.\n"
+            "AWG Manager → Новый туннель → «Phobos» → верхнее поле «Ссылка установки Phobos»:\n"
+            f"<code>{esc(url)}</code>\n\n"
+            f"Срабатывает один раз, действует сутки — до {time.strftime('%d.%m %H:%M', time.localtime(exp))}. "
+            "Ссылка — это доступ к VPN: отправляй только тому, кому он предназначен.")
 
 
 @act("il")
@@ -851,7 +846,7 @@ async def _install_link(cb: CallbackQuery, state: FSMContext, name: str) -> None
     if c is None or not c.get("pub"):
         await ui.render(cb, f"Клиента <b>{esc(name)}</b> нет.", ui.kb(ui.back(act.data("list"))))
         return
-    base, insecure = await install_base()
+    base = await install_base()
     if not base:
         await ui.render(cb, "<b>🔗 Ссылка установки</b>\nСсылку отдаёт Mini App или веб-панель с доступом для всех — "
                             "сейчас ни одна из них не работает. Включи Mini App: Бот → 📱 Mini App.",
@@ -862,7 +857,7 @@ async def _install_link(cb: CallbackQuery, state: FSMContext, name: str) -> None
     except share.PersistenceError as e:
         await cb.answer(str(e), show_alert=True)
         return
-    await ui.render(cb, install_text(name, instlink.url_for(base, token), exp, insecure),
+    await ui.render(cb, install_text(name, instlink.url_for(base, token), exp),
                     ui.kb(("🚫 Отозвать", act.data("ilx", f"{name}|{rid}")), ui.back(act.data("v", name))))
 
 

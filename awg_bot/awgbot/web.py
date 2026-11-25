@@ -623,8 +623,6 @@ class WebPanel:
         app.on_response_prepare.append(self.headers)
         sub = web.Application(client_max_size=64 * 1024)
         sub["bot"] = None                       # отправки в Telegram — только из бота
-        # Самоподписанный сертификат — curl по ссылке установки нужен -k
-        sub["tls_insecure"] = lambda: getattr(self, "cert_kind", "self") == "self"
         sub.router.add_get("/", self.index)
         sub.router.add_get("/web.js", self.web_js)
         sub.router.add_get(r"/{file:(app|icons)\.js}", self.static)

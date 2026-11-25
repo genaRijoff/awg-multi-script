@@ -5455,21 +5455,15 @@ route(/^\/wgobf\/client\/([^/]+)$/, async (ctx, name) => {
   const c = (rows || []).find((x) => x.name === name);
   if (d.error && !c) throw new Error(d.error);
   const presets = (ws && ws.presets) || [], cur = (c && c.preset) || "main";
-  // Ссылка установки — по кнопке: одноразовая, на сутки
+  // Ссылка установки для AWG Manager (Keenetic) — по кнопке: одноразовая, на сутки
   const linkBox = h("div", { "data-name": "wgobf-install-link" });
   const showLink = (r) => {
-    const cmd = `curl -fsSL${r.insecure ? "k" : ""} ${r.url} | sudo bash`;
     const until = new Date(r.exp * 1000).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
     linkBox.replaceChildren(h("div", { class: "card" },
-      h("div", { class: "small" }, "Ставит этого клиента на устройство одной командой, без пересылки файлов: компьютер "
-        + "или ноутбук с Linux, роутер Keenetic. Весь интернет устройства пойдёт через этот сервер, входящие подключения "
-        + "(SSH) — как раньше. На сервер с AWG Toolza не ставится."),
+      h("div", { class: "small" }, "Keenetic настроит туннель сам, без файлов: AWG Manager → Новый туннель → «Phobos» → "
+        + "верхнее поле «Ссылка установки Phobos» — эта ссылка целиком."),
       h("div", { class: "muted small", style: "margin-top:4px" }, `Срабатывает один раз, действует до ${until}. Ссылка — это доступ к VPN.`),
-      h("label", {}, "Linux (Debian, Ubuntu) — в терминале"), h("pre", { "data-name": "install-cmd" }, cmd),
-      r.insecure ? hint("-k — у веб-панели самоподписанный сертификат; надёжнее — ссылка из Mini App.") : null,
-      copyBtn("Скопировать команду", cmd),
-      h("label", {}, "Keenetic — AWG Manager → «Phobos» → верхнее поле «Ссылка установки Phobos»"),
-      h("div", { class: "mono small", style: "overflow-wrap:anywhere" }, r.url),
+      h("div", { class: "mono small", "data-name": "install-url", style: "overflow-wrap:anywhere;margin-top:6px" }, r.url),
       copyBtn("Скопировать ссылку", r.url),
       btn("🚫 Отозвать", (b) => busy(b, async () => {
         const x = await post("/api/wgobf/install-link/revoke", { id: r.id }); haptic();

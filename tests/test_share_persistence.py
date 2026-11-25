@@ -230,7 +230,7 @@ class HandlerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class InstallLinkTests(unittest.IsolatedAsyncioTestCase):
-    """Одноразовая ссылка установки WG + обфускатора (instlink.py)."""
+    """Одноразовая ссылка установки WG + обфускатора для AWG Manager (instlink.py)."""
 
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -264,7 +264,7 @@ class InstallLinkTests(unittest.IsolatedAsyncioTestCase):
     def url(self, token):
         return f"/api/install/{token}"
 
-    async def test_script_once_browser_page_not_spent(self):
+    async def test_link_page_only_no_script_not_spent(self):
         token, rid, exp = instlink.create("kn1", "CPUB=", "test")
         self.assertRegex(token, r"^[A-Za-z0-9_-]{32}$")
         raw = (store.STATE_DIR / "wgobf-install.json").read_text()
@@ -274,16 +274,20 @@ class InstallLinkTests(unittest.IsolatedAsyncioTestCase):
         page = await r.text()
         self.assertEqual(r.status, 200)
         self.assertIn("Установка клиента kn1", page)
-        self.assertIn("| sudo bash", page)
+        self.assertIn("AWG Manager", page)
+        self.assertNotIn("sudo bash", page)
         self.assertNotIn("PrivateKey", page)
-        self.assertEqual(self.calls, 0)                       # браузеру — без awg2
-        r = await self.http.get(self.url(token), headers={"User-Agent": "curl/8.5.0"})
-        self.assertEqual(r.status, 200)
-        self.assertTrue((await r.text()).startswith("#!/bin/bash"))
-        self.assertEqual(r.headers.get("Cache-Control"), "no-store")
-        r = await self.http.get(self.url(token), headers={"User-Agent": "curl/8.5.0"})
-        self.assertEqual(r.status, 404)
-        self.assertFalse(instlink.revoke(rid))
+        # curl и wget скрипта не получают (ссылка — только для AWG Manager) и её не тратят
+        for ua in ("curl/8.5.0", "Wget/1.21"):
+            r = await self.http.get(self.url(token), headers={"User-Agent": ua})
+            self.assertEqual(r.status, 404)
+            body = await r.text()
+            self.assertIn("AWG Manager", body)
+            self.assertNotIn("#!/bin/bash", body)
+            self.assertEqual(r.headers.get("Cache-Control"), "no-store")
+        self.assertEqual(self.calls, 0)                       # без awg2
+        self.assertIsNotNone(instlink._peek(token))
+        self.assertTrue(instlink.revoke(rid))
 
     async def test_package_for_awg_manager_preview_not_spent(self):
         import io
@@ -297,51 +301,51 @@ class InstallLinkTests(unittest.IsolatedAsyncioTestCase):
         with tarfile.open(fileobj=io.BytesIO(await r.read()), mode="r:gz") as tf:
             names = tf.getnames()
             conf = tf.extractfile("kn1.conf").read().decode()
-        self.assertEqual(names[0], "kn1.conf")
+        self.assertEqual(names, ["kn1.conf", "README.txt"])     # установщика Linux в архиве нет
         self.assertIn("[instance]", conf)
         r = await self.http.get(self.url(token), headers={"User-Agent": "Wget/1.21"})
         self.assertEqual(r.status, 404)
 
     async def test_other_client_key_head_unknown_and_expired(self):
         token, _, _ = instlink.create("kn1", "OLD-PUB=", "test")
-        r = await self.http.get(self.url(token), headers={"User-Agent": "curl/8"})
+        pkg = self.url(token) + "/package.tar.gz"
+        r = await self.http.get(pkg, headers={"User-Agent": "Go-http-client/1.1"})
         self.assertEqual(r.status, 404)                       # клиент пересоздан — ключ другой
         self.assertIsNotNone(instlink._peek(token))           # и ссылка не потрачена
-        r = await self.http.head(self.url(token), headers={"User-Agent": "curl/8"})
+        r = await self.http.head(pkg, headers={"User-Agent": "Go-http-client/1.1"})
         self.assertEqual(r.status, 405)
-        r = await self.http.get(self.url("A" * 32), headers={"User-Agent": "curl/8"})
+        r = await self.http.get(self.url("A" * 32) + "/package.tar.gz", headers={"User-Agent": "Go-http-client/1.1"})
         self.assertEqual(r.status, 404)
         self.assertEqual(self.calls, 1)                       # неверная ссылка — без awg2
         token2, _, _ = instlink.create("kn1", "CPUB=", "test", now=1000.0)
         self.assertIsNone(instlink._peek(token2))             # сутки прошли
-        r = await self.http.get(self.url(token2), headers={"User-Agent": "curl/8"})
+        r = await self.http.get(self.url(token2) + "/package.tar.gz", headers={"User-Agent": "Go-http-client/1.1"})
         self.assertEqual(r.status, 404)
 
-    async def test_panel_route_url_and_insecure_flag(self):
+    async def test_panel_route_url_and_revoke(self):
         async def data(*args, **kw):
             return [{"name": "kn1", "pub": "CPUB="}] if args[:2] == ("wgobf", "clients") else None
-        for insecure in (False, True):
-            app = web.Application()
-            if insecure:                                     # веб-панель с самоподписанным сертификатом
-                app["tls_insecure"] = lambda: True
-            panel.setup(app, lambda request: {"web": True, "first_name": "test", "owner": True})
-            http = TestClient(TestServer(app))
-            await http.start_server()
-            try:
-                with patch.object(api, "data", data):
-                    r = await http.post("/api/wgobf/install-link", json={"name": "kn1"})
-                    d = await r.json()
-                    r2 = await http.post("/api/wgobf/install-link", json={"name": "nobody"})
-            finally:
-                await http.close()
-            with self.subTest(insecure=insecure):
-                self.assertEqual(r.status, 200)
-                self.assertRegex(d["url"], r"^https://127\.0\.0\.1:\d+/api/install/[A-Za-z0-9_-]{32}$")
-                self.assertIs(d["insecure"], insecure)
-                self.assertEqual(d["ttl"], 86400)
-                self.assertIsNotNone(instlink._peek(d["url"].rsplit("/", 1)[1]))
-                self.assertEqual(r2.status, 404)
-                self.assertTrue(instlink.revoke(d["id"]))
+        app = web.Application()
+        panel.setup(app, lambda request: {"web": True, "first_name": "test", "owner": True})
+        http = TestClient(TestServer(app))
+        await http.start_server()
+        try:
+            with patch.object(api, "data", data):
+                r = await http.post("/api/wgobf/install-link", json={"name": "kn1"})
+                d = await r.json()
+                r2 = await http.post("/api/wgobf/install-link", json={"name": "nobody"})
+                rv = await (await http.post("/api/wgobf/install-link/revoke", json={"id": d["id"]})).json()
+                rv2 = await (await http.post("/api/wgobf/install-link/revoke", json={"id": d["id"]})).json()
+        finally:
+            await http.close()
+        self.assertEqual(r.status, 200)
+        self.assertRegex(d["url"], r"^https://127\.0\.0\.1:\d+/api/install/[A-Za-z0-9_-]{32}$")
+        self.assertNotIn("insecure", d)
+        self.assertEqual(d["ttl"], 86400)
+        self.assertEqual(r2.status, 404)
+        # Отозвать уже недействующую — не ошибка, а «отзывать нечего»
+        self.assertEqual(rv, {"ok": True, "revoked": True})
+        self.assertEqual(rv2, {"ok": True, "revoked": False})
 
     async def test_obfuscator_in_name_and_url(self):
         token, _, _ = instlink.create("myobfuscator", "CPUB=", "test")

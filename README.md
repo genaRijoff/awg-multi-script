@@ -10,7 +10,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-ffffff?style=flat-square&labelColor=000000)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Ubuntu%2024%20%2F%20Debian%2012%2B-E95420?style=flat-square&logo=ubuntu&logoColor=white)](https://ubuntu.com/)
 [![Protocol](https://img.shields.io/badge/AWG-2.0%20%2F%203.1-00d4ff?style=flat-square)](#)
-[![Version](https://img.shields.io/badge/version-v1.2.68-ff6b00?style=flat-square)](#)
+[![Version](https://img.shields.io/badge/version-v1.2.69-ff6b00?style=flat-square)](#)
 
 <br>
 
@@ -568,13 +568,12 @@ v1.6. Весь трафик клиента маскируется под **STUN*
   ссылка `phobos://`) — со всеми обязательными полями `[instance]` по формату
   Phobos: `source-if`, `source-lport`, `target`, `key`, `masking`, `verbose`,
   `idle-timeout`, `max-dummy` (и `obfuscate-bytes`, если профиль его задаёт).
-- **Ссылка установки** — одноразовая, на сутки: в боте и панели, карточка клиента →
-  «🔗 Ссылка установки». На Linux — `curl -fsSL <ссылка> | sudo bash`; на Keenetic —
-  AWG Manager → вкладка «Phobos» → верхнее поле «Ссылка установки Phobos». Ссылка
-  срабатывает один раз (скрипт или архив для AWG Manager), браузер и предпросмотр
-  мессенджеров её не тратят; её отдают Mini App или веб-панель (в ней — по адресу,
-  с которого панель открыта). OpenWrt — вручную, по памятке комплекта.
-- Клиент Linux (`install-linux.sh`, ссылка) — для устройства, которому нужен VPN:
+- **Ссылка установки для AWG Manager** (Keenetic) — одноразовая, на сутки: в боте и
+  панели, карточка клиента → «🔗 Ссылка установки» → AWG Manager → вкладка «Phobos» →
+  верхнее поле «Ссылка установки Phobos». Ссылка срабатывает один раз, браузер и
+  предпросмотр мессенджеров её не тратят; её отдают Mini App или веб-панель (в ней —
+  по адресу, с которого панель открыта). OpenWrt — вручную, по памятке комплекта.
+- Клиент Linux (`install-linux.sh` из архива комплекта) — для устройства, которому нужен VPN:
   компьютер, ноутбук, Linux-роутер. Весь его интернет идёт через сервер, а ответы на
   входящие подключения (SSH и др.) — прежним путём: служба `wgobf-<имя>-keep` ставит
   для адресов аплинка свою таблицу с прежним шлюзом, и сессия SSH на удалённой машине
@@ -891,6 +890,6 @@ python3 tests/test_kernel_routing.py  # маршруты туннелей на �
 
 *Сообщество [AWG-Toolza](https://t.me/awgToolza)*
 
-**AWG Toolza v1.2.68** · MIT License
+**AWG Toolza v1.2.69** · MIT License
 
 </div>

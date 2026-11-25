@@ -1681,16 +1681,17 @@ async def run():
     real_base = wgobfmod.install_base
 
     async def fake_base():
-        return "https://vpn.example:8443/", False
+        return "https://vpn.example:8443/"
     wgobfmod.install_base = fake_base
     try:
         text, buttons = screen(await press("wo:il:clus"))
     finally:
         wgobfmod.install_base = real_base
-    m = re.search(r"curl -fsSL https://vpn\.example:8443/api/install/([A-Za-z0-9_-]{32}) \| sudo bash", text)
+    m = re.search(r"<code>https://vpn\.example:8443/api/install/([A-Za-z0-9_-]{32})</code>", text)
     rid = next((d.split("|")[1] for _, d in buttons if d.startswith("wo:ilx:clus|")), "")
-    chk("ссылка установки: команда curl | sudo bash, ссылка для AWG Manager, срок и «Отозвать»",
-        m and f"<code>https://vpn.example:8443/api/install/{m.group(1)}</code>" in text and "один раз" in text
+    chk("ссылка установки — только для AWG Manager (без curl | bash): ссылка, срок и «Отозвать»",
+        m and "AWG Manager" in text and "Ссылка установки Phobos" in text and "один раз" in text
+        and "curl" not in text and "sudo bash" not in text
         and instlink._peek(m.group(1)) and instlink._peek(m.group(1))["pub"] == "CPUB=" and rid, [text, buttons])
     if m:
         await press(f"wo:ilx:clus|{rid}")

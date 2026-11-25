@@ -430,9 +430,8 @@ def setup(app: web.Application, user_of: UserOf) -> None:
         store.set_monitored(store.WGOBF + _name(body), bool(body.get("on")))
         return web.json_response({"ok": True})
 
-    # Одноразовая ссылка установки (curl | sudo bash, AWG Manager): адрес — тот,
-    # по которому открыта панель; у веб-панели с самоподписанным сертификатом
-    # curl проверку пропустит (-k) — об этом скажет экран
+    # Одноразовая ссылка установки для AWG Manager (Keenetic): адрес — тот, по
+    # которому открыта панель
     @route("/api/wgobf/install-link")
     async def _wgobf_install_link(request: web.Request, user: dict, body: dict) -> web.Response:
         name = _name(body)
@@ -444,9 +443,8 @@ def setup(app: web.Application, user_of: UserOf) -> None:
             return web.json_response({"error": "Адрес сервера не распознан"}, status=400)
         by = f"web:{user.get('first_name', '')}" if user.get("web") else f"tg:{user.get('id')}"
         token, rid, exp = instlink.create(name, row["pub"], by)
-        insecure = request.config_dict.get("tls_insecure")
         return web.json_response({"ok": True, "url": f"https://{request.host}{instlink.PATH}{token}", "id": rid,
-                                  "exp": exp, "ttl": instlink.TTL, "insecure": bool(insecure and insecure())})
+                                  "exp": exp, "ttl": instlink.TTL})
 
     @route("/api/wgobf/install-link/revoke")
     async def _wgobf_install_revoke(request: web.Request, user: dict, body: dict) -> web.Response:

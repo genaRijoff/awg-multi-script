@@ -1897,15 +1897,16 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     if (await page.locator("[data-name=kn1]").count()) throw new Error("старое имя осталось в списке");
     await rename("kn2", "kn1");
   });
-  await step("обфускатор: ссылка установки — браузер видит подсказку, curl берёт скрипт один раз, AWG Manager — архив", async () => {
+  await step("обфускатор: ссылка установки — только для AWG Manager: браузер видит подсказку, curl скрипта не получает, архив — один раз", async () => {
     const make = async () => {
       await nav("/wgobf/client/kn1", "text=Ссылка для Keenetic");
       await page.click("button:has-text('Ссылка установки')");
-      await page.waitForSelector("[data-name=install-cmd]");
-      const cmd = await page.textContent("[data-name=install-cmd]");
-      const m = cmd.match(new RegExp("^curl -fsSL (https://127\\.0\\.0\\.1:" + port + "/api/install/[A-Za-z0-9_-]{32}) \\| sudo bash$"));
-      if (!m) throw new Error("команда: " + cmd);
-      return m[1];
+      await page.waitForSelector("[data-name=install-url]");
+      const url = (await page.textContent("[data-name=install-url]")).trim();
+      if (!new RegExp("^https://127\\.0\\.0\\.1:" + port + "/api/install/[A-Za-z0-9_-]{32}$").test(url)) throw new Error("ссылка: " + url);
+      const box = await page.textContent("[data-name=wgobf-install-link]");
+      if (/curl|sudo bash/.test(box) || !box.includes("Ссылка установки Phobos")) throw new Error("карточка ссылки: " + box);
+      return url;
     };
     const url = await make();
     await shot("51d-wgobf-install-link");
@@ -1916,33 +1917,26 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
     await p2.close();
     const curl = { headers: { "User-Agent": "curl/8.5.0" } };
     let r = await ctx.request.get(url, curl);
-    const body = await r.text();
-    if (r.status() !== 200 || !body.startsWith("#!/bin/bash") || !/main "\$@"\s*$/.test(body) || !/\[main\]/.test(body))
-      throw new Error("скрипт: " + r.status() + " " + body.slice(0, 200));
-    r = await ctx.request.get(url, curl);
-    if (r.status() !== 404) throw new Error("второй раз ссылка сработала: " + r.status());
+    if (r.status() !== 404 || (await r.text()).includes("#!/bin/bash")) throw new Error("curl получил скрипт: " + r.status());
     // AWG Manager: …/package.tar.gz; предпросмотр Telegram ссылку не тратит
-    const url2 = await make();
-    r = await ctx.request.get(url2 + "/package.tar.gz", { headers: { "User-Agent": "TelegramBot (like TwitterBot)" } });
+    r = await ctx.request.get(url + "/package.tar.gz", { headers: { "User-Agent": "TelegramBot (like TwitterBot)" } });
     if (r.status() !== 404) throw new Error("предпросмотр получил архив: " + r.status());
-    r = await ctx.request.get(url2 + "/package.tar.gz", { headers: { "User-Agent": "Go-http-client/1.1" } });
+    r = await ctx.request.get(url + "/package.tar.gz", { headers: { "User-Agent": "Go-http-client/1.1" } });
     const tar = require("zlib").gunzipSync(await r.body()).toString("latin1");
-    if (r.status() !== 200 || tar.slice(0, 8) !== "kn1.conf" || !tar.includes("[instance]") || !tar.includes("idle-timeout = "))
-      throw new Error("архив: " + r.status() + " " + tar.slice(0, 120));
-    if ((await ctx.request.get(url2, curl)).status() !== 404) throw new Error("после архива скрипт ещё отдаётся");
-    // Отозвать
-    const url3 = await make();
-    await page.click("[data-name=wgobf-install-link] button:has-text('Отозвать')");
-    await page.waitForSelector(".toast >> text=Ссылка отозвана");
-    if ((await ctx.request.get(url3, curl)).status() !== 404) throw new Error("отозванная ссылка работает");
-    // Ссылка уже сработала — «Отозвать» не ошибка («HTTP 200»), а честное «уже не действует»
-    const url4 = await make();
-    if (!(await page.textContent("[data-name=wgobf-install-link]")).includes("Весь интернет устройства пойдёт через этот сервер"))
-      throw new Error("нет описания, для чего ссылка");
-    if ((await ctx.request.get(url4, curl)).status() !== 200) throw new Error("ссылка не сработала");
+    if (r.status() !== 200 || tar.slice(0, 8) !== "kn1.conf" || !tar.includes("[instance]") || !tar.includes("idle-timeout = ")
+      || tar.includes("#!/bin/bash")) throw new Error("архив: " + r.status() + " " + tar.slice(0, 120));
+    r = await ctx.request.get(url + "/package.tar.gz", { headers: { "User-Agent": "Go-http-client/1.1" } });
+    if (r.status() !== 404) throw new Error("архив отдан второй раз: " + r.status());
+    // Уже сработала — «Отозвать» не ошибка («HTTP 200»), а честное «уже не действует»
     await page.click("[data-name=wgobf-install-link] button:has-text('Отозвать')");
     await page.waitForSelector(".toast >> text=Ссылка уже не действует");
     if (await page.locator("text=HTTP 200").count()) throw new Error("ошибка HTTP 200 при отзыве");
+    // Отозвать живую
+    const url3 = await make();
+    await page.click("[data-name=wgobf-install-link] button:has-text('Отозвать')");
+    await page.waitForSelector(".toast >> text=Ссылка отозвана");
+    r = await ctx.request.get(url3 + "/package.tar.gz", { headers: { "User-Agent": "Go-http-client/1.1" } });
+    if (r.status() !== 404) throw new Error("отозванная ссылка работает");
   });
   await step("обфускатор: профили — список, IPv6 без IPv6 у сервера, max-dummy основного, профиль клиента, новый профиль", async () => {
     await nav("/wgobf", "[data-name=preset-media]");

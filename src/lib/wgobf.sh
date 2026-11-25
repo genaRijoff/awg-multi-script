@@ -586,8 +586,7 @@ _wgobf_write_readme() {
     echo "  phobos-link.txt  — то же ссылкой phobos://"
     [[ -f "$dir/wg-direct.conf" ]] && echo "  wg-direct.conf   — БЕЗ обфускатора (телефоны); DPI видит его как WireGuard"
     echo ""
-    echo "Linux (Debian/Ubuntu): sudo bash install-linux.sh — или ссылкой установки из бота:"
-    echo "  curl -fsSL <ссылка> | sudo bash"
+    echo "Linux (Debian/Ubuntu): sudo bash install-linux.sh (компьютер или ноутбук, не VPN-сервер)"
     echo ""
     echo "Windows, Android: приложение Phobos (github.com/Ground-Zerro/Phobos, папки windows и mobil)"
     echo "  — импорт ссылки из phobos-link.txt."
@@ -663,8 +662,8 @@ EOF
 
 # Самостоятельный установщик клиента для Debian/Ubuntu: собирает обфускатор
 # профиля (ClusterM или форк Phobos) из закреплённого коммита, кладёт конфиги
-# и включает автозапуск. Тело — в функции: через «curl … | sudo bash» bash
-# читает скрипт целиком до запуска, и apt не съест его остаток со stdin.
+# и включает автозапуск. Тело — в функции: bash читает скрипт целиком до
+# запуска (и из канала: «cat … | sudo bash»), и apt не съест его остаток со stdin.
 # На сервере AWG Toolza не ставится: туннель увёл бы и его клиентов.
 _wgobf_write_installer() {
   local name="$1" dir="$2" preset="$3" eng="$4" ep
@@ -675,7 +674,7 @@ _wgobf_write_installer() {
 # AWG Toolza — VPN-клиент «WG + обфускатор» ($name, $(_wgobf_preset_label "$preset")) для Debian/Ubuntu.
 # Ставится на устройство, которому нужен VPN (компьютер, ноутбук, Linux-роутер): весь его
 # интернет пойдёт через сервер $ep. Входящие подключения (SSH и др.) — прежним путём.
-# Установка: sudo bash install-linux.sh   (или ссылкой: curl -fsSL <ссылка> | sudo bash)
+# Установка: sudo bash install-linux.sh
 # Удаление:  sudo bash install-linux.sh --remove   (или sudo bash /usr/local/lib/wgobf-$name/uninstall.sh)
 set -euo pipefail
 main() {
@@ -699,8 +698,7 @@ if [[ -f "$SERVER_CONF" || -f "$WGOBF_WG_CONF" ]]; then
   echo "Здесь стоит сервер AWG Toolza — клиент сюда не ставится: туннель увёл бы через"
   echo "другой сервер весь трафик этой машины и её VPN-клиентов."
   echo "Клиент — для устройства, которому нужен VPN: компьютер, ноутбук, Linux-роутер."
-  echo "Связать два сервера — awg2 → Туннели → Exit-ноды. Ссылка уже сработала: для"
-  echo "другого устройства попроси новую."
+  echo "Связать два сервера — awg2 → Туннели → Exit-ноды."
   exit 1
 fi
 command -v apt-get >/dev/null || { echo "Нужен Debian/Ubuntu. На другой системе — см. README.txt"; exit 1; }
@@ -830,7 +828,7 @@ wgobf_show_bundle() {
   fi
   echo -e "${Y}# Keenetic, AWG Manager → «Phobos» (одной вставкой):${N}"
   cat "$dir/phobos-link.txt"
-  echo -e "  ${D}Ссылка установки (одноразовая, curl | bash и AWG Manager) — в боте и панели${N}"
+  echo -e "  ${D}Ссылка установки для AWG Manager (одноразовая) — в боте и панели${N}"
   echo -e "  ${D}Вкладка «ClusterM» и подробности — $dir/keenetic.txt${N}"
   info "Linux: install-linux.sh на устройство и sudo bash install-linux.sh"
   info "Забрать папку: scp -r root@$(wgobf_get ENDPOINT):$dir ."
