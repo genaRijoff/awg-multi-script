@@ -4342,7 +4342,7 @@ route(/^\/tunnels\/xray\/observatory$/, async (ctx) => {
       btn("⚖️ К балансировщику", () => go("/tunnels/xray"), "btn-block"));
     return;
   }
-  async function setUrl(b) {
+  async function pickUrl(b) {
     const v = await sheet("🔗 URL проверки выходов", [
       ...OBS_URLS.map(([n, u]) => ({ label: `${obs.probeUrl === u ? "🔘" : "⚪️"} ${n} — ${u}`, value: u })),
       { label: "✏️ Свой URL…", value: "custom" }]);
@@ -4350,7 +4350,7 @@ route(/^\/tunnels\/xray\/observatory$/, async (ctx) => {
     if (v === "custom") return go("/tunnels/xray/observatory/url");
     await quick(b, "URL проверки: " + v, ["xray", "observatory", "url", v]);
   }
-  async function setInterval(b) {
+  async function pickInterval(b) {
     const v = await sheet("⏱ Интервал проверки", OBS_INTERVALS.map((i) =>
       ({ label: `${obs.probeInterval === i ? "🔘" : "⚪️"} ${i}`, value: i })));
     if (v) await quick(b, "Интервал: " + v, ["xray", "observatory", "interval", v]);
@@ -4358,17 +4358,17 @@ route(/^\/tunnels\/xray\/observatory$/, async (ctx) => {
   ctx.put(title("🔭 Проверка выходов"),
     hint("Для leastPing / leastLoad. Слишком частый интервал — лишний трафик."),
     h("div", { class: "card list" },
-      h("div", { class: "item", onclick: (e) => setUrl(e.currentTarget) },
+      h("div", { class: "item", onclick: (e) => pickUrl(e.currentTarget) },
         h("div", { class: "main" }, h("div", { class: "title" }, "URL проверки"),
           h("div", { class: "sub" }, obs.probeUrl || "—")),
         h("div", { class: "side" }, icon("chevron-right"))),
-      h("div", { class: "item", onclick: (e) => setInterval(e.currentTarget) },
+      h("div", { class: "item", onclick: (e) => pickInterval(e.currentTarget) },
         h("div", { class: "main" }, h("div", { class: "title" }, "Интервал"),
           h("div", { class: "sub" }, obs.probeInterval || "1m")),
         h("div", { class: "side" }, icon("chevron-right")))),
+    // Ошибка awg2 — исключением: переключатель остаётся как был (quick её проглотил бы)
     switchRow("Параллельная проверка", "все выходы сразу", !!obs.enableConcurrency,
-      (on) => quick(null, `Параллельно: ${on ? "on" : "off"}`,
-        ["xray", "observatory", "concurrency", on ? "on" : "off"])));
+      async (on) => { await call("xray", "observatory", "concurrency", on ? "on" : "off"); toast("Параллельно: " + (on ? "вкл" : "выкл")); }));
 });
 
 route(/^\/tunnels\/xray\/observatory\/url$/, async (ctx) => {

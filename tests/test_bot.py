@@ -2661,6 +2661,48 @@ async def run():
     botapi.call = real_call_
     botapi.job_start = real_job_start
 
+    print("Xray: проверка выходов (observatory)")
+    chk("кэш: смена настроек проверки — запись (кэш сбрасывается), get — чтение",
+        botapi._writes(("xray", "observatory", "interval", "30s")) and botapi._writes(("xray", "observatory", "url", "x"))
+        and not botapi._writes(("xray", "observatory", "get")))
+    OBS = {"balancer": "leastPing", "obs": {"on": True, "probeUrl": "https://www.google.com/generate_204",
+                                            "probeInterval": "1m", "enableConcurrency": False}}
+    obs_calls = []
+
+    async def obs_call(*args, **kw):
+        if args[:2] == ("xray", "status"):
+            return botapi.Result(True, data={"installed": True, "tags": ["a", "b"], "balancer": OBS["balancer"],
+                                             "obs": OBS["obs"]})
+        if args[:2] == ("xray", "observatory"):
+            obs_calls.append(args[2:])
+            return botapi.Result(True, log="  √ готово")
+        return await real_call_(*args, **kw)
+    botapi.call = obs_call
+    try:
+        text, buttons = screen(await press("xr:obs"))
+        chk("проверка выходов: URL, интервал, параллельно — кнопками",
+            "generate_204" in text and "Интервал: <b>1m</b>" in text and ("🔗 URL проверки", "xr:obsurl") in buttons
+            and ("⏱ Интервал", "xr:obsint") in buttons and ("⬜️ Параллельно", "xr:obsconc:on") in buttons, [text, buttons])
+        await press("xr:obsintset:30s")
+        await press("xr:obsintset:7s")
+        await press("xr:obsurlset:2")
+        await press("xr:obsurlset:9")
+        await press("xr:obsconc:on")
+        chk("интервал, URL из списка и параллельность — в awg2; чужие значения из старых кнопок — нет",
+            obs_calls == [("interval", "30s"), ("url", "http://cp.cloudflare.com/generate_204"), ("concurrency", "on")],
+            obs_calls)
+        await press("xr:obsurlask")
+        await say("ftp://bad")
+        text, _ = screen(await say("https://probe.example.org/204"))
+        chk("свой URL: не http(s) — повторный вопрос, http(s) — в awg2",
+            obs_calls[-1] == ("url", "https://probe.example.org/204"), [obs_calls, text])
+        OBS["balancer"] = "random"
+        text, buttons = screen(await press("xr:obs"))
+        chk("без leastPing/leastLoad — пояснение вместо настроек", "только при" in text
+            and not any(d == "xr:obsint" for _, d in buttons), text)
+    finally:
+        botapi.call = real_call_
+
     print("Новое ядро: автосборка модуля и перезагрузка")
     KC = {"kernel_gap": "", "kernel_new": "", "kernel_auto": True, "kernel_fix": "", "kernel_fix_why": ""}
     k_real_data = al.api.data

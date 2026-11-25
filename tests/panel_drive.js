@@ -2239,7 +2239,7 @@ const [port, initData, out, theme, profile, sandboxRoot] = process.argv.slice(2)
         + "/server/vkblock /server/entries /tunnels/rudirect /tunnels/fail /diag/route /diag/route/alice "
         + "/server/params /server/proto /tunnels /tunnels/cascade /tunnels/cascade/add /tunnels/dns /tunnels/dns/manual /tunnels/exits "
         + "/tunnels/exits/add /tunnels/tun2socks /tunnels/warp /tunnels/warp/clients /tunnels/warp/endpoint /tunnels/warp/import "
-        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /update /wgobf /wgobf/add /wgobf/client/ob1 /wgobf/preset/main /wgobf/preset/media /wgobf/preset-add").split(" ");
+        + "/tunnels/warp/key /tunnels/xray /tunnels/xray/add /tunnels/xray/clients /tunnels/xray/observatory /tunnels/xray/observatory/url /update /wgobf /wgobf/add /wgobf/client/ob1 /wgobf/preset/main /wgobf/preset/media /wgobf/preset-add").split(" ");
       const bad = [];
       for (const [skin, w, hgt] of [["toolza", 390, 844], ["cards", 390, 844], ["toolza", 320, 640]]) {
         const c = await browser.newContext({ ignoreHTTPSErrors: true, viewport: { width: w, height: hgt } });
