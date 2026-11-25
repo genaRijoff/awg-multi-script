@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.67"
+VERSION="v1.2.68"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -7697,18 +7697,87 @@ xray_balancer() {  # стратегия
   return 0
 }
 
+# Observatory (leastPing|leastLoad): URL / интервал / параллельная проверка выходов.
+xray_obs_on() {
+  local b
+  b=$(py xray-balancer-get "$XRAY_CONF" 2>/dev/null) || return 1
+  [[ "$b" == leastPing || "$b" == leastLoad ]]
+}
+
+xray_observatory() {  # url|interval|concurrency значение
+  local field="${1:-}" value="${2:-}"
+  [[ "$field" =~ ^(url|interval|concurrency)$ && -n "$value" ]] \
+    || { err "observatory: url URL | interval 10s|15s|30s|1m|2m | concurrency on|off"; return 1; }
+  xray_installed || { err "Xray не установлен"; return 1; }
+  py xray-observatory-set "$XRAY_CONF" "$field" "$value" >/dev/null || return 1
+  case "$field" in
+    url) ok "URL проверки: $value" ;;
+    interval) ok "Интервал проверки: $value" ;;
+    concurrency) ok "Параллельная проверка: $value" ;;
+  esac
+  xray_is_up && xray_restart
+  return 0
+}
+
+xray_observatory_menu() {
+  local c url interval conc=0 urls ivals line
+  xray_obs_on || { warn "Проверка выходов — только при leastPing или leastLoad"; return 0; }
+  line=$(py xray-observatory-get "$XRAY_CONF" shell 2>/dev/null) || return 1
+  IFS=$'\t' read -r url interval conc <<< "$line"
+  echo -e "  URL проверки: ${W}${url:-?}${N}"
+  echo -e "  Интервал    : ${W}${interval:-?}${N}"
+  echo -e "  Параллельно : ${W}$( (( conc )) && echo вкл || echo выкл)${N}"
+  echo -e "  ${C}1)${N} URL проверки ${D}— Google / Gstatic / Cloudflare / свой${N}"
+  echo -e "  ${C}2)${N} Интервал ${D}— 10s / 15s / 30s / 1m / 2m${N}"
+  echo -e "  ${C}3)${N} Параллельная проверка выходов ${D}— переключить${N}"
+  read_choice c "${C}  Выбор [1-3] (0 — назад): ${N}" 0 3 0
+  case "$c" in
+    1)
+      urls=("https://www.google.com/generate_204" "https://www.gstatic.com/generate_204"
+            "http://cp.cloudflare.com/generate_204")
+      echo -e "  ${C}1)${N} Google ${D}— ${urls[0]}${N}"
+      echo -e "  ${C}2)${N} Gstatic ${D}— ${urls[1]}${N}"
+      echo -e "  ${C}3)${N} Cloudflare ${D}— ${urls[2]}${N}"
+      echo -e "  ${C}4)${N} Свой URL"
+      read_choice c "${C}  URL [1-4] (0 — отмена): ${N}" 0 4 0
+      (( c )) || return 0
+      if (( c == 4 )); then
+        read_line url "${C}  http(s)://… : ${N}"
+        [[ -n "$url" ]] || return 0
+      else
+        url="${urls[$((c - 1))]}"
+      fi
+      xray_observatory url "$url" || true ;;
+    2)
+      ivals=(10s 15s 30s 1m 2m)
+      echo -e "  ${C}1)${N} 10s  ${C}2)${N} 15s  ${C}3)${N} 30s  ${C}4)${N} 1m  ${C}5)${N} 2m"
+      read_choice c "${C}  Интервал [1-5] (0 — отмена): ${N}" 0 5 0
+      (( c )) || return 0
+      xray_observatory interval "${ivals[$((c - 1))]}" || true ;;
+    3)
+      if (( conc )); then xray_observatory concurrency off || true
+      else xray_observatory concurrency on || true; fi ;;
+  esac
+}
+
 xray_balancer_menu() {
-  local c s=(random roundRobin leastPing leastLoad off) n
+  local c s=(random roundRobin leastPing leastLoad off) n bal max=5
   n=$(xray_tags | grep -c . || true)
   (( n >= 2 )) || { warn "Для балансировки нужно минимум 2 выхода"; return 0; }
-  echo -e "  Сейчас: ${W}$(py xray-balancer-get "$XRAY_CONF")${N}"
+  bal=$(py xray-balancer-get "$XRAY_CONF")
+  echo -e "  Сейчас: ${W}$bal${N}"
   echo -e "  ${C}1)${N} random ${D}— случайный выход${N}"
   echo -e "  ${C}2)${N} roundRobin ${D}— по очереди${N}"
   echo -e "  ${C}3)${N} leastPing ${D}— самый быстрый${N}"
   echo -e "  ${C}4)${N} leastLoad ${D}— наименее загружен${N}"
   echo -e "  ${C}5)${N} Выключить ${D}— первый выход${N}"
-  read_choice c "${C}  Выбор [1-5] (0 — отмена): ${N}" 0 5 0
+  if [[ "$bal" == leastPing || "$bal" == leastLoad ]]; then
+    echo -e "  ${C}6)${N} Проверка выходов ${D}— URL / интервал / параллельно${N}"
+    max=6
+  fi
+  read_choice c "${C}  Выбор [1-$max] (0 — отмена): ${N}" 0 "$max" 0
   (( c )) || return 0
+  if (( c == 6 )); then xray_observatory_menu; return; fi
   xray_balancer "${s[$((c - 1))]}"
 }
 
@@ -8274,7 +8343,7 @@ xray_uninstall() {
 
 # ── Статус и диагностика ──────────────────────────────────
 xray_status() {
-  local tags=() n total name tag fail
+  local tags=() n total name tag fail obs_line
   if ! xray_installed; then echo -e "  Xray      : ${D}○ не установлен${N}"; return 0; fi
   echo -e "  Версия    : $("$XRAY_BIN" version 2>/dev/null | head -1 | awk '{print $2}')"
   fail=$(xray_fail)
@@ -8293,6 +8362,10 @@ xray_status() {
   mapfile -t tags < <(xray_tags)
   echo -e "  Выходы    : ${W}${tags[*]:-нет}${N}"
   echo -e "  Балансир  : $(py xray-balancer-get "$XRAY_CONF" 2>/dev/null || echo off)"
+  if xray_obs_on; then
+    obs_line=$(py xray-observatory-get "$XRAY_CONF" line 2>/dev/null) || true
+    [[ -n "$obs_line" ]] && echo -e "  Проверка  : ${W}$obs_line${N}"
+  fi
   (( ${#tags[@]} )) && echo -e "  По умолч. : ${W}$(py xray-main-get "$XRAY_CONF" 2>/dev/null | sed 's/^balancer$/балансировщик/')${N}"
   xray_client_outs | while IFS='|' read -r name _ tag; do
     echo -e "  ${D}  $name → $tag$(xray_tags | grep -qxF "$tag" || echo " (выхода нет — по умолчанию)")${N}"
@@ -17074,6 +17147,7 @@ _api_xray() {
         _kv tags:j "$(xray_tags | py json-list)"
         _kv balancer "$(xray_installed && py xray-balancer-get "$XRAY_CONF" 2>/dev/null || echo off)"
         _kv main "$(xray_installed && py xray-main-get "$XRAY_CONF" 2>/dev/null)"
+        _kv obs:j "$(xray_installed && py xray-observatory-get "$XRAY_CONF" 2>/dev/null || echo '{}')"
         _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         # Выходы для карточек: протокол, защита, транспорт, адрес
@@ -17100,6 +17174,16 @@ _api_xray() {
         || { _api_usage "xray balancer random|roundRobin|leastPing|leastLoad|off"; return; }
       xray_installed || { err "Xray не установлен"; return 1; }
       xray_balancer "$1" ;;
+    # Observatory: url|interval|concurrency — только при leastPing/leastLoad
+    observatory)
+      xray_installed || { err "Xray не установлен"; return 1; }
+      case "${1:-}" in
+        ""|get) { _kv obs:j "$(py xray-observatory-get "$XRAY_CONF")"; } | api_obj ;;
+        url|interval|concurrency)
+          [[ -n "${2:-}" ]] || { _api_usage "xray observatory url|interval|concurrency ЗНАЧЕНИЕ"; return; }
+          xray_observatory "$1" "$2" ;;
+        *) _api_usage "xray observatory get|url URL|interval 10s|15s|30s|1m|2m|concurrency on|off" ;;
+      esac ;;
     main)
       [[ -n "${1:-}" ]] || { _api_usage "xray main ТЕГ"; return; }
       xray_main_set "$1" ;;
@@ -17117,7 +17201,7 @@ _api_xray() {
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|sub …|diag|fix|remove" ;;
+    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|observatory …|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|sub …|diag|fix|remove" ;;
   esac
 }
 
@@ -17787,7 +17871,8 @@ _api_readonly() {
   [[ "$a $b" != *[[:space:]]*[[:space:]]* ]] || return 1
   case "$a $b $c" in
     "server params "|"server params check"|"bot proxy get"|"bot proxy check"|"bot proxy candidates"|"bot webapp get"|\
-    "tunnels fail "|"tunnels fail list"|"backup key "|"backup key status"|"xray sub "|"xray sub status") return 0 ;;
+    "tunnels fail "|"tunnels fail list"|"backup key "|"backup key status"|"xray sub "|"xray sub status"|\
+    "xray observatory "|"xray observatory get") return 0 ;;
   esac
   case "$a $b" in
     "server info"|"module report"|"module tags"|"module check"|"module backups"|"clients "|"clients list"|\
@@ -17939,6 +18024,7 @@ awg2 $VERSION — AmneziaWG 2.0 / 3.1 для Ubuntu 24.04+ и Debian 12+
   awg2 --tunnel Т up|down|restart
                                 Т: warp | xray | tun2socks | exits | dns
   awg2 --xray-balancer С        С: random | roundRobin | leastPing | leastLoad | off
+  awg2 --xray-observatory …     url URL | interval 10s|15s|30s|1m|2m | concurrency on|off
   awg2 --xray-ru-update         обновить РФ-базы Xray
   awg2 --wgobf add ИМЯ [ПРОФИЛЬ] | del|bundle ИМЯ | rotate-key [ПРОФИЛЬ] | restart
   awg2 --wgobf preset add|set ИМЯ [masking=] [obfb=] [dummy=] [idle=] | preset del|default ИМЯ
@@ -18016,6 +18102,11 @@ main() {
       AUTO_MODE=1
       xray_installed || { err "Xray не установлен"; exit 1; }
       xray_balancer "$2" && exit 0 || exit 1 ;;
+    --xray-observatory)
+      [[ -n "${2:-}" && -n "${3:-}" ]] \
+        || { err "Использование: awg2 --xray-observatory url|interval|concurrency ЗНАЧЕНИЕ"; exit 1; }
+      AUTO_MODE=1
+      xray_observatory "$2" "$3" && exit 0 || exit 1 ;;
     --xray-ru-update)
       xray_ru_on || { info "РФ-правила Xray выключены — обновлять нечего"; exit 0; }
       xray_ru_update || exit 1
@@ -19856,7 +19947,7 @@ if __name__ == "__main__":
 '
 # CPS_GENERATOR_END v2
 
-_PY_HELPER_SUM=8e9b32b08f2c7c2c
+_PY_HELPER_SUM=f81edb32cf955493
 IFS= read -r -d '' _PY_HELPER <<'__AWG2_PY_HELPER__' || true
 """Встроенный помощник awg2: разбор и атомарная правка конфигов, JSON Xray,
 расчёты подсетей, разбор pcap. Вызывается как `py <команда> [аргументы]`.
@@ -22069,6 +22160,65 @@ def cmd_xray_tun_probe(out):
                 "outbounds": [{"protocol": "freedom", "tag": "direct"}]})
 
 
+# Observatory (leastPing / leastLoad): URL и интервал проверки выходов.
+# Значения по умолчанию — как ставила Тулза раньше; свои — через
+# xray-observatory-set и не сбрасываются при смене стратегии на least*.
+XRAY_OBS_URL = "https://www.google.com/generate_204"
+XRAY_OBS_INTERVAL = "1m"
+# Допустимые интервалы: ввод → нормализованная строка для Xray
+XRAY_OBS_INTERVALS = {
+    "10": "10s", "10s": "10s",
+    "15": "15s", "15s": "15s",
+    "30": "30s", "30s": "30s",
+    "60": "1m", "60s": "1m", "1m": "1m",
+    "120": "2m", "120s": "2m", "2m": "2m",
+}
+
+
+def _obs_url_ok(url):
+    if not isinstance(url, str) or not (8 <= len(url) <= 512) or any(c.isspace() for c in url):
+        return False
+    p = urllib.parse.urlparse(url)
+    return p.scheme in ("http", "https") and bool(p.netloc) and not p.netloc.startswith(".")
+
+
+def _obs_interval_norm(raw):
+    return XRAY_OBS_INTERVALS.get(str(raw).strip().lower())
+
+
+def _obs_concurrency_norm(raw):
+    v = str(raw).strip().lower()
+    if v in ("1", "on", "true", "yes"):
+        return True
+    if v in ("0", "off", "false", "no"):
+        return False
+    return None
+
+
+def _observatory(tags, prev=None):
+    """Блок observatory для leastPing/leastLoad. prev — прежние настройки
+    (чтобы смена стратегии не затирала URL/интервал/concurrency)."""
+    prev = prev if isinstance(prev, dict) else {}
+    url = prev.get("probeUrl") if _obs_url_ok(prev.get("probeUrl")) else XRAY_OBS_URL
+    interval = _obs_interval_norm(prev.get("probeInterval")) or XRAY_OBS_INTERVAL
+    out = {"subjectSelector": list(tags), "probeUrl": url, "probeInterval": interval}
+    if prev.get("enableConcurrency") is True:
+        out["enableConcurrency"] = True
+    return out
+
+
+def _obs_info(conf):
+    """Сводка observatory для API/UI: on — блок есть (leastPing/leastLoad)."""
+    obs = conf.get("observatory") if isinstance(conf, dict) else None
+    if not isinstance(obs, dict):
+        return {"on": False, "probeUrl": XRAY_OBS_URL, "probeInterval": XRAY_OBS_INTERVAL,
+                "enableConcurrency": False}
+    return {"on": True,
+            "probeUrl": obs.get("probeUrl") if _obs_url_ok(obs.get("probeUrl")) else XRAY_OBS_URL,
+            "probeInterval": _obs_interval_norm(obs.get("probeInterval")) or XRAY_OBS_INTERVAL,
+            "enableConcurrency": obs.get("enableConcurrency") is True}
+
+
 def cmd_xray_balancer(path, strategy):
     if strategy not in ("random", "roundRobin", "leastPing", "leastLoad", "off"):
         die("стратегия: random|roundRobin|leastPing|leastLoad|off")
@@ -22095,9 +22245,7 @@ def cmd_xray_balancer(path, strategy):
         rule["balancerTag"] = "balancer"
         # leastPing/leastLoad выбирают по замерам observatory
         if strategy in ("leastPing", "leastLoad"):
-            conf["observatory"] = {"subjectSelector": tags,
-                                   "probeUrl": "https://www.google.com/generate_204",
-                                   "probeInterval": "1m"}
+            conf["observatory"] = _observatory(tags, conf.get("observatory"))
         else:
             conf.pop("observatory", None)
     jsave(path, conf)
@@ -22106,6 +22254,58 @@ def cmd_xray_balancer(path, strategy):
 def cmd_xray_balancer_get(path):
     b = jload(path).get("routing", {}).get("balancers") or []
     print(b[0].get("strategy", {}).get("type", "random") if b else "off")
+
+
+def cmd_xray_observatory_get(path, fmt="json"):
+    """json — для API; shell — url<TAB>interval<TAB>0|1; line — одна строка статуса."""
+    info = _obs_info(jload(path))
+    if fmt == "shell":
+        print("%s\t%s\t%d" % (info["probeUrl"], info["probeInterval"],
+                              1 if info["enableConcurrency"] else 0))
+        return
+    if fmt == "line":
+        host = info["probeUrl"].split("://", 1)[-1][:40]
+        extra = " · параллельно" if info["enableConcurrency"] else ""
+        print("%s · %s%s" % (info["probeInterval"], host, extra))
+        return
+    if fmt != "json":
+        die("формат: json|shell|line")
+    print(json.dumps(info, ensure_ascii=False))
+
+
+def cmd_xray_observatory_set(path, field, value):
+    """Правка observatory: url | interval | concurrency. Только при leastPing/leastLoad."""
+    conf = jload(path)
+    bal = (conf.get("routing") or {}).get("balancers") or []
+    strategy = (bal[0].get("strategy") or {}).get("type") if bal else "off"
+    if strategy not in ("leastPing", "leastLoad"):
+        die("observatory — только при leastPing или leastLoad")
+    tags = proxy_tags(conf)
+    if len(tags) < 2:
+        die("нужно минимум 2 proxy-outbound")
+    obs = _observatory(tags, conf.get("observatory"))
+    if field == "url":
+        if not _obs_url_ok(value):
+            die("url: http(s)://… без пробелов, до 512 символов")
+        obs["probeUrl"] = value
+    elif field == "interval":
+        norm = _obs_interval_norm(value)
+        if not norm:
+            die("interval: 10s|15s|30s|1m|2m")
+        obs["probeInterval"] = norm
+    elif field == "concurrency":
+        on = _obs_concurrency_norm(value)
+        if on is None:
+            die("concurrency: on|off")
+        if on:
+            obs["enableConcurrency"] = True
+        else:
+            obs.pop("enableConcurrency", None)
+    else:
+        die("поле: url|interval|concurrency")
+    conf["observatory"] = obs
+    jsave(path, conf)
+    print(json.dumps(_obs_info(conf), ensure_ascii=False))
 
 
 XRAY_CLIENT_RULE = "client-out"
@@ -23306,6 +23506,7 @@ COMMANDS = {
     "xray-probe-tag": cmd_xray_probe_tag, "xray-tun-probe": cmd_xray_tun_probe, "xray-compat": cmd_xray_compat,
     "xray-test-copy": cmd_xray_test_copy,
     "xray-balancer": cmd_xray_balancer, "xray-balancer-get": cmd_xray_balancer_get,
+    "xray-observatory-get": cmd_xray_observatory_get, "xray-observatory-set": cmd_xray_observatory_set,
     "xray-main": cmd_xray_main, "xray-main-get": cmd_xray_main_get,
     "xray-ru": cmd_xray_ru, "xray-prepare": cmd_xray_prepare,
     "xray-sub-parse": cmd_xray_sub_parse, "xray-sub-meta": cmd_xray_sub_meta, "xray-sub-probe": cmd_xray_sub_probe,
@@ -23335,5 +23536,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=390835d7a6fd568b
+_BUILD_SUM=dc061023329f49a2
 main "$@"
