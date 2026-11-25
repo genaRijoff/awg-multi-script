@@ -10,6 +10,7 @@ awg2 $VERSION — AmneziaWG 2.0 / 3.1 для Ubuntu 24.04+ и Debian 12+
   awg2 --tunnel Т up|down|restart
                                 Т: warp | xray | tun2socks | exits | dns
   awg2 --xray-balancer С        С: random | roundRobin | leastPing | leastLoad | off
+  awg2 --xray-observatory …     url URL | interval 10s|15s|30s|1m|2m | concurrency on|off
   awg2 --xray-ru-update         обновить РФ-базы Xray
   awg2 --wgobf add|del|bundle ИМЯ | rotate-key | restart
   awg2 --status                 сводка состояния
@@ -85,6 +86,11 @@ main() {
       AUTO_MODE=1
       xray_installed || { err "Xray не установлен"; exit 1; }
       xray_balancer "$2" && exit 0 || exit 1 ;;
+    --xray-observatory)
+      [[ -n "${2:-}" && -n "${3:-}" ]] \
+        || { err "Использование: awg2 --xray-observatory url|interval|concurrency ЗНАЧЕНИЕ"; exit 1; }
+      AUTO_MODE=1
+      xray_observatory "$2" "$3" && exit 0 || exit 1 ;;
     --xray-ru-update)
       xray_ru_on || { info "РФ-правила Xray выключены — обновлять нечего"; exit 0; }
       xray_ru_update || exit 1

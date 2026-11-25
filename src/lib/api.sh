@@ -651,6 +651,7 @@ _api_xray() {
         _kv tags:j "$(xray_tags | py json-list)"
         _kv balancer "$(xray_installed && py xray-balancer-get "$XRAY_CONF" 2>/dev/null || echo off)"
         _kv main "$(xray_installed && py xray-main-get "$XRAY_CONF" 2>/dev/null)"
+        _kv obs:j "$(xray_installed && py xray-observatory-get "$XRAY_CONF" 2>/dev/null || echo '{}')"
         _kv per_client:b "$(xray_installed && _b xray_tun_supported || echo 0)"
         _kv clients:j "$(xray_client_outs | py json-rows name ip out)"
         # Выходы для карточек: протокол, защита, транспорт, адрес
@@ -677,6 +678,16 @@ _api_xray() {
         || { _api_usage "xray balancer random|roundRobin|leastPing|leastLoad|off"; return; }
       xray_installed || { err "Xray не установлен"; return 1; }
       xray_balancer "$1" ;;
+    # Observatory: url|interval|concurrency — только при leastPing/leastLoad
+    observatory)
+      xray_installed || { err "Xray не установлен"; return 1; }
+      case "${1:-}" in
+        ""|get) { _kv obs:j "$(py xray-observatory-get "$XRAY_CONF")"; } | api_obj ;;
+        url|interval|concurrency)
+          [[ -n "${2:-}" ]] || { _api_usage "xray observatory url|interval|concurrency ЗНАЧЕНИЕ"; return; }
+          xray_observatory "$1" "$2" ;;
+        *) _api_usage "xray observatory get|url URL|interval 10s|15s|30s|1m|2m|concurrency on|off" ;;
+      esac ;;
     main)
       [[ -n "${1:-}" ]] || { _api_usage "xray main ТЕГ"; return; }
       xray_main_set "$1" ;;
@@ -694,7 +705,7 @@ _api_xray() {
     diag) xray_diagnose ;;
     fix) xray_fix ;;
     remove) xray_uninstall ;;
-    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|sub …|diag|fix|remove" ;;
+    *) _api_usage "xray status|probe|install|add ССЫЛКА|del ТЕГ|balancer СТРАТЕГИЯ|observatory …|main ТЕГ|client ИМЯ ТЕГ|default|up|down|restart|ru on|off|ru-update|sub …|diag|fix|remove" ;;
   esac
 }
 
