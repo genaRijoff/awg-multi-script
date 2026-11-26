@@ -5,7 +5,7 @@
 # ненулевая команда обрывала бы скрипт посреди настройки сети.
 set -uo pipefail
 
-VERSION="v1.2.69"
+VERSION="v1.2.70"
 # Буква тестовой сборки (AWG_BUILD=b ./build.sh): видна в меню, боте и панели,
 # в сравнении версий не участвует. У выпущенной сборки пусто.
 BUILD=""
@@ -803,6 +803,7 @@ unit_enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
 write_unit() {
   write_file "/etc/systemd/system/$1" 644 && systemctl daemon-reload
 }
+unit_file_exists() { [[ -f "/etc/systemd/system/$1" ]]; }
 
 # Таймер в состоянии «active (elapsed)» больше не сработает никогда, хотя
 # is-active отвечает «active». Так глох таймер сроков и лимитов (v1.2.0-1.2.2):
@@ -8226,6 +8227,7 @@ EOF
 Description=AWG Toolza — xray0 через tun2socks
 After=$XRAY_UNIT
 PartOf=$XRAY_UNIT
+ConditionPathExists=$XRAY_STATE
 
 [Service]
 ExecStart=$T2S_BIN --device tun://$XRAY_IF --proxy socks5://$XRAY_SOCKS --loglevel warn
@@ -8238,11 +8240,15 @@ EOF
   else
     remove_unit "$XRAY_TUN_UNIT"
   fi
+  # Условие — то же, что у Xray: без него при выключенном Xray (юниты включены,
+  # состояния нет — например, после восстановления бэкапа) загрузка ждала xray0
+  # ~20 с и юнит падал. PartOf пропущенного Xray этого не останавливает.
   write_unit "$XRAY_ROUTING_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — маршруты клиентов в Xray
 After=$after awg-quick@awg0.service
 PartOf=$XRAY_UNIT
+ConditionPathExists=$XRAY_STATE
 
 [Service]
 Type=oneshot
@@ -12640,7 +12646,13 @@ helpers_refresh() {
   # готовый конфиг сразу, а не при следующем «Включить»
   [[ -f "$XRAY_CONF" ]] && py xray-compat "$XRAY_CONF"
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
-  [[ -f "$XRAY_STATE" && ! -f "/etc/systemd/system/$XRAY_UNIT" ]] && ! xray_is_up && rm -f "$XRAY_STATE"
+  [[ -f "$XRAY_STATE" ]] && ! unit_file_exists "$XRAY_UNIT" && ! xray_is_up && rm -f "$XRAY_STATE"
+  # С v1.2.70 у юнитов маршрутов Xray и его tun2socks — условие самого Xray:
+  # юниты заново (режим — по юниту tun2socks), упавший без Xray — не «failed»
+  if unit_file_exists "$XRAY_ROUTING_UNIT"; then
+    _xray_write_units "$(unit_file_exists "$XRAY_TUN_UNIT" && echo tun2socks || echo native)" &>/dev/null
+    [[ -f "$XRAY_STATE" ]] || systemctl reset-failed "$XRAY_ROUTING_UNIT" &>/dev/null
+  fi
   wgobf_installed && _wgobf_write_service_files
   # Веб-панель: скрипт правила доступа и его запуск в юните — до старта панели
   if web_installed; then _web_fw_emit && web_write_unit; fi
@@ -23651,5 +23663,5 @@ if __name__ == "__main__":
     main()
 __AWG2_PY_HELPER__
 
-_BUILD_SUM=75404e5534485f75
+_BUILD_SUM=b388b16682b2ba22
 main "$@"

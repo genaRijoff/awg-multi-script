@@ -187,6 +187,7 @@ AUTOSTART_DROPIN="{ROOT}/etc/systemd/system/awg-quick@awg0.service.d"
 WEB_CONF="${{AWG_WEB_CONF:-{ROOT}/etc/awg-web.conf}}"; WEB_DIR="{ROOT}/etc/awg-web"; WEB_LOG="{ROOT}/awg-web.log"
 WEB_NETS_FILE="${{AWG_WEB_NETS:-$WEB_DIR/access.nets}}"
 write_unit() {{ mkdir -p "{ROOT}/units"; cat > "{ROOT}/units/$1"; }}
+unit_file_exists() {{ [[ -f "{ROOT}/units/$1" ]]; }}
 remove_unit() {{ :; }}
 mkdir -p "$AWG_DIR" "$CLIENT_DIR" "$STATE_DIR" "{ROOT}/scripts"
 '''

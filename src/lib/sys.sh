@@ -121,6 +121,7 @@ unit_enabled() { systemctl is-enabled --quiet "$1" 2>/dev/null; }
 write_unit() {
   write_file "/etc/systemd/system/$1" 644 && systemctl daemon-reload
 }
+unit_file_exists() { [[ -f "/etc/systemd/system/$1" ]]; }
 
 # Таймер в состоянии «active (elapsed)» больше не сработает никогда, хотя
 # is-active отвечает «active». Так глох таймер сроков и лимитов (v1.2.0-1.2.2):

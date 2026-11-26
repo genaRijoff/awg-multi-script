@@ -831,6 +831,7 @@ EOF
 Description=AWG Toolza — xray0 через tun2socks
 After=$XRAY_UNIT
 PartOf=$XRAY_UNIT
+ConditionPathExists=$XRAY_STATE
 
 [Service]
 ExecStart=$T2S_BIN --device tun://$XRAY_IF --proxy socks5://$XRAY_SOCKS --loglevel warn
@@ -843,11 +844,15 @@ EOF
   else
     remove_unit "$XRAY_TUN_UNIT"
   fi
+  # Условие — то же, что у Xray: без него при выключенном Xray (юниты включены,
+  # состояния нет — например, после восстановления бэкапа) загрузка ждала xray0
+  # ~20 с и юнит падал. PartOf пропущенного Xray этого не останавливает.
   write_unit "$XRAY_ROUTING_UNIT" <<EOF
 [Unit]
 Description=AWG Toolza — маршруты клиентов в Xray
 After=$after awg-quick@awg0.service
 PartOf=$XRAY_UNIT
+ConditionPathExists=$XRAY_STATE
 
 [Service]
 Type=oneshot

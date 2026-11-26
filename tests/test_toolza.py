@@ -2679,6 +2679,57 @@ bsum, _, ver = rest.partition("--")
 chk("служебные скрипты пересобираются и для новой сборки той же версии",
     len(bsum) == 16 and ver.startswith("v1.") and mark == f"{ver} {bsum}", out)
 
+# Маршруты Xray и его tun2socks — с условием самого Xray: без него при выключенном
+# Xray (юниты включены, состояния нет) загрузка ждала xray0 ~20 с и юнит падал.
+# Обновление awg2 перегенерирует юниты прежних версий.
+UD = os.path.join(ROOT, "units")
+XST = os.path.join(ROOT, "etc/xray/state")
+os.makedirs(UD, exist_ok=True)
+for u in ("awg-xray.service", "awg-xray-routing.service", "awg-xray-tun.service"):
+    if os.path.exists(os.path.join(UD, u)):
+        os.remove(os.path.join(UD, u))
+with open(os.path.join(UD, "awg-xray-routing.service"), "w") as f:
+    f.write("[Unit]\nDescription=AWG Toolza — маршруты клиентов в Xray\nAfter=awg-xray.service awg-quick@awg0.service\n"
+            "PartOf=awg-xray.service\n\n[Service]\nType=oneshot\n")
+had_xst = os.path.exists(XST)
+if had_xst:
+    os.rename(XST, XST + ".keep")
+REFRESH = ('server_exists() { return 1; }; cascade_count() { echo 0; }; wgobf_installed() { return 1; }; '
+           'MOD_SRC_DIR=/nonexistent; echo old > "$STATE_DIR/version"; ')
+reset_calls()
+rc, out, err = bash(REFRESH + 'helpers_refresh')
+uread = lambda u: open(os.path.join(UD, u)).read() if os.path.exists(os.path.join(UD, u)) else ""
+cond = f"ConditionPathExists={XST}\n"
+ru, xu = uread("awg-xray-routing.service"), uread("awg-xray.service")
+chk("обновление awg2: юнит маршрутов Xray прежней версии — с условием Xray; без Xray — не «failed»",
+    cond in ru and "PartOf=awg-xray.service" in ru and "WantedBy=multi-user.target" in ru and cond in xu
+    and "After=awg-xray.service awg-quick@awg0.service" in ru and not uread("awg-xray-tun.service")
+    and "systemctl reset-failed awg-xray-routing.service" in calls(), [ru, calls()[-600:], err[-300:]])
+first = ru
+reset_calls()
+bash(REFRESH + 'helpers_refresh')
+chk("перегенерация идемпотентна: тот же юнит", uread("awg-xray-routing.service") == first, uread("awg-xray-routing.service"))
+# Режим tun2socks (есть его юнит), Xray включён: оба юнита с условием, «failed» не трогаем
+os.makedirs(os.path.dirname(XST), exist_ok=True)
+with open(XST, "w") as f:
+    f.write("active\ntun_mode=tun2socks\n")
+with open(os.path.join(UD, "awg-xray-tun.service"), "w") as f:
+    f.write("[Unit]\nDescription=old\n")
+reset_calls()
+bash(REFRESH + 'helpers_refresh')
+ru, tu = uread("awg-xray-routing.service"), uread("awg-xray-tun.service")
+chk("tun2socks: юнит xray0 и маршрутов — с условием, порядок после tun2socks; Xray включён — reset-failed не нужен",
+    cond in tu and "PartOf=awg-xray.service" in tu and cond in ru
+    and "After=awg-xray.service awg-xray-tun.service awg-quick@awg0.service" in ru and "reset-failed" not in calls(),
+    [ru, tu, calls()[-400:]])
+for u in ("awg-xray.service", "awg-xray-routing.service", "awg-xray-tun.service"):
+    if os.path.exists(os.path.join(UD, u)):
+        os.remove(os.path.join(UD, u))
+if os.path.exists(XST):
+    os.remove(XST)
+if had_xst:
+    os.rename(XST + ".keep", XST)
+
 # Xray 26.7+ без имени у входа tun поднимает utunN: обновление awg2 сразу
 # ставит имя xray0 в готовый конфиг — служба переживёт перезапуск на новом Xray
 XCF = os.path.join(ROOT, "etc/xray/config.json")

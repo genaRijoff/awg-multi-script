@@ -332,7 +332,13 @@ helpers_refresh() {
   # готовый конфиг сразу, а не при следующем «Включить»
   [[ -f "$XRAY_CONF" ]] && py xray-compat "$XRAY_CONF"
   # Xray прежних версий жил во временных юнитах и перезагрузку не переживал
-  [[ -f "$XRAY_STATE" && ! -f "/etc/systemd/system/$XRAY_UNIT" ]] && ! xray_is_up && rm -f "$XRAY_STATE"
+  [[ -f "$XRAY_STATE" ]] && ! unit_file_exists "$XRAY_UNIT" && ! xray_is_up && rm -f "$XRAY_STATE"
+  # С v1.2.70 у юнитов маршрутов Xray и его tun2socks — условие самого Xray:
+  # юниты заново (режим — по юниту tun2socks), упавший без Xray — не «failed»
+  if unit_file_exists "$XRAY_ROUTING_UNIT"; then
+    _xray_write_units "$(unit_file_exists "$XRAY_TUN_UNIT" && echo tun2socks || echo native)" &>/dev/null
+    [[ -f "$XRAY_STATE" ]] || systemctl reset-failed "$XRAY_ROUTING_UNIT" &>/dev/null
+  fi
   wgobf_installed && _wgobf_write_service_files
   # Веб-панель: скрипт правила доступа и его запуск в юните — до старта панели
   if web_installed; then _web_fw_emit && web_write_unit; fi
